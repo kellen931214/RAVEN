@@ -1,0 +1,72 @@
+# Python caches and local tooling
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.ipynb_checkpoints/
+
+# Local virtual environments
+.venv/
+.venv-*/
+venv/
+env/
+ENV/
+
+# Local environment files and secrets
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.token
+
+# OS and editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Generated experiment artifacts
+outputs/
+logs/
+out/
+raven_repro/outputs/
+raven_repro/logs/
+*.log
+*.pid
+*.exit
+
+# Local datasets and generated images
+data/
+datasets/
+
+# Model/cache artifacts
+.cache/
+cache/
+models/
+checkpoints/
+*.ckpt
+*.pt
+*.pth
+*.safetensors
+*.onnx
+*.bin
+
+# Package/build artifacts
+build/
+dist/
+*.egg-info/
+.eggs/
+wheels/
+
+# Runtime scratch
+tmp/
+temp/
+*.tmp
