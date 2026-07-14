@@ -1,5 +1,5 @@
-model_id: stabilityai/stable-diffusion-2-1-base
-model_revision: null
+model_id: RedbeardNZ/stable-diffusion-2-1-base
+model_revision: c6a5e9bab8d874d081de76fa270ae0aefa5410ff
 prompt: ""
 negative_prompt: ""
 steps: 50
@@ -11,7 +11,8 @@ shift_max: 32
 shift_sign: random
 shift_sampling: independent_axes
 shift_space: image_pixels
-padding_mode: reflection
+warp_mode: integer
+padding_mode: zeros
 view_guided_attention: true
 color_transfer: true
 seed: 42

@@ -43,6 +43,9 @@ raven_repro/logs/
 *.pid
 *.exit
 
+# External reference repositories checked out locally for audit only
+NFPA/
+
 # Local datasets and generated images
 data/
 datasets/

@@ -2,7 +2,7 @@
 
 This is a clean reproduction scaffold for **RAVEN: Erasing Invisible Watermarks via Novel View Synthesis**. It is intended for academic robustness evaluation on images you own or generated yourself.
 
-The implementation follows the local `PLAN.md` and uses the NFPA repository as an implementation reference for two ideas: frame-guided self-attention and latent warping with `grid_sample`. It does not modify NFPA.
+The implementation follows the local `PLAN.md` and uses the NFPA repository as an implementation reference for frame-guided self-attention and the optional `grid_sample` warp ablation. It does not modify NFPA.
 
 ## Setup
 
@@ -19,7 +19,7 @@ Optional evaluation packages:
 pip install open_clip_torch torchmetrics clean-fid
 ```
 
-The default model is `stabilityai/stable-diffusion-2-1-base`. The first run will download model weights from Hugging Face.
+The reproduction model is `RedbeardNZ/stable-diffusion-2-1-base` at revision `c6a5e9bab8d874d081de76fa270ae0aefa5410ff`.
 
 ## Single Image
 
@@ -27,7 +27,7 @@ The default model is `stabilityai/stable-diffusion-2-1-base`. The first run will
 python scripts/run_raven.py \
   --input path/to/watermarked.png \
   --output_dir outputs/raven_test \
-  --model_id stabilityai/stable-diffusion-2-1-base \
+  --model_id RedbeardNZ/stable-diffusion-2-1-base \
   --steps 50 \
   --strength 0.15 \
   --inversion_mode ddim \
@@ -37,7 +37,8 @@ python scripts/run_raven.py \
   --shift_sign random \
   --shift_sampling independent_axes \
   --shift_space image_pixels \
-  --padding_mode reflection \
+  --warp_mode integer \
+  --padding_mode zeros \
   --view_guided_attention true \
   --color_transfer true \
   --seed 42 \
@@ -51,7 +52,7 @@ python scripts/run_raven.py \
 python scripts/attack_folder.py \
   --input_dir data/watermarked \
   --output_dir outputs/raven_folder \
-  --model_id stabilityai/stable-diffusion-2-1-base \
+  --model_id RedbeardNZ/stable-diffusion-2-1-base \
   --steps 50 \
   --strength 0.15 \
   --guidance_scale 2.5 \
@@ -59,7 +60,8 @@ python scripts/attack_folder.py \
   --shift_max 32 \
   --shift_sign random \
   --shift_space image_pixels \
-  --padding_mode reflection \
+  --warp_mode integer \
+  --padding_mode zeros \
   --view_guided_attention true \
   --color_transfer true \
   --seed 42 \
@@ -84,7 +86,7 @@ PSNR and SSIM use the overlapping crop implied by each output folder's `debug_in
 
 - `raven/pipeline_raven.py`: two-stream partial-noising and denoising pipeline.
 - `raven/inversion.py`: VAE encoding plus partial DDIM inversion or Equation-(4) forward noising.
-- `raven/warp.py`: diagonal latent translation with `torch.nn.functional.grid_sample`.
+- `raven/warp.py`: integer zero-padded latent translation plus an explicit `grid_sample` ablation.
 - `raven/attention.py`: view-guided self-attention processor. Text cross-attention is left unchanged.
 - `raven/color_transfer.py`: LAB luminance matching and original-image chroma transfer.
 - `scripts/run_raven.py`: single-image CLI.
@@ -139,7 +141,7 @@ Extract raw detector scores without applying a default threshold:
 python scripts/extract_detector_scores.py \
   --method TR \
   --metadata /workspace/data/watermarked/mscoco/TR/metadata.csv \
-  --model-id stabilityai/stable-diffusion-2-1-base \
+  --model-id RedbeardNZ/stable-diffusion-2-1-base \
   --steps 50 \
   --limit 10 \
   --output outputs/audit/mscoco_TR_raw_scores.csv
@@ -167,6 +169,11 @@ must be requested explicitly so metric model provenance is recorded.
   while Implementation Details specifies DDIM inversion. The primary mode is
   now partial DDIM inversion; `--inversion_mode forward_noise` preserves the
   Equation-(4) implementation as a labeled ablation.
+- The primary warp mode is an integer latent translation with explicit zero
+  padding and no interpolation or circular wrap-around. Positive x moves
+  content right and positive y moves content down. `--warp_mode grid_sample`
+  retains bilinear interpolation as a labeled ablation; its padding mode and
+  `align_corners=True` setting are recorded in `debug_info.json`.
 - Latent viewpoint modulation uses a global diagonal translation, matching the requested reproduction scope, not a learned or depth-aware camera transform.
 - View-guided correspondence attention is implemented only for UNet self-attention. Cross-attention to text remains the default Diffusers behavior.
 - The implementation assumes paired latent ordering `[reference, view]`; with classifier-free guidance this becomes `[uncond reference, uncond view, cond reference, cond view]`. Debug mode records attention call counts and Q/K/V checksums.
@@ -176,6 +183,6 @@ must be requested explicitly so metric model provenance is recorded.
 ## Troubleshooting
 
 - If CUDA is unavailable, run with `--device cpu --dtype float32`; this will be slow.
-- If the model download fails, authenticate with Hugging Face or pre-download `stabilityai/stable-diffusion-2-1-base`.
+- If model loading fails, verify the pinned RedbeardNZ revision in the local Hugging Face cache.
 - If attention shape errors occur after upgrading Diffusers, first run `pytest tests/test_attention_shapes.py`, then inspect `raven/attention.py`.
 - If outputs drift too much, lower `--strength` or use `--view_guided_attention true --color_transfer true`.

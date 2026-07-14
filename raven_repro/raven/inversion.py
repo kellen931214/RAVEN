@@ -17,6 +17,11 @@ class PartialInversionResult:
     start_timestep: Any
     mode: str
     inversion_timesteps: Any = None
+    target_timestep: int = -1
+    denoise_scheduler: str = ""
+    inverse_scheduler: str = ""
+    prediction_type: str = ""
+    eta: float = 0.0
 
 
 def retrieve_img2img_timesteps(scheduler, num_inference_steps: int, strength: float, device) -> Tuple[Any, int]:
@@ -71,6 +76,10 @@ def partial_diffusion_inversion(
         raise ValueError("No timesteps selected; increase strength or num_inference_steps")
     start_timestep = timesteps[:1].repeat(clean_latents.shape[0])
     inversion_timesteps = None
+    target_timestep = int(start_timestep[0].detach().cpu().item())
+    denoise_scheduler_name = type(scheduler).__name__
+    inverse_scheduler_name = ""
+    prediction_type = str(getattr(scheduler.config, "prediction_type", "unspecified"))
     if mode == "forward_noise":
         noise = torch.randn(clean_latents.shape, generator=generator, device=device, dtype=dtype)
         noisy_latents = scheduler.add_noise(clean_latents, noise, start_timestep)
@@ -84,8 +93,17 @@ def partial_diffusion_inversion(
 
         inverse_scheduler = DDIMInverseScheduler.from_config(scheduler.config)
         inverse_scheduler.set_timesteps(num_inference_steps, device=device)
-        target_timestep = int(start_timestep[0].detach().cpu().item())
-        selected = [t for t in inverse_scheduler.timesteps if int(t) < target_timestep]
+        inverse_scheduler_name = type(inverse_scheduler).__name__
+        inverse_prediction_type = str(getattr(inverse_scheduler.config, "prediction_type", "unspecified"))
+        if inverse_prediction_type != prediction_type:
+            raise ValueError(
+                f"scheduler prediction_type mismatch: denoise={prediction_type}, inverse={inverse_prediction_type}"
+            )
+        inverse_values = [int(t) for t in inverse_scheduler.timesteps]
+        if target_timestep not in inverse_values:
+            raise ValueError(f"target timestep {target_timestep} is absent from inverse scheduler timesteps")
+        target_index = inverse_values.index(target_timestep)
+        selected = list(inverse_scheduler.timesteps[:target_index])
         latents = clean_latents
         do_cfg = guidance_scale > 1.0
         with torch.no_grad():
@@ -115,4 +133,9 @@ def partial_diffusion_inversion(
         start_timestep=start_timestep,
         mode=mode,
         inversion_timesteps=inversion_timesteps,
+        target_timestep=target_timestep,
+        denoise_scheduler=denoise_scheduler_name,
+        inverse_scheduler=inverse_scheduler_name,
+        prediction_type=prediction_type,
+        eta=0.0,
     )

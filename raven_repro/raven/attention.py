@@ -16,6 +16,14 @@ class AttentionDebugState:
     last_query_checksums: Optional[list[float]] = None
     last_key_source_checksums: Optional[list[float]] = None
     last_value_source_checksums: Optional[list[float]] = None
+    layer_name: str = ""
+    self_calls: int = 0
+    cfg_layout: Optional[str] = None
+    last_query_fingerprints: Optional[list[dict[str, float]]] = None
+    last_original_key_fingerprints: Optional[list[dict[str, float]]] = None
+    last_original_value_fingerprints: Optional[list[dict[str, float]]] = None
+    last_injected_key_fingerprints: Optional[list[dict[str, float]]] = None
+    last_injected_value_fingerprints: Optional[list[dict[str, float]]] = None
 
 
 class ViewGuidedAttnProcessor:
@@ -26,10 +34,22 @@ class ViewGuidedAttnProcessor:
     cond view]. Cross-attention is passed through unchanged.
     """
 
-    def __init__(self, stream_batch_size: int = 1, debug: bool = False):
+    def __init__(self, stream_batch_size: int = 1, debug: bool = False, layer_name: str = ""):
         self.stream_batch_size = stream_batch_size
         self.debug = debug
-        self.state = AttentionDebugState(enabled=True)
+        self.state = AttentionDebugState(enabled=True, layer_name=layer_name)
+
+    @staticmethod
+    def _fingerprints(tensor) -> list[dict[str, float]]:
+        values = tensor.detach().float()
+        return [
+            {
+                "sum": float(item.sum().cpu().item()),
+                "abs_sum": float(item.abs().sum().cpu().item()),
+                "square_sum": float(item.square().sum().cpu().item()),
+            }
+            for item in values
+        ]
 
     def __call__(
         self,
@@ -82,8 +102,13 @@ class ViewGuidedAttnProcessor:
 
         if self.debug:
             self.state.last_query_checksums = query.detach().float().sum(dim=(1, 2)).cpu().tolist()
+            self.state.last_query_fingerprints = self._fingerprints(query)
 
         if not is_cross_attention:
+            self.state.self_calls += 1
+            self.state.cfg_layout = (
+                "[uncond reference, uncond view, cond reference, cond view]" if batch_size == 4 else "adjacent reference/view pairs"
+            )
             if batch_size % 2 != 0:
                 raise ValueError(
                     "View-guided self-attention expects paired reference/view batches; "
@@ -91,6 +116,9 @@ class ViewGuidedAttnProcessor:
                 )
             # Pairs are adjacent: 0=reference, 1=view, repeated for CFG halves.
             pair_count = batch_size // 2
+            if self.debug:
+                self.state.last_original_key_fingerprints = self._fingerprints(key)
+                self.state.last_original_value_fingerprints = self._fingerprints(value)
             key_pairs = key.view(pair_count, 2, sequence_length, -1)
             value_pairs = value.view(pair_count, 2, sequence_length, -1)
             ref_key = key_pairs[:, 0:1].expand(-1, 2, -1, -1).reshape_as(key)
@@ -101,6 +129,8 @@ class ViewGuidedAttnProcessor:
         if self.debug:
             self.state.last_key_source_checksums = key.detach().float().sum(dim=(1, 2)).cpu().tolist()
             self.state.last_value_source_checksums = value.detach().float().sum(dim=(1, 2)).cpu().tolist()
+            self.state.last_injected_key_fingerprints = self._fingerprints(key)
+            self.state.last_injected_value_fingerprints = self._fingerprints(value)
 
         query = attn.head_to_batch_dim(query)
         key = attn.head_to_batch_dim(key)
@@ -124,31 +154,31 @@ class ViewGuidedAttnProcessor:
 
 
 def make_view_guided_processors(unet, debug: bool = False) -> Dict[str, Any]:
-    """Create processors only for self-attention layers, preserving cross-attn behavior."""
-    try:
-        from diffusers.models.attention_processor import AttnProcessor
-    except ImportError as exc:
-        raise ImportError("make_view_guided_processors requires diffusers") from exc
-
+    """Replace self-attention only and preserve each existing cross-attn processor."""
+    existing = dict(unet.attn_processors)
     processors: Dict[str, Any] = {}
-    for name in unet.attn_processors.keys():
+    for name, processor in existing.items():
         if name.endswith("attn1.processor"):
-            processors[name] = ViewGuidedAttnProcessor(debug=debug)
+            processors[name] = ViewGuidedAttnProcessor(debug=debug, layer_name=name)
         else:
-            processors[name] = AttnProcessor()
+            processors[name] = processor
     return processors
 
 
 def install_view_guided_attention(unet, debug: bool = False) -> Dict[str, Any]:
     processors = make_view_guided_processors(unet, debug=debug)
+    installed_processors = dict(processors)
     unet.set_attn_processor(processors)
-    return processors
+    return installed_processors
 
 
-def restore_default_attention(unet) -> None:
+def restore_default_attention(unet, processors: Optional[Dict[str, Any]] = None) -> None:
+    """Restore an exact processor mapping, with the legacy generic fallback preserved."""
+    if processors is not None:
+        unet.set_attn_processor(dict(processors))
+        return
     try:
         from diffusers.models.attention_processor import AttnProcessor
     except ImportError as exc:
         raise ImportError("restore_default_attention requires diffusers") from exc
-
     unet.set_attn_processor(AttnProcessor())

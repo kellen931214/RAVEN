@@ -12,10 +12,10 @@ def test_known_integer_translation_has_perfect_overlap(dx, dy):
     original = np.stack((xx, yy, xx + yy), axis=2).astype(np.float64)
     translated = np.full_like(original, -999.0)
 
-    output_x0, output_x1 = max(0, -dx), width - max(0, dx)
-    output_y0, output_y1 = max(0, -dy), height - max(0, dy)
-    input_x0, input_x1 = max(0, dx), width + min(0, dx)
-    input_y0, input_y1 = max(0, dy), height + min(0, dy)
+    output_x0, output_x1 = max(0, dx), width - max(0, -dx)
+    output_y0, output_y1 = max(0, dy), height - max(0, -dy)
+    input_x0, input_x1 = max(0, -dx), width - max(0, dx)
+    input_y0, input_y1 = max(0, -dy), height - max(0, dy)
     translated[output_y0:output_y1, output_x0:output_x1] = original[
         input_y0:input_y1, input_x0:input_x1
     ]

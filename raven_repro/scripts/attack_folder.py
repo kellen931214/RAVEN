@@ -20,8 +20,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run RAVEN on a directory of images.")
     parser.add_argument("--input_dir", required=True)
     parser.add_argument("--output_dir", required=True)
-    parser.add_argument("--model_id", default="stabilityai/stable-diffusion-2-1-base")
-    parser.add_argument("--model_revision", default=None)
+    parser.add_argument("--model_id", default="RedbeardNZ/stable-diffusion-2-1-base")
+    parser.add_argument("--model_revision", default="c6a5e9bab8d874d081de76fa270ae0aefa5410ff")
     parser.add_argument("--prompt", default="")
     parser.add_argument("--negative_prompt", default="")
     parser.add_argument("--steps", type=int, default=50)
@@ -33,7 +33,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--shift_sign", choices=["positive", "negative", "random"], default="random")
     parser.add_argument("--shift_sampling", choices=["independent_axes", "coupled_diagonal"], default="independent_axes")
     parser.add_argument("--shift_space", choices=["image_pixels", "latent_pixels"], default="image_pixels")
-    parser.add_argument("--padding_mode", choices=["reflection", "border", "zeros"], default="reflection")
+    parser.add_argument("--warp_mode", choices=["integer", "grid_sample"], default="integer")
+    parser.add_argument("--padding_mode", choices=["reflection", "border", "zeros"], default="zeros")
     parser.add_argument("--view_guided_attention", type=parse_bool, default=True)
     parser.add_argument("--color_transfer", type=parse_bool, default=True)
     parser.add_argument("--seed", type=int, default=42)
@@ -83,6 +84,7 @@ def main() -> None:
                     shift_space=args.shift_space,
                     padding_mode=args.padding_mode,
                     view_guided_attention=args.view_guided_attention,
+                    warp_mode=args.warp_mode,
                     color_transfer=args.color_transfer,
                     seed=args.seed + index,
                     prompt=args.prompt,

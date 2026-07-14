@@ -76,3 +76,66 @@ def test_cfg_pairs_use_reference_key_value_sources():
     assert key_checksums[2] == pytest.approx(key_checksums[3])
     assert value_checksums[0] == pytest.approx(value_checksums[1])
     assert value_checksums[2] == pytest.approx(value_checksums[3])
+
+def test_install_preserves_processor_audit_mapping_when_unet_consumes_input():
+    from raven.attention import install_view_guided_attention
+
+    class ConsumingUNet:
+        def __init__(self):
+            self.attn_processors = {
+                "down.attn1.processor": object(),
+                "down.attn2.processor": object(),
+            }
+            self.installed = {}
+
+        def set_attn_processor(self, processors):
+            while processors:
+                name, processor = processors.popitem()
+                self.installed[name] = processor
+
+    unet = ConsumingUNet()
+    returned = install_view_guided_attention(unet, debug=True)
+    assert set(returned) == {"down.attn1.processor", "down.attn2.processor"}
+    assert set(unet.installed) == set(returned)
+    assert hasattr(returned["down.attn1.processor"], "state")
+
+
+def test_install_preserves_existing_cross_attention_processor_identity():
+    from raven.attention import install_view_guided_attention
+
+    class DummyUNet:
+        def __init__(self):
+            self.cross = object()
+            self.attn_processors = {
+                "down.attn1.processor": object(),
+                "down.attn2.processor": self.cross,
+            }
+
+        def set_attn_processor(self, processors):
+            self.attn_processors = dict(processors)
+
+    unet = DummyUNet()
+    installed = install_view_guided_attention(unet)
+    assert installed["down.attn2.processor"] is unet.cross
+    assert unet.attn_processors["down.attn2.processor"] is unet.cross
+
+
+def test_restore_default_attention_restores_exact_mapping():
+    from raven.attention import install_view_guided_attention, restore_default_attention
+
+    class DummyUNet:
+        def __init__(self):
+            self.attn_processors = {
+                "down.attn1.processor": object(),
+                "down.attn2.processor": object(),
+            }
+
+        def set_attn_processor(self, processors):
+            self.attn_processors = dict(processors)
+
+    unet = DummyUNet()
+    original = dict(unet.attn_processors)
+    install_view_guided_attention(unet)
+    restore_default_attention(unet, original)
+    assert unet.attn_processors.keys() == original.keys()
+    assert all(unet.attn_processors[name] is processor for name, processor in original.items())

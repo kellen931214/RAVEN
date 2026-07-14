@@ -161,20 +161,18 @@ def bit_accuracy(ground_truth: str, prediction: str, expected_length: int | None
 
 
 def crop_overlap(first, second, dx: int, dy: int):
-    """Crop arrays to correspondence under RAVEN's sampling convention.
+    """Crop arrays to correspondence under RAVEN's right/down convention.
 
-    ``translate_latent`` samples output(x, y) from input(x + dx, y + dy), so
-    positive shifts align the right/lower part of ``first`` with the
-    left/upper part of ``second``.
+    Positive ``dx`` moves content right and positive ``dy`` moves content down.
     """
     height = min(first.shape[0], second.shape[0])
     width = min(first.shape[1], second.shape[1])
     first = first[:height, :width]
     second = second[:height, :width]
-    first_x0, first_x1 = max(0, dx), width + min(0, dx)
-    first_y0, first_y1 = max(0, dy), height + min(0, dy)
-    second_x0, second_x1 = max(0, -dx), width - max(0, dx)
-    second_y0, second_y1 = max(0, -dy), height - max(0, dy)
+    first_x0, first_x1 = max(0, -dx), width - max(0, dx)
+    first_y0, first_y1 = max(0, -dy), height - max(0, dy)
+    second_x0, second_x1 = max(0, dx), width - max(0, -dx)
+    second_y0, second_y1 = max(0, dy), height - max(0, -dy)
     if first_x0 >= first_x1 or first_y0 >= first_y1:
         raise ValueError(f"shift ({dx}, {dy}) leaves no overlapping region for {width}x{height}")
     return (
