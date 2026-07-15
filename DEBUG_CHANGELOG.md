@@ -6,6 +6,7 @@ This file records implementation bugs, validated non-bugs, ablations, and the ev
 
 | Date | Area | Status | Evidence |
 | --- | --- | --- | --- |
+| 2026-07-15 | DiffusionDB latest RAVEN-paper/NFPA-gap-fill Tree-Ring L1 rerun preparation | Fixed attacked-clean config drift, verified 2-sample smoke and 10-sample validation; full 1001 run prepared for nohup. | `raven_repro/scripts/raven_nfpa_tr_eval.py`; `raven_repro/scripts/raven_p1_full.py`; `outputs/raven_tr_full_diffusiondb/20260715T060017Z/validation10_eval/aggregate_results.json` |
 | 2026-07-15 | RAVEN-paper / NFPA-gap-fill warp and inverse-overlap quality | Implemented and verified on focused tests plus 10-sample DiffusionDB validation. Existing 1001 DiffusionDB P1 outputs were quality-recomputed without rerunning attack. | `raven_repro/raven/warp.py`; `raven_repro/raven/metrics.py`; `raven_repro/scripts/raven_paper_nfpa_gap_fill_eval.py`; `outputs/raven_paper_nfpa_gap_fill/audit_report_20260715T040535Z.md` |
 | 2026-07-15 | RAVEN exact two-stage color transfer | Implemented and verified. Existing 10 validation pre-color outputs were reused; no DDIM inversion or denoising was rerun. | `raven_repro/raven/color_transfer.py`; `raven_repro/scripts/raven_color_transfer_validation.py`; `outputs/raven_color_transfer_validation/diffusiondb_20260715T042018Z/aggregate_results.md` |
 | 2026-07-14 | NFPA-style Tree-Ring complex L1 evaluation | Completed for DiffusionDB only. MS-COCO was not run after scope was corrected. | `outputs/raven_nfpa_tr_eval/diffusiondb/20260714T161952Z/aggregate_results.json` |
@@ -99,6 +100,17 @@ This file records implementation bugs, validated non-bugs, ablations, and the ev
 | Verification | DiffusionDB completed with 1001 rows. NFPA-style before threshold 76.23775482177734, before actual FPR 0.008991008991008992, before TPR 1.0; after threshold 79.72408294677734, after actual FPR 0.008991008991008992, after TPR 0.48451548451548454; attack success 0.5154845154845155. |
 | Evidence | `raven_repro/scripts/raven_nfpa_tr_eval.py`; `outputs/raven_nfpa_tr_eval/diffusiondb/20260714T161952Z/nfpa_l1_scores.jsonl`; `outputs/raven_nfpa_tr_eval/diffusiondb/20260714T161952Z/aggregate_results.json` |
 | Status | Completed for DiffusionDB. This is separate from legacy `-log10(p)` fixed-threshold analysis. |
+
+### 2026-07-15 - Attacked-Clean Evaluation Still Used Legacy `latent_grid` Config
+
+| Field | Details |
+| --- | --- |
+| Problem | `raven_nfpa_tr_eval.py attack-clean` still called the pipeline with `warp_mode="latent_grid"`, while the new formal attacked-watermarked driver uses `raven_paper_nfpa_gap_fill` with nearest/reflection and paper-exact two-stage color transfer. |
+| Impact | Post-attack NFPA-style L1 calibration could compare attacked-clean negatives produced by a different transform from attacked-watermarked positives, invalidating the after-attack `TPR@1%FPR`. |
+| Core logic changed | `attack-clean` now uses `raven_paper_nfpa_gap_fill`, `padding_mode="reflection"`, `latent_sampling_mode="nearest"`, empty prompts, DDIM, strength 0.15, guidance 2.5, and `paper_exact_two_stage` color transfer. Both attacked-clean and attacked-watermarked records now save config fields and `transform_config_hash`; L1 scoring stops if run ID, seed, dx/dy, timestep, scheduler/prompt/warp/sampling/padding/color-transfer settings, or transform hash differ. Scoring output is standardized as `l1_scores.jsonl` plus `per_sample_results.csv`, with before/after thresholds calibrated separately from original-clean and attacked-clean scores. |
+| Verification | `py_compile` passed for `raven_nfpa_tr_eval.py` and `raven_p1_full.py`. Focused tests passed: `58 passed, 8 warnings` for `test_warp.py`, `test_overlap_metrics.py`, `test_metrics.py`, and `test_color_transfer.py`. 2-sample smoke completed with finite L1 and no NaN/Inf. 10-sample validation completed with after TPR 0.700000, attack success 0.300000, config/hash audit passing for all 10 records, and no duplicate rounded/exact L1 groups. |
+| Evidence | `raven_repro/scripts/raven_nfpa_tr_eval.py`; `raven_repro/scripts/raven_p1_full.py`; `outputs/raven_tr_full_diffusiondb/20260715T060017Z/smoke2_eval/aggregate_results.json`; `outputs/raven_tr_full_diffusiondb/20260715T060017Z/validation10_eval/aggregate_results.json` |
+| Status | Fixed and gate-verified. Full DiffusionDB 1001 rerun is the next stage and must use new timestamped outputs. |
 
 ## Confirmed Non-Bugs
 
@@ -229,6 +241,16 @@ Source: `outputs/raven_color_transfer_validation/diffusiondb_20260715T042018Z/ag
 | MS-COCO | 1000 | 0.012000 | 1.000000 | 0.634000 | 0.366000 | 0.934490 | 19.743 | 0.6063 | Fixed threshold clean FPR differed from exactly 1%; do not call this COCO result dataset-calibrated TPR@1%FPR. |
 
 Sources: `outputs/raven_p1_full/combined_summary.json`; `outputs/raven_p1_full/diffusiondb/20260714T095907Z/aggregate_results.json`; `outputs/raven_p1_full/mscoco/20260714T095907Z/aggregate_results.json`.
+
+
+### 2026-07-15 - Latest Formal DiffusionDB Rerun Gates
+
+| Implementation | Main difference | Evaluation setting | Result | Conclusion |
+| --- | --- | --- | --- | --- |
+| 2-sample smoke | New attacked-watermarked plus new attacked-clean, both `raven_paper_nfpa_gap_fill`, nearest/reflection, paper-exact color transfer | DiffusionDB first 2 samples; NFPA-style complex L1; separate before/after clean calibration | Before TPR 1.000000; after TPR 1.000000; NaN/Inf 0; duplicate exact/rounded groups 0 | Integration path works but N=2 is not statistical. |
+| 10-sample validation | Same formal settings with deterministic shift plan | DiffusionDB first 10 samples; NFPA-style complex L1 | Before TPR 1.000000; after TPR 0.700000; attack success 0.300000; mean attacked-WM L1 81.251940; overlap PSNR vs WM 20.005228; overlap SSIM vs WM 0.594788; NaN/Inf 0 | Gate passed; safe to start full 1001 DiffusionDB run using the same scripts/config. |
+
+Sources: `outputs/raven_tr_full_diffusiondb/20260715T060017Z/smoke2_eval/aggregate_results.md`; `outputs/raven_tr_full_diffusiondb/20260715T060017Z/validation10_eval/aggregate_results.md`.
 
 ## Open Or In-Progress Items
 

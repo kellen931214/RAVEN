@@ -34,7 +34,7 @@ from skimage.metrics import peak_signal_noise_ratio, structural_similarity
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from raven.metrics import crop_overlap
+from raven.metrics import crop_overlap_inverse_warp, roc_auc
 from raven.pipeline_raven import RavenPipeline
 from raven.utils import load_image
 from scripts import raven_p1_full as p1
@@ -108,7 +108,7 @@ def finite_stats(values) -> dict:
 def quality_pair(reference: Image.Image, attacked: Image.Image, dx: int, dy: int, suffix: str) -> dict:
     first = np.asarray(reference.convert("RGB"), dtype=np.float32) / 255.0
     second = np.asarray(attacked.convert("RGB"), dtype=np.float32) / 255.0
-    overlap_first, overlap_second = crop_overlap(first, second, dx, dy)
+    overlap_first, overlap_second = crop_overlap_inverse_warp(first, second, dx, dy)
     return {
         f"psnr_vs_{suffix}": float(peak_signal_noise_ratio(overlap_first, overlap_second, data_range=1.0)),
         f"ssim_vs_{suffix}": float(structural_similarity(overlap_first, overlap_second, channel_axis=2, data_range=1.0)),
@@ -129,6 +129,93 @@ def load_protocol(output_dir: Path) -> tuple[dict, dict[str, dict[str, str]], di
     manifest = {str(row["run_id"]): row for row in load_csv_rows(output_dir / "diagnostic_manifest.csv")}
     provenance = json.loads((output_dir / "provenance.json").read_text())
     return plan, manifest, provenance
+
+
+FORMAL_ATTACK_CONFIG = {
+    "warp_mode": "raven_paper_nfpa_gap_fill",
+    "padding_mode": "reflection",
+    "sampling_mode": "nearest",
+    "color_transfer_mode": "paper_exact_two_stage",
+    "inversion_mode": "ddim",
+    "strength": 0.15,
+    "guidance_scale": 2.5,
+    "steps": 50,
+    "prompt": "",
+    "inversion_prompt": "",
+    "reconstruction_prompt": "",
+}
+
+
+def assert_formal_debug_config(debug_info: dict, run_id: str, stage: str) -> None:
+    checks = {
+        "warp_mode": debug_info.get("warp_mode"),
+        "padding_mode": debug_info.get("padding_mode"),
+        "sampling_mode": debug_info.get("interpolation_mode"),
+        "color_transfer_mode": debug_info.get("color_transfer_mode"),
+        "inversion_mode": debug_info.get("inversion_mode"),
+        "strength": float(debug_info.get("strength")),
+        "guidance_scale": float(debug_info.get("guidance_scale")),
+        "inversion_prompt": debug_info.get("inversion_prompt"),
+        "reconstruction_prompt": debug_info.get("reconstruction_prompt"),
+    }
+    for key, expected in FORMAL_ATTACK_CONFIG.items():
+        if key in {"steps", "prompt"}:
+            continue
+        actual = checks.get(key)
+        if isinstance(expected, float):
+            if abs(float(actual) - expected) > 1e-9:
+                raise RuntimeError(f"{stage} config mismatch run_id={run_id}: {key}={actual!r}, expected {expected!r}")
+        elif actual != expected:
+            raise RuntimeError(f"{stage} config mismatch run_id={run_id}: {key}={actual!r}, expected {expected!r}")
+    if not debug_info.get("transform_config_hash"):
+        raise RuntimeError(f"{stage} missing transform_config_hash run_id={run_id}")
+
+
+def attack_config_from_record(record: dict) -> dict:
+    return {
+        "run_id": str(record["run_id"]),
+        "seed": int(record["seed"]),
+        "flow_dx_image_px": float(record["flow_dx_image_px"]),
+        "flow_dy_image_px": float(record["flow_dy_image_px"]),
+        "exact_ddim_timestep": int(record["exact_ddim_timestep"]),
+        "steps": int(record.get("steps", 50)),
+        "strength": float(record.get("strength", 0.15)),
+        "guidance_scale": float(record.get("guidance_scale", 2.5)),
+        "inversion_mode": record.get("inversion_mode", "ddim"),
+        "inversion_prompt": record.get("inversion_prompt", ""),
+        "reconstruction_prompt": record.get("reconstruction_prompt", ""),
+        "warp_mode": record.get("warp_mode"),
+        "sampling_mode": record.get("sampling_mode"),
+        "padding_mode": record.get("padding_mode"),
+        "normalization_formula": record.get("normalization_formula"),
+        "color_transfer_mode": record.get("color_transfer_mode", "paper_exact_two_stage"),
+        "transform_config_hash": record.get("transform_config_hash"),
+    }
+
+
+def assert_attack_pair_config_match(clean_attack: dict, wm_attack: dict, run_id: str) -> None:
+    clean_cfg = attack_config_from_record(clean_attack)
+    wm_cfg = attack_config_from_record(wm_attack)
+    for key in (
+        "run_id", "seed", "flow_dx_image_px", "flow_dy_image_px", "exact_ddim_timestep",
+        "steps", "strength", "guidance_scale", "inversion_mode", "inversion_prompt",
+        "reconstruction_prompt", "warp_mode", "sampling_mode", "padding_mode",
+        "normalization_formula", "color_transfer_mode", "transform_config_hash",
+    ):
+        if clean_cfg[key] != wm_cfg[key]:
+            raise RuntimeError(
+                f"attacked clean/watermarked config mismatch run_id={run_id}: "
+                f"{key} clean={clean_cfg[key]!r} wm={wm_cfg[key]!r}"
+            )
+    for key, expected in FORMAL_ATTACK_CONFIG.items():
+        if key == "prompt":
+            continue
+        actual = clean_cfg.get(key)
+        if isinstance(expected, float):
+            if abs(float(actual) - expected) > 1e-9:
+                raise RuntimeError(f"formal config mismatch run_id={run_id}: {key}={actual!r}, expected {expected!r}")
+        elif actual != expected:
+            raise RuntimeError(f"formal config mismatch run_id={run_id}: {key}={actual!r}, expected {expected!r}")
 
 
 def validate_p1_source(p1_dir: Path, expected_count: int) -> tuple[dict, list[dict], list[dict]]:
@@ -165,12 +252,13 @@ def command_prepare(args) -> int:
     plan, manifest, attacks = validate_p1_source(args.p1_dir.resolve(), args.expected_count)
     shutil.copy2(args.p1_dir / "diagnostic_manifest.csv", output_dir / "diagnostic_manifest.csv")
     shutil.copy2(args.p1_dir / "shift_plan.json", output_dir / "shift_plan.json")
+    shutil.copy2(args.p1_dir / "attack_records.jsonl", output_dir / "attack_records.jsonl")
     shutil.copy2(args.p1_dir / "attack_records.jsonl", output_dir / "attacked_watermarked_records.jsonl")
     if (args.p1_dir / "per_sample_results.jsonl").is_file():
         shutil.copy2(args.p1_dir / "per_sample_results.jsonl", output_dir / "legacy_log10p_fixed_threshold_results.jsonl")
 
     provenance = {
-        "protocol": "nfpa_style_tree_ring_complex_l1_v1",
+        "protocol": "raven_paper_nfpa_gap_fill_tree_ring_complex_l1_v2",
         "dataset": args.dataset,
         "expected_count": args.expected_count,
         "source_p1_dir": str(args.p1_dir.resolve()),
@@ -253,7 +341,7 @@ def command_attack_clean(args) -> int:
                 strength=0.15,
                 guidance_scale=2.5,
                 shift_space="image_pixels",
-                warp_mode="latent_grid",
+                warp_mode="raven_paper_nfpa_gap_fill",
                 padding_mode="reflection",
                 latent_sampling_mode="nearest",
                 shift_x=shift["flow_dx_image_px"],
@@ -272,10 +360,9 @@ def command_attack_clean(args) -> int:
             debug_info = json.loads(debug_info_path.read_text())
             if debug_info["inversion_prompt"] != "" or debug_info["reconstruction_prompt"] != "":
                 raise RuntimeError(f"non-empty prompt in attacked-clean run_id={run_id}")
-            if debug_info["warp_mode"] != "latent_grid" or debug_info["padding_mode"] != "reflection" or debug_info["interpolation_mode"] != "nearest":
-                raise RuntimeError(f"P1 metadata drift in attacked-clean run_id={run_id}")
-            visual_dx = int(round(shift["visual_shift_dx_image_px"]))
-            visual_dy = int(round(shift["visual_shift_dy_image_px"]))
+            assert_formal_debug_config(debug_info, run_id, "attacked-clean")
+            flow_dx = int(round(shift["flow_dx_image_px"]))
+            flow_dy = int(round(shift["flow_dy_image_px"]))
             record = {
                 "dataset": provenance["dataset"],
                 "sample_id": run_id,
@@ -289,6 +376,7 @@ def command_attack_clean(args) -> int:
                 "attacked_clean_sha256": sha256_path(final_path),
                 "seed": int(row["attack_seed"]),
                 "watermark_seed": int(row["watermark_seed"]),
+                **shift,
                 "prompt": "",
                 "inversion_prompt": debug_info["inversion_prompt"],
                 "reconstruction_prompt": debug_info["reconstruction_prompt"],
@@ -296,9 +384,18 @@ def command_attack_clean(args) -> int:
                 "model_revision": MODEL_REVISION,
                 "exact_ddim_timestep": int(debug_info["exact_timestep"]),
                 "active_denoising_steps": len(debug_info["timesteps"]),
-                **shift,
-                **quality_pair(clean, attacked, visual_dx, visual_dy, "clean"),
-                **quality_pair(watermarked, attacked, visual_dx, visual_dy, "watermarked"),
+                "steps": 50,
+                "strength": 0.15,
+                "guidance_scale": 2.5,
+                "inversion_mode": debug_info["inversion_mode"],
+                "warp_mode": debug_info["warp_mode"],
+                "sampling_mode": debug_info["interpolation_mode"],
+                "padding_mode": debug_info["padding_mode"],
+                "normalization_formula": debug_info["normalized_coordinate_formula"],
+                "color_transfer_mode": debug_info.get("color_transfer_mode", "paper_exact_two_stage"),
+                "transform_config_hash": debug_info.get("transform_config_hash"),
+                **quality_pair(clean, attacked, flow_dx, flow_dy, "clean"),
+                **quality_pair(watermarked, attacked, flow_dx, flow_dy, "watermarked"),
                 "quality_primary_reference": "clean_input_for_attacked_clean_stage",
                 "runtime_seconds": float(time.monotonic() - started),
                 "peak_gpu_memory_bytes": int(torch.cuda.max_memory_allocated()),
@@ -368,7 +465,7 @@ def command_score_l1(args) -> int:
     if len(attacked_wm) != len(plan["samples"]):
         raise ValueError(f"expected {len(plan['samples'])} attacked-watermarked rows, found {len(attacked_wm)}")
 
-    records_path = args.output_dir / "nfpa_l1_scores.jsonl"
+    records_path = args.output_dir / "l1_scores.jsonl"
     completed: dict[str, dict] = {}
     open_mode = "x"
     if records_path.exists():
@@ -406,6 +503,7 @@ def command_score_l1(args) -> int:
             row = manifest[run_id]
             clean_attack = attacked_clean[run_id]
             wm_attack = attacked_wm[run_id]
+            assert_attack_pair_config_match(clean_attack, wm_attack, run_id)
             paths = {
                 "original_clean": Path(row["clean_path"]),
                 "watermarked": Path(row["watermarked_path"]),
@@ -451,6 +549,15 @@ def command_score_l1(args) -> int:
                 "attacked_clean_decoded_abs_mean": scores["attacked_clean"]["decoded_abs_mean"],
                 "attacked_watermarked_decoded_abs_mean": scores["attacked_watermarked"]["decoded_abs_mean"],
                 "target_abs_mean": scores["watermarked"]["target_abs_mean"],
+                "attack_config_hash": clean_attack.get("transform_config_hash"),
+                "warp_mode": clean_attack.get("warp_mode"),
+                "sampling_mode": clean_attack.get("sampling_mode"),
+                "padding_mode": clean_attack.get("padding_mode"),
+                "normalization_formula": clean_attack.get("normalization_formula"),
+                "color_transfer_mode": clean_attack.get("color_transfer_mode"),
+                "flow_dx_image_px": float(clean_attack["flow_dx_image_px"]),
+                "flow_dy_image_px": float(clean_attack["flow_dy_image_px"]),
+                "visual_content_direction": clean_attack.get("visual_content_direction"),
                 "detector_nan": any(item["nan"] for item in scores.values()),
                 "detector_inf": any(item["inf"] for item in scores.values()),
                 "p_value_underflow": None,
@@ -470,7 +577,8 @@ def command_score_l1(args) -> int:
             )
 
     rows.sort(key=lambda x: int(x["run_id"]))
-    write_csv(args.output_dir / "nfpa_l1_scores.csv", rows)
+    write_csv(args.output_dir / "per_sample_results.csv", rows)
+    write_csv(args.output_dir / "l1_scores.csv", rows)
     del provider, pipe
     gc.collect()
     torch.cuda.empty_cache()
@@ -489,7 +597,7 @@ def nfpa_rate(scores: list[float], threshold: float) -> float:
 
 def command_aggregate(args) -> int:
     plan, _, provenance = load_protocol(args.output_dir)
-    rows = load_jsonl(args.output_dir / "nfpa_l1_scores.jsonl")
+    rows = load_jsonl(args.output_dir / "l1_scores.jsonl")
     if len(rows) != len(plan["samples"]):
         raise ValueError(f"expected {len(plan['samples'])} NFPA L1 rows, found {len(rows)}")
     if len({str(row["run_id"]) for row in rows}) != len(rows):
@@ -506,9 +614,49 @@ def command_aggregate(args) -> int:
     before_tpr = nfpa_rate(watermarked, before_threshold)
     after_fpr = nfpa_rate(attacked_clean, after_threshold)
     after_tpr = nfpa_rate(attacked_watermarked, after_threshold)
+    attacked_tpr_at_before_threshold = nfpa_rate(attacked_watermarked, before_threshold)
+    before_fp = int(np.sum(np.asarray(original_clean, dtype=np.float64) < before_threshold))
+    after_fp = int(np.sum(np.asarray(attacked_clean, dtype=np.float64) < after_threshold))
+    before_auc = roc_auc([-v for v in watermarked], [-v for v in original_clean])
+    after_auc = roc_auc([-v for v in attacked_watermarked], [-v for v in attacked_clean])
+
+    direction_stats = {}
+    for direction in sorted({str(row.get("visual_content_direction")) for row in rows}):
+        items = [row for row in rows if str(row.get("visual_content_direction")) == direction]
+        direction_stats[direction] = {
+            "N": len(items),
+            "after_tpr": nfpa_rate([float(row["attacked_watermarked_l1"]) for row in items], after_threshold),
+            "mean_attacked_watermarked_l1": finite_stats(row["attacked_watermarked_l1"] for row in items)["mean"],
+        }
+
+    duplicate_score_audit = {}
+    for key, values in (
+        ("original_clean_l1", original_clean),
+        ("watermarked_l1", watermarked),
+        ("attacked_clean_l1", attacked_clean),
+        ("attacked_watermarked_l1", attacked_watermarked),
+    ):
+        rounded = {}
+        exact = {}
+        for row, value in zip(rows, values):
+            rounded.setdefault(f"{value:.6f}", []).append(str(row["run_id"]))
+            exact.setdefault(repr(float(value)), []).append(str(row["run_id"]))
+        duplicate_score_audit[key] = {
+            "rounded_6dp_duplicate_groups": {k: v for k, v in rounded.items() if len(v) > 1},
+            "exact_duplicate_groups": {k: v for k, v in exact.items() if len(v) > 1},
+        }
+
+    score_histograms = {
+        "original_clean_l1": p1.histogram(original_clean),
+        "watermarked_l1": p1.histogram(watermarked),
+        "attacked_clean_l1": p1.histogram(attacked_clean),
+        "attacked_watermarked_l1": p1.histogram(attacked_watermarked),
+    }
+    write_json(args.output_dir / "score_histograms.json", score_histograms, exclusive=False)
+    write_json(args.output_dir / "failed_samples.json", {"failed": []}, exclusive=False)
 
     aggregate = {
-        "protocol": "nfpa_style_tree_ring_complex_l1_v1",
+        "protocol": "raven_paper_nfpa_gap_fill_tree_ring_complex_l1_v2",
         "result_name": "NFPA-style Tree-Ring TPR@1%FPR",
         "dataset": provenance["dataset"],
         "N": len(rows),
@@ -518,15 +666,20 @@ def command_aggregate(args) -> int:
         "before_attack": {
             "threshold": before_threshold,
             "actual_fpr": before_fpr,
+            "false_positives": before_fp,
             "tpr": before_tpr,
+            "roc_auc": before_auc,
             "clean_score_source": "original_clean_l1",
             "watermarked_score_source": "watermarked_l1",
         },
         "after_attack": {
             "threshold": after_threshold,
             "actual_fpr": after_fpr,
+            "false_positives": after_fp,
             "tpr": after_tpr,
             "attack_success_rate": 1.0 - after_tpr,
+            "roc_auc": after_auc,
+            "attacked_tpr_at_fixed_before_threshold": attacked_tpr_at_before_threshold,
             "clean_score_source": "attacked_clean_l1",
             "watermarked_score_source": "attacked_watermarked_l1",
         },
@@ -541,6 +694,14 @@ def command_aggregate(args) -> int:
             "watermarked": finite_stats(watermarked),
             "attacked_clean": finite_stats(attacked_clean),
             "attacked_watermarked": finite_stats(attacked_watermarked),
+        },
+        "score_histograms": score_histograms,
+        "shift_direction_analysis": direction_stats,
+        "duplicate_score_audit": duplicate_score_audit,
+        "quality": {
+            "primary_reference": "watermarked_input",
+            "post_color_overlap_psnr_vs_watermarked": finite_stats(row.get("psnr_vs_watermarked", float("nan")) for row in load_jsonl(args.output_dir / "attacked_watermarked_records.jsonl")),
+            "post_color_overlap_ssim_vs_watermarked": finite_stats(row.get("ssim_vs_watermarked", float("nan")) for row in load_jsonl(args.output_dir / "attacked_watermarked_records.jsonl")),
         },
         "numeric_diagnostics": {
             "nan_count": int(sum(bool(row["detector_nan"]) for row in rows)),
@@ -559,14 +720,15 @@ def command_aggregate(args) -> int:
         "",
         "Score: `torch.abs(decoded_watermark - target_watermark).mean(-1)`; lower means more likely watermarked.",
         "",
-        "| Dataset | N | Before threshold | Before actual FPR | Before TPR | After threshold | After actual FPR | After TPR | Attack success | Clean mean | WM mean | Attacked-clean mean | Attacked-WM mean |",
-        "| ------- | -: | ---------------: | ----------------: | ---------: | --------------: | ---------------: | --------: | -------------: | ---------: | ------: | ------------------: | ---------------: |",
-        (
-            f"| {provenance['dataset']} | {len(rows)} | {before_threshold:.8f} | {before_fpr:.6f} | {before_tpr:.6f} | "
-            f"{after_threshold:.8f} | {after_fpr:.6f} | {after_tpr:.6f} | {1.0 - after_tpr:.6f} | "
-            f"{aggregate['mean_scores']['original_clean']:.8f} | {aggregate['mean_scores']['watermarked']:.8f} | "
-            f"{aggregate['mean_scores']['attacked_clean']:.8f} | {aggregate['mean_scores']['attacked_watermarked']:.8f} |"
-        ),
+        "| Metric | Before | After |",
+        "| --- | ---: | ---: |",
+        f"| Threshold | {before_threshold:.8f} | {after_threshold:.8f} |",
+        f"| Actual FPR | {before_fpr:.6f} ({before_fp} FP) | {after_fpr:.6f} ({after_fp} FP) |",
+        f"| TPR@1%FPR | {before_tpr:.6f} | {after_tpr:.6f} |",
+        f"| Attack success rate | - | {1.0 - after_tpr:.6f} |",
+        f"| Mean clean L1 | {aggregate['mean_scores']['original_clean']:.8f} | {aggregate['mean_scores']['attacked_clean']:.8f} |",
+        f"| Mean watermarked L1 | {aggregate['mean_scores']['watermarked']:.8f} | {aggregate['mean_scores']['attacked_watermarked']:.8f} |",
+        f"| ROC-AUC | {before_auc:.6f} | {after_auc:.6f} |",
         "",
         "The copied `legacy_log10p_fixed_threshold_results.jsonl` is retained only as separate analysis.",
     ]
