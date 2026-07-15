@@ -26,7 +26,7 @@ from skimage.metrics import peak_signal_noise_ratio, structural_similarity
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from raven.metrics import crop_overlap, detection_rate, roc_auc
+from raven.metrics import crop_overlap_inverse_warp, detection_rate, roc_auc
 from raven.pipeline_raven import RavenPipeline
 from raven.utils import load_image
 from scripts import diagonal_shift_ablation as base
@@ -37,7 +37,7 @@ THRESHOLD = base.THRESHOLD
 EMPTY_PROMPT_SHA256 = hashlib.sha256(b"").hexdigest()
 PLAN_SEED = 2026071401
 VAE_SCALE_FACTOR = 8
-P1_MODE = "P1_nearest_reflection"
+P1_MODE = "RAVEN_paper_NFPA_gap_fill_nearest"
 
 
 def sha256_path(path: Path) -> str:
@@ -100,7 +100,7 @@ def histogram(values, bins: int = 40) -> dict:
 def quality_pair(reference: Image.Image, attacked: Image.Image, dx: int, dy: int, suffix: str) -> dict:
     first = np.asarray(reference.convert("RGB"), dtype=np.float32) / 255.0
     second = np.asarray(attacked.convert("RGB"), dtype=np.float32) / 255.0
-    overlap_first, overlap_second = crop_overlap(first, second, dx, dy)
+    overlap_first, overlap_second = crop_overlap_inverse_warp(first, second, dx, dy)
     return {
         f"psnr_vs_{suffix}": float(peak_signal_noise_ratio(overlap_first, overlap_second, data_range=1.0)),
         f"ssim_vs_{suffix}": float(structural_similarity(overlap_first, overlap_second, channel_axis=2, data_range=1.0)),
@@ -145,7 +145,7 @@ def build_shift(run_id: str, index: int, seed_base: int) -> dict:
     flow_y = float(y_sign * y_mag)
     return {
         "mode": P1_MODE,
-        "warp_mode": "latent_grid",
+        "warp_mode": "raven_paper_nfpa_gap_fill",
         "sampling_mode": "nearest",
         "padding_mode": "reflection",
         "align_corners": False,
@@ -162,9 +162,11 @@ def build_shift(run_id: str, index: int, seed_base: int) -> dict:
         "dy_latent_equivalent": flow_y / VAE_SCALE_FACTOR,
         "visual_shift_dx_image_px": -flow_x,
         "visual_shift_dy_image_px": -flow_y,
+        "visual_dx_image_px": -flow_x,
+        "visual_dy_image_px": -flow_y,
         "flow_direction": direction_label(flow_x, flow_y),
         "visual_content_direction": direction_label(-flow_x, -flow_y),
-        "normalization_formula": "identity=2*(latent_index+0.5)/latent_size-1; delta=2*(image_shift/8)/latent_size",
+        "normalization_formula": "x_norm = 2*(x+dx)/W - 1; y_norm = 2*(y+dy)/H - 1; coordinate grid resized bilinear to latent grid",
         "grid_sample_inverse_sampling": True,
     }
 
@@ -366,7 +368,7 @@ def command_attack(args) -> int:
                 strength=0.15,
                 guidance_scale=2.5,
                 shift_space="image_pixels",
-                warp_mode="latent_grid",
+                warp_mode="raven_paper_nfpa_gap_fill",
                 padding_mode="reflection",
                 latent_sampling_mode="nearest",
                 shift_x=shift["flow_dx_image_px"],
@@ -385,13 +387,13 @@ def command_attack(args) -> int:
             debug_info = json.loads(debug_info_path.read_text())
             if debug_info["inversion_prompt"] != "" or debug_info["reconstruction_prompt"] != "":
                 raise RuntimeError(f"non-empty prompt run_id={run_id}")
-            if debug_info["warp_mode"] != "latent_grid" or debug_info["padding_mode"] != "reflection" or debug_info["interpolation_mode"] != "nearest":
+            if debug_info["warp_mode"] != "raven_paper_nfpa_gap_fill" or debug_info["padding_mode"] != "reflection" or debug_info["interpolation_mode"] != "nearest":
                 raise RuntimeError(f"P1 metadata drift run_id={run_id}")
-            visual_dx = int(round(shift["visual_shift_dx_image_px"]))
-            visual_dy = int(round(shift["visual_shift_dy_image_px"]))
+            flow_dx = int(round(shift["flow_dx_image_px"]))
+            flow_dy = int(round(shift["flow_dy_image_px"]))
             quality = {
-                **quality_pair(watermarked, attacked, visual_dx, visual_dy, "watermarked"),
-                **quality_pair(clean, attacked, visual_dx, visual_dy, "clean"),
+                **quality_pair(watermarked, attacked, flow_dx, flow_dy, "watermarked"),
+                **quality_pair(clean, attacked, flow_dx, flow_dy, "clean"),
             }
             clip = debug_info["clipping_diagnostics"]
             attention = debug_info.get("attention_debug", {})
@@ -703,7 +705,7 @@ def command_determinism_check(args) -> int:
             strength=0.15,
             guidance_scale=2.5,
             shift_space="image_pixels",
-            warp_mode="latent_grid",
+            warp_mode="raven_paper_nfpa_gap_fill",
             padding_mode="reflection",
             latent_sampling_mode="nearest",
             shift_x=shift["flow_dx_image_px"],

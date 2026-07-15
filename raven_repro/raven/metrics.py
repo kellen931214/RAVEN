@@ -181,6 +181,109 @@ def crop_overlap(first, second, dx: int, dy: int):
     )
 
 
+def _require_integer_flow(value: float, name: str) -> int:
+    rounded = int(round(float(value)))
+    if abs(float(value) - rounded) > 1e-6:
+        raise ValueError(f"{name} must be an integer image-pixel flow for overlap metrics, got {value}")
+    return rounded
+
+
+def crop_overlap_inverse_warp(reference, attacked, flow_dx_px: float, flow_dy_px: float):
+    """Crop arrays to valid correspondence under inverse-warp flow.
+
+    The convention is ``attacked[y, x]`` corresponds to
+    ``reference[y + flow_dy_px, x + flow_dx_px]``. Only pixels with a real
+    reference/attacked pair are retained; padding or reflected boundary values
+    are excluded from quality metrics.
+    """
+    dx = _require_integer_flow(flow_dx_px, "flow_dx_px")
+    dy = _require_integer_flow(flow_dy_px, "flow_dy_px")
+    height = min(reference.shape[0], attacked.shape[0])
+    width = min(reference.shape[1], attacked.shape[1])
+    reference = reference[:height, :width]
+    attacked = attacked[:height, :width]
+
+    attacked_x0 = max(0, -dx)
+    attacked_x1 = min(width, width - dx)
+    attacked_y0 = max(0, -dy)
+    attacked_y1 = min(height, height - dy)
+    if attacked_x0 >= attacked_x1 or attacked_y0 >= attacked_y1:
+        raise ValueError(f"flow ({dx}, {dy}) leaves no overlapping region for {width}x{height}")
+
+    reference_x0 = attacked_x0 + dx
+    reference_x1 = attacked_x1 + dx
+    reference_y0 = attacked_y0 + dy
+    reference_y1 = attacked_y1 + dy
+    return (
+        reference[reference_y0:reference_y1, reference_x0:reference_x1],
+        attacked[attacked_y0:attacked_y1, attacked_x0:attacked_x1],
+    )
+
+
+def rgb_float_array(image):
+    """Return RGB float32 image data in [0, 1]."""
+    import numpy as np
+
+    if hasattr(image, "convert"):
+        image = image.convert("RGB")
+    return np.asarray(image, dtype=np.float32) / 255.0
+
+
+def pair_quality_metrics(reference, attacked, flow_dx_px: float | None = None, flow_dy_px: float | None = None) -> dict:
+    """Compute raw full-image and optional inverse-warp overlap PSNR/SSIM."""
+    import numpy as np
+    from skimage.metrics import peak_signal_noise_ratio, structural_similarity
+
+    reference_array = rgb_float_array(reference)
+    attacked_array = rgb_float_array(attacked)
+    height = min(reference_array.shape[0], attacked_array.shape[0])
+    width = min(reference_array.shape[1], attacked_array.shape[1])
+    reference_array = reference_array[:height, :width]
+    attacked_array = attacked_array[:height, :width]
+    result = {
+        "raw_full_psnr": float(peak_signal_noise_ratio(reference_array, attacked_array, data_range=1.0)),
+        "raw_full_ssim": float(structural_similarity(reference_array, attacked_array, data_range=1.0, channel_axis=-1)),
+    }
+    if flow_dx_px is not None and flow_dy_px is not None:
+        reference_crop, attacked_crop = crop_overlap_inverse_warp(
+            reference_array, attacked_array, flow_dx_px, flow_dy_px
+        )
+        result.update({
+            "overlap_psnr": float(peak_signal_noise_ratio(reference_crop, attacked_crop, data_range=1.0)),
+            "overlap_ssim": float(structural_similarity(reference_crop, attacked_crop, data_range=1.0, channel_axis=-1)),
+            "valid_overlap_width": int(reference_crop.shape[1]),
+            "valid_overlap_height": int(reference_crop.shape[0]),
+            "valid_overlap_area_ratio": float(reference_crop.shape[0] * reference_crop.shape[1] / (height * width)),
+            "overlap_protocol": "inverse_warp_valid_correspondence",
+            "flow_dx_px": float(flow_dx_px),
+            "flow_dy_px": float(flow_dy_px),
+        })
+    return result
+
+
+def summarize_numeric(values: Iterable[float]) -> dict:
+    import numpy as np
+
+    items = [float(value) for value in values]
+    finite = [value for value in items if math.isfinite(value)]
+    if not finite:
+        return {
+            "n": len(items), "mean": None, "median": None, "std": None,
+            "min": None, "max": None, "nan_count": sum(math.isnan(value) for value in items),
+            "inf_count": sum(math.isinf(value) for value in items),
+        }
+    return {
+        "n": len(items),
+        "mean": float(np.mean(finite)),
+        "median": float(np.median(finite)),
+        "std": float(np.std(finite, ddof=1)) if len(finite) > 1 else 0.0,
+        "min": float(min(finite)),
+        "max": float(max(finite)),
+        "nan_count": sum(math.isnan(value) for value in items),
+        "inf_count": sum(math.isinf(value) for value in items),
+    }
+
+
 def psnr(first, second, data_range: float = 1.0) -> float:
     import numpy as np
 

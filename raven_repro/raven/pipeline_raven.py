@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import inspect
+import json
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -18,6 +20,7 @@ from .warp import (
     latent_grid_warp,
     latent_grid_warp_nearest_reflection,
     nfpa_warp_single_latent,
+    raven_paper_nfpa_gap_fill_warp,
     sample_translation,
     translate_latent,
 )
@@ -220,11 +223,25 @@ class RavenPipeline:
             dx, dy = float(shift_x), float(shift_y)
             shift_source = "explicit_plan"
         inverse_sampling_modes = {
-            "nfpa_exact", "nfpa_pixel_center", "latent_grid_nearest_reflection", "latent_grid"
+            "nfpa_exact", "nfpa_pixel_center", "latent_grid_nearest_reflection", "latent_grid",
+            "raven_paper_nfpa_gap_fill",
         }
         inverse_sampling_warp = warp_mode in inverse_sampling_modes
         nfpa_warp_metadata = None
-        if warp_mode in {"nfpa_exact", "nfpa_pixel_center"}:
+        if warp_mode == "raven_paper_nfpa_gap_fill":
+            if shift_space != "image_pixels":
+                raise ValueError("raven_paper_nfpa_gap_fill requires image-space flow")
+            if padding_mode != "reflection":
+                raise ValueError("raven_paper_nfpa_gap_fill requires padding_mode='reflection'")
+            shifted_latents, nfpa_warp_metadata = raven_paper_nfpa_gap_fill_warp(
+                inversion.noisy_latents,
+                dx_image_px=float(dx),
+                dy_image_px=float(dy),
+                vae_scale_factor=self.vae_scale_factor,
+                sampling_mode=latent_sampling_mode or "nearest",
+                return_metadata=True,
+            )
+        elif warp_mode in {"nfpa_exact", "nfpa_pixel_center"}:
             if shift_space != "image_pixels":
                 raise ValueError(f"{warp_mode} requires image-space flow")
             nfpa_flow = create_nfpa_translation_flow(
@@ -341,6 +358,14 @@ class RavenPipeline:
                 -(dy if shift_space == "image_pixels" else float(dy) * self.vae_scale_factor)
                 if inverse_sampling_warp else (dy if shift_space == "image_pixels" else float(dy) * self.vae_scale_factor)
             ),
+            "visual_dx_image_px": (
+                -(dx if shift_space == "image_pixels" else float(dx) * self.vae_scale_factor)
+                if inverse_sampling_warp else (dx if shift_space == "image_pixels" else float(dx) * self.vae_scale_factor)
+            ),
+            "visual_dy_image_px": (
+                -(dy if shift_space == "image_pixels" else float(dy) * self.vae_scale_factor)
+                if inverse_sampling_warp else (dy if shift_space == "image_pixels" else float(dy) * self.vae_scale_factor)
+            ),
             "image_dx": dx if shift_space == "image_pixels" else float(dx) * self.vae_scale_factor,
             "image_dy": dy if shift_space == "image_pixels" else float(dy) * self.vae_scale_factor,
             "shift_space": shift_space,
@@ -356,6 +381,16 @@ class RavenPipeline:
             "guidance_scale": guidance_scale,
             "attention_processor_mode": attention_mode,
             "warp_mode": warp_mode,
+            "transform_setting_name": (
+                nfpa_warp_metadata.get("transform_setting_name")
+                if nfpa_warp_metadata and nfpa_warp_metadata.get("transform_setting_name")
+                else warp_mode
+            ),
+            "implementation_classification": (
+                nfpa_warp_metadata.get("implementation_classification")
+                if nfpa_warp_metadata and nfpa_warp_metadata.get("implementation_classification")
+                else None
+            ),
             "interpolation_mode": (
                 nfpa_warp_metadata.get("latent_sampling_mode")
                 if inverse_sampling_warp and nfpa_warp_metadata
@@ -382,6 +417,24 @@ class RavenPipeline:
             "view_guided_attention": view_guided_attention,
             "color_transfer": color_transfer,
         }
+
+
+        debug_info["transform_config_hash"] = hashlib.sha256(json.dumps({
+            "warp_mode": debug_info["warp_mode"],
+            "transform_setting_name": debug_info["transform_setting_name"],
+            "grid_implementation_version": (nfpa_warp_metadata or {}).get("grid_implementation_version"),
+            "latent_sampling_mode": debug_info["interpolation_mode"],
+            "padding_mode": debug_info["padding_mode"],
+            "normalization_formula": debug_info["normalized_coordinate_formula"],
+            "align_corners": debug_info["align_corners"],
+            "flow_dx_image_px": debug_info["flow_dx_image_px"],
+            "flow_dy_image_px": debug_info["flow_dy_image_px"],
+            "shift_sampling": debug_info["shift_sampling"],
+            "strength": debug_info["strength"],
+            "guidance_scale": debug_info["guidance_scale"],
+            "steps": steps,
+            "prompt": prompt,
+        }, sort_keys=True).encode("utf-8")).hexdigest()
 
         if debug:
             for key, value in debug_info.items():

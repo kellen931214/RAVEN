@@ -10,10 +10,19 @@ ShiftSign = Literal["positive", "negative", "random"]
 ShiftSampling = Literal["independent_axes", "coupled_diagonal"]
 ShiftSpace = Literal["image_pixels", "latent_pixels"]
 PaddingMode = Literal["reflection", "border", "zeros"]
+LatentSamplingMode = Literal["nearest", "bilinear"]
 WarpMode = Literal[
     "integer", "grid_sample", "nfpa_exact", "nfpa_pixel_center",
     "latent_grid_nearest_reflection", "latent_grid",
+    "raven_paper_nfpa_gap_fill",
 ]
+
+RAVEN_PAPER_NFPA_GAP_FILL = "raven_paper_nfpa_gap_fill"
+RAVEN_PAPER_NFPA_GAP_FILL_CLASSIFICATION = (
+    "RAVEN paper-faithful settings with NFPA-based gap filling "
+    "for underspecified warp implementation details."
+)
+NFPA_IMAGE_GRID_IMPLEMENTATION_VERSION = "nfpa_image_grid_w_h_norm_v1"
 
 
 
@@ -61,6 +70,7 @@ def nfpa_warp_single_latent(
     reference_flow,
     return_metadata: bool = False,
     pixel_center_offset: float = 0.0,
+    sampling_mode: LatentSamplingMode = "nearest",
 ):
     """Warp a latent following NFPA utils.py coordinate and sampling convention."""
     try:
@@ -70,6 +80,8 @@ def nfpa_warp_single_latent(
 
     if latent.ndim != 4:
         raise ValueError(f"Expected latent BCHW, got {tuple(latent.shape)}")
+    if sampling_mode not in {"nearest", "bilinear"}:
+        raise ValueError(f"Unsupported sampling_mode: {sampling_mode}")
     if reference_flow.ndim != 4 or reference_flow.shape[1] != 2:
         raise ValueError(f"Expected reference_flow B2HW, got {tuple(reference_flow.shape)}")
     if reference_flow.shape[0] != latent.shape[0]:
@@ -104,7 +116,7 @@ def nfpa_warp_single_latent(
     warped = F.grid_sample(
         latent,
         grid,
-        mode="nearest",
+        mode=sampling_mode,
         padding_mode="reflection",
         align_corners=False,
     )
@@ -129,12 +141,73 @@ def nfpa_warp_single_latent(
         "coordinate_resize_mode": "bilinear",
         "nfpa_source_omitted_interpolate_align_corners": True,
         "effective_interpolate_align_corners": False,
-        "latent_sampling_mode": "nearest",
+        "grid_implementation_version": NFPA_IMAGE_GRID_IMPLEMENTATION_VERSION,
+        "latent_sampling_mode": sampling_mode,
         "padding_mode": "reflection",
         "nfpa_source_omitted_grid_sample_align_corners": True,
         "effective_grid_sample_align_corners": False,
         "grid_sample_inverse_sampling": True,
     }
+    if return_metadata:
+        return warped, metadata
+    return warped
+
+
+def raven_paper_nfpa_gap_fill_warp(
+    latent,
+    dx_image_px: float,
+    dy_image_px: float,
+    vae_scale_factor: int = 8,
+    sampling_mode: LatentSamplingMode = "nearest",
+    return_metadata: bool = False,
+):
+    """RAVEN paper shift plan with NFPA coordinate/sampling gap filling.
+
+    ``dx_image_px`` and ``dy_image_px`` are RAVEN paper image-pixel flow values.
+    NFPA supplies only the coordinate-grid construction, normalization, resize,
+    inverse sampling, nearest/bilinear value sampling, and reflection padding.
+    """
+    if latent.ndim != 4:
+        raise ValueError(f"Expected latent BCHW, got {tuple(latent.shape)}")
+    if vae_scale_factor <= 0:
+        raise ValueError("vae_scale_factor must be positive")
+    if sampling_mode not in {"nearest", "bilinear"}:
+        raise ValueError(f"Unsupported sampling_mode: {sampling_mode}")
+    batch, _, latent_h, latent_w = latent.shape
+    flow = create_nfpa_translation_flow(
+        dx_image_px=float(dx_image_px),
+        dy_image_px=float(dy_image_px),
+        batch=batch,
+        height=latent_h * vae_scale_factor,
+        width=latent_w * vae_scale_factor,
+        device=latent.device,
+        dtype=latent.dtype,
+    )
+    warped, metadata = nfpa_warp_single_latent(
+        latent,
+        flow,
+        return_metadata=True,
+        pixel_center_offset=0.0,
+        sampling_mode=sampling_mode,
+    )
+    metadata.update({
+        "transform_setting_name": RAVEN_PAPER_NFPA_GAP_FILL,
+        "implementation_classification": RAVEN_PAPER_NFPA_GAP_FILL_CLASSIFICATION,
+        "raven_shift_unit": "image_pixels",
+        "raven_shift_rule": (
+            "dx and dy sampled independently from [24,32] or [-32,-24] image pixels"
+        ),
+        "nfpa_gap_fill_scope": (
+            "coordinate grid, constant motion field, W/H normalization, coordinate-grid "
+            "resize, inverse grid_sample convention, reflection padding"
+        ),
+        "excluded_nfpa_behaviors": [
+            "max_warp_latents",
+            "adaptive_xy_search",
+            "NFP_XY_40",
+            "NFPA checkpoint or inference hyperparameters",
+        ],
+    })
     if return_metadata:
         return warped, metadata
     return warped
@@ -282,12 +355,23 @@ def translate_latent(
     if warp_mode not in {
         "integer", "grid_sample", "nfpa_exact", "nfpa_pixel_center",
         "latent_grid_nearest_reflection", "latent_grid",
+        "raven_paper_nfpa_gap_fill",
     }:
         raise ValueError(f"Unsupported warp_mode: {warp_mode}")
     if vae_scale_factor <= 0:
         raise ValueError("vae_scale_factor must be positive")
 
     batch, _, height, width = latents.shape
+    if warp_mode == "raven_paper_nfpa_gap_fill":
+        if shift_space != "image_pixels":
+            raise ValueError("raven_paper_nfpa_gap_fill requires image-pixel flow")
+        return raven_paper_nfpa_gap_fill_warp(
+            latents,
+            dx,
+            dy,
+            vae_scale_factor=vae_scale_factor,
+            sampling_mode="nearest",
+        )
     if warp_mode in {"nfpa_exact", "nfpa_pixel_center"}:
         if shift_space != "image_pixels":
             raise ValueError(f"{warp_mode} requires image-pixel flow")

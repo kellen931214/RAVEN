@@ -6,7 +6,8 @@ This file records implementation bugs, validated non-bugs, ablations, and the ev
 
 | Date | Area | Status | Evidence |
 | --- | --- | --- | --- |
-| 2026-07-14 | NFPA-style Tree-Ring complex L1 evaluation | In progress for DiffusionDB only. Existing attacked-watermarked images are reused; only missing attacked-clean images are being generated before L1 scoring. MS-COCO was not started after the scope was corrected. | `outputs/raven_nfpa_tr_eval/logs/run_nfpa_tr_diffusiondb_only_20260714T162739Z.log`; `outputs/raven_nfpa_tr_eval/diffusiondb/20260714T161952Z/attacked_clean_records.jsonl` |
+| 2026-07-15 | RAVEN-paper / NFPA-gap-fill warp and inverse-overlap quality | Implemented and verified on focused tests plus 10-sample DiffusionDB validation. Existing 1001 DiffusionDB P1 outputs were quality-recomputed without rerunning attack. | `raven_repro/raven/warp.py`; `raven_repro/raven/metrics.py`; `raven_repro/scripts/raven_paper_nfpa_gap_fill_eval.py`; `outputs/raven_paper_nfpa_gap_fill/audit_report_20260715T040535Z.md` |
+| 2026-07-14 | NFPA-style Tree-Ring complex L1 evaluation | Completed for DiffusionDB only. MS-COCO was not run after scope was corrected. | `outputs/raven_nfpa_tr_eval/diffusiondb/20260714T161952Z/aggregate_results.json` |
 
 ## Confirmed Issues And Fixes
 
@@ -65,6 +66,17 @@ This file records implementation bugs, validated non-bugs, ablations, and the ev
 | Evidence | `raven_repro/scripts/raven_p1_full.py`; `raven_repro/scripts/nfpa_sampling_padding_ablation.py`; `outputs/raven_p1_full/diffusiondb/20260714T095907Z/aggregate_results.json`; `outputs/raven_sampling_padding_ablation/20260714T093603Z/aggregate_results.md` |
 | Status | Fixed for current diagnostics and P1 full outputs. |
 
+### 2026-07-15 - RAVEN Paper/NFPA Gap-Fill Warp And Inverse-Overlap Quality
+
+| Field | Details |
+| --- | --- |
+| Problem | The previous P1 full driver used a direct latent-grid `/8` displacement with nearest/reflection. That was useful for the P1 ablation but did not preserve the requested priority rule: use RAVEN paper settings for shift sampling and use NFPA only for underspecified coordinate-grid implementation details. Existing PSNR/SSIM also used visual-shift overlap rather than the explicit inverse-warp correspondence formula requested for the paper-comparable quality protocol. |
+| Impact | Future full runs could silently reuse the old P1 transform as if it were the paper/NFPA gap-fill setting, and quality metrics could include the wrong correspondence crop if flow direction and visual direction were confused. |
+| Core logic changed | Added `raven_paper_nfpa_gap_fill` mode, which passes RAVEN image-pixel `dx/dy` directly into an NFPA-style 512x512 coordinate flow, uses `/W` `/H` normalization, bilinear coordinate-grid resize, inverse `grid_sample`, `padding_mode=reflection`, `align_corners=False`, and main `mode=nearest`. Bilinear is retained only as a same-grid ablation. Added `crop_overlap_inverse_warp` and quality helpers that compare watermarked input against pre/post color-transfer outputs over valid inverse-warp overlap only. Future `raven_p1_full.py` runs now use the new mode and record a config hash including grid version, sampling, padding, normalization, align_corners, and shift. |
+| Verification | Focused syntax/tests passed: `46 passed, 1 warning` for `test_warp.py` and `test_overlap_metrics.py`. Existing DiffusionDB 1001 P1 outputs were recomputed for inverse-overlap quality without rerunning attack. A 10-sample validation compared old P1, new nearest main, and bilinear ablation with complex L1 scoring. |
+| Evidence | `raven_repro/raven/warp.py`; `raven_repro/raven/metrics.py`; `raven_repro/raven/pipeline_raven.py`; `raven_repro/scripts/raven_p1_full.py`; `raven_repro/scripts/raven_paper_nfpa_gap_fill_eval.py`; `outputs/raven_paper_nfpa_gap_fill/audit_report_20260715T040535Z.md`; `outputs/raven_paper_nfpa_gap_fill/diffusiondb_quality_recompute_20260715T034545Z/quality_summary.json`; `outputs/raven_paper_nfpa_gap_fill/diffusiondb_validation_20260715T035849Z/aggregate_results.json` |
+| Status | Implemented and verified on focused tests plus 10-sample validation. Full 1001 new-transform attack has not been run. |
+
 ### 2026-07-14 - NFPA-Style Tree-Ring Complex L1 Metric Was Missing
 
 | Field | Details |
@@ -72,9 +84,9 @@ This file records implementation bugs, validated non-bugs, ablations, and the ev
 | Problem | Existing Tree-Ring evaluation used `-log10(p)` fixed/calibrated threshold logic, while NFPA evaluates Tree-Ring with complex L1 distance `torch.abs(decoded_watermark - target_watermark).mean(-1)` where lower score indicates watermark. |
 | Impact | The existing P1 result is useful as separate `-log10(p)` analysis but is not the requested NFPA-style Tree-Ring `TPR@1%FPR`. After-attack NFPA calibration also requires attacked-clean images, not only attacked-watermarked images. |
 | Core logic changed | Added an independent `raven_nfpa_tr_eval.py` flow that copies existing P1 attacked-watermarked records, generates only attacked-clean images with the same shift plan/settings, scores original clean/watermarked/attacked-clean/attacked-watermarked with complex L1, and calibrates before/after thresholds separately with NFPA's strict `< threshold` rule. |
-| Verification | `prepare` validated 1001 DiffusionDB manifest, shift plan, and attacked-watermarked hashes. DiffusionDB attacked-clean generation is in progress; scoring/aggregate are not complete yet. |
-| Evidence | `raven_repro/scripts/raven_nfpa_tr_eval.py`; `outputs/raven_nfpa_tr_eval/diffusiondb/20260714T161952Z/source_counts.json`; `outputs/raven_nfpa_tr_eval/logs/run_nfpa_tr_diffusiondb_only_20260714T162739Z.log` |
-| Status | In progress. Do not report final NFPA-style DiffusionDB TPR until `nfpa_l1_scores.jsonl` and `aggregate_results.json` are complete. |
+| Verification | DiffusionDB completed with 1001 rows. NFPA-style before threshold 76.23775482177734, before actual FPR 0.008991008991008992, before TPR 1.0; after threshold 79.72408294677734, after actual FPR 0.008991008991008992, after TPR 0.48451548451548454; attack success 0.5154845154845155. |
+| Evidence | `raven_repro/scripts/raven_nfpa_tr_eval.py`; `outputs/raven_nfpa_tr_eval/diffusiondb/20260714T161952Z/nfpa_l1_scores.jsonl`; `outputs/raven_nfpa_tr_eval/diffusiondb/20260714T161952Z/aggregate_results.json` |
+| Status | Completed for DiffusionDB. This is separate from legacy `-log10(p)` fixed-threshold analysis. |
 
 ## Confirmed Non-Bugs
 
@@ -168,6 +180,25 @@ Source: `outputs/raven_nfpa_normalization_ablation/20260714T090146Z/aggregate_re
 
 Source: `outputs/raven_sampling_padding_ablation/20260714T093603Z/aggregate_results.md`.
 
+### 2026-07-15 - RAVEN-paper / NFPA-gap-fill Validation, 10 Samples
+
+| Implementation | Main difference | Evaluation setting | Result | Conclusion |
+| --- | --- | --- | --- | --- |
+| A_old_P1_latent_grid_nearest_reflection | Legacy direct latent-grid `/8` nearest/reflection output reused from old P1 | DiffusionDB first 10 samples; NFPA-style complex L1; post-color inverse-overlap quality vs watermarked input | Mean L1 before 54.087430; mean L1 after 81.962275; mean delta 27.874845; PSNR 19.732; SSIM 0.5911 | Old output remains a valid legacy reference but is not the new paper/NFPA gap-fill transform. |
+| B_RAVEN_paper_NFPA_gap_fill_nearest | RAVEN image-pixel shift plan passed through NFPA image-coordinate grid, nearest/reflection main mode | Same | Mean L1 before 54.087430; mean L1 after 81.677802; mean delta 27.590371; PSNR 19.608; SSIM 0.5861 | New main mode executes end-to-end; suppression/quality are close to old P1 on this tiny cohort. |
+| C_RAVEN_paper_NFPA_gap_fill_bilinear | Same grid/padding/shift as B; only latent value sampling changed to bilinear | Same | Mean L1 before 54.087430; mean L1 after 81.472040; mean delta 27.384610; PSNR 20.700; SSIM 0.6221 | Bilinear quality is higher but this is an ablation; main remains nearest because NFPA uses nearest. |
+
+Sources: `outputs/raven_paper_nfpa_gap_fill/diffusiondb_validation_20260715T035849Z/aggregate_results.md`; `outputs/raven_paper_nfpa_gap_fill/audit_report_20260715T040535Z.md`.
+
+### 2026-07-15 - Existing DiffusionDB P1 Inverse-Overlap Quality Recompute
+
+| Implementation | Main difference | Evaluation setting | Result | Conclusion |
+| --- | --- | --- | --- | --- |
+| Existing P1 outputs, post-color overlap | No attack rerun; recomputed valid inverse-warp overlap against watermarked input | DiffusionDB 1001 existing P1 attacked-watermarked outputs | Mean PSNR 20.097515; median 20.104606; mean SSIM 0.564739; median 0.571788; NaN/Inf 0 | Existing records had enough path and flow metadata to correct quality metrics without rerunning attack. |
+| Existing P1 outputs, raw full image | Same images, no overlap crop | Same | Mean PSNR 14.897020; mean SSIM 0.439846 | Full-image metrics are lower because shifted non-corresponding regions are included; paper-comparable local protocol should use overlap fields. |
+
+Source: `outputs/raven_paper_nfpa_gap_fill/diffusiondb_quality_recompute_20260715T034545Z/quality_summary.md`.
+
 ### 2026-07-14 - P1 Full Fixed `-log10(p)` Evaluation
 
 | Dataset | N | Clean FPR | Before TPR | Attacked TPR | Attack success | ROC-AUC | PSNR vs WM | SSIM vs WM | Conclusion |
@@ -181,5 +212,5 @@ Sources: `outputs/raven_p1_full/combined_summary.json`; `outputs/raven_p1_full/d
 
 | Date | Item | Current evidence | Next verification |
 | --- | --- | --- | --- |
-| 2026-07-14 | NFPA-style complex L1 DiffusionDB result | `prepare` completed and validated source counts; attacked-clean generation is in progress. | Wait for `nfpa_l1_scores.jsonl` to reach 1001 rows and `aggregate_results.json` to be produced, then record before/after thresholds, actual FPR, TPR, attack success, and mean scores. |
-| 2026-07-14 | Whether NFPA-style complex L1 changes the conclusion versus `-log10(p)` | 尚未確認. The metric and required attacked-clean calibration are still running. | Compare `outputs/raven_nfpa_tr_eval/diffusiondb/20260714T161952Z/aggregate_results.json` against P1 fixed `-log10(p)` outputs after completion. |
+| 2026-07-15 | Whether to expand `RAVEN-paper / NFPA-gap-fill` to 100-200 or full 1001 | 10-sample validation is complete, but full new-transform attack has not been run. | If requested, first run 100-200 samples in a new output directory; do not overwrite old P1 outputs. |
+| 2026-07-15 | Paper PSNR/SSIM provenance | RAVEN arXiv HTML inspected; local report treats overlap PSNR/SSIM as requested paper-comparable protocol, while the inspected paper quality table emphasizes FID/CLIP. | If exact PSNR/SSIM numbers are required for a table, cite the user-defined overlap protocol separately from paper-reported FID/CLIP. |

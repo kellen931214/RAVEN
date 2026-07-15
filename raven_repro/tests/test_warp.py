@@ -2,7 +2,14 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from raven.warp import sample_translation, translate_latent
+from raven.warp import (
+    RAVEN_PAPER_NFPA_GAP_FILL,
+    create_nfpa_translation_flow,
+    nfpa_warp_single_latent,
+    raven_paper_nfpa_gap_fill_warp,
+    sample_translation,
+    translate_latent,
+)
 
 
 def test_sample_translation_diagonal_and_seeded():
@@ -312,3 +319,71 @@ def test_translate_latent_generic_latent_grid_uses_requested_padding():
     )
     assert reflected.shape == zeroed.shape == latent.shape
     assert not torch.equal(reflected, zeroed)
+
+
+def test_raven_shift_sampler_signs_bounds_and_reproducibility():
+    samples = [sample_translation(24, 32, "random", seed=i, sampling="independent_axes") for i in range(64)]
+    assert samples == [sample_translation(24, 32, "random", seed=i, sampling="independent_axes") for i in range(64)]
+    assert all(24 <= abs(value) <= 32 for pair in samples for value in pair)
+    assert any(dx > 0 for dx, _ in samples)
+    assert any(dx < 0 for dx, _ in samples)
+    assert any(dy > 0 for _, dy in samples)
+    assert any(dy < 0 for _, dy in samples)
+
+
+def _nfpa_reference_warp(latent, flow, mode="nearest"):
+    import torch.nn.functional as F
+
+    _, _, H, W = flow.size()
+    _, _, h, w = latent.size()
+    coords = torch.meshgrid(torch.arange(H, device=latent.device), torch.arange(W, device=latent.device), indexing="ij")
+    coords = torch.stack(coords[::-1], dim=0).float().to(latent.dtype)[None].repeat(latent.shape[0], 1, 1, 1)
+    coords_t0 = coords + flow.to(latent.device, latent.dtype)
+    coords_t0[:, 0] /= W
+    coords_t0[:, 1] /= H
+    coords_t0 = coords_t0 * 2.0 - 1.0
+    coords_t0 = F.interpolate(coords_t0, size=(h, w), mode="bilinear", align_corners=False)
+    coords_t0 = torch.permute(coords_t0, (0, 2, 3, 1))
+    return F.grid_sample(latent, coords_t0, mode=mode, padding_mode="reflection", align_corners=False)
+
+
+@pytest.mark.parametrize("mode", ["nearest", "bilinear"])
+def test_raven_paper_nfpa_gap_fill_matches_reference_helper(mode):
+    torch.manual_seed(11)
+    latent = torch.randn(1, 3, 16, 16)
+    flow = create_nfpa_translation_flow(29, -31, height=128, width=128, device=latent.device, dtype=latent.dtype)
+    expected = _nfpa_reference_warp(latent, flow, mode=mode)
+    actual, metadata = raven_paper_nfpa_gap_fill_warp(
+        latent, 29, -31, vae_scale_factor=8, sampling_mode=mode, return_metadata=True
+    )
+    assert torch.equal(actual, expected)
+    assert metadata["transform_setting_name"] == RAVEN_PAPER_NFPA_GAP_FILL
+    assert metadata["latent_sampling_mode"] == mode
+    assert metadata["padding_mode"] == "reflection"
+    assert metadata["normalization_formula"] == "x_norm = 2*x_pixel/W - 1; y_norm = 2*y_pixel/H - 1"
+
+
+def test_raven_paper_nfpa_gap_fill_inverse_warp_direction():
+    latent = torch.zeros(1, 1, 64, 64)
+    latent[0, 0, 32, 32] = 1.0
+    shifted = translate_latent(
+        latent, 24, 24, shift_space="image_pixels", warp_mode="raven_paper_nfpa_gap_fill", padding_mode="reflection"
+    )
+    y, x = torch.nonzero(shifted[0, 0] == shifted.max(), as_tuple=True)
+    assert int(x[0]) == 29
+    assert int(y[0]) == 29
+
+
+def test_raven_gap_fill_nearest_and_bilinear_only_change_sampling_mode():
+    latent = torch.arange(64 * 64, dtype=torch.float32).reshape(1, 1, 64, 64)
+    nearest, nearest_meta = raven_paper_nfpa_gap_fill_warp(
+        latent, 27, -30, sampling_mode="nearest", return_metadata=True
+    )
+    bilinear, bilinear_meta = raven_paper_nfpa_gap_fill_warp(
+        latent, 27, -30, sampling_mode="bilinear", return_metadata=True
+    )
+    assert nearest.shape == bilinear.shape == latent.shape
+    assert not torch.equal(nearest, bilinear)
+    comparable = set(nearest_meta) - {"latent_sampling_mode"}
+    for key in comparable:
+        assert nearest_meta[key] == bilinear_meta[key]
