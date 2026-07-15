@@ -7,6 +7,7 @@ This file records implementation bugs, validated non-bugs, ablations, and the ev
 | Date | Area | Status | Evidence |
 | --- | --- | --- | --- |
 | 2026-07-15 | RAVEN-paper / NFPA-gap-fill warp and inverse-overlap quality | Implemented and verified on focused tests plus 10-sample DiffusionDB validation. Existing 1001 DiffusionDB P1 outputs were quality-recomputed without rerunning attack. | `raven_repro/raven/warp.py`; `raven_repro/raven/metrics.py`; `raven_repro/scripts/raven_paper_nfpa_gap_fill_eval.py`; `outputs/raven_paper_nfpa_gap_fill/audit_report_20260715T040535Z.md` |
+| 2026-07-15 | RAVEN exact two-stage color transfer | Implemented and verified. Existing 10 validation pre-color outputs were reused; no DDIM inversion or denoising was rerun. | `raven_repro/raven/color_transfer.py`; `raven_repro/scripts/raven_color_transfer_validation.py`; `outputs/raven_color_transfer_validation/diffusiondb_20260715T042018Z/aggregate_results.md` |
 | 2026-07-14 | NFPA-style Tree-Ring complex L1 evaluation | Completed for DiffusionDB only. MS-COCO was not run after scope was corrected. | `outputs/raven_nfpa_tr_eval/diffusiondb/20260714T161952Z/aggregate_results.json` |
 
 ## Confirmed Issues And Fixes
@@ -76,6 +77,17 @@ This file records implementation bugs, validated non-bugs, ablations, and the ev
 | Verification | Focused syntax/tests passed: `46 passed, 1 warning` for `test_warp.py` and `test_overlap_metrics.py`. Existing DiffusionDB 1001 P1 outputs were recomputed for inverse-overlap quality without rerunning attack. A 10-sample validation compared old P1, new nearest main, and bilinear ablation with complex L1 scoring. |
 | Evidence | `raven_repro/raven/warp.py`; `raven_repro/raven/metrics.py`; `raven_repro/raven/pipeline_raven.py`; `raven_repro/scripts/raven_p1_full.py`; `raven_repro/scripts/raven_paper_nfpa_gap_fill_eval.py`; `outputs/raven_paper_nfpa_gap_fill/audit_report_20260715T040535Z.md`; `outputs/raven_paper_nfpa_gap_fill/diffusiondb_quality_recompute_20260715T034545Z/quality_summary.json`; `outputs/raven_paper_nfpa_gap_fill/diffusiondb_validation_20260715T035849Z/aggregate_results.json` |
 | Status | Implemented and verified on focused tests plus 10-sample validation. Full 1001 new-transform attack has not been run. |
+
+### 2026-07-15 - Color Transfer Used Direct Generated-Luminance Statistics Instead Of Paper Two-Stage Formula
+
+| Field | Details |
+| --- | --- |
+| Problem | The previous CIELAB transfer matched generated-image `L_opt` mean/std directly to the original watermarked luminance and then inserted original `a/b`. The requested RAVEN formula first builds `x_c_lab = (L_opt, a_w, b_w)`, converts LAB -> RGB -> LAB, computes statistics from the realized `L_c`, then matches `L_c` to `L_w`. |
+| Impact | In gamut-clipped cases, the realized luminance after combining generated L with original chroma can differ from raw `L_opt`. Direct statistics can therefore produce slightly different luminance matching and diagnostics from the paper formula. |
+| Core logic changed | `color_contrast_transfer` now defaults to `paper_exact_two_stage`; old behavior remains available as `direct_stats`. Diagnostics now include `L_opt`, `L_c`, `L_w`, pre/post clip `L_final` ranges, final output L mean/std, saturated pixel ratio, and luminance mean/std errors. Pipeline debug metadata records `color_transfer_mode=paper_exact_two_stage`. |
+| Verification | `test_color_transfer.py` covers output shape/dtype/range, deterministic output, constant luminance with no NaN/Inf, final L mean/std closeness to original, and a gamut-clipping synthetic case where `paper_exact_two_stage` differs from `direct_stats`. 10-sample color-only validation reused existing `view_guided_output.png` files and did not rerun DDIM/denoising. |
+| Evidence | `raven_repro/raven/color_transfer.py`; `raven_repro/tests/test_color_transfer.py`; `raven_repro/scripts/raven_color_transfer_validation.py`; `outputs/raven_color_transfer_validation/diffusiondb_20260715T042018Z/aggregate_results.json` |
+| Status | Fixed and verified for focused tests plus 10-sample color-only validation. Existing full attacked images generated before this change remain legacy color-transfer outputs. |
 
 ### 2026-07-14 - NFPA-Style Tree-Ring Complex L1 Metric Was Missing
 
@@ -198,6 +210,16 @@ Sources: `outputs/raven_paper_nfpa_gap_fill/diffusiondb_validation_20260715T0358
 | Existing P1 outputs, raw full image | Same images, no overlap crop | Same | Mean PSNR 14.897020; mean SSIM 0.439846 | Full-image metrics are lower because shifted non-corresponding regions are included; paper-comparable local protocol should use overlap fields. |
 
 Source: `outputs/raven_paper_nfpa_gap_fill/diffusiondb_quality_recompute_20260715T034545Z/quality_summary.md`.
+
+### 2026-07-15 - Color Transfer Formula Comparison, 10 Samples
+
+| Implementation | Main difference | Evaluation setting | Result | Conclusion |
+| --- | --- | --- | --- | --- |
+| no_color_transfer | Reused pre-color `view_guided_output.png` directly | Existing 10 DiffusionDB validation outputs; no inversion/denoising rerun; NFPA-style complex L1 scoring | Mean L1 76.687901; overlap PSNR 23.090; overlap SSIM 0.6654; saturated ratio 0.015703; L mean/std errors 0.715407/0.385719 | Highest image similarity because no chroma/luminance correction is applied, but luminance mean error is worse than color-transfer modes. |
+| direct_stats | Old local formula: match raw generated `L_opt` stats to original `L_w` | Same | Mean L1 81.677802; overlap PSNR 19.608; overlap SSIM 0.5861; saturated ratio 0.103858; L mean/std errors 0.081025/0.206632 | Legacy ablation retained; good luminance matching, but not the requested paper two-stage formula. |
+| paper_exact_two_stage | Build `(L_opt,a_w,b_w)`, LAB->RGB->LAB, match realized `L_c` stats to `L_w` | Same | Mean L1 81.570660; overlap PSNR 19.579; overlap SSIM 0.5844; saturated ratio 0.109624; L mean/std errors 0.057105/0.146216 | New default follows requested paper formula and improves luminance mean/std matching versus direct_stats on this cohort. |
+
+Source: `outputs/raven_color_transfer_validation/diffusiondb_20260715T042018Z/aggregate_results.md`.
 
 ### 2026-07-14 - P1 Full Fixed `-log10(p)` Evaluation
 

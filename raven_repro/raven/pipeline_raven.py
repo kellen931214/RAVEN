@@ -416,6 +416,7 @@ class RavenPipeline:
             "overlap_handling": "valid overlap crop for paired quality metrics",
             "view_guided_attention": view_guided_attention,
             "color_transfer": color_transfer,
+            "color_transfer_mode": "paper_exact_two_stage" if color_transfer else "none",
         }
 
 
@@ -470,13 +471,16 @@ class RavenPipeline:
         debug_info["clipping_diagnostics"] = clipping_diagnostics
         save_image(view_image, output_dir / "view_guided_output.png")
 
-        final_image = color_contrast_transfer_pil(view_image, input_image) if color_transfer else view_image
+        final_image = (
+            color_contrast_transfer_pil(view_image, input_image, mode="paper_exact_two_stage")
+            if color_transfer else view_image
+        )
         final_name = "final_color_corrected.png" if color_transfer else "final.png"
         save_image(final_image, output_dir / final_name)
 
         if color_transfer:
             debug_info["color_transfer_diagnostics"] = color_transfer_diagnostics(
-                view_image, input_image, final_image
+                view_image, input_image, final_image, mode="paper_exact_two_stage"
             )
 
         if processors:
