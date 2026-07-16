@@ -93,13 +93,11 @@ PSNR and SSIM use the overlapping crop implied by each output folder's `debug_in
 - `scripts/attack_folder.py`: folder CLI with failure logging.
 - `scripts/eval_quality.py`: PSNR/SSIM helper.
 - `scripts/audit_dataset.py`: metadata, hash, image-format, and pairing audit.
-- `scripts/extract_detector_scores.py`: clean/before/after raw detector score extraction.
-- `scripts/eval_reproduction.py`: clean-negative TPR@1%FPR calibration, GS bit audit, and quality aggregation.
-- `scripts/aggregate_reproduction.py`: version-checked CSV/Markdown table generation.
-
-The current clean-negative verification workflow is documented in
-[`VERIFICATION_WORKFLOW.md`](VERIFICATION_WORKFLOW.md). It uses strict pairing
-manifests plus streaming extraction and keeps legacy and calibrated rates separate.
+- `scripts/raven_p1_full.py`: formal DiffusionDB/MS-COCO P1 attack workflow.
+- `scripts/raven_nfpa_tr_eval.py`: formal Tree-Ring L1 attacked-clean calibration/evaluation.
+- `scripts/quality_decomposition_experiment.py`: formal quality decomposition run.
+- `scripts/build_verification_manifest.py` and `scripts/evaluate_verification.py`: strict pairing and calibrated verification utilities.
+- Archived legacy scripts live under `archive/legacy_scripts_20260716/`.
 
 ## Outputs
 
@@ -135,32 +133,9 @@ python scripts/audit_dataset.py \
   --output outputs/audit/mscoco_TR.json
 ```
 
-Extract raw detector scores without applying a default threshold:
-
-```bash
-python scripts/extract_detector_scores.py \
-  --method TR \
-  --metadata /workspace/data/watermarked/mscoco/TR/metadata.csv \
-  --model-id RedbeardNZ/stable-diffusion-2-1-base \
-  --steps 50 \
-  --limit 10 \
-  --output outputs/audit/mscoco_TR_raw_scores.csv
-```
-
-Recompute TPR using clean negatives to calibrate 1% FPR:
-
-```bash
-python scripts/eval_reproduction.py \
-  --method TR \
-  --records outputs/audit/mscoco_TR_raw_scores.csv \
-  --target-fpr 0.01 \
-  --output-json outputs/audit/mscoco_TR_metrics.json
-```
-
-For GS, the extraction CSV includes the 256-bit ground truth and recovered
-bit strings; the evaluator reports per-sample errors and aggregate bit
-accuracy. Optional OpenCLIP and FID computations are disabled by default and
-must be requested explicitly so metric model provenance is recorded.
+Legacy detector extraction/evaluation CLIs were removed during the 2026-07-16
+cleanup. Use the formal RAVEN P1/NFPA scripts for current experiments, or see
+`archive/legacy_scripts_20260716/` for historical ablations.
 
 ## Approximations Relative To The Paper
 

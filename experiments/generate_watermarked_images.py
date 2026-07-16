@@ -26,7 +26,7 @@ for root in (str(RAVEN_ROOT), str(BENCH_ROOT)):
     if root not in sys.path:
         sys.path.insert(0, root)
 
-from raven.gpu_utils import configure_gpu, finalize_gpu_logging, utc_timestamp, write_experiment_records
+from raven.gpu_utils import configure_gpu, finalize_gpu_logging, setup_run_logging, utc_timestamp, write_experiment_records
 
 PAPER_WM_METHODS_IN_BENCH = ["GS", "TR", "RID", "HSTR", "HSQR"]
 PAPER_WM_NAMES = {
@@ -382,6 +382,7 @@ def main() -> int:
     first = base_parser().parse_known_args()[0]
     dataset_dir = Path(first.output_dir) / first.dataset_name
     dataset_dir.mkdir(parents=True, exist_ok=True)
+    setup_run_logging(dataset_dir)
     started_at = utc_timestamp()
     gpu_record = configure_gpu(first.gpu, first.device, dataset_dir, require_free_gpu=first.require_free_gpu)
 

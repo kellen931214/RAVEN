@@ -1,4 +1,4 @@
-"""GPU selection and experiment GPU logging helpers."""
+"""GPU selection and experiment output helpers."""
 
 from __future__ import annotations
 
@@ -65,6 +65,17 @@ class GpuInfo:
 
 def utc_timestamp() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def setup_run_logging(output_dir: str | os.PathLike[str], filename: str = "run.log") -> Path:
+    """Append stdout/stderr to a single experiment log file."""
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    log_path = out / filename
+    stream = log_path.open("a", encoding="utf-8", buffering=1)
+    sys.stdout = stream
+    sys.stderr = stream
+    return log_path
 
 
 def _run_command(args: List[str]) -> subprocess.CompletedProcess[str]:
@@ -211,34 +222,6 @@ def _format_gpu(gpu: GpuInfo) -> str:
     )
 
 
-def write_gpu_status_log(
-    output_dir: str | os.PathLike[str], status: Dict[str, Any], selected_gpu_id: Optional[str], name: str
-) -> Path:
-    logs_dir = Path(output_dir) / "logs"
-    logs_dir.mkdir(parents=True, exist_ok=True)
-    out = logs_dir / name
-
-    lines = [
-        f"timestamp: {status.get('timestamp', utc_timestamp())}",
-        f"selected_gpu_id: {selected_gpu_id if selected_gpu_id is not None else 'none'}",
-    ]
-    if status.get("error"):
-        lines.append(f"error: {status['error']}")
-    lines.append("")
-    lines.append("parsed_gpus:")
-    for gpu in status.get("gpus") or []:
-        lines.append(f"- {_format_gpu(gpu)}")
-    if not status.get("gpus"):
-        lines.append("- none")
-    lines.append("")
-    lines.append("raw_nvidia_smi:")
-    lines.append(status.get("raw_nvidia_smi") or "")
-    if status.get("raw_nvidia_smi_stderr"):
-        lines.append("")
-        lines.append("raw_nvidia_smi_stderr:")
-        lines.append(status["raw_nvidia_smi_stderr"])
-    out.write_text("\n".join(lines))
-    return out
 
 
 def configure_gpu(
@@ -264,7 +247,6 @@ def configure_gpu(
             selected_gpu_id = selected.index
             all_busy = not any(gpu.is_idle for gpu in status_before.get("gpus") or [])
             if all_busy and require_free_gpu:
-                write_gpu_status_log(output_dir, status_before, selected_gpu_id, "gpu_status_before.txt")
                 raise RuntimeError(
                     "All visible GPUs appear busy. Refusing to start a full experiment; wait for an idle GPU or choose one manually."
                 )
@@ -297,7 +279,6 @@ def configure_gpu(
             flush=True,
         )
 
-    write_gpu_status_log(output_dir, status_before, selected_gpu_id, "gpu_status_before.txt")
     return {
         "requested_gpu": normalized_gpu_arg,
         "selected_gpu_id": selected_gpu_id,
@@ -310,12 +291,11 @@ def configure_gpu(
 
 def finalize_gpu_logging(output_dir: str | os.PathLike[str], gpu_record: Dict[str, Any]) -> Dict[str, Any]:
     status_after = query_gpu_status()
-    write_gpu_status_log(output_dir, status_after, gpu_record.get("selected_gpu_id"), "gpu_status_after.txt")
     gpu_record["status_after"] = _serializable_status(status_after)
     return gpu_record
 
 
-def write_experiment_records(
+def write_results_json(
     output_dir: str | os.PathLike[str],
     args: Dict[str, Any],
     gpu_record: Dict[str, Any],
@@ -326,23 +306,16 @@ def write_experiment_records(
 ) -> None:
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
-    config = {
+    results = {
         "args": _json_safe(args),
-        "gpu": _json_safe(gpu_record),
-        "started_at": started_at,
-        "finished_at": finished_at,
-        "status": status,
-    }
-    summary = {
         "started_at": started_at,
         "finished_at": finished_at,
         "status": status,
         "gpu": _json_safe(gpu_record),
     }
     if extra_summary:
-        summary.update(_json_safe(extra_summary))
-    (out / "experiment_config.json").write_text(json.dumps(config, indent=2, sort_keys=True))
-    (out / "runtime_summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True))
+        results.update(_json_safe(extra_summary))
+    (out / "results.json").write_text(json.dumps(results, indent=2, sort_keys=True))
 
 
 def _serializable_status(status: Dict[str, Any]) -> Dict[str, Any]:
@@ -359,3 +332,6 @@ def _json_safe(value: Any) -> Any:
     if isinstance(value, Path):
         return str(value)
     return value
+
+
+write_experiment_records = write_results_json

@@ -29,11 +29,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from raven.metrics import crop_overlap_inverse_warp, detection_rate, roc_auc
 from raven.pipeline_raven import RavenPipeline
 from raven.utils import load_image
-from scripts import diagonal_shift_ablation as base
-
-MODEL_ID = base.MODEL_ID
-MODEL_REVISION = base.MODEL_REVISION
-THRESHOLD = base.THRESHOLD
+MODEL_ID = "RedbeardNZ/stable-diffusion-2-1-base"
+MODEL_REVISION = "c6a5e9bab8d874d081de76fa270ae0aefa5410ff"
+THRESHOLD = 1.6372738343020807
 EMPTY_PROMPT_SHA256 = hashlib.sha256(b"").hexdigest()
 PLAN_SEED = 2026071401
 VAE_SCALE_FACTOR = 8

@@ -1,9 +1,15 @@
+import hashlib
+
 import pytest
 
 np = pytest.importorskip("numpy")
 pytest.importorskip("skimage")
 
-from raven.color_transfer import color_contrast_transfer, color_transfer_diagnostics
+from raven.color_transfer import (
+    align_original_chroma_to_generated,
+    color_contrast_transfer,
+    color_transfer_diagnostics,
+)
 
 
 def test_color_transfer_shape_dtype_and_range():
@@ -82,3 +88,89 @@ def test_color_transfer_diagnostics_include_required_fields():
     ):
         assert key in diagnostics
     assert diagnostics["color_transfer_mode"] == "paper_exact_two_stage"
+
+
+
+@pytest.mark.parametrize(
+    "dx,dy",
+    [
+        (2, 0), (-2, 0), (0, 2), (0, -2),
+        (2, 2), (2, -2), (-2, 2), (-2, -2),
+    ],
+)
+def test_aligned_chroma_uses_inverse_warp_correspondence(dx, dy):
+    height, width = 7, 9
+    original = np.zeros((height, width, 2), dtype=np.float32)
+    yy, xx = np.mgrid[:height, :width]
+    original[..., 0] = yy * 100 + xx
+    original[..., 1] = -(yy * 100 + xx)
+    generated = np.full_like(original, -999.0)
+    aligned, valid = align_original_chroma_to_generated(original, generated, dx, dy)
+    for y in range(height):
+        for x in range(width):
+            source_y, source_x = y + dy, x + dx
+            if 0 <= source_y < height and 0 <= source_x < width:
+                assert valid[y, x]
+                assert np.array_equal(aligned[y, x], original[source_y, source_x])
+            else:
+                assert not valid[y, x]
+                assert np.array_equal(aligned[y, x], generated[y, x])
+
+
+def test_aligned_chroma_has_no_circular_wrap_and_preserves_non_overlap():
+    original = np.arange(5 * 6 * 2, dtype=np.float32).reshape(5, 6, 2)
+    generated = np.full_like(original, 777.0)
+    aligned, valid = align_original_chroma_to_generated(original, generated, 2, -1)
+    assert np.all(aligned[~valid] == 777.0)
+    assert np.all(aligned[:, -2:] == 777.0)
+    assert np.all(aligned[0] == 777.0)
+
+
+def test_aligned_chroma_alpha_endpoints():
+    rng = np.random.default_rng(10)
+    original = rng.normal(size=(8, 9, 2)).astype(np.float32)
+    generated = rng.normal(size=(8, 9, 2)).astype(np.float32)
+    zero, valid = align_original_chroma_to_generated(original, generated, 2, -1, alpha=0.0)
+    one, valid_one = align_original_chroma_to_generated(original, generated, 2, -1, alpha=1.0)
+    assert np.array_equal(zero, generated)
+    assert np.array_equal(valid, valid_one)
+    yy, xx = np.nonzero(valid)
+    assert np.allclose(one[yy, xx], original[yy - 1, xx + 2])
+    assert np.array_equal(one[~valid], generated[~valid])
+
+
+@pytest.mark.parametrize(
+    "mode,alpha",
+    [
+        ("paper_exact_two_stage_aligned", 1.0),
+        ("paper_exact_two_stage_aligned_blend", 0.5),
+    ],
+)
+def test_aligned_modes_shape_dtype_range_and_finite(mode, alpha):
+    rng = np.random.default_rng(11)
+    original = rng.integers(0, 256, (24, 25, 3), dtype=np.uint8)
+    generated = rng.integers(0, 256, (24, 25, 3), dtype=np.uint8)
+    output = color_contrast_transfer(
+        generated, original, mode=mode,
+        flow_dx_image_px=3, flow_dy_image_px=-2, alpha=alpha,
+    )
+    diagnostics = color_transfer_diagnostics(
+        generated, original, output, mode=mode,
+        flow_dx_image_px=3, flow_dy_image_px=-2, alpha=alpha,
+    )
+    assert output.shape == generated.shape
+    assert output.dtype == np.uint8
+    assert output.min() >= 0 and output.max() <= 255
+    assert all(np.isfinite(value) for value in diagnostics.values() if isinstance(value, float))
+    assert diagnostics["alignment_formula"] == "generated[y,x] <- original[y+flow_dy,x+flow_dx]"
+    assert 0.0 <= diagnostics["output_rgb_out_of_gamut_ratio_before_clip"] <= 1.0
+
+
+def test_paper_exact_two_stage_baseline_regression_hash_unchanged():
+    rng = np.random.default_rng(20260716)
+    generated = rng.integers(0, 256, (17, 19, 3), dtype=np.uint8)
+    original = rng.integers(0, 256, (17, 19, 3), dtype=np.uint8)
+    output = color_contrast_transfer(generated, original, mode="paper_exact_two_stage")
+    assert hashlib.sha256(output.tobytes()).hexdigest() == (
+        "865e1f6332c95bae6e7bcdb066b345a03f04b7cd6d232805af9e12434127321a"
+    )

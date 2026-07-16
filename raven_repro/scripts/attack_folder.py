@@ -10,7 +10,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from raven.gpu_utils import configure_gpu, finalize_gpu_logging, utc_timestamp, write_experiment_records
+from raven.gpu_utils import configure_gpu, finalize_gpu_logging, setup_run_logging, utc_timestamp, write_experiment_records
 from raven.resource_guard import CpuMemoryGuard
 from raven.pipeline_raven import RavenPipeline
 from raven.utils import iter_image_files, load_image, parse_bool, prepare_output_dir
@@ -52,8 +52,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_parser().parse_args()
-    started_at = utc_timestamp()
     output_root = prepare_output_dir(args.output_dir)
+    setup_run_logging(output_root)
+    started_at = utc_timestamp()
     gpu_record = configure_gpu(args.gpu, args.device, output_root, require_free_gpu=args.require_free_gpu)
     memory_guard = CpuMemoryGuard(args.min_cpu_mem_gb, args.max_process_ram_gb, args.warn_cpu_mem_gb)
     memory_guard.check("before loading RAVEN model")

@@ -9,7 +9,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from raven.gpu_utils import configure_gpu, finalize_gpu_logging, utc_timestamp, write_experiment_records
+from raven.gpu_utils import configure_gpu, finalize_gpu_logging, setup_run_logging, utc_timestamp, write_experiment_records
 from raven.resource_guard import CpuMemoryGuard
 from raven.pipeline_raven import RavenPipeline
 from raven.utils import load_image, parse_bool
@@ -51,6 +51,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_parser().parse_args()
+    Path(args.output_dir).mkdir(parents=True, exist_ok=True)
+    setup_run_logging(args.output_dir)
     started_at = utc_timestamp()
     gpu_record = configure_gpu(args.gpu, args.device, args.output_dir, require_free_gpu=args.require_free_gpu)
     memory_guard = CpuMemoryGuard(args.min_cpu_mem_gb, args.max_process_ram_gb, args.warn_cpu_mem_gb)

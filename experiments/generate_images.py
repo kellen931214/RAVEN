@@ -10,7 +10,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "raven_repro"))
 
-from raven.gpu_utils import configure_gpu, finalize_gpu_logging, utc_timestamp, write_experiment_records
+from raven.gpu_utils import configure_gpu, finalize_gpu_logging, setup_run_logging, utc_timestamp, write_experiment_records
 from raven.resource_guard import CpuMemoryGuard, limit_cpu_threads
 from raven.utils import parse_bool
 
@@ -78,8 +78,10 @@ def _load_prompts(path: str, prompt_column: str | None, limit: int | None) -> li
 
 def main() -> None:
     args = build_parser().parse_args()
-    started_at = utc_timestamp()
     output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    setup_run_logging(output_dir)
+    started_at = utc_timestamp()
     output_dir.mkdir(parents=True, exist_ok=True)
     gpu_record = configure_gpu(args.gpu, args.device, output_dir, require_free_gpu=args.require_free_gpu)
     memory_guard = CpuMemoryGuard(args.min_cpu_mem_gb, args.max_process_ram_gb, args.warn_cpu_mem_gb)

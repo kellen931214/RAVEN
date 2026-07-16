@@ -45,6 +45,7 @@ raven_repro/logs/
 
 # External reference repositories checked out locally for audit only
 NFPA/
+external/
 
 # Local datasets and generated images
 data/
