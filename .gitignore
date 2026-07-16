@@ -73,3 +73,5 @@ wheels/
 tmp/
 temp/
 *.tmp
+
+tree-ring-watermark-official/

@@ -384,6 +384,57 @@ def test_raven_gap_fill_nearest_and_bilinear_only_change_sampling_mode():
     )
     assert nearest.shape == bilinear.shape == latent.shape
     assert not torch.equal(nearest, bilinear)
-    comparable = set(nearest_meta) - {"latent_sampling_mode"}
+    sampling_derived = {
+        "latent_sampling_mode",
+        "effective_displacement_protocol",
+        "effective_source_dx_latent_cells",
+        "effective_source_dy_latent_cells",
+        "effective_flow_dx_image_px",
+        "effective_flow_dy_image_px",
+        "effective_visual_dx_image_px",
+        "effective_visual_dy_image_px",
+        "effective_flow_is_fractional",
+    }
+    comparable = set(nearest_meta) - sampling_derived
     for key in comparable:
         assert nearest_meta[key] == bilinear_meta[key]
+
+
+@pytest.mark.parametrize(
+    "requested,expected",
+    [
+        (-32, -32), (-31, -32), (-28, -32), (-27, -24), (-24, -24),
+        (24, 24), (28, 24), (29, 32), (32, 32),
+    ],
+)
+def test_nfpa_nearest_metadata_reports_effective_source_flow(requested, expected):
+    latent = torch.zeros(1, 1, 64, 64)
+    flow = create_nfpa_translation_flow(
+        requested, requested, height=512, width=512,
+        device=latent.device, dtype=latent.dtype,
+    )
+    _, metadata = nfpa_warp_single_latent(latent, flow, return_metadata=True)
+    assert metadata["effective_flow_dx_image_px"] == expected
+    assert metadata["effective_flow_dy_image_px"] == expected
+    assert metadata["effective_visual_dx_image_px"] == -expected
+    assert metadata["effective_visual_dy_image_px"] == -expected
+    assert metadata["effective_flow_is_fractional"] is False
+
+
+@pytest.mark.parametrize("sampling_mode", ["nearest", "bilinear"])
+def test_latent_grid_metadata_reports_sampling_effect(sampling_mode):
+    from raven.warp import latent_grid_warp
+
+    latent = torch.zeros(1, 1, 64, 64)
+    _, metadata = latent_grid_warp(
+        latent, 27, -29, sampling_mode=sampling_mode,
+        padding_mode="reflection", return_metadata=True,
+    )
+    if sampling_mode == "nearest":
+        assert metadata["effective_flow_dx_image_px"] == 24
+        assert metadata["effective_flow_dy_image_px"] == -32
+        assert metadata["effective_flow_is_fractional"] is False
+    else:
+        assert metadata["effective_flow_dx_image_px"] == pytest.approx(27)
+        assert metadata["effective_flow_dy_image_px"] == pytest.approx(-29)
+        assert metadata["effective_flow_is_fractional"] is False

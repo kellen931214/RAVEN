@@ -335,6 +335,8 @@ class RavenPipeline:
             "input_image_size": list(input_image.size),
             "latent_shape": list(inversion.clean_latents.shape),
             "reference_latent_shape": list(inversion.noisy_latents.shape),
+            "warp_input_stage": "ddim_inversion.noisy_latents_z_tau",
+            "warp_input_is_inversion_noisy_latents": True,
             "shifted_latent_shape": list(shifted_latents.shape),
             "timesteps": [int(t) for t in inversion.timesteps.detach().cpu().tolist()],
             "strength": strength,
@@ -467,6 +469,7 @@ class RavenPipeline:
             restore_default_attention(self.pipe.unet, self._default_attn_processors)
 
         view_latent = latents[1:2]
+        debug_info["decoded_output_branch"] = "view_branch_index_1"
         view_image, clipping_diagnostics = self._decode_latents_with_diagnostics(view_latent)
         debug_info["clipping_diagnostics"] = clipping_diagnostics
         save_image(view_image, output_dir / "view_guided_output.png")

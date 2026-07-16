@@ -258,3 +258,40 @@ Sources: `outputs/raven_tr_full_diffusiondb/20260715T060017Z/smoke2_eval/aggrega
 | --- | --- | --- | --- |
 | 2026-07-15 | Whether to expand `RAVEN-paper / NFPA-gap-fill` to 100-200 or full 1001 | 10-sample validation is complete, but full new-transform attack has not been run. | If requested, first run 100-200 samples in a new output directory; do not overwrite old P1 outputs. |
 | 2026-07-15 | Paper PSNR/SSIM provenance | RAVEN arXiv HTML inspected; local report treats overlap PSNR/SSIM as requested paper-comparable protocol, while the inspected paper quality table emphasizes FID/CLIP. | If exact PSNR/SSIM numbers are required for a table, cite the user-defined overlap protocol separately from paper-reported FID/CLIP. |
+
+
+### 2026-07-16 - Effective-Flow Warp Sampling Diagnostic (N=10)
+
+| Field | Details |
+| --- | --- |
+| Problem | Nearest latent sampling quantizes the requested 24-32 image-pixel flow, so requested-flow overlap crops can compare the wrong pixels. |
+| Impact | Requested-flow PSNR/SSIM understated quality and could not isolate NFPA coordinate construction from direct latent-grid sampling. |
+| Core logic changed | Quality records now use measured effective source flow. Nearest uses integer effective-flow overlap; bilinear uses fractional inverse-warp reference alignment. Requested-flow metrics remain only as `legacy_requested_*` diagnostics. Attack, detector, shift plan, DDIM, attention, and color transfer were unchanged. |
+| Verification | Effective-displacement impulse tests and formal quality-field regression passed. The paired run completed all 30 outputs with finite scores/metrics; all attention assertions passed. |
+| Status | Diagnostic completed; N=10 only, no statistical-significance claim. |
+
+| Implementation | Main difference | Evaluation setting | Result | Conclusion |
+| --- | --- | --- | --- | --- |
+| `NFPA_exact_nearest` | NFPA 512-grid, bilinear coordinate resize, nearest/reflection latent sampling | Same first 10 official DiffusionDB WM inputs, seed/shift plan, DDIM-50, strength 0.15, CFG 2.5, empty prompts, fixed official before threshold | Detect 0/10; mean L1 77.843750; effective-overlap PSNR 22.1563; SSIM 0.818978; 7 unique effective shifts | Requested 10 shifts quantized to 7 effective pairs. |
+| `latent_grid_nearest` | Direct `dx/8`, nearest/reflection | Same | Detect 0/10; mean L1 77.843750; PSNR 22.1563; SSIM 0.818978 | Output SHA matched NFPA nearest for 10/10 samples on this shift plan. |
+| `latent_grid_bilinear` | Direct `dx/8`, bilinear/reflection; fractional reference alignment for quality | Same | Detect 0/10; mean L1 79.100000; PSNR 19.7496; SSIM 0.569415; 10 unique effective shifts | Preserved all requested displacements but did not improve quality on this cohort. |
+
+Source: `outputs/raven_effective_flow_ablation/20260716T035848Z/experiment1/aggregate_results.json`; `outputs/raven_effective_flow_ablation/20260716T035848Z/paired_comparisons.json`; `outputs/raven_effective_flow_ablation/20260716T035848Z/validation_results.json`.
+
+### 2026-07-16 - Shift And Color-Transfer Diagnostic (N=10)
+
+| Field | Details |
+| --- | --- |
+| Problem | Prior quality summaries combined latent shift and paper two-stage color transfer, so their separate effects were not quantified under corrected effective-flow overlap. |
+| Impact | Low post-color PSNR/SSIM could not be attributed to shift versus color transfer. |
+| Core logic changed | No attack logic changed. A paired diagnostic held images, seeds, prompts, DDIM, attention, and shift plan fixed while toggling only shift/color transfer. |
+| Verification | All 30 comparison records were finite. Shift-no-color output SHA matched the corresponding with-color pre-color SHA for 10/10 samples, proving the color comparison uses the same denoising output. |
+| Status | Diagnostic completed; N=10 only, no statistical-significance claim. |
+
+| Implementation | Main difference | Evaluation setting | Result | Conclusion |
+| --- | --- | --- | --- | --- |
+| `DDIM_shift_no_color` | Effective nearest shift, no color transfer | Same first 10 official DiffusionDB WM inputs and fixed before L1 threshold | Detect 0/10; mean L1 78.800000; corrected PSNR 30.9971; SSIM 0.930483 | Shift alone removed detection on this cohort with modest overlap-quality loss versus no shift. |
+| `DDIM_shift_with_color` | Same shifted denoising output plus paper two-stage color transfer | Same | Detect 0/10; mean L1 77.843750; pre-color PSNR/SSIM 30.9971/0.930483; post-color 22.1563/0.818978; mean saturated ratio 0.147120 | Color transfer reduced PSNR by 8.8408 dB and SSIM by 0.111506 on average; detector effect was mixed and small. |
+| `DDIM_no_shift_no_color` | No shift, no color transfer | Same | Detect 10/10; mean L1 44.965625; PSNR 33.1419; SSIM 0.943884 | Confirms shift drives watermark suppression in this N=10 cohort. |
+
+Source: `outputs/raven_effective_flow_ablation/20260716T035848Z/experiment2/aggregate_results.json`; `outputs/raven_effective_flow_ablation/20260716T035848Z/experiment2/quality_stage_summary.json`; `outputs/raven_effective_flow_ablation/20260716T035848Z/experiment2/clipping_summary.json`; `outputs/raven_effective_flow_ablation/20260716T035848Z/paired_comparisons.json`.

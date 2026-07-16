@@ -25,6 +25,48 @@ RAVEN_PAPER_NFPA_GAP_FILL_CLASSIFICATION = (
 NFPA_IMAGE_GRID_IMPLEMENTATION_VERSION = "nfpa_image_grid_w_h_norm_v1"
 
 
+def _effective_displacement_metadata(
+    grid,
+    *,
+    latent_height: int,
+    latent_width: int,
+    image_height: int,
+    image_width: int,
+    sampling_mode: LatentSamplingMode,
+) -> dict[str, Any]:
+    """Measure the interior source-flow displacement encoded by a sampling grid."""
+    import torch
+
+    center_y = latent_height // 2
+    center_x = latent_width // 2
+    sample = grid[0, center_y, center_x].detach().float()
+    source_x = (sample[0] + 1.0) * latent_width / 2.0 - 0.5
+    source_y = (sample[1] + 1.0) * latent_height / 2.0 - 0.5
+    if sampling_mode == "nearest":
+        source_x = torch.round(source_x)
+        source_y = torch.round(source_y)
+    dx_latent = float((source_x - center_x).cpu().item())
+    dy_latent = float((source_y - center_y).cpu().item())
+    dx_image = dx_latent * image_width / latent_width
+    dy_image = dy_latent * image_height / latent_height
+    return {
+        "effective_displacement_protocol": (
+            "interior nearest source index under align_corners_false"
+            if sampling_mode == "nearest"
+            else "interior fractional source coordinate under align_corners_false"
+        ),
+        "effective_source_dx_latent_cells": dx_latent,
+        "effective_source_dy_latent_cells": dy_latent,
+        "effective_flow_dx_image_px": dx_image,
+        "effective_flow_dy_image_px": dy_image,
+        "effective_visual_dx_image_px": -dx_image,
+        "effective_visual_dy_image_px": -dy_image,
+        "effective_flow_is_fractional": bool(
+            abs(dx_image - round(dx_image)) > 1e-6
+            or abs(dy_image - round(dy_image)) > 1e-6
+        ),
+    }
+
 
 def coords_grid(batch: int, ht: int, wd: int, device, dtype=None):
     """NFPA/RAFT-style pixel coordinate grid with channels ordered as x, y."""
@@ -148,6 +190,14 @@ def nfpa_warp_single_latent(
         "effective_grid_sample_align_corners": False,
         "grid_sample_inverse_sampling": True,
     }
+    metadata.update(_effective_displacement_metadata(
+        grid,
+        latent_height=latent_h,
+        latent_width=latent_w,
+        image_height=flow_h,
+        image_width=flow_w,
+        sampling_mode=sampling_mode,
+    ))
     if return_metadata:
         return warped, metadata
     return warped
@@ -270,6 +320,14 @@ def latent_grid_warp(
         "grid_sample_inverse_sampling": True,
         "pixel_center_offset_latent_cells": 0.5,
     }
+    metadata.update(_effective_displacement_metadata(
+        grid,
+        latent_height=height,
+        latent_width=width,
+        image_height=height * vae_scale_factor,
+        image_width=width * vae_scale_factor,
+        sampling_mode=sampling_mode,
+    ))
     if return_metadata:
         return warped, metadata
     return warped

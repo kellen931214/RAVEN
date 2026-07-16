@@ -220,6 +220,45 @@ def crop_overlap_inverse_warp(reference, attacked, flow_dx_px: float, flow_dy_px
     )
 
 
+def align_fractional_overlap_inverse_warp(
+    reference, attacked, flow_dx_px: float, flow_dy_px: float
+):
+    """Align reference pixels for a fractional inverse warp and crop valid support."""
+    import numpy as np
+    import torch
+    import torch.nn.functional as F
+
+    reference = np.asarray(reference, dtype=np.float32)
+    attacked = np.asarray(attacked, dtype=np.float32)
+    height = min(reference.shape[0], attacked.shape[0])
+    width = min(reference.shape[1], attacked.shape[1])
+    reference = reference[:height, :width]
+    attacked = attacked[:height, :width]
+    dx = float(flow_dx_px)
+    dy = float(flow_dy_px)
+
+    attacked_x0 = max(0, int(math.ceil(-dx)))
+    attacked_x1 = min(width, int(math.floor((width - 1) - dx)) + 1)
+    attacked_y0 = max(0, int(math.ceil(-dy)))
+    attacked_y1 = min(height, int(math.floor((height - 1) - dy)) + 1)
+    if attacked_x0 >= attacked_x1 or attacked_y0 >= attacked_y1:
+        raise ValueError(f"flow ({dx}, {dy}) leaves no overlapping region for {width}x{height}")
+
+    y = torch.arange(attacked_y0, attacked_y1, dtype=torch.float32)
+    x = torch.arange(attacked_x0, attacked_x1, dtype=torch.float32)
+    yy, xx = torch.meshgrid(y, x, indexing="ij")
+    grid = torch.stack((
+        2.0 * (xx + dx + 0.5) / width - 1.0,
+        2.0 * (yy + dy + 0.5) / height - 1.0,
+    ), dim=-1).unsqueeze(0)
+    reference_tensor = torch.from_numpy(reference).permute(2, 0, 1).unsqueeze(0)
+    aligned_reference = F.grid_sample(
+        reference_tensor, grid, mode="bilinear", padding_mode="zeros", align_corners=False
+    )[0].permute(1, 2, 0).numpy()
+    attacked_crop = attacked[attacked_y0:attacked_y1, attacked_x0:attacked_x1]
+    return aligned_reference, attacked_crop
+
+
 def rgb_float_array(image):
     """Return RGB float32 image data in [0, 1]."""
     import numpy as np
@@ -229,9 +268,15 @@ def rgb_float_array(image):
     return np.asarray(image, dtype=np.float32) / 255.0
 
 
-def pair_quality_metrics(reference, attacked, flow_dx_px: float | None = None, flow_dy_px: float | None = None) -> dict:
-    """Compute raw full-image and optional inverse-warp overlap PSNR/SSIM."""
-    import numpy as np
+def pair_quality_metrics(
+    reference,
+    attacked,
+    flow_dx_px: float | None = None,
+    flow_dy_px: float | None = None,
+    *,
+    alignment_mode: str = "integer_crop",
+) -> dict:
+    """Compute full-image and effective inverse-warp overlap PSNR/SSIM."""
     from skimage.metrics import peak_signal_noise_ratio, structural_similarity
 
     reference_array = rgb_float_array(reference)
@@ -245,21 +290,29 @@ def pair_quality_metrics(reference, attacked, flow_dx_px: float | None = None, f
         "raw_full_ssim": float(structural_similarity(reference_array, attacked_array, data_range=1.0, channel_axis=-1)),
     }
     if flow_dx_px is not None and flow_dy_px is not None:
-        reference_crop, attacked_crop = crop_overlap_inverse_warp(
-            reference_array, attacked_array, flow_dx_px, flow_dy_px
-        )
+        if alignment_mode == "integer_crop":
+            reference_crop, attacked_crop = crop_overlap_inverse_warp(
+                reference_array, attacked_array, flow_dx_px, flow_dy_px
+            )
+            protocol = "effective_integer_inverse_warp_valid_correspondence"
+        elif alignment_mode == "fractional_grid_sample":
+            reference_crop, attacked_crop = align_fractional_overlap_inverse_warp(
+                reference_array, attacked_array, flow_dx_px, flow_dy_px
+            )
+            protocol = "effective_fractional_inverse_warp_bilinear_reference_alignment"
+        else:
+            raise ValueError(f"unsupported alignment_mode: {alignment_mode}")
         result.update({
             "overlap_psnr": float(peak_signal_noise_ratio(reference_crop, attacked_crop, data_range=1.0)),
             "overlap_ssim": float(structural_similarity(reference_crop, attacked_crop, data_range=1.0, channel_axis=-1)),
             "valid_overlap_width": int(reference_crop.shape[1]),
             "valid_overlap_height": int(reference_crop.shape[0]),
             "valid_overlap_area_ratio": float(reference_crop.shape[0] * reference_crop.shape[1] / (height * width)),
-            "overlap_protocol": "inverse_warp_valid_correspondence",
+            "overlap_protocol": protocol,
             "flow_dx_px": float(flow_dx_px),
             "flow_dy_px": float(flow_dy_px),
         })
     return result
-
 
 def summarize_numeric(values: Iterable[float]) -> dict:
     import numpy as np
