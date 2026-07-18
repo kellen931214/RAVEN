@@ -284,7 +284,8 @@ class RavenPipeline:
                 padding_mode=padding_mode,
                 warp_mode=warp_mode,
             )
-        save_image(self._decode_latents(shifted_latents), output_dir / "latent_shift_only.png")
+        if debug:
+            save_image(self._decode_latents(shifted_latents), output_dir / "latent_shift_only.png")
 
         latents = torch.cat([inversion.noisy_latents, shifted_latents], dim=0)
         prompt_embeds = self._encode_prompt(

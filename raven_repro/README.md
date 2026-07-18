@@ -95,7 +95,10 @@ PSNR and SSIM use the overlapping crop implied by each output folder's `debug_in
 - `scripts/audit_dataset.py`: metadata, hash, image-format, and pairing audit.
 - `scripts/raven_p1_full.py`: formal DiffusionDB/MS-COCO P1 attack workflow.
 - `scripts/raven_nfpa_tr_eval.py`: formal Tree-Ring L1 attacked-clean calibration/evaluation.
-- `scripts/quality_decomposition_experiment.py`: formal quality decomposition run.
+- `scripts/quality_decomposition_experiment.py`: paired formal evaluation for aligned and blended-aligned color variants only.
+- `scripts/run_diffusiondb_chain_after_clean.py`: despite the legacy filename, this now shards complete clean/Tree-Ring pairs across two idle compatible GPUs, merges only after a fail-closed provenance audit, chains attack/evaluation, and invalidates the old shared-latent data only after success. Monitor the fixed top-level `run.log`; generation worker logs live under `logs/paired_generation_shard_*.log`.
+- `scripts/paired_generation_shards.py`: migrates committed rows into shard metadata, quarantines crash-written images without provenance, and merges shards only when run-ID coverage, latent uniqueness, image hashes, target/config hashes, and model revision all pass.
+- `raven/pairing_provenance.py`: fail-closed latent, image, target, pairing, and attack-config audits.
 - `scripts/build_verification_manifest.py` and `scripts/evaluate_verification.py`: strict pairing and calibrated verification utilities.
 - Archived legacy scripts live under `archive/legacy_scripts_20260716/`.
 
@@ -110,6 +113,8 @@ view_guided_output.png
 final_color_corrected.png
 debug_info.json
 ```
+
+`latent_shift_only.png` is emitted only with debug mode enabled; it is not a formal attack output or quality input.
 
 ## Ablations
 

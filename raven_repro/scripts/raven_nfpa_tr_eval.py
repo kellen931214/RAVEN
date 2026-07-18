@@ -35,6 +35,11 @@ from skimage.metrics import peak_signal_noise_ratio, structural_similarity
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from raven.metrics import crop_overlap_inverse_warp, roc_auc
+from raven.pairing_provenance import (
+    assert_attack_pair_config_match as assert_attack_pair_provenance,
+    audit_pairing_rows,
+    build_attack_config_sha256,
+)
 from raven.pipeline_raven import RavenPipeline
 from raven.utils import load_image
 from scripts import raven_p1_full as p1
@@ -126,8 +131,14 @@ def load_jsonl(path: Path) -> list[dict]:
 
 def load_protocol(output_dir: Path) -> tuple[dict, dict[str, dict[str, str]], dict]:
     plan = json.loads((output_dir / "shift_plan.json").read_text())
-    manifest = {str(row["run_id"]): row for row in load_csv_rows(output_dir / "diagnostic_manifest.csv")}
+    rows = load_csv_rows(output_dir / "diagnostic_manifest.csv")
+    pairing_audit = audit_pairing_rows(
+        rows, expected_count=len(plan["samples"]), verify_files=True
+    )
+    manifest = {str(row["run_id"]): row for row in rows}
     provenance = json.loads((output_dir / "provenance.json").read_text())
+    if provenance.get("pairing_audit") != pairing_audit:
+        raise ValueError("stored pairing audit does not match current source provenance")
     return plan, manifest, provenance
 
 
@@ -135,7 +146,7 @@ FORMAL_ATTACK_CONFIG = {
     "warp_mode": "raven_paper_nfpa_gap_fill",
     "padding_mode": "reflection",
     "sampling_mode": "nearest",
-    "color_transfer_mode": "paper_exact_two_stage",
+    "color_transfer_mode": "none",
     "inversion_mode": "ddim",
     "strength": 0.15,
     "guidance_scale": 2.5,
@@ -216,20 +227,40 @@ def assert_attack_pair_config_match(clean_attack: dict, wm_attack: dict, run_id:
                 raise RuntimeError(f"formal config mismatch run_id={run_id}: {key}={actual!r}, expected {expected!r}")
         elif actual != expected:
             raise RuntimeError(f"formal config mismatch run_id={run_id}: {key}={actual!r}, expected {expected!r}")
+    assert_attack_pair_provenance(clean_attack, wm_attack, run_id)
 
 
-def validate_p1_source(p1_dir: Path, expected_count: int) -> tuple[dict, list[dict], list[dict]]:
+def validate_p1_protocol_source(
+    p1_dir: Path, expected_count: int
+) -> tuple[dict, list[dict], dict]:
     manifest = load_csv_rows(p1_dir / "diagnostic_manifest.csv")
     plan = json.loads((p1_dir / "shift_plan.json").read_text())
-    attacks = load_jsonl(p1_dir / "attack_records.jsonl")
     if len(manifest) != expected_count:
         raise ValueError(f"{p1_dir}: expected {expected_count} manifest rows, got {len(manifest)}")
     if len(plan["samples"]) != expected_count:
         raise ValueError(f"{p1_dir}: expected {expected_count} shift samples, got {len(plan['samples'])}")
-    if len(attacks) != expected_count:
-        raise ValueError(f"{p1_dir}: expected {expected_count} attacked-watermarked rows, got {len(attacks)}")
     if len({str(row["run_id"]) for row in manifest}) != expected_count:
         raise ValueError(f"{p1_dir}: duplicate run_id in manifest")
+    if len({str(row["run_id"]) for row in plan["samples"]}) != expected_count:
+        raise ValueError(f"{p1_dir}: duplicate run_id in shift plan")
+    if {str(row["run_id"]) for row in manifest} != {
+        str(row["run_id"]) for row in plan["samples"]
+    }:
+        raise ValueError(f"{p1_dir}: manifest/shift-plan run_id mismatch")
+    pairing_audit = audit_pairing_rows(
+        manifest, expected_count=expected_count, verify_files=True
+    )
+    source_provenance = json.loads((p1_dir / "provenance.json").read_text())
+    if source_provenance.get("pairing_audit") != pairing_audit:
+        raise ValueError(f"{p1_dir}: stored pairing audit does not match current files")
+    return plan, manifest, pairing_audit
+
+
+def validate_p1_source(p1_dir: Path, expected_count: int) -> tuple[dict, list[dict], list[dict]]:
+    plan, manifest, _ = validate_p1_protocol_source(p1_dir, expected_count)
+    attacks = load_jsonl(p1_dir / "attack_records.jsonl")
+    if len(attacks) != expected_count:
+        raise ValueError(f"{p1_dir}: expected {expected_count} attacked-watermarked rows, got {len(attacks)}")
     if len({str(row["run_id"]) for row in attacks}) != expected_count:
         raise ValueError(f"{p1_dir}: duplicate run_id in attacked-watermarked records")
     for attack in attacks:
@@ -238,10 +269,12 @@ def validate_p1_source(p1_dir: Path, expected_count: int) -> tuple[dict, list[di
             raise FileNotFoundError(path)
         if sha256_path(path) != attack["attacked_sha256"]:
             raise ValueError(f"attacked-watermarked SHA drift: {path}")
+        if attack.get("attack_config_sha256") != build_attack_config_sha256(attack):
+            raise ValueError(f"attacked-watermarked config SHA drift: {path}")
     return plan, manifest, attacks
 
 
-def command_prepare(args) -> int:
+def prepare_protocol_workspace(args) -> dict:
     output_dir = args.output_dir.resolve()
     if output_dir.exists():
         raise FileExistsError(f"refusing to overwrite {output_dir}")
@@ -249,13 +282,11 @@ def command_prepare(args) -> int:
     for name in ("configs", "logs", "state", "attacked_clean_outputs"):
         (output_dir / name).mkdir(parents=True, exist_ok=True)
 
-    plan, manifest, attacks = validate_p1_source(args.p1_dir.resolve(), args.expected_count)
+    plan, manifest, pairing_audit = validate_p1_protocol_source(
+        args.p1_dir.resolve(), args.expected_count
+    )
     shutil.copy2(args.p1_dir / "diagnostic_manifest.csv", output_dir / "diagnostic_manifest.csv")
     shutil.copy2(args.p1_dir / "shift_plan.json", output_dir / "shift_plan.json")
-    shutil.copy2(args.p1_dir / "attack_records.jsonl", output_dir / "attack_records.jsonl")
-    shutil.copy2(args.p1_dir / "attack_records.jsonl", output_dir / "attacked_watermarked_records.jsonl")
-    if (args.p1_dir / "per_sample_results.jsonl").is_file():
-        shutil.copy2(args.p1_dir / "per_sample_results.jsonl", output_dir / "legacy_log10p_fixed_threshold_results.jsonl")
 
     provenance = {
         "protocol": "raven_paper_nfpa_gap_fill_tree_ring_complex_l1_v2",
@@ -264,9 +295,11 @@ def command_prepare(args) -> int:
         "source_p1_dir": str(args.p1_dir.resolve()),
         "source_p1_manifest_sha256": sha256_path(args.p1_dir / "diagnostic_manifest.csv"),
         "source_p1_shift_plan_sha256": sha256_path(args.p1_dir / "shift_plan.json"),
-        "source_p1_attacked_watermarked_records_sha256": sha256_path(args.p1_dir / "attack_records.jsonl"),
+        "source_p1_attacked_watermarked_records_sha256": None,
+        "attacked_watermarked_sync_status": "pending",
         "model_id": MODEL_ID,
         "model_revision": MODEL_REVISION,
+        "pairing_audit": pairing_audit,
         "target_fpr": TARGET_FPR,
         "score_name": "NFPA-style Tree-Ring complex L1",
         "score_definition": "torch.abs(decoded_watermark - target_watermark).mean(-1)",
@@ -286,8 +319,86 @@ def command_prepare(args) -> int:
     write_json(output_dir / "source_counts.json", {
         "manifest_rows": len(manifest),
         "shift_samples": len(plan["samples"]),
-        "attacked_watermarked_records": len(attacks),
+        "attacked_watermarked_records": 0,
     })
+    return provenance
+
+
+def sync_attacked_watermarked(args) -> dict:
+    output_dir = args.output_dir.resolve()
+    if not output_dir.is_dir():
+        raise FileNotFoundError(output_dir)
+    p1_dir = args.p1_dir.resolve()
+    plan, manifest, attacks = validate_p1_source(p1_dir, args.expected_count)
+    pairing_audit = audit_pairing_rows(
+        manifest, expected_count=args.expected_count, verify_files=True
+    )
+    provenance_path = output_dir / "provenance.json"
+    provenance = json.loads(provenance_path.read_text())
+    expected_source = str(p1_dir)
+    if provenance.get("source_p1_dir") != expected_source:
+        raise ValueError(
+            f"NFPA protocol source mismatch: {provenance.get('source_p1_dir')} != {expected_source}"
+        )
+    expected_hashes = {
+        "source_p1_manifest_sha256": sha256_path(p1_dir / "diagnostic_manifest.csv"),
+        "source_p1_shift_plan_sha256": sha256_path(p1_dir / "shift_plan.json"),
+    }
+    for key, actual in expected_hashes.items():
+        if provenance.get(key) != actual:
+            raise ValueError(f"NFPA protocol source hash mismatch: {key}")
+    if provenance.get("pairing_audit") != pairing_audit:
+        raise ValueError("NFPA protocol pairing audit drift before watermarked sync")
+
+    source_records = p1_dir / "attack_records.jsonl"
+    source_bytes = source_records.read_bytes()
+    for destination in (
+        output_dir / "attack_records.jsonl",
+        output_dir / "attacked_watermarked_records.jsonl",
+    ):
+        if destination.exists() and destination.read_bytes() != source_bytes:
+            raise ValueError(f"refusing to replace mismatched existing records: {destination}")
+        if not destination.exists():
+            shutil.copy2(source_records, destination)
+    legacy_source = p1_dir / "per_sample_results.jsonl"
+    legacy_destination = output_dir / "legacy_log10p_fixed_threshold_results.jsonl"
+    if legacy_source.is_file() and not legacy_destination.exists():
+        shutil.copy2(legacy_source, legacy_destination)
+
+    records_sha = sha256_path(source_records)
+    provenance["source_p1_attacked_watermarked_records_sha256"] = records_sha
+    provenance["attacked_watermarked_sync_status"] = "complete"
+    provenance["attacked_watermarked_synced_utc"] = time.strftime(
+        "%Y%m%dT%H%M%SZ", time.gmtime()
+    )
+    write_json(provenance_path, provenance, exclusive=False)
+    write_json(
+        output_dir / "source_counts.json",
+        {
+            "manifest_rows": len(manifest),
+            "shift_samples": len(plan["samples"]),
+            "attacked_watermarked_records": len(attacks),
+        },
+        exclusive=False,
+    )
+    return provenance
+
+
+def command_prepare_protocol(args) -> int:
+    provenance = prepare_protocol_workspace(args)
+    print(json.dumps(provenance, indent=2, ensure_ascii=False), flush=True)
+    return 0
+
+
+def command_sync_watermarked(args) -> int:
+    provenance = sync_attacked_watermarked(args)
+    print(json.dumps(provenance, indent=2, ensure_ascii=False), flush=True)
+    return 0
+
+
+def command_prepare(args) -> int:
+    prepare_protocol_workspace(args)
+    provenance = sync_attacked_watermarked(args)
     print(json.dumps(provenance, indent=2, ensure_ascii=False), flush=True)
     return 0
 
@@ -307,6 +418,8 @@ def command_attack_clean(args) -> int:
             attacked_path = Path(row["attacked_clean_path"])
             if not attacked_path.is_file() or sha256_path(attacked_path) != row["attacked_clean_sha256"]:
                 raise ValueError(f"completed attacked-clean hash mismatch run_id={run_id}")
+            if row.get("attack_config_sha256") != build_attack_config_sha256(row):
+                raise ValueError(f"completed attacked-clean config hash mismatch run_id={run_id}")
             completed[run_id] = row
         open_mode = "a"
 
@@ -347,14 +460,14 @@ def command_attack_clean(args) -> int:
                 shift_x=shift["flow_dx_image_px"],
                 shift_y=shift["flow_dy_image_px"],
                 view_guided_attention=True,
-                color_transfer=True,
+                color_transfer=False,
                 seed=int(row["attack_seed"]),
                 prompt="",
                 negative_prompt="",
                 debug=args.debug,
                 inversion_mode="ddim",
             )
-            final_path = item_dir / "final_color_corrected.png"
+            final_path = item_dir / "final.png"
             attacked = load_image(final_path, size=None)
             debug_info_path = item_dir / "debug_info.json"
             debug_info = json.loads(debug_info_path.read_text())
@@ -372,6 +485,12 @@ def command_attack_clean(args) -> int:
                 "clean_sha256": row["clean_sha256"],
                 "watermarked_path": row["watermarked_path"],
                 "watermarked_sha256": row["watermarked_sha256"],
+                "pairing_sha256": row["pairing_sha256"],
+                "base_latent_seed": int(row["base_latent_seed"]),
+                "base_latent_sha256": row["base_latent_sha256"],
+                "watermark_target_sha256": row["watermark_target_sha256"],
+                "generation_config_sha256": row["generation_config_sha256"],
+                "watermark_config_sha256": row["watermark_config_sha256"],
                 "attacked_clean_path": str(final_path.resolve()),
                 "attacked_clean_sha256": sha256_path(final_path),
                 "seed": int(row["attack_seed"]),
@@ -404,6 +523,7 @@ def command_attack_clean(args) -> int:
                 "attention_processor_count": int(debug_info.get("attention_processor_count") or 0),
                 "debug_info_path": str(debug_info_path.resolve()),
             }
+            record["attack_config_sha256"] = build_attack_config_sha256(record)
             append_jsonl(output, record)
             done += 1
             print(f"[attack-clean {done}/{total}] dataset={provenance['dataset']} run_id={run_id} gpu={record['peak_gpu_memory_bytes']/2**30:.2f}GiB", flush=True)
@@ -861,6 +981,15 @@ def build_parser() -> argparse.ArgumentParser:
     prepare.add_argument("--p1-dir", type=Path, required=True)
     prepare.add_argument("--output-dir", type=Path, required=True)
     prepare.add_argument("--expected-count", type=int, required=True)
+    prepare_protocol = sub.add_parser("prepare-protocol")
+    prepare_protocol.add_argument("--dataset", required=True)
+    prepare_protocol.add_argument("--p1-dir", type=Path, required=True)
+    prepare_protocol.add_argument("--output-dir", type=Path, required=True)
+    prepare_protocol.add_argument("--expected-count", type=int, required=True)
+    sync_watermarked = sub.add_parser("sync-watermarked")
+    sync_watermarked.add_argument("--p1-dir", type=Path, required=True)
+    sync_watermarked.add_argument("--output-dir", type=Path, required=True)
+    sync_watermarked.add_argument("--expected-count", type=int, required=True)
     attack = sub.add_parser("attack-clean")
     attack.add_argument("--output-dir", type=Path, required=True)
     attack.add_argument("--device", default="cuda")
@@ -885,6 +1014,10 @@ def main() -> int:
     args = build_parser().parse_args()
     if args.command == "prepare":
         return command_prepare(args)
+    if args.command == "prepare-protocol":
+        return command_prepare_protocol(args)
+    if args.command == "sync-watermarked":
+        return command_sync_watermarked(args)
     if args.command == "attack-clean":
         return command_attack_clean(args)
     if args.command == "score-l1":

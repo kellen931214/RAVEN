@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import subprocess
@@ -106,6 +107,15 @@ def build_experiment_command(args) -> list[str]:
 
 
 def launch_once(args) -> int:
+    completed_marker = getattr(args, "completed_marker", args.experiment_output_dir / "results.json")
+    started_marker = getattr(args, "started_marker", args.experiment_output_dir / ".experiment_started")
+    pid_file = getattr(args, "experiment_pid_file", args.experiment_output_dir / "experiment.pid")
+    if completed_marker.is_file():
+        log("Experiment 1 completion marker exists; refusing duplicate launch")
+        return 0
+    if started_marker.is_file():
+        log("Experiment 1 start marker exists; refusing duplicate launch")
+        return 0
     if (args.experiment_output_dir / "results.json").is_file():
         log("Experiment 1 already completed; refusing duplicate launch")
         return 0
@@ -129,6 +139,10 @@ def launch_once(args) -> int:
     if process.poll() is not None:
         tail = log_path.read_text(encoding="utf-8", errors="replace")[-8000:]
         raise RuntimeError(f"Experiment 1 exited immediately code={process.returncode}:\n{tail}")
+    pid_file.parent.mkdir(parents=True, exist_ok=True)
+    pid_file.write_text(str(process.pid) + "\n", encoding="utf-8")
+    started_marker.parent.mkdir(parents=True, exist_ok=True)
+    started_marker.write_text(utc_now() + "\n", encoding="utf-8")
     log(f"Experiment 1 launched pid={process.pid} log={log_path}")
     return process.pid
 
@@ -159,6 +173,12 @@ def one_iteration(args) -> str:
         raise RuntimeError(f"partial/temporary files found: {partial}")
     log("completion signal verified; auditing required images, records, debug JSON, hashes, and configs")
     audit = audit_sources(args.source_p1_dir, args.source_nfpa_dir, args.expected_count)
+    waiter_audit = getattr(args, "waiter_audit", None)
+    if waiter_audit is not None:
+        waiter_audit.parent.mkdir(parents=True, exist_ok=True)
+        waiter_audit.write_text(
+            json.dumps(audit, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
     log(f"source audit passed counts={audit['counts']}")
     launch_once(args)
     return "launched"

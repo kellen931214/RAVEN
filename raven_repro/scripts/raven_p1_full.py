@@ -27,6 +27,10 @@ from skimage.metrics import peak_signal_noise_ratio, structural_similarity
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from raven.metrics import crop_overlap_inverse_warp, detection_rate, roc_auc
+from raven.pairing_provenance import (
+    audit_pairing_rows,
+    build_attack_config_sha256,
+)
 from raven.pipeline_raven import RavenPipeline
 from raven.utils import load_image
 MODEL_ID = "RedbeardNZ/stable-diffusion-2-1-base"
@@ -178,6 +182,16 @@ def command_plan_dataset(args) -> int:
         rows = rows[:args.count]
     if len(rows) != args.expected_count:
         raise ValueError(f"expected {args.expected_count} rows, got {len(rows)}")
+    pairing_audit = audit_pairing_rows(
+        rows, expected_count=args.expected_count, verify_files=True
+    )
+    if pairing_audit["model_revision"] != MODEL_REVISION:
+        raise ValueError(
+            f"paired generation model revision {pairing_audit['model_revision']} "
+            f"does not match formal attack revision {MODEL_REVISION}"
+        )
+    if {row["model_id"] for row in rows} != {MODEL_ID}:
+        raise ValueError("paired generation model_id does not match formal attack model_id")
     run_ids = [str(row["run_id"]) for row in rows]
     if len(set(run_ids)) != len(run_ids):
         raise ValueError("duplicate run_id in manifest slice")
@@ -213,14 +227,29 @@ def command_plan_dataset(args) -> int:
             "sample_id": run_id,
             "run_id": run_id,
             "prompt_id": row.get("prompt_id", ""),
+            "prompt": row.get("prompt", ""),
             "source_prompt": row.get("prompt", ""),
             "raven_prompt": "",
-            "prompt_sha256": EMPTY_PROMPT_SHA256,
+            "prompt_sha256": row["prompt_sha256"],
+            "raven_prompt_sha256": EMPTY_PROMPT_SHA256,
             "source": row.get("source", ""),
             "clean_path": str(clean),
             "clean_sha256": sha256_path(clean),
             "watermarked_path": str(watermarked),
             "watermarked_sha256": sha256_path(watermarked),
+            "protocol": row["protocol"],
+            "base_latent_seed": int(row["base_latent_seed"]),
+            "base_latent_sha256": row["base_latent_sha256"],
+            "clean_base_latent_sha256": row["clean_base_latent_sha256"],
+            "watermarked_base_latent_sha256": row["watermarked_base_latent_sha256"],
+            "watermarked_latent_sha256": row["watermarked_latent_sha256"],
+            "watermark_target_sha256": row["watermark_target_sha256"],
+            "watermark_mask_sha256": row["watermark_mask_sha256"],
+            "generation_config_sha256": row["generation_config_sha256"],
+            "watermark_config_sha256": row["watermark_config_sha256"],
+            "pairing_sha256": row["pairing_sha256"],
+            "injection_only_difference_verified": row["injection_only_difference_verified"],
+            "injection_max_abs_error": row["injection_max_abs_error"],
             "generation_seed": row.get("generation_seed", ""),
             "attack_seed": int(row.get("attack_seed") or (42 + int(run_id))),
             "watermark_seed": int(row.get("w_seed") or 999999),
@@ -268,6 +297,7 @@ def command_plan_dataset(args) -> int:
         "threshold_source": "DiffusionDB calibrated threshold from outputs/verification_v2/metrics/TR_diffusiondb_1001_20260713T074340Z.json",
         "model_id": MODEL_ID,
         "model_revision": MODEL_REVISION,
+        "pairing_audit": pairing_audit,
         "python": sys.executable,
     }
     write_json(output_dir / "configs" / "fixed_conditions.json", fixed)
@@ -313,8 +343,12 @@ def package_versions() -> dict:
 def load_protocol(output_dir: Path) -> tuple[dict, dict[str, dict[str, str]], dict]:
     plan = json.loads((output_dir / "shift_plan.json").read_text())
     with (output_dir / "diagnostic_manifest.csv").open(newline="", encoding="utf-8") as handle:
-        manifest = {row["run_id"]: row for row in csv.DictReader(handle)}
+        rows = list(csv.DictReader(handle))
+    audit = audit_pairing_rows(rows, expected_count=len(plan["samples"]), verify_files=True)
+    manifest = {row["run_id"]: row for row in rows}
     provenance = json.loads((output_dir / "provenance.json").read_text())
+    if provenance.get("pairing_audit") != audit:
+        raise ValueError("stored pairing audit does not match current source provenance")
     return plan, manifest, provenance
 
 
@@ -333,6 +367,8 @@ def command_attack(args) -> int:
             attacked_path = Path(row["attacked_path"])
             if not attacked_path.is_file() or sha256_path(attacked_path) != row["attacked_sha256"]:
                 raise ValueError(f"completed output hash mismatch for {key}")
+            if row.get("attack_config_sha256") != build_attack_config_sha256(row):
+                raise ValueError(f"completed attack config hash mismatch for {key}")
             completed[key] = row
         open_mode = "a"
     pipe = RavenPipeline(model_id=MODEL_ID, revision=MODEL_REVISION, device=args.device, dtype=args.dtype)
@@ -372,14 +408,14 @@ def command_attack(args) -> int:
                 shift_x=shift["flow_dx_image_px"],
                 shift_y=shift["flow_dy_image_px"],
                 view_guided_attention=True,
-                color_transfer=True,
+                color_transfer=False,
                 seed=int(row["attack_seed"]),
                 prompt="",
                 negative_prompt="",
                 debug=args.debug,
                 inversion_mode="ddim",
             )
-            final_path = item_dir / "final_color_corrected.png"
+            final_path = item_dir / "final.png"
             attacked = load_image(final_path, size=None)
             debug_info_path = item_dir / "debug_info.json"
             debug_info = json.loads(debug_info_path.read_text())
@@ -405,6 +441,12 @@ def command_attack(args) -> int:
                 "clean_sha256": row["clean_sha256"],
                 "watermarked_path": row["watermarked_path"],
                 "watermarked_sha256": row["watermarked_sha256"],
+                "pairing_sha256": row["pairing_sha256"],
+                "base_latent_seed": int(row["base_latent_seed"]),
+                "base_latent_sha256": row["base_latent_sha256"],
+                "watermark_target_sha256": row["watermark_target_sha256"],
+                "generation_config_sha256": row["generation_config_sha256"],
+                "watermark_config_sha256": row["watermark_config_sha256"],
                 "attacked_path": str(final_path.resolve()),
                 "attacked_sha256": sha256_path(final_path),
                 "seed": int(row["attack_seed"]),
@@ -442,6 +484,7 @@ def command_attack(args) -> int:
                 "attention_expected_total_calls": int((attention.get("self_processor_count") or 0) * len(debug_info["timesteps"])),
                 "debug_info_path": str(debug_info_path.resolve()),
             }
+            record["attack_config_sha256"] = build_attack_config_sha256(record)
             append_jsonl(output, record)
             done += 1
             print(f"[{done}/{total}] dataset={record['dataset']} run_id={run_id} score_pending psnr_wm={record['psnr_vs_watermarked']:.3f} ssim_wm={record['ssim_vs_watermarked']:.4f} gpu={record['peak_gpu_memory_bytes']/2**30:.2f}GiB", flush=True)

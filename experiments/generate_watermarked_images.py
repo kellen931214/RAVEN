@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import csv
 import gc
+import hashlib
 import json
 import os
 import sys
@@ -27,6 +28,14 @@ for root in (str(RAVEN_ROOT), str(BENCH_ROOT)):
         sys.path.insert(0, root)
 
 from raven.gpu_utils import configure_gpu, finalize_gpu_logging, setup_run_logging, utc_timestamp, write_experiment_records
+from raven.pairing_provenance import (
+    PAIRING_PROTOCOL,
+    audit_pairing_rows,
+    build_pairing_sha256,
+    canonical_json_sha256,
+    sha256_path,
+    tensor_sha256,
+)
 
 PAPER_WM_METHODS_IN_BENCH = ["GS", "TR", "RID", "HSTR", "HSQR"]
 PAPER_WM_NAMES = {
@@ -61,12 +70,15 @@ def base_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dataset_name", type=str, default="mscoco")
     parser.add_argument("--prompts_csv", type=str, default=str(WORKSPACE / "data" / "prompts" / "mscoco_5000.csv"))
     parser.add_argument("--output_dir", type=str, default=str(WORKSPACE / "data" / "watermarked"))
+    parser.add_argument("--clean_output_dir", type=str, default=None)
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--gpu", type=str, default=None)
     parser.add_argument("--require_free_gpu", type=str_to_bool, default=True)
     parser.add_argument("--min_cpu_mem_gb", type=float, default=64.0)
     parser.add_argument("--warn_cpu_mem_gb", type=float, default=96.0)
     parser.add_argument("--max_process_ram_gb", type=float, default=16.0)
+    parser.add_argument("--num_shards", type=int, default=1)
+    parser.add_argument("--shard_index", type=int, default=0)
     return parser
 
 
@@ -90,6 +102,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
 
     parser.add_argument("--modelid_target", type=str, default="RedbeardNZ/stable-diffusion-2-1-base")
+    parser.add_argument("--model_revision", type=str, default="c6a5e9bab8d874d081de76fa270ae0aefa5410ff")
     parser.add_argument("--scheduler_target", type=str, default="DDIM", choices=sorted(pipe_utils.SCHEDULER_CLASSES.keys()))
     parser.add_argument("--num_inference_steps_target", type=int, default=50)
     parser.add_argument("--guidance_scale_target", type=float, default=7.5)
@@ -114,8 +127,15 @@ def save_json(path: Path, payload: Dict[str, Any]) -> None:
     path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
 
 
-def load_prompts(path: Path, start_index: int, num_pairs: int) -> List[Dict[str, str]]:
-    rows: List[Dict[str, str]] = []
+def load_prompts(
+    path: Path,
+    start_index: int,
+    num_pairs: int,
+    *,
+    num_shards: int = 1,
+    shard_index: int = 0,
+) -> List[Dict[str, str]]:
+    selected: List[Dict[str, str]] = []
     with path.open(newline="", encoding="utf-8") as handle:
         reader = csv.DictReader(handle)
         if not reader.fieldnames:
@@ -127,40 +147,71 @@ def load_prompts(path: Path, start_index: int, num_pairs: int) -> List[Dict[str,
             prompt = (row.get(prompt_field) or "").strip()
             if not prompt:
                 continue
-            rows.append({
+            selected.append({
                 "run_id": str(row_index),
                 "prompt": prompt,
                 "prompt_id": str(row.get("id", row_index)),
                 "source": str(row.get("source", "")),
             })
-            if len(rows) >= num_pairs:
+            if len(selected) >= num_pairs:
                 break
-    if len(rows) < num_pairs:
-        raise ValueError(f"Only found {len(rows)} prompts in {path}; requested {num_pairs}")
-    return rows
+    if len(selected) < num_pairs:
+        raise ValueError(f"Only found {len(selected)} prompts in {path}; requested {num_pairs}")
+    return [row for row in selected if int(row["run_id"]) % num_shards == shard_index]
 
 
-def existing_completed_rows(csv_path: Path) -> set[int]:
+def shard_suffix(num_shards: int, shard_index: int) -> str:
+    if num_shards == 1:
+        return ""
+    return f".shard-{shard_index:03d}-of-{num_shards:03d}"
+
+
+def existing_completed_rows(csv_path: Path) -> dict[int, dict[str, str]]:
     if not csv_path.exists():
-        return set()
-    done: set[int] = set()
+        return {}
+    rows: list[dict[str, str]] = []
     with csv_path.open(newline="", encoding="utf-8") as handle:
         reader = csv.DictReader(handle)
         for row in reader:
-            try:
-                run_id = int(row["run_id"])
-            except Exception:
-                continue
-            if str(row.get("watermarked_image_path", "")) and Path(row["watermarked_image_path"]).exists():
-                done.add(run_id)
-    return done
+            rows.append(row)
+    # Partial resumes are allowed only after every existing row passes the full
+    # provenance and file audit. Legacy metadata fails here by design.
+    audit_pairing_rows(rows, expected_count=len(rows), verify_files=True)
+    return {int(row["run_id"]): row for row in rows}
 
 
 def append_row(csv_path: Path, row: Dict[str, Any]) -> None:
     csv_path.parent.mkdir(parents=True, exist_ok=True)
     exists = csv_path.exists()
+    desired_fields = list(row.keys())
+    if exists:
+        with csv_path.open(newline="", encoding="utf-8-sig") as handle:
+            reader = csv.DictReader(handle)
+            stored_fields = list(reader.fieldnames or [])
+            stored_rows = list(reader)
+        if set(stored_fields) != set(desired_fields):
+            raise ValueError(
+                f"metadata schema field mismatch for {csv_path}: "
+                f"missing={sorted(set(desired_fields) - set(stored_fields))} "
+                f"extra={sorted(set(stored_fields) - set(desired_fields))}"
+            )
+        if stored_fields != desired_fields:
+            if stored_rows:
+                audit_pairing_rows(
+                    stored_rows, expected_count=len(stored_rows), verify_files=True
+                )
+            temp = csv_path.with_name(f".{csv_path.name}.schema-{os.getpid()}.tmp")
+            with temp.open("x", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(
+                    handle, fieldnames=desired_fields, extrasaction="raise"
+                )
+                writer.writeheader()
+                writer.writerows(stored_rows)
+                handle.flush()
+                os.fsync(handle.fileno())
+            temp.replace(csv_path)
     with csv_path.open("a", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=list(row.keys()))
+        writer = csv.DictWriter(handle, fieldnames=desired_fields)
         if not exists:
             writer.writeheader()
         writer.writerow(row)
@@ -206,6 +257,27 @@ def generate_watermarked(pipe_provider_target: Any, wm_provider: Any, prompt: st
     return generated["images_PIL"][0]
 
 
+def generate_clean(pipe_provider_target: Any, prompt: str, base_zT: Any, args: argparse.Namespace) -> Image.Image:
+    generated = pipe_provider_target.generate(
+        prompts=prompt,
+        latents=base_zT,
+        num_inference_steps=args.num_inference_steps_target,
+        guidance_scale=args.guidance_scale_target,
+    )
+    return generated["images_PIL"][0]
+
+
+def verify_tree_ring_injection(torch, provider: Any, base_latent: Any, watermarked_latent: Any) -> float:
+    """Verify the provider output is exactly base latent plus configured FFT injection."""
+    expected_fft = torch.fft.fftshift(torch.fft.fft2(base_latent.float()), dim=(-1, -2))
+    expected_fft[provider.watermarking_mask] = provider.gt_patch[provider.watermarking_mask].clone()
+    expected = torch.fft.ifft2(torch.fft.ifftshift(expected_fft, dim=(-1, -2))).real
+    max_abs = float((expected - watermarked_latent.float()).abs().max().detach().cpu().item())
+    if max_abs > 1e-6:
+        raise RuntimeError(f"Tree-Ring injection reconstruction mismatch: max_abs={max_abs}")
+    return max_abs
+
+
 def summarize_metadata(csv_path: Path) -> Dict[str, Any]:
     if not csv_path.exists():
         return {"completed": 0}
@@ -243,8 +315,15 @@ def run_method(args: argparse.Namespace, dataset_dir: Path, wm_type: str, prompt
 
     method_dir = dataset_dir / wm_type
     method_dir.mkdir(parents=True, exist_ok=True)
-    metadata_csv = method_dir / "metadata.csv"
-    summary_json = method_dir / "summary.json"
+    clean_root = (
+        Path(args.clean_output_dir)
+        if args.clean_output_dir
+        else Path(args.output_dir).resolve().parent / "generated"
+    ) / args.dataset_name
+    clean_root.mkdir(parents=True, exist_ok=True)
+    suffix = shard_suffix(args.num_shards, args.shard_index)
+    metadata_csv = method_dir / f"metadata{suffix}.csv"
+    summary_json = method_dir / f"summary{suffix}.json"
     completed = existing_completed_rows(metadata_csv)
     detection_threshold = get_detection_threshold(wm_type, args.modelid_target)
 
@@ -257,6 +336,7 @@ def run_method(args: argparse.Namespace, dataset_dir: Path, wm_type: str, prompt
         eager_loading=False,
         schedulers_name=args.scheduler_target,
         disable_tqdm=True,
+        revision=args.model_revision,
     )
     provider_kwargs = vars(args).copy()
     for reserved_key in ("latent_shape", "dtype", "device"):
@@ -267,13 +347,35 @@ def run_method(args: argparse.Namespace, dataset_dir: Path, wm_type: str, prompt
         device=device,
         **provider_kwargs,
     )
-    wm_initial_results = wm_provider.get_wm_latents()
-    wm_zT = wm_initial_results["zT_torch"]
-    message_bits_str_initial = (
-        wm_initial_results["message_bits_str_list"][0]
-        if "message_bits_str_list" in wm_initial_results
-        else None
-    )
+    if wm_type != "TR":
+        raise ValueError("paired formal generation currently supports only Tree-Ring (TR)")
+    watermark_target_sha256 = tensor_sha256(wm_provider.gt_patch)
+    watermark_mask_sha256 = tensor_sha256(wm_provider.watermarking_mask)
+    generation_config = {
+        "model_id": args.modelid_target,
+        "model_revision": args.model_revision,
+        "scheduler": args.scheduler_target,
+        "num_inference_steps": args.num_inference_steps_target,
+        "guidance_scale": args.guidance_scale_target,
+        "resolution": args.resolution,
+        "dtype": str(pipe_provider_target.get_dtype()),
+    }
+    generation_config_sha256 = canonical_json_sha256(generation_config)
+    watermark_config = {
+        "wm_type": "TR",
+        "w_seed": int(args.w_seed),
+        "w_channel": int(args.w_channel),
+        "w_pattern": str(args.w_pattern),
+        "w_mask_shape": str(args.w_mask_shape),
+        "w_radius": int(args.w_radius),
+        "w_measurement": str(args.w_measurement),
+        "w_injection": str(args.w_injection),
+        "w_pattern_const": float(args.w_pattern_const),
+        "watermark_target_sha256": watermark_target_sha256,
+        "watermark_mask_sha256": watermark_mask_sha256,
+    }
+    watermark_config_sha256 = canonical_json_sha256(watermark_config)
+    message_bits_str_initial = None
 
     rows_written = 0
     try:
@@ -281,7 +383,8 @@ def run_method(args: argparse.Namespace, dataset_dir: Path, wm_type: str, prompt
             run_id = int(prompt_row["run_id"])
             item_dir = method_dir / f"{run_id:06d}"
             image_path = item_dir / "watermarked.png"
-            if run_id in completed and image_path.exists():
+            clean_path = clean_root / f"{run_id:06d}.png"
+            if run_id in completed:
                 if local_idx == 0 or (local_idx + 1) % 25 == 0:
                     print(f"[{wm_type}] skip existing run_id={run_id}", flush=True)
                 continue
@@ -290,13 +393,47 @@ def run_method(args: argparse.Namespace, dataset_dir: Path, wm_type: str, prompt
             if wm_type in ["PRC", "SPH"]:
                 seed_everything(args.seed)
 
-            print(f"[{wm_type}] generating {local_idx + 1}/{len(prompt_rows)} run_id={run_id}", flush=True)
-            if image_path.exists():
-                watermarked_image = Image.open(image_path).convert("RGB")
-            else:
-                watermarked_image = generate_watermarked(pipe_provider_target, wm_provider, prompt_row["prompt"], wm_zT, args)
-                item_dir.mkdir(parents=True, exist_ok=True)
-                watermarked_image.save(image_path)
+            if image_path.exists() or clean_path.exists():
+                raise FileExistsError(
+                    f"unrecorded paired output exists for run_id={run_id}: "
+                    f"clean={clean_path.exists()} watermarked={image_path.exists()}"
+                )
+            base_latent_seed = int(args.seed) + run_id
+            generator = torch.Generator(device="cpu").manual_seed(base_latent_seed)
+            base_cpu = torch.randn(
+                tuple(pipe_provider_target.get_latent_shape()),
+                generator=generator,
+                dtype=torch.float32,
+                device="cpu",
+            )
+            base_latent = base_cpu.to(device=device, dtype=pipe_provider_target.get_dtype())
+            wm_results = wm_provider.get_wm_latents(latents_clean=base_latent)
+            clean_zT = wm_results["zT_clean_torch"]
+            wm_zT = wm_results["zT_torch"]
+            base_latent_sha256 = tensor_sha256(base_latent)
+            clean_base_latent_sha256 = tensor_sha256(clean_zT)
+            watermarked_base_latent_sha256 = tensor_sha256(base_latent)
+            if clean_base_latent_sha256 != base_latent_sha256:
+                raise RuntimeError(f"provider changed clean base latent run_id={run_id}")
+            injection_max_abs_error = verify_tree_ring_injection(torch, wm_provider, clean_zT, wm_zT)
+            watermarked_latent_sha256 = tensor_sha256(wm_zT)
+            if watermarked_latent_sha256 == base_latent_sha256:
+                raise RuntimeError(f"Tree-Ring injection made no latent change run_id={run_id}")
+
+            print(
+                f"[{wm_type}] generating paired {local_idx + 1}/{len(prompt_rows)} "
+                f"run_id={run_id} base_seed={base_latent_seed}",
+                flush=True,
+            )
+            clean_image = generate_clean(
+                pipe_provider_target, prompt_row["prompt"], clean_zT, args
+            )
+            watermarked_image = generate_watermarked(
+                pipe_provider_target, wm_provider, prompt_row["prompt"], wm_zT, args
+            )
+            item_dir.mkdir(parents=True, exist_ok=True)
+            clean_image.save(clean_path)
+            watermarked_image.save(image_path)
 
             if args.validate_before:
                 before = validate(
@@ -327,14 +464,21 @@ def run_method(args: argparse.Namespace, dataset_dir: Path, wm_type: str, prompt
                 before_compact = {}
 
             row = {
+                "protocol": PAIRING_PROTOCOL,
                 "dataset_name": args.dataset_name,
+                "dataset": args.dataset_name,
                 "run_id": run_id,
+                "num_shards": int(args.num_shards),
+                "shard_index": int(args.shard_index),
                 "prompt_id": prompt_row["prompt_id"],
                 "prompt": prompt_row["prompt"],
+                "prompt_sha256": hashlib.sha256(prompt_row["prompt"].encode("utf-8")).hexdigest(),
                 "source": prompt_row["source"],
                 "wm_type": wm_type,
                 "wm_name": PAPER_WM_NAMES[wm_type],
                 "target_model": args.modelid_target,
+                "model_id": args.modelid_target,
+                "model_revision": args.model_revision,
                 "scheduler_target": args.scheduler_target,
                 "num_inference_steps_target": args.num_inference_steps_target,
                 "guidance_scale_target": args.guidance_scale_target,
@@ -343,8 +487,32 @@ def run_method(args: argparse.Namespace, dataset_dir: Path, wm_type: str, prompt
                 "detection_metric": METRIC_MAP[wm_type],
                 "before_detection_successful": bool_for_json(before_successful),
                 "before_detection_metric_value": bool_for_json(before_metric_value),
-                "watermarked_image_path": str(image_path),
+                "base_latent_seed": base_latent_seed,
+                "generation_seed": base_latent_seed,
+                "base_latent_sha256": base_latent_sha256,
+                "clean_base_latent_sha256": clean_base_latent_sha256,
+                "watermarked_base_latent_sha256": watermarked_base_latent_sha256,
+                "watermarked_latent_sha256": watermarked_latent_sha256,
+                "watermark_target_sha256": watermark_target_sha256,
+                "watermark_mask_sha256": watermark_mask_sha256,
+                "generation_config_sha256": generation_config_sha256,
+                "watermark_config_sha256": watermark_config_sha256,
+                "injection_only_difference_verified": True,
+                "injection_max_abs_error": injection_max_abs_error,
+                "clean_path": str(clean_path.resolve()),
+                "clean_sha256": sha256_path(clean_path),
+                "watermarked_path": str(image_path.resolve()),
+                "watermarked_image_path": str(image_path.resolve()),
+                "watermarked_sha256": sha256_path(image_path),
+                "w_seed": int(args.w_seed),
+                "w_channel": int(args.w_channel),
+                "w_pattern": str(args.w_pattern),
+                "w_mask_shape": str(args.w_mask_shape),
+                "w_radius": int(args.w_radius),
+                "w_measurement": str(args.w_measurement),
+                "w_injection": str(args.w_injection),
             }
+            row["pairing_sha256"] = build_pairing_sha256(row)
             row.update({f"before_{key}": bool_for_json(value) for key, value in before_compact.items()})
             append_row(metadata_csv, row)
             rows_written += 1
@@ -355,6 +523,7 @@ def run_method(args: argparse.Namespace, dataset_dir: Path, wm_type: str, prompt
                 flush=True,
             )
             guard.check(f"{args.dataset_name}/{wm_type}/run_id={run_id}/done")
+            del base_cpu, base_latent, clean_zT, wm_zT, wm_results, clean_image, watermarked_image
             gc.collect()
             torch.cuda.empty_cache()
     finally:
@@ -365,13 +534,22 @@ def run_method(args: argparse.Namespace, dataset_dir: Path, wm_type: str, prompt
         torch.cuda.empty_cache()
         gc.collect()
 
+    with metadata_csv.open(newline="", encoding="utf-8") as handle:
+        final_rows = list(csv.DictReader(handle))
+    audit = audit_pairing_rows(final_rows, expected_count=len(prompt_rows), verify_files=True)
+    save_json(method_dir / f"pairing_audit{suffix}.json", audit)
+    save_json(method_dir / f"generation_config{suffix}.json", generation_config)
+    save_json(method_dir / f"watermark_config{suffix}.json", watermark_config)
     summary = summarize_metadata(metadata_csv)
     summary.update({
         "wm_type": wm_type,
         "wm_name": PAPER_WM_NAMES[wm_type],
         "rows_written_this_run": rows_written,
         "target_images_requested": len(prompt_rows),
-        "paper_setting_note": "Watermarked image generation only; RAVEN/removal not run in this step.",
+        "num_shards": int(args.num_shards),
+        "shard_index": int(args.shard_index),
+        "pairing_audit": audit,
+        "paper_setting_note": "Per-sample paired clean/Tree-Ring generation; RAVEN/removal not run in this step.",
     })
     save_json(summary_json, summary)
     print(f"[{wm_type}] summary: {summary}", flush=True)
@@ -382,7 +560,8 @@ def main() -> int:
     first = base_parser().parse_known_args()[0]
     dataset_dir = Path(first.output_dir) / first.dataset_name
     dataset_dir.mkdir(parents=True, exist_ok=True)
-    setup_run_logging(dataset_dir)
+    suffix = shard_suffix(first.num_shards, first.shard_index)
+    setup_run_logging(dataset_dir, filename=f"run{suffix}.log")
     started_at = utc_timestamp()
     gpu_record = configure_gpu(first.gpu, first.device, dataset_dir, require_free_gpu=first.require_free_gpu)
 
@@ -394,6 +573,11 @@ def main() -> int:
         args = parse_args()
         args_dict = vars(args).copy()
         os.environ.setdefault("TQDM_DISABLE", "1")
+
+        if args.num_shards <= 0:
+            raise ValueError("--num_shards must be positive")
+        if args.shard_index < 0 or args.shard_index >= args.num_shards:
+            raise ValueError("--shard_index must be in [0, num_shards)")
 
         from raven.resource_guard import CpuMemoryGuard, limit_cpu_threads
         import torch
@@ -409,10 +593,23 @@ def main() -> int:
         if args.device == "cuda" and not torch.cuda.is_available():
             raise RuntimeError("--device cuda requested but torch.cuda.is_available() is false")
         device = torch.device(args.device)
-        prompt_rows = load_prompts(Path(args.prompts_csv), args.start_index, args.num_pairs)
+        prompt_rows = load_prompts(
+            Path(args.prompts_csv),
+            args.start_index,
+            args.num_pairs,
+            num_shards=args.num_shards,
+            shard_index=args.shard_index,
+        )
+        if not prompt_rows:
+            raise ValueError(
+                f"shard {args.shard_index}/{args.num_shards} has no selected prompts"
+            )
 
         settings = {
             "paper_dataset_size_used_for_detection": args.num_pairs,
+            "shard_sample_count": len(prompt_rows),
+            "num_shards": args.num_shards,
+            "shard_index": args.shard_index,
             "model_setup": {
                 "model_id_requested_by_paper": "stabilityai/stable-diffusion-2-1-base",
                 "model_id_used": args.modelid_target,
@@ -428,7 +625,7 @@ def main() -> int:
             ],
             "stage": "generate_watermarked_images_only",
         }
-        save_json(dataset_dir / "paper_settings.json", settings)
+        save_json(dataset_dir / f"paper_settings{suffix}.json", settings)
 
         for wm_type in args.wm_types:
             summaries[wm_type] = run_method(args, dataset_dir, wm_type, prompt_rows, guard, device)
@@ -445,7 +642,16 @@ def main() -> int:
         extra = {"method_summaries": summaries}
         if error:
             extra["error"] = error
-        write_experiment_records(dataset_dir, args_dict or vars(first), gpu_record, started_at, finished_at, status, extra)
+        write_experiment_records(
+            dataset_dir,
+            args_dict or vars(first),
+            gpu_record,
+            started_at,
+            finished_at,
+            status,
+            extra,
+            filename=f"results{suffix}.json",
+        )
 
 
 if __name__ == "__main__":

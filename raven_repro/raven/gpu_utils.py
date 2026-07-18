@@ -67,14 +67,45 @@ def utc_timestamp() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def setup_run_logging(output_dir: str | os.PathLike[str], filename: str = "run.log") -> Path:
-    """Append stdout/stderr to a single experiment log file."""
+class _TeeStream:
+    """Line-buffered mirror used to retain both parent and child logs."""
+
+    def __init__(self, *streams: Any) -> None:
+        self.streams = streams
+
+    def write(self, value: str) -> int:
+        for stream in self.streams:
+            stream.write(value)
+            stream.flush()
+        return len(value)
+
+    def flush(self) -> None:
+        for stream in self.streams:
+            stream.flush()
+
+    def isatty(self) -> bool:
+        return any(bool(getattr(stream, "isatty", lambda: False)()) for stream in self.streams)
+
+
+def setup_run_logging(
+    output_dir: str | os.PathLike[str],
+    filename: str = "run.log",
+    *,
+    mirror_console: bool = True,
+) -> Path:
+    """Append stdout/stderr to a run log and optionally mirror inherited output."""
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
     log_path = out / filename
     stream = log_path.open("a", encoding="utf-8", buffering=1)
-    sys.stdout = stream
-    sys.stderr = stream
+    if mirror_console:
+        original_stdout = sys.stdout
+        original_stderr = sys.stderr
+        sys.stdout = _TeeStream(original_stdout, stream)
+        sys.stderr = _TeeStream(original_stderr, stream)
+    else:
+        sys.stdout = stream
+        sys.stderr = stream
     return log_path
 
 
@@ -303,6 +334,7 @@ def write_results_json(
     finished_at: str,
     status: str,
     extra_summary: Optional[Dict[str, Any]] = None,
+    filename: str = "results.json",
 ) -> None:
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -315,7 +347,7 @@ def write_results_json(
     }
     if extra_summary:
         results.update(_json_safe(extra_summary))
-    (out / "results.json").write_text(json.dumps(results, indent=2, sort_keys=True))
+    (out / filename).write_text(json.dumps(results, indent=2, sort_keys=True))
 
 
 def _serializable_status(status: Dict[str, Any]) -> Dict[str, Any]:
