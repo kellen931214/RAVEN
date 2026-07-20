@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Experiment 1: offline shift-aligned chroma transfer on formal RAVEN outputs."""
+"""ABLATION ONLY - NOT A FORMAL EVALUATION ENTRYPOINT. Color alignment experiment."""
 
 from __future__ import annotations
 

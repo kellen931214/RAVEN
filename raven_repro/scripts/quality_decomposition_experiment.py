@@ -1,5 +1,7 @@
 #!/usr/bin/env python
-"""Quality decomposition experiment for DiffusionDB RAVEN outputs.
+"""ABLATION ONLY - NOT A FORMAL EVALUATION ENTRYPOINT.
+
+Quality decomposition experiment for DiffusionDB RAVEN outputs.
 
 This script intentionally runs a narrow set of experiments:
 

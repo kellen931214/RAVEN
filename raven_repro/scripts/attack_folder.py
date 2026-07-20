@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Run RAVEN on every image in a folder."""
+"""ABLATION ONLY - NOT A FORMAL EVALUATION ENTRYPOINT. Attack an ad hoc folder."""
 
 from __future__ import annotations
 

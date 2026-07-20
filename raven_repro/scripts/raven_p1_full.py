@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Full P1 RAVEN Tree-Ring evaluation with sequential gate, DiffusionDB, and MS-COCO stages."""
+"""ABLATION ONLY - NOT A FORMAL EVALUATION ENTRYPOINT. Historical P1 workflow."""
 
 from __future__ import annotations
 

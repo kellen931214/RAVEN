@@ -1,5 +1,7 @@
 #!/usr/bin/env python
-"""RAVEN-paper / NFPA-gap-fill warp and overlap-quality diagnostics.
+"""ABLATION ONLY - NOT A FORMAL EVALUATION ENTRYPOINT.
+
+RAVEN-paper / NFPA-gap-fill warp and overlap-quality diagnostics.
 
 This script keeps completed P1 outputs immutable. It can recompute quality
 metrics from existing DiffusionDB P1 outputs and run a small paired validation

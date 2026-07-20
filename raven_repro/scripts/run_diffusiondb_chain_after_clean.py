@@ -1,5 +1,7 @@
 #!/usr/bin/env python
-"""Run the fail-closed paired DiffusionDB Tree-Ring formal experiment.
+"""ABLATION ONLY - NOT A FORMAL EVALUATION ENTRYPOINT.
+
+Run the historical paired DiffusionDB Tree-Ring experiment.
 
 The historical implementation waited for independently generated clean images.
 That workflow is intentionally removed: clean and watermarked images are now

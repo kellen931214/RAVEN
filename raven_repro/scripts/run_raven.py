@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Run RAVEN on a single image."""
+"""ABLATION ONLY - NOT A FORMAL EVALUATION ENTRYPOINT. Run one diagnostic image."""
 
 from __future__ import annotations
 
