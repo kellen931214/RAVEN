@@ -1,96 +1,53 @@
-# Watermark Verification Workflow
+# Formal Watermark Verification Workflow
 
-This workflow evaluates existing DiffusionDB and MS-COCO images. It does not
-generate images or rerun RAVEN. Run one dataset and one method at a time.
+The only formal orchestrator is `experiments/run_raven_formal_eval.py`. Detector
+scripts are implementation helpers and must not be invoked as alternative formal runners.
 
-## 1. Select the existing Python environment
+## Inputs And Snapshot
 
-The current `/usr/bin/python` can build and evaluate manifests but does not
-contain the detector dependencies. Set `PYTHON_BIN` to the existing environment
-used for the original runs, then verify it without installing anything:
+The `snapshot` stage reads only complete CSV lines, checks unique run IDs, required
+prompt/prompt ID fields, clean and watermarked image decodability, image SHA-256, and
+provider configuration. It writes fsynced immutable batch CSVs and an append-only
+`snapshot_index.jsonl`. Later stages never reread the live source CSV.
 
-```bash
-export PYTHON_BIN=/absolute/path/to/existing/python
-"$PYTHON_BIN" -c 'import diffusers, scipy, torch, tqdm; print(torch.__version__, tqdm.__version__)'
-"$PYTHON_BIN" raven_repro/scripts/extract_verification_scores.py --help
+## Formal Stage Order
+
+```text
+snapshot -> attack-watermarked -> attack-clean (TR only) -> verify
+         -> quality -> fid -> clip -> aggregate -> validate
 ```
 
-Confirm that the installed tqdm supports `TQDM_DISABLE=1`. The extractor also
-passes `disable_tqdm=True` directly to the Diffusers pipeline.
+Every stage uses the same `--dataset`, `--method`, `--source-metadata`, `--output-root`,
+`--expected-count`, `--batch-size`, `--device`, and optional `--gpu`. Add `--resume`
+after the initial snapshot. Attack resume validates manifest, input, config, model
+revision, seed, planned flow, attacked SHA, debug SHA, and transform hash; drift is a
+hard error rather than a skip or rerun.
 
-## 2. Build strict pairing manifests
+## Detector Protocol
 
-DiffusionDB Tree-Ring:
+Raw detector scores are stored with their direction and converted to a canonical
+higher-means-watermark direction where applicable. The clean negatives from the same
+immutable cohort calibrate the requested 1% FPR; reports preserve target FPR, actual
+empirical FPR, false-positive count, threshold, before/attacked TPR, and ROC-AUC.
+Legacy fixed thresholds use `legacy_fixed_threshold_*` fields only.
 
-```bash
-/usr/bin/python raven_repro/scripts/build_verification_manifest.py \
-  --dataset diffusiondb --method TR \
-  --metadata data/watermarked/diffusiondb/TR/metadata.csv \
-  --raven-results outputs/raven_eval/diffusiondb/TR/results.csv \
-  --clean-dir data/generated/diffusiondb \
-  --watermark-config data/watermarked/diffusiondb/experiment_config.json \
-  --clean-config data/generated/diffusiondb/experiment_config.json \
-  --raven-config outputs/raven_eval/diffusiondb/experiment_config.json \
-  --workspace-root /workspace/kellen \
-  --output outputs/verification/diffusiondb/TR/pairs.csv
-```
+Tree-Ring uses complex L1 and attacks clean negatives with the identical transform.
+It reports `full_precision_protocol` and `nfpa_rounded2_protocol` separately. NFPA
+rounded2 is primary, threshold detection is strict `<`, and attacked TPR is named
+separately at the original-clean and attacked-clean-recalibrated thresholds. One
+canonical provider config and target watermark are required per cohort.
 
-Use the same command with `mscoco` paths after DiffusionDB completes. The
-builder refuses to overwrite an existing manifest and verifies run ID, prompt,
-prompt ID, image existence, and SHA-256 hashes.
+## Quality, FID, And CLIP
 
-## 3. Extract scores
+Primary PSNR/SSIM compares watermarked input with the final post-color-transfer output
+over an inverse-warp overlap derived from effective source flow measured from the exact
+sampling grid. FID uses a new config-hash directory, exact completed run-ID sets, the
+watermarked inputs as reference, and attacked outputs as comparison. CLIP is centralized
+as prompt-image cosine using `ViT-bigG-14/laion2b_s39b_b160k`, original prompts, and
+L2-normalized embeddings; mixed provenance fails aggregation.
 
-Start with `--limit 10`, then use 100, then omit `--limit` for the formal run.
-Use a new output path for every stage.
+## Memory Safety
 
-```bash
-TS=$(date -u +%Y%m%dT%H%M%SZ)
-LOG="raven_repro/logs/TR_diffusiondb_10_${TS}.log"
-PID="raven_repro/logs/TR_diffusiondb_10_${TS}.pid"
-
-nohup env \
-  TQDM_DISABLE=1 \
-  PYTHONUNBUFFERED=1 \
-  TOKENIZERS_PARALLELISM=false \
-  OMP_NUM_THREADS=1 \
-  MKL_NUM_THREADS=1 \
-  OPENBLAS_NUM_THREADS=1 \
-  NUMEXPR_NUM_THREADS=1 \
-  "$PYTHON_BIN" -u raven_repro/scripts/extract_verification_scores.py \
-  --method TR \
-  --metadata outputs/verification/diffusiondb/TR/pairs.csv \
-  --output "outputs/verification/diffusiondb/TR/raw_scores_10_${TS}.csv" \
-  --eval-repo eval_bench_wm \
-  --model-id RedbeardNZ/stable-diffusion-2-1-base \
-  --scheduler DDIM --steps 50 --resolution 512 --device cuda \
-  --limit 10 --target-fpr 0.01 \
-  --min-cpu-mem-gb 92 --warn-cpu-mem-gb 110 --max-process-ram-gb 16 \
-  > "$LOG" 2>&1 &
-echo $! > "$PID"
-```
-
-Do not launch MS-COCO while DiffusionDB has a live PID. The extractor uses
-batch size one, no DataLoader workers, one detector pipeline, and fsyncs every
-score row without retaining latents across samples.
-
-## 4. Calibrate and report
-
-```bash
-/usr/bin/python raven_repro/scripts/evaluate_verification.py \
-  --method TR \
-  --records outputs/verification/diffusiondb/TR/raw_scores_full.csv \
-  --target-fpr 0.01 \
-  --output-json outputs/verification/diffusiondb/TR/metrics.json
-```
-
-The report contains both `legacy_fixed_threshold_detect_rate` and
-`calibrated_TPR_at_1pct_FPR`. Only the calibrated field is paper-comparable.
-For GS, also pass `--output-rows` to save decoded bits, ground-truth bits,
-error indices, key, nonce, offset, and per-sample bit accuracy.
-
-## Order
-
-Run DiffusionDB TR smoke, diagnostic, and full evaluation first. Then run
-MS-COCO TR. Continue sequentially with RID, HSTR, HSQR, and GS. Quality metrics
-and any RAVEN ablation remain separate later stages.
+Check `free -h` and GPU availability before every gate. The runner processes one attack
+image at a time, limits CPU threads, avoids DataLoader workers and dataset caches, and
+hashes files incrementally. Use fresh timestamped roots for 2-, 10-, and 30-sample gates.

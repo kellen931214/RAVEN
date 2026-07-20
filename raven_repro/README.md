@@ -7,7 +7,7 @@ The implementation follows the local `PLAN.md` and uses the NFPA repository as a
 ## Setup
 
 ```bash
-cd /home/kellen/code/REVAN/raven_repro
+cd /workspace/RAVEN/raven_repro
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
@@ -21,7 +21,9 @@ pip install open_clip_torch torchmetrics clean-fid
 
 The reproduction model is `RedbeardNZ/stable-diffusion-2-1-base` at revision `c6a5e9bab8d874d081de76fa270ae0aefa5410ff`.
 
-## Single Image
+## Diagnostic Single Image
+
+`scripts/run_raven.py` is **ABLATION ONLY - NOT A FORMAL EVALUATION ENTRYPOINT**.
 
 ```bash
 python scripts/run_raven.py \
@@ -46,7 +48,9 @@ python scripts/run_raven.py \
   --debug true
 ```
 
-## Folder Attack
+## Diagnostic Folder Attack
+
+`scripts/attack_folder.py` is **ABLATION ONLY - NOT A FORMAL EVALUATION ENTRYPOINT**.
 
 ```bash
 python scripts/attack_folder.py \
@@ -72,15 +76,20 @@ Each image is saved into its own subdirectory. Failed files are listed in `faile
 
 ## Evaluation
 
+The only formal evaluation entrypoint is `experiments/run_raven_formal_eval.py`.
+Run stages separately against one immutable timestamped output root:
+
 ```bash
-python scripts/eval_quality.py \
-  --input_dir data/watermarked \
-  --output_dir outputs/raven_folder \
-  --metrics psnr ssim \
-  --save_csv outputs/raven_folder/metrics.csv
+python experiments/run_raven_formal_eval.py \
+  --dataset diffusiondb --method TR \
+  --source-metadata /absolute/path/to/metadata.csv \
+  --output-root outputs/raven_formal_eval/diffusiondb/TR/$(date -u +%Y%m%dT%H%M%SZ) \
+  --expected-count 30 --batch-size 10 --device cuda --gpu 0 --stage snapshot
 ```
 
-PSNR and SSIM use the overlapping crop implied by each output folder's `debug_info.json` shift.
+Then run `attack-watermarked`, `attack-clean` for TR, `verify`, `quality`, `fid`,
+`clip`, `aggregate`, and `validate` with the identical arguments plus `--resume`.
+Do not run a full cohort until the 2/10/30 gates pass in fresh output roots.
 
 ## Key Files
 
@@ -93,10 +102,10 @@ PSNR and SSIM use the overlapping crop implied by each output folder's `debug_in
 - `scripts/attack_folder.py`: folder CLI with failure logging.
 - `scripts/eval_quality.py`: PSNR/SSIM helper.
 - `scripts/audit_dataset.py`: metadata, hash, image-format, and pairing audit.
-- `scripts/raven_p1_full.py`: formal DiffusionDB/MS-COCO P1 attack workflow.
-- `scripts/raven_nfpa_tr_eval.py`: formal Tree-Ring L1 attacked-clean calibration/evaluation.
-- `scripts/quality_decomposition_experiment.py`: paired formal evaluation for aligned and blended-aligned color variants only.
-- `scripts/run_diffusiondb_chain_after_clean.py`: despite the legacy filename, this now shards complete clean/Tree-Ring pairs across two idle compatible GPUs, merges only after a fail-closed provenance audit, chains attack/evaluation, and invalidates the old shared-latent data only after success. Monitor the fixed top-level `run.log`; generation worker logs live under `logs/paired_generation_shard_*.log`.
+- `../experiments/run_raven_formal_eval.py`: the single formal stage orchestrator.
+- `raven/eval_protocol.py`: centralized formal attack, detector, FID, resume, provider, and CLIP provenance.
+- `scripts/raven_nfpa_tr_eval.py`: Tree-Ring complex-L1 detector helper used by the formal runner.
+- `scripts/raven_p1_full.py`, `scripts/quality_decomposition_experiment.py`, and `scripts/run_diffusiondb_chain_after_clean.py`: preserved ablation/evidence scripts, never formal entrypoints.
 - `scripts/paired_generation_shards.py`: migrates committed rows into shard metadata, quarantines crash-written images without provenance, and merges shards only when run-ID coverage, latent uniqueness, image hashes, target/config hashes, and model revision all pass.
 - `raven/pairing_provenance.py`: fail-closed latent, image, target, pairing, and attack-config audits.
 - `scripts/build_verification_manifest.py` and `scripts/evaluate_verification.py`: strict pairing and calibrated verification utilities.
@@ -118,6 +127,8 @@ debug_info.json
 
 ## Ablations
 
+All commands in this section are **ABLATION ONLY - NOT A FORMAL EVALUATION ENTRYPOINT**.
+
 ```bash
 python scripts/run_raven.py --input path/to/watermarked.png --output_dir outputs/no_vga --view_guided_attention false --color_transfer true
 python scripts/run_raven.py --input path/to/watermarked.png --output_dir outputs/no_color --view_guided_attention true --color_transfer false
@@ -138,9 +149,8 @@ python scripts/audit_dataset.py \
   --output outputs/audit/mscoco_TR.json
 ```
 
-Legacy detector extraction/evaluation CLIs were removed during the 2026-07-16
-cleanup. Use the formal RAVEN P1/NFPA scripts for current experiments, or see
-`archive/legacy_scripts_20260716/` for historical ablations.
+Use only `experiments/run_raven_formal_eval.py` for current formal evaluation.
+Historical scripts remain solely as reproducibility evidence.
 
 ## Approximations Relative To The Paper
 
@@ -149,11 +159,9 @@ cleanup. Use the formal RAVEN P1/NFPA scripts for current experiments, or see
   while Implementation Details specifies DDIM inversion. The primary mode is
   now partial DDIM inversion; `--inversion_mode forward_noise` preserves the
   Equation-(4) implementation as a labeled ablation.
-- The primary warp mode is an integer latent translation with explicit zero
-  padding and no interpolation or circular wrap-around. Positive x moves
-  content right and positive y moves content down. `--warp_mode grid_sample`
-  retains bilinear interpolation as a labeled ablation; its padding mode and
-  `align_corners=True` setting are recorded in `debug_info.json`.
+- Formal evaluation explicitly pins `raven_paper_nfpa_gap_fill`, image-pixel
+  flow, nearest latent sampling, reflection padding, and `align_corners=False`.
+  Integer, zero-padded, bilinear, and forward-noise modes are ablations only.
 - Latent viewpoint modulation uses a global diagonal translation, matching the requested reproduction scope, not a learned or depth-aware camera transform.
 - View-guided correspondence attention is implemented only for UNet self-attention. Cross-attention to text remains the default Diffusers behavior.
 - The implementation assumes paired latent ordering `[reference, view]`; with classifier-free guidance this becomes `[uncond reference, uncond view, cond reference, cond view]`. Debug mode records attention call counts and Q/K/V checksums.
