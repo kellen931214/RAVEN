@@ -74,3 +74,10 @@ wheels/
 tmp/
 temp/
 *.tmp
+
+# Generated evaluation logs, failure artifacts, and local result tables.
+# Keep audit protocol documents and source manifests version-controlled.
+audit/ablation_logs/
+audit/full_run_logs/
+audit/gate_negative/
+audit/tables/
