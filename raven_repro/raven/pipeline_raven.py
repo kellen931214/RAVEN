@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import math
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -24,6 +25,23 @@ from .warp import (
     sample_translation,
     translate_latent,
 )
+
+
+def require_effective_source_flow(metadata: dict[str, Any] | None) -> tuple[float, float]:
+    """Return actual-grid source flow; planned-flow fallback is forbidden."""
+    fields = (
+        "effective_source_flow_dx_image_px",
+        "effective_source_flow_dy_image_px",
+    )
+    if not metadata or any(field not in metadata for field in fields):
+        raise RuntimeError(
+            "aligned color transfer requires effective source flow from the "
+            "actual warp grid; planned-flow fallback is forbidden"
+        )
+    values = tuple(float(metadata[field]) for field in fields)
+    if not all(math.isfinite(value) for value in values):
+        raise RuntimeError("aligned color transfer effective source flow is non-finite")
+    return values
 
 
 class RavenPipeline:
@@ -284,6 +302,11 @@ class RavenPipeline:
                 padding_mode=padding_mode,
                 warp_mode=warp_mode,
             )
+        aligned_effective_flow = (
+            require_effective_source_flow(nfpa_warp_metadata)
+            if color_transfer
+            else None
+        )
         if debug:
             save_image(self._decode_latents(shifted_latents), output_dir / "latent_shift_only.png")
 
@@ -418,7 +441,9 @@ class RavenPipeline:
             "overlap_handling": "valid overlap crop for paired quality metrics",
             "view_guided_attention": view_guided_attention,
             "color_transfer": color_transfer,
-            "color_transfer_mode": "paper_exact_two_stage" if color_transfer else "none",
+            "color_transfer_mode": (
+                "paper_exact_two_stage_aligned" if color_transfer else "none"
+            ),
         }
         planned_dx = dx if shift_space == "image_pixels" else float(dx) * self.vae_scale_factor
         planned_dy = dy if shift_space == "image_pixels" else float(dy) * self.vae_scale_factor
@@ -499,15 +524,27 @@ class RavenPipeline:
         save_image(view_image, output_dir / "view_guided_output.png")
 
         final_image = (
-            color_contrast_transfer_pil(view_image, input_image, mode="paper_exact_two_stage")
-            if color_transfer else view_image
+            color_contrast_transfer_pil(
+                view_image,
+                input_image,
+                mode="paper_exact_two_stage_aligned",
+                effective_source_flow_dx_image_px=aligned_effective_flow[0],
+                effective_source_flow_dy_image_px=aligned_effective_flow[1],
+            )
+            if color_transfer
+            else view_image
         )
         final_name = "final_color_corrected.png" if color_transfer else "final.png"
         save_image(final_image, output_dir / final_name)
 
         if color_transfer:
             debug_info["color_transfer_diagnostics"] = color_transfer_diagnostics(
-                view_image, input_image, final_image, mode="paper_exact_two_stage"
+                view_image,
+                input_image,
+                final_image,
+                mode="paper_exact_two_stage_aligned",
+                effective_source_flow_dx_image_px=aligned_effective_flow[0],
+                effective_source_flow_dy_image_px=aligned_effective_flow[1],
             )
 
         if processors:

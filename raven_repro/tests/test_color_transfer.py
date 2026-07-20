@@ -1,94 +1,84 @@
-import hashlib
+import inspect
 
 import pytest
 
 np = pytest.importorskip("numpy")
 pytest.importorskip("skimage")
 
+from raven.pipeline_raven import require_effective_source_flow
+
 from raven.color_transfer import (
+    PAPER_EXACT_TWO_STAGE_ALIGNED,
     align_original_chroma_to_generated,
     color_contrast_transfer,
     color_transfer_diagnostics,
 )
 
 
-def test_color_transfer_shape_dtype_and_range():
-    original = np.zeros((32, 32, 3), dtype=np.uint8)
-    original[..., 0] = 180
-    original[..., 1] = 80
-    original[..., 2] = 40
-    generated = np.full((32, 32, 3), 120, dtype=np.uint8)
-    out = color_contrast_transfer(generated, original)
-    assert out.shape == original.shape
-    assert out.dtype == np.uint8
-    assert out.min() >= 0
-    assert out.max() <= 255
+def _images(seed=11, shape=(32, 33, 3)):
+    rng = np.random.default_rng(seed)
+    return (
+        rng.integers(0, 256, shape, dtype=np.uint8),
+        rng.integers(0, 256, shape, dtype=np.uint8),
+    )
 
 
-def test_color_transfer_is_deterministic_for_fixed_input():
-    rng = np.random.default_rng(7)
-    original = rng.integers(0, 256, (24, 24, 3), dtype=np.uint8)
-    generated = rng.integers(0, 256, (24, 24, 3), dtype=np.uint8)
-    first = color_contrast_transfer(generated, original)
-    second = color_contrast_transfer(generated, original)
+def test_aligned_mode_is_the_only_public_mode():
+    assert PAPER_EXACT_TWO_STAGE_ALIGNED == "paper_exact_two_stage_aligned"
+    signature = inspect.signature(color_contrast_transfer)
+    assert "effective_source_flow_dx_image_px" in signature.parameters
+    assert "effective_source_flow_dy_image_px" in signature.parameters
+    assert "flow_dx_image_px" not in signature.parameters
+    assert "flow_dy_image_px" not in signature.parameters
+    assert "alpha" not in signature.parameters
+
+
+@pytest.mark.parametrize(
+    "legacy_mode",
+    ["paper_exact_two_stage", "paper_exact_two_stage_aligned_blend", "direct_stats"],
+)
+def test_legacy_color_transfer_modes_are_rejected(legacy_mode):
+    generated, original = _images()
+    with pytest.raises(ValueError, match="Unsupported color transfer mode"):
+        color_contrast_transfer(
+            generated,
+            original,
+            mode=legacy_mode,
+            effective_source_flow_dx_image_px=3,
+            effective_source_flow_dy_image_px=-2,
+        )
+
+
+def test_aligned_color_transfer_requires_effective_flow():
+    generated, original = _images()
+    with pytest.raises(ValueError, match="requires effective source flow"):
+        color_contrast_transfer(generated, original)
+
+
+def test_aligned_color_transfer_is_deterministic_and_finite():
+    generated, original = _images()
+    kwargs = {
+        "effective_source_flow_dx_image_px": 3,
+        "effective_source_flow_dy_image_px": -2,
+    }
+    first = color_contrast_transfer(generated, original, **kwargs)
+    second = color_contrast_transfer(generated, original, **kwargs)
+    diagnostics = color_transfer_diagnostics(generated, original, first, **kwargs)
     assert np.array_equal(first, second)
-
-
-def test_constant_luminance_has_no_nan_or_inf():
-    original = np.full((16, 16, 3), (180, 80, 40), dtype=np.uint8)
-    generated = np.full((16, 16, 3), 120, dtype=np.uint8)
-    output = color_contrast_transfer(generated, original)
-    diagnostics = color_transfer_diagnostics(generated, original, output)
-    numeric = [value for value in diagnostics.values() if isinstance(value, float)]
-    assert all(np.isfinite(value) for value in numeric)
-    assert 0.0 <= diagnostics["output_saturated_pixel_ratio"] <= 1.0
-
-
-def test_paper_exact_luminance_mean_std_close_to_original():
-    rng = np.random.default_rng(123)
-    original = rng.integers(0, 256, (32, 32, 3), dtype=np.uint8)
-    generated = rng.integers(0, 256, (32, 32, 3), dtype=np.uint8)
-    output = color_contrast_transfer(generated, original, mode="paper_exact_two_stage")
-    diagnostics = color_transfer_diagnostics(generated, original, output, mode="paper_exact_two_stage")
-    assert diagnostics["final_output_L_mean_abs_error_vs_original"] < 0.75
-    assert diagnostics["final_output_L_std_abs_error_vs_original"] < 1.25
-    assert diagnostics["L_c_mean"] is not None
-    assert diagnostics["L_c_std"] is not None
-
-
-def test_two_stage_and_direct_stats_differ_under_gamut_clipping():
-    rng = np.random.default_rng(0)
-    original = rng.integers(0, 256, (32, 32, 3), dtype=np.uint8)
-    generated = rng.integers(0, 256, (32, 32, 3), dtype=np.uint8)
-    direct = color_contrast_transfer(generated, original, mode="direct_stats")
-    paper = color_contrast_transfer(generated, original, mode="paper_exact_two_stage")
-    assert not np.array_equal(direct, paper)
-    assert np.abs(direct.astype(np.int16) - paper.astype(np.int16)).max() > 0
-
-
-def test_color_transfer_diagnostics_include_required_fields():
-    original = np.full((16, 16, 3), (180, 80, 40), dtype=np.uint8)
-    generated = np.full((16, 16, 3), 120, dtype=np.uint8)
-    output = color_contrast_transfer(generated, original)
-    diagnostics = color_transfer_diagnostics(generated, original, output)
-    for key in (
-        "L_opt_mean",
-        "L_opt_std",
-        "L_c_mean",
-        "L_c_std",
-        "L_w_mean",
-        "L_w_std",
-        "L_final_before_clip_min",
-        "L_final_before_clip_max",
-        "L_final_after_clip_min",
-        "L_final_after_clip_max",
-        "final_output_L_mean",
-        "final_output_L_std",
-        "output_saturated_pixel_ratio",
-    ):
-        assert key in diagnostics
-    assert diagnostics["color_transfer_mode"] == "paper_exact_two_stage"
-
+    assert first.shape == generated.shape
+    assert first.dtype == np.uint8
+    assert first.min() >= 0 and first.max() <= 255
+    assert all(
+        np.isfinite(value)
+        for value in diagnostics.values()
+        if isinstance(value, float)
+    )
+    assert diagnostics["color_transfer_mode"] == PAPER_EXACT_TWO_STAGE_ALIGNED
+    assert diagnostics["alignment_flow_source"] == (
+        "effective source flow from actual warp grid"
+    )
+    assert diagnostics["effective_source_flow_dx_image_px"] == 3.0
+    assert diagnostics["effective_source_flow_dy_image_px"] == -2.0
 
 
 @pytest.mark.parametrize(
@@ -98,14 +88,19 @@ def test_color_transfer_diagnostics_include_required_fields():
         (2, 2), (2, -2), (-2, 2), (-2, -2),
     ],
 )
-def test_aligned_chroma_uses_inverse_warp_correspondence(dx, dy):
+def test_aligned_chroma_uses_effective_inverse_warp_correspondence(dx, dy):
     height, width = 7, 9
     original = np.zeros((height, width, 2), dtype=np.float32)
     yy, xx = np.mgrid[:height, :width]
     original[..., 0] = yy * 100 + xx
     original[..., 1] = -(yy * 100 + xx)
     generated = np.full_like(original, -999.0)
-    aligned, valid = align_original_chroma_to_generated(original, generated, dx, dy)
+    aligned, valid = align_original_chroma_to_generated(
+        original,
+        generated,
+        effective_source_flow_dx_image_px=dx,
+        effective_source_flow_dy_image_px=dy,
+    )
     for y in range(height):
         for x in range(width):
             source_y, source_x = y + dy, x + dx
@@ -117,60 +112,36 @@ def test_aligned_chroma_uses_inverse_warp_correspondence(dx, dy):
                 assert np.array_equal(aligned[y, x], generated[y, x])
 
 
-def test_aligned_chroma_has_no_circular_wrap_and_preserves_non_overlap():
-    original = np.arange(5 * 6 * 2, dtype=np.float32).reshape(5, 6, 2)
+def test_effective_flow_changes_alignment_and_preserves_non_overlap():
+    original = np.arange(8 * 9 * 2, dtype=np.float32).reshape(8, 9, 2)
     generated = np.full_like(original, 777.0)
-    aligned, valid = align_original_chroma_to_generated(original, generated, 2, -1)
-    assert np.all(aligned[~valid] == 777.0)
-    assert np.all(aligned[:, -2:] == 777.0)
-    assert np.all(aligned[0] == 777.0)
-
-
-def test_aligned_chroma_alpha_endpoints():
-    rng = np.random.default_rng(10)
-    original = rng.normal(size=(8, 9, 2)).astype(np.float32)
-    generated = rng.normal(size=(8, 9, 2)).astype(np.float32)
-    zero, valid = align_original_chroma_to_generated(original, generated, 2, -1, alpha=0.0)
-    one, valid_one = align_original_chroma_to_generated(original, generated, 2, -1, alpha=1.0)
-    assert np.array_equal(zero, generated)
-    assert np.array_equal(valid, valid_one)
-    yy, xx = np.nonzero(valid)
-    assert np.allclose(one[yy, xx], original[yy - 1, xx + 2])
-    assert np.array_equal(one[~valid], generated[~valid])
-
-
-@pytest.mark.parametrize(
-    "mode,alpha",
-    [
-        ("paper_exact_two_stage_aligned", 1.0),
-        ("paper_exact_two_stage_aligned_blend", 0.5),
-    ],
-)
-def test_aligned_modes_shape_dtype_range_and_finite(mode, alpha):
-    rng = np.random.default_rng(11)
-    original = rng.integers(0, 256, (24, 25, 3), dtype=np.uint8)
-    generated = rng.integers(0, 256, (24, 25, 3), dtype=np.uint8)
-    output = color_contrast_transfer(
-        generated, original, mode=mode,
-        flow_dx_image_px=3, flow_dy_image_px=-2, alpha=alpha,
+    flow_3, valid_3 = align_original_chroma_to_generated(
+        original,
+        generated,
+        effective_source_flow_dx_image_px=3,
+        effective_source_flow_dy_image_px=-2,
     )
-    diagnostics = color_transfer_diagnostics(
-        generated, original, output, mode=mode,
-        flow_dx_image_px=3, flow_dy_image_px=-2, alpha=alpha,
+    flow_4, valid_4 = align_original_chroma_to_generated(
+        original,
+        generated,
+        effective_source_flow_dx_image_px=4,
+        effective_source_flow_dy_image_px=-2,
     )
-    assert output.shape == generated.shape
-    assert output.dtype == np.uint8
-    assert output.min() >= 0 and output.max() <= 255
-    assert all(np.isfinite(value) for value in diagnostics.values() if isinstance(value, float))
-    assert diagnostics["alignment_formula"] == "generated[y,x] <- original[y+flow_dy,x+flow_dx]"
-    assert 0.0 <= diagnostics["output_rgb_out_of_gamut_ratio_before_clip"] <= 1.0
+    assert not np.array_equal(flow_3, flow_4)
+    assert np.all(flow_3[~valid_3] == 777.0)
+    assert np.all(flow_4[~valid_4] == 777.0)
 
 
-def test_paper_exact_two_stage_baseline_regression_hash_unchanged():
-    rng = np.random.default_rng(20260716)
-    generated = rng.integers(0, 256, (17, 19, 3), dtype=np.uint8)
-    original = rng.integers(0, 256, (17, 19, 3), dtype=np.uint8)
-    output = color_contrast_transfer(generated, original, mode="paper_exact_two_stage")
-    assert hashlib.sha256(output.tobytes()).hexdigest() == (
-        "865e1f6332c95bae6e7bcdb066b345a03f04b7cd6d232805af9e12434127321a"
-    )
+def test_pipeline_requires_actual_grid_effective_flow():
+    metadata = {
+        "planned_flow_dx_image_px": 27.0,
+        "planned_flow_dy_image_px": -29.0,
+        "effective_source_flow_dx_image_px": 24.0,
+        "effective_source_flow_dy_image_px": -32.0,
+    }
+    assert require_effective_source_flow(metadata) == (24.0, -32.0)
+    with pytest.raises(RuntimeError, match="planned-flow fallback is forbidden"):
+        require_effective_source_flow({
+            "planned_flow_dx_image_px": 27.0,
+            "planned_flow_dy_image_px": -29.0,
+        })

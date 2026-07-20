@@ -89,6 +89,8 @@ python experiments/run_raven_formal_eval.py \
 
 Then run `attack-watermarked`, `attack-clean` for TR, `verify`, `quality`, `fid`,
 `clip`, `aggregate`, and `validate` with the identical arguments plus `--resume`.
+Formal color transfer is exclusively `paper_exact_two_stage_aligned` and consumes
+`effective_source_flow_dx_image_px` / `effective_source_flow_dy_image_px`.
 Do not run a full cohort until the 2/10/30 gates pass in fresh output roots.
 
 ## Key Files
@@ -97,7 +99,7 @@ Do not run a full cohort until the 2/10/30 gates pass in fresh output roots.
 - `raven/inversion.py`: VAE encoding plus partial DDIM inversion or Equation-(4) forward noising.
 - `raven/warp.py`: integer zero-padded latent translation plus an explicit `grid_sample` ablation.
 - `raven/attention.py`: view-guided self-attention processor. Text cross-attention is left unchanged.
-- `raven/color_transfer.py`: LAB luminance matching and original-image chroma transfer.
+- `raven/color_transfer.py`: effective-source-flow aligned LAB luminance/chroma transfer; unaligned modes are unsupported.
 - `scripts/run_raven.py`: single-image CLI.
 - `scripts/attack_folder.py`: folder CLI with failure logging.
 - `scripts/eval_quality.py`: PSNR/SSIM helper.
@@ -105,7 +107,8 @@ Do not run a full cohort until the 2/10/30 gates pass in fresh output roots.
 - `../experiments/run_raven_formal_eval.py`: the single formal stage orchestrator.
 - `raven/eval_protocol.py`: centralized formal attack, detector, FID, resume, provider, and CLIP provenance.
 - `scripts/raven_nfpa_tr_eval.py`: Tree-Ring complex-L1 detector helper used by the formal runner.
-- `scripts/raven_p1_full.py`, `scripts/quality_decomposition_experiment.py`, and `scripts/run_diffusiondb_chain_after_clean.py`: preserved ablation/evidence scripts, never formal entrypoints.
+- `scripts/run_diffusiondb_chain_after_clean.py`: disabled historical chain retained only for helper-level research evidence.
+- `../experiments/run_raven_aligned_color_eval.py`: the sole effective-flow aligned postprocessing evaluator.
 - `scripts/paired_generation_shards.py`: migrates committed rows into shard metadata, quarantines crash-written images without provenance, and merges shards only when run-ID coverage, latent uniqueness, image hashes, target/config hashes, and model revision all pass.
 - `raven/pairing_provenance.py`: fail-closed latent, image, target, pairing, and attack-config audits.
 - `scripts/build_verification_manifest.py` and `scripts/evaluate_verification.py`: strict pairing and calibrated verification utilities.
@@ -131,7 +134,6 @@ All commands in this section are **ABLATION ONLY - NOT A FORMAL EVALUATION ENTRY
 
 ```bash
 python scripts/run_raven.py --input path/to/watermarked.png --output_dir outputs/no_vga --view_guided_attention false --color_transfer true
-python scripts/run_raven.py --input path/to/watermarked.png --output_dir outputs/no_color --view_guided_attention true --color_transfer false
 python scripts/run_raven.py --input path/to/watermarked.png --output_dir outputs/strength_005 --strength 0.05
 python scripts/run_raven.py --input path/to/watermarked.png --output_dir outputs/shift_latent --shift_space latent_pixels
 python scripts/run_raven.py --input path/to/watermarked.png --output_dir outputs/forward_noise --inversion_mode forward_noise

@@ -48,3 +48,5 @@ records.
 GPU discovery currently fails with `nvidia-smi: Failed to initialize NVML: Unknown Error`.
 Historical gate results are not substituted for new-runner gates. Status is therefore
 `NOT SAFE TO RUN FULL EVAL`.
+
+- Color alignment flow source: effective source flow from actual warp grid; planned flow fallback is forbidden.

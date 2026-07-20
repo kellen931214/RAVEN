@@ -51,3 +51,13 @@ L2-normalized embeddings; mixed provenance fails aggregation.
 Check `free -h` and GPU availability before every gate. The runner processes one attack
 image at a time, limits CPU threads, avoids DataLoader workers and dataset caches, and
 hashes files incrementally. Use fresh timestamped roots for 2-, 10-, and 30-sample gates.
+
+## Aligned Color Transfer
+
+The only supported color-transfer mode is `paper_exact_two_stage_aligned`. It
+uses `effective_source_flow_dx_image_px` and
+`effective_source_flow_dy_image_px` derived from the actual warp grid for both
+attacked-clean and attacked-watermarked outputs. Planned flow and visual shift
+are provenance fields only and must never drive alignment or quality overlap.
+Use `experiments/run_raven_aligned_color_eval.py` to reprocess immutable
+pre-color formal attack views without rerunning DDIM, shift, or attention.

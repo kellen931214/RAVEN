@@ -287,3 +287,72 @@ Sources: `outputs/raven_tr_full_diffusiondb/20260715T060017Z/smoke2_eval/aggrega
 | --- | --- | --- | --- |
 | 2026-07-15 | Whether to expand `RAVEN-paper / NFPA-gap-fill` to 100-200 or full 1001 | 10-sample validation is complete, but full new-transform attack has not been run. | If requested, first run 100-200 samples in a new output directory; do not overwrite old P1 outputs. |
 | 2026-07-15 | Paper PSNR/SSIM provenance | RAVEN arXiv HTML inspected; local report treats overlap PSNR/SSIM as requested paper-comparable protocol, while the inspected paper quality table emphasizes FID/CLIP. | If exact PSNR/SSIM numbers are required for a table, cite the user-defined overlap protocol separately from paper-reported FID/CLIP. |
+
+## 2026-07-20 — Effective-flow aligned color transfer only
+
+### Problem
+The formal pipeline still executed unaligned `paper_exact_two_stage`, while old
+decomposition launchers exposed no-color, blended, direct-stat, and legacy-flow
+paths. The unaligned result had poor quality and could not be treated as the
+final color-transfer protocol.
+
+### Root cause
+`RavenPipeline.run()` hard-coded the unaligned mode and did not pass warp-derived
+effective source flow into color transfer. Historical decomposition scripts read
+`flow_dx_image_px` / `flow_dy_image_px`, which represented planned legacy flow.
+
+### Affected files
+- `raven_repro/raven/color_transfer.py`
+- `raven_repro/raven/pipeline_raven.py`
+- `raven_repro/raven/eval_protocol.py`
+- `experiments/run_raven_aligned_color_eval.py`
+
+### Affected outputs
+`outputs/raven_formal_eval/diffusiondb/TR/1001_20260718T090947Z` remains immutable
+but its unaligned post-color metrics are legacy. The previous no-color output is
+ablation-only. Neither may be merged into the new aligned result.
+
+### Fix
+Only `paper_exact_two_stage_aligned` remains executable. Alignment and quality
+overlap use `effective_source_flow_dx_image_px` and
+`effective_source_flow_dy_image_px`; missing actual-grid flow fails closed. The
+aligned evaluator reuses immutable pre-color views and rebuilds attacked-clean
+and attacked-watermarked postprocessing under a new config/source manifest.
+
+### Reused code
+The formal manifest builder, Tree-Ring `score-formal`, NFPA rounded2 threshold,
+FID staging, OpenCLIP helper, and overlap metrics remain unchanged.
+
+### Historical bug coverage
+All reachable unaligned/direct/blended color modes and old decomposition/color
+alignment launchers were removed or disabled. Archived evidence is not a formal
+entrypoint.
+
+### Regression prevention
+Tests reject legacy modes and legacy flow keywords, require actual-grid effective
+flow, prove planned flow is ignored by the alignment selector, and reject
+attacked-clean/watermarked effective-flow drift.
+
+### Validation
+Targeted aligned/effective-flow tests: 75 passed. Full repository suite: 142
+passed. The 2/10/1001 aligned evaluation results remain pending execution.
+
+### Watermark integrity
+- Source data: unchanged immutable 1001-sample paired cohort.
+- Pairing/base latents: unchanged; no generation rerun.
+- Attack pairing: seed, planned flow, effective flow, timestep, model revision,
+  and transform provenance checked per run ID.
+- Detector: unchanged complex L1, lower-is-watermark, strict `<` threshold.
+- Threshold: original-clean and attacked-clean calibration reported separately.
+- Quality: watermarked input versus aligned attacked-watermarked valid overlap.
+- CLIP: aligned attacked-watermarked image versus original prompt.
+- FID: fresh watermarked-versus-aligned-attacked staging.
+
+### Git provenance
+- Repository: `kellen931214/RAVEN`
+- Branch: `agent/cleanup-quality-decomposition`
+- Commit: pending
+- Remote branch: `origin/agent/cleanup-quality-decomposition`
+- Push status: pending
+- Entry point: `experiments/run_raven_aligned_color_eval.py`
+- Formal output eligibility: pending tests, gates, and aligned full evaluation

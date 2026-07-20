@@ -28,7 +28,7 @@ def debug_payload(dx=27.0, dy=-29.0):
         "effective_visual_shift_dx_image_px": -24.0,
         "effective_visual_shift_dy_image_px": 32.0,
         "view_guided_attention": True, "color_transfer": True,
-        "color_transfer_mode": "paper_exact_two_stage",
+        "color_transfer_mode": "paper_exact_two_stage_aligned",
     }
     payload["transform_config_hash"] = canonical_json_hash(transform_config_payload(payload))
     return payload

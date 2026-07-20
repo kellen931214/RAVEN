@@ -31,7 +31,7 @@ from raven.pairing_provenance import (
     audit_pairing_rows,
     build_attack_config_sha256,
 )
-from raven.pipeline_raven import RavenPipeline
+from raven.pipeline_raven import RavenPipeline, require_effective_source_flow
 from raven.utils import load_image
 MODEL_ID = "RedbeardNZ/stable-diffusion-2-1-base"
 MODEL_REVISION = "c6a5e9bab8d874d081de76fa270ae0aefa5410ff"
@@ -99,10 +99,18 @@ def histogram(values, bins: int = 40) -> dict:
     return {"counts": counts.tolist(), "bin_edges": edges.tolist()}
 
 
-def quality_pair(reference: Image.Image, attacked: Image.Image, dx: int, dy: int, suffix: str) -> dict:
+def quality_pair(
+    reference: Image.Image,
+    attacked: Image.Image,
+    effective_source_dx: float,
+    effective_source_dy: float,
+    suffix: str,
+) -> dict:
     first = np.asarray(reference.convert("RGB"), dtype=np.float32) / 255.0
     second = np.asarray(attacked.convert("RGB"), dtype=np.float32) / 255.0
-    overlap_first, overlap_second = crop_overlap_inverse_warp(first, second, dx, dy)
+    overlap_first, overlap_second = crop_overlap_inverse_warp(
+        first, second, effective_source_dx, effective_source_dy
+    )
     return {
         f"psnr_vs_{suffix}": float(peak_signal_noise_ratio(overlap_first, overlap_second, data_range=1.0)),
         f"ssim_vs_{suffix}": float(structural_similarity(overlap_first, overlap_second, channel_axis=2, data_range=1.0)),
@@ -423,11 +431,12 @@ def command_attack(args) -> int:
                 raise RuntimeError(f"non-empty prompt run_id={run_id}")
             if debug_info["warp_mode"] != "raven_paper_nfpa_gap_fill" or debug_info["padding_mode"] != "reflection" or debug_info["interpolation_mode"] != "nearest":
                 raise RuntimeError(f"P1 metadata drift run_id={run_id}")
-            flow_dx = int(round(shift["flow_dx_image_px"]))
-            flow_dy = int(round(shift["flow_dy_image_px"]))
+            effective_dx, effective_dy = require_effective_source_flow(debug_info)
             quality = {
-                **quality_pair(watermarked, attacked, flow_dx, flow_dy, "watermarked"),
-                **quality_pair(clean, attacked, flow_dx, flow_dy, "clean"),
+                **quality_pair(
+                    watermarked, attacked, effective_dx, effective_dy, "watermarked"
+                ),
+                **quality_pair(clean, attacked, effective_dx, effective_dy, "clean"),
             }
             clip = debug_info["clipping_diagnostics"]
             attention = debug_info.get("attention_debug", {})
@@ -468,8 +477,10 @@ def command_attack(args) -> int:
                 "sampling_mode": debug_info["interpolation_mode"],
                 "padding_mode": debug_info["padding_mode"],
                 "normalization_formula": debug_info["normalized_coordinate_formula"],
-                "color_transfer_mode": debug_info.get("color_transfer_mode", "paper_exact_two_stage"),
+                "color_transfer_mode": debug_info["color_transfer_mode"],
                 "transform_config_hash": debug_info.get("transform_config_hash"),
+                "effective_source_flow_dx_image_px": effective_dx,
+                "effective_source_flow_dy_image_px": effective_dy,
                 **quality,
                 "quality_primary_reference": "watermarked_input",
                 "runtime_seconds": float(time.monotonic() - started),

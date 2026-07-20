@@ -102,12 +102,19 @@ def image_path_near_debug(debug_info_path: Path, filename: str) -> Path:
     return path
 
 
-def quality_record(reference_path: Path, pre_color_path: Path, post_color_path: Path, flow_dx: float, flow_dy: float, suffix: str) -> dict:
+def quality_record(
+    reference_path: Path,
+    pre_color_path: Path,
+    post_color_path: Path,
+    effective_source_dx: float,
+    effective_source_dy: float,
+    suffix: str,
+) -> dict:
     reference = Image.open(reference_path).convert("RGB")
     pre = Image.open(pre_color_path).convert("RGB")
     post = Image.open(post_color_path).convert("RGB")
-    pre_metrics = pair_quality_metrics(reference, pre, flow_dx, flow_dy)
-    post_metrics = pair_quality_metrics(reference, post, flow_dx, flow_dy)
+    pre_metrics = pair_quality_metrics(reference, pre, effective_source_dx, effective_source_dy)
+    post_metrics = pair_quality_metrics(reference, post, effective_source_dx, effective_source_dy)
     return {
         **prefix_metrics(f"pre_color_vs_{suffix}", pre_metrics),
         **prefix_metrics(f"post_color_vs_{suffix}", post_metrics),
@@ -146,8 +153,8 @@ def command_recompute_quality(args) -> int:
                     raise ValueError(f"SHA drift for {path_key} run_id={row['run_id']}")
             if sha256_path(post_color_path) != row["attacked_sha256"]:
                 raise ValueError(f"attacked SHA drift run_id={row['run_id']}")
-            flow_dx = float(row["flow_dx_image_px"])
-            flow_dy = float(row["flow_dy_image_px"])
+            flow_dx = float(row["effective_source_flow_dx_image_px"])
+            flow_dy = float(row["effective_source_flow_dy_image_px"])
             record = {
                 "dataset": row["dataset"],
                 "run_id": str(row["run_id"]),
@@ -161,10 +168,10 @@ def command_recompute_quality(args) -> int:
                 "pre_color_sha256": sha256_path(pre_color_path),
                 "post_color_path": str(post_color_path.resolve()),
                 "post_color_sha256": row["attacked_sha256"],
-                "flow_dx_image_px": flow_dx,
-                "flow_dy_image_px": flow_dy,
-                "visual_dx_image_px": -flow_dx,
-                "visual_dy_image_px": -flow_dy,
+                "effective_source_flow_dx_image_px": flow_dx,
+                "effective_source_flow_dy_image_px": flow_dy,
+                "effective_visual_shift_dx_image_px": -flow_dx,
+                "effective_visual_shift_dy_image_px": -flow_dy,
                 **quality_record(Path(row["watermarked_path"]), pre_color_path, post_color_path, flow_dx, flow_dy, "watermarked"),
                 **quality_record(Path(row["clean_path"]), pre_color_path, post_color_path, flow_dx, flow_dy, "clean"),
             }
@@ -359,8 +366,12 @@ def command_validate(args) -> int:
                     debug_info = json.loads(debug_info_path.read_text())
                     attacked_sha = sha256_path(final_path)
                     peak_gpu = int(torch.cuda.max_memory_allocated())
-                flow_dx = float(old["flow_dx_image_px"])
-                flow_dy = float(old["flow_dy_image_px"])
+                flow_dx = float(
+                    debug_info["effective_source_flow_dx_image_px"]
+                )
+                flow_dy = float(
+                    debug_info["effective_source_flow_dy_image_px"]
+                )
                 attacked = load_image(final_path, size=None)
                 quality = {
                     **quality_record(Path(old["watermarked_path"]), pre_color_path, final_path, flow_dx, flow_dy, "watermarked"),
@@ -388,10 +399,10 @@ def command_validate(args) -> int:
                     "pre_color_path": str(pre_color_path.resolve()),
                     "pre_color_sha256": sha256_path(pre_color_path),
                     "debug_info_path": str(debug_info_path.resolve()),
-                    "flow_dx_image_px": flow_dx,
-                    "flow_dy_image_px": flow_dy,
-                    "visual_dx_image_px": -flow_dx,
-                    "visual_dy_image_px": -flow_dy,
+                    "effective_source_flow_dx_image_px": flow_dx,
+                    "effective_source_flow_dy_image_px": flow_dy,
+                    "effective_visual_shift_dx_image_px": -flow_dx,
+                    "effective_visual_shift_dy_image_px": -flow_dy,
                     "warp_mode": debug_info.get("warp_mode"),
                     "transform_setting_name": debug_info.get("transform_setting_name"),
                     "latent_sampling_mode": debug_info.get("interpolation_mode"),

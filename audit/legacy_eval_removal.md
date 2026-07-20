@@ -24,3 +24,13 @@ Preserved detector providers and formal helpers include all GS/TR/RID/HSTR/HSQR 
 files plus `raven_p1_full.py`, `raven_nfpa_tr_eval.py`,
 `extract_verification_scores.py`, and `evaluate_verification.py`. Research scripts are
 labeled `ABLATION ONLY - NOT A FORMAL EVALUATION ENTRYPOINT`.
+
+## 2026-07-20 aligned color migration
+
+- `paper_exact_two_stage`, `paper_exact_two_stage_aligned_blend`, and
+  `direct_stats` are no longer executable color-transfer modes.
+- Historical unaligned formal output
+  `outputs/raven_formal_eval/diffusiondb/TR/1001_20260718T090947Z` is retained
+  as legacy evidence and must not be merged with aligned results.
+- Removed obsolete no-color/decomposition/alignment launchers. The sole
+  reprocessing entrypoint is `experiments/run_raven_aligned_color_eval.py`.

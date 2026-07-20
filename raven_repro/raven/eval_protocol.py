@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
 
-METRIC_PROTOCOL_VERSION = "raven_formal_eval_v1"
+METRIC_PROTOCOL_VERSION = "raven_formal_eval_v2_aligned_color"
 
 FORMAL_ATTACK_CONFIG: dict[str, Any] = {
     "model_id": "RedbeardNZ/stable-diffusion-2-1-base",
@@ -27,7 +27,7 @@ FORMAL_ATTACK_CONFIG: dict[str, Any] = {
     "padding_mode": "reflection",
     "view_guided_attention": True,
     "color_transfer": True,
-    "color_transfer_mode": "paper_exact_two_stage",
+    "color_transfer_mode": "paper_exact_two_stage_aligned",
     "inversion_mode": "ddim",
     "prompt": "",
     "negative_prompt": "",
