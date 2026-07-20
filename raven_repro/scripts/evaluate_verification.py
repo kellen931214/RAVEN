@@ -94,7 +94,19 @@ def semantic_report(method: str, rows: list[dict[str, str]], target_fpr: float, 
     raw = {stage: [finite_float(row, f"{stage}_raw_score") for row in rows] for stage in ("clean", "watermarked", "attacked")}
     canonical = {stage: [finite_float(row, f"{stage}_canonical_score") for row in rows] for stage in raw}
     summary = summarize_detection(canonical["clean"], canonical["watermarked"], canonical["attacked"], target_fpr)
-    metric = summary.to_dict()
+    metric = {
+        "N": {stage: len(values) for stage, values in raw.items()},
+        "target_fpr": target_fpr,
+        "actual_empirical_fpr": summary.calibration.actual_fpr,
+        "threshold": summary.calibration.threshold,
+        "false_positive_count": summary.calibration.false_positives,
+        "before_tpr": summary.watermarked_tpr,
+        "attacked_tpr_at_original_clean_threshold": summary.attacked_tpr,
+        "attacked_tpr_at_recalibrated_threshold": None,
+        "before_roc_auc": summary.watermarked_auc,
+        "attacked_roc_auc": summary.attacked_auc,
+        "attack_success_rate_at_original_clean_threshold": 1.0 - summary.attacked_tpr,
+    }
 
     recorded_thresholds = {finite_float(row, "legacy_threshold") for row in rows}
     if threshold_override is not None:
@@ -108,18 +120,10 @@ def semantic_report(method: str, rows: list[dict[str, str]], target_fpr: float, 
         for stage, values in raw.items()
     }
     metric.update({
-        "N": {stage: len(values) for stage, values in raw.items()},
-        "threshold": summary.calibration.threshold,
-        "target_FPR": target_fpr,
-        "actual_FPR": summary.calibration.actual_fpr,
-        "calibrated_TPR_at_1pct_FPR": summary.attacked_tpr if target_fpr == 0.01 else None,
-        "calibrated_before_TPR": summary.watermarked_tpr,
-        "calibrated_attacked_TPR": summary.attacked_tpr,
         "legacy_threshold": legacy_threshold,
-        "legacy_fixed_threshold_detect_rate": legacy_rates["attacked"],
-        "legacy_before_detect_rate": legacy_rates["watermarked"],
-        "legacy_actual_clean_FPR": legacy_rates["clean"],
-        "ROC_AUC": {"before": summary.watermarked_auc, "attacked": summary.attacked_auc},
+        "legacy_fixed_threshold_before_detect_rate": legacy_rates["watermarked"],
+        "legacy_fixed_threshold_attacked_detect_rate": legacy_rates["attacked"],
+        "legacy_actual_clean_fpr": legacy_rates["clean"],
         "score_distributions": {
             stage: {"raw": distribution(raw[stage]), "canonical": distribution(canonical[stage])}
             for stage in raw

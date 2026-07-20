@@ -41,6 +41,12 @@ from raven.pairing_provenance import (
     build_attack_config_sha256,
 )
 from raven.pipeline_raven import RavenPipeline
+from raven.eval_protocol import (
+    FORMAL_ATTACK_CONFIG as CENTRAL_FORMAL_ATTACK_CONFIG,
+    provider_config,
+    require_uniform_provider_config,
+    sha256_path as formal_sha256_path,
+)
 from raven.utils import load_image
 from scripts import raven_p1_full as p1
 
@@ -711,8 +717,192 @@ def nfpa_threshold(clean_scores: list[float], target_fpr: float = TARGET_FPR) ->
     return float(sorted_scores[k])
 
 
-def nfpa_rate(scores: list[float], threshold: float) -> float:
+def nfpa_round2(value: float) -> float:
+    """Match the pinned NFPA NumPy-array `.round(2)` score serialization."""
+    return float(np.asarray(value, dtype=np.float64).round(2))
+
+
+def nfpa_detection_rate(scores: list[float], threshold: float) -> float:
     return float(np.mean(np.asarray(scores, dtype=np.float64) < threshold))
+
+
+nfpa_rate = nfpa_detection_rate
+
+
+def aggregate_nfpa_protocol(rows: list[dict], suffix: str) -> dict:
+    columns = {
+        stage: [float(row[f"{stage}_l1_{suffix}"]) for row in rows]
+        for stage in (
+            "original_clean", "watermarked", "attacked_clean", "attacked_watermarked"
+        )
+    }
+    before_threshold = nfpa_threshold(columns["original_clean"])
+    after_threshold = nfpa_threshold(columns["attacked_clean"])
+    before_fp = int(np.sum(np.asarray(columns["original_clean"]) < before_threshold))
+    after_fp = int(np.sum(np.asarray(columns["attacked_clean"]) < after_threshold))
+    before_tpr = nfpa_detection_rate(columns["watermarked"], before_threshold)
+    recalibrated_tpr = nfpa_detection_rate(columns["attacked_watermarked"], after_threshold)
+    original_threshold_tpr = nfpa_detection_rate(
+        columns["attacked_watermarked"], before_threshold
+    )
+    return {
+        "target_fpr": TARGET_FPR,
+        "original_clean_target_fpr": TARGET_FPR,
+        "original_clean_threshold": before_threshold,
+        "original_clean_actual_fpr": before_fp / len(rows),
+        "original_clean_fp_count": before_fp,
+        "before_threshold": before_threshold,
+        "before_actual_fpr": before_fp / len(rows),
+        "before_false_positives": before_fp,
+        "before_tpr": before_tpr,
+        "before_roc_auc": roc_auc(
+            [-value for value in columns["watermarked"]],
+            [-value for value in columns["original_clean"]],
+        ),
+        "attacked_clean_recalibrated_threshold": after_threshold,
+        "attacked_clean_target_fpr": TARGET_FPR,
+        "attacked_clean_actual_fpr": after_fp / len(rows),
+        "attacked_clean_fp_count": after_fp,
+        "attacked_actual_fpr": after_fp / len(rows),
+        "attacked_false_positives": after_fp,
+        "attacked_tpr_at_original_clean_threshold": original_threshold_tpr,
+        "attacked_tpr_at_attacked_clean_recalibrated_threshold": recalibrated_tpr,
+        "attacked_roc_auc": roc_auc(
+            [-value for value in columns["attacked_watermarked"]],
+            [-value for value in columns["attacked_clean"]],
+        ),
+        "attack_success_rate_at_recalibrated_threshold": 1.0 - recalibrated_tpr,
+    }
+
+
+def command_score_formal(args) -> int:
+    import torch
+
+    if args.output_dir.exists():
+        raise FileExistsError(f"refusing to reuse formal TR output: {args.output_dir}")
+    with args.manifest.open(newline="", encoding="utf-8-sig") as handle:
+        manifest_rows = list(csv.DictReader(handle))
+    clean_rows = load_jsonl(args.attacked_clean_records)
+    if not manifest_rows or len(manifest_rows) != len(clean_rows):
+        raise ValueError("formal TR manifest and attacked-clean record counts differ")
+    manifest = {str(row["run_id"]): row for row in manifest_rows}
+    clean = {str(row["run_id"]): row for row in clean_rows}
+    if len(manifest) != len(manifest_rows) or len(clean) != len(clean_rows):
+        raise ValueError("duplicate run ID in formal TR inputs")
+    if set(manifest) != set(clean):
+        raise ValueError("formal TR manifest and attacked-clean run-ID sets differ")
+    config, config_hash = require_uniform_provider_config("TR", manifest_rows)
+    recorded_hashes = {row.get("provider_config_hash", "") for row in manifest_rows}
+    if recorded_hashes != {config_hash}:
+        raise ValueError(f"formal TR provider hash mismatch: {sorted(recorded_hashes)}")
+
+    sys.path.insert(0, str(args.eval_repo.resolve()))
+    from raven.resource_guard import CpuMemoryGuard, limit_cpu_threads
+    from scripts.extract_verification_scores import provider_class
+    from utils.pipe import pipe_utils
+
+    limit_cpu_threads(1)
+    CpuMemoryGuard(24.0, 48.0, 40.0).check("formal TR score startup")
+    device = torch.device(args.device)
+    pipe = pipe_utils.get_pipe_provider(
+        pretrained_model_name_or_path=CENTRAL_FORMAL_ATTACK_CONFIG["model_id"],
+        resolution=512,
+        device=device,
+        eager_loading=False,
+        schedulers_name="DDIM",
+        disable_tqdm=True,
+        revision=CENTRAL_FORMAL_ATTACK_CONFIG["model_revision"],
+    )
+    provider = provider_class("TR")(
+        latent_shape=pipe.get_latent_shape(),
+        dtype=pipe.get_dtype(),
+        device=device,
+        **config,
+    )
+    target_bytes = provider.gt_patch.detach().cpu().numpy().tobytes()
+    target_hash = hashlib.sha256(target_bytes).hexdigest()
+    args.output_dir.mkdir(parents=True)
+    output_path = args.output_dir / "l1_scores.jsonl"
+    rows = []
+    with output_path.open("x", encoding="utf-8") as output:
+        for index, run_id in enumerate(sorted(manifest, key=int), start=1):
+            row = manifest[run_id]
+            clean_attack = clean[run_id]
+            if clean_attack.get("input_role") != "clean":
+                raise ValueError(f"run_id={run_id}: attacked-clean record has wrong role")
+            if clean_attack.get("attack_config_hash") != row.get("attack_config_hash"):
+                raise ValueError(f"run_id={run_id}: attacked clean/watermarked config mismatch")
+            for field in (
+                "attack_seed", "planned_flow_dx_image_px", "planned_flow_dy_image_px",
+                "transform_config_hash",
+            ):
+                if str(clean_attack.get(field)) != str(row.get(field)):
+                    raise ValueError(f"run_id={run_id}: attacked pair {field} mismatch")
+            paths = {
+                "original_clean": Path(row["clean_path"]),
+                "watermarked": Path(row["watermarked_path"]),
+                "attacked_clean": Path(clean_attack["attacked_path"]),
+                "attacked_watermarked": Path(row["attacked_path"]),
+            }
+            expected = {
+                "original_clean": row["clean_sha256"],
+                "watermarked": row["watermarked_sha256"],
+                "attacked_clean": clean_attack["attacked_sha256"],
+                "attacked_watermarked": row["attacked_sha256"],
+            }
+            for stage, path in paths.items():
+                if formal_sha256_path(path) != expected[stage]:
+                    raise RuntimeError(f"run_id={run_id}: {stage} SHA mismatch")
+            scores = {
+                stage: complex_l1_score(torch, provider, pipe, path, 50)["score"]
+                for stage, path in paths.items()
+            }
+            if not all(math.isfinite(value) for value in scores.values()):
+                raise ValueError(f"run_id={run_id}: non-finite complex-L1 score")
+            record = {
+                "dataset": row["dataset"],
+                "method": "TR",
+                "run_id": run_id,
+                "provider_config": config,
+                "provider_config_hash": config_hash,
+                "target_watermark_hash": target_hash,
+                "source_target_watermark_hash": row.get("target_watermark_hash", ""),
+                "score_direction": "lower means watermark",
+            }
+            for stage, value in scores.items():
+                record[f"{stage}_l1_full_precision"] = value
+                record[f"{stage}_l1_nfpa_rounded2"] = nfpa_round2(value)
+            record["tr_l1_full_precision"] = scores["attacked_watermarked"]
+            record["tr_l1_rounded2"] = nfpa_round2(scores["attacked_watermarked"])
+            append_jsonl(output, record)
+            rows.append(record)
+            print(f"[formal-tr {index}/{len(manifest)}] run_id={run_id}", flush=True)
+    aggregate = {
+        "protocol": "formal_tree_ring_complex_l1_v3",
+        "N": len(rows),
+        "sample_count": len(rows),
+        "gate_only": len(rows) < 1000,
+        "paper_comparable": False,
+        "statistical_validity": (
+            "gate_only_insufficient_for_1pct_fpr"
+            if len(rows) < 100
+            else "requires_final_protocol_review"
+        ),
+        "score_definition": "torch.abs(decoded_watermark - target_watermark).mean()",
+        "threshold_rule": "NFPA order statistic; strict score < threshold",
+        "provider_config": config,
+        "provider_config_hash": config_hash,
+        "target_watermark_hash": target_hash,
+        "full_precision_protocol": aggregate_nfpa_protocol(rows, "full_precision"),
+        "nfpa_rounded2_protocol": aggregate_nfpa_protocol(rows, "nfpa_rounded2"),
+        "primary_protocol": "nfpa_rounded2_protocol",
+    }
+    write_json(args.output_dir / "aggregate_results.json", aggregate)
+    del provider, pipe
+    gc.collect()
+    if args.device.startswith("cuda"):
+        torch.cuda.empty_cache()
+    return 0
 
 
 def command_aggregate(args) -> int:
@@ -1003,6 +1193,12 @@ def build_parser() -> argparse.ArgumentParser:
     score.add_argument("--resume", action="store_true")
     aggregate = sub.add_parser("aggregate")
     aggregate.add_argument("--output-dir", type=Path, required=True)
+    formal = sub.add_parser("score-formal")
+    formal.add_argument("--manifest", type=Path, required=True)
+    formal.add_argument("--attacked-clean-records", type=Path, required=True)
+    formal.add_argument("--output-dir", type=Path, required=True)
+    formal.add_argument("--eval-repo", type=Path, default=Path(__file__).resolve().parents[2] / "eval_bench_wm")
+    formal.add_argument("--device", choices=["cuda", "cpu"], default="cuda")
     run = sub.add_parser("run-sequential")
     run.add_argument("--root", type=Path, default=Path("outputs/raven_nfpa_tr_eval"))
     run.add_argument("--diffusiondb-p1-dir", type=Path, required=True)
@@ -1024,6 +1220,8 @@ def main() -> int:
         return command_score_l1(args)
     if args.command == "aggregate":
         return command_aggregate(args)
+    if args.command == "score-formal":
+        return command_score_formal(args)
     if args.command == "run-sequential":
         return command_run_sequential(args)
     raise AssertionError(args.command)

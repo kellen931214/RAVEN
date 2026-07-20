@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import inspect
 import json
 from pathlib import Path
@@ -12,6 +11,7 @@ from PIL import Image
 
 from .attention import install_view_guided_attention, restore_default_attention
 from .color_transfer import color_contrast_transfer_pil, color_transfer_diagnostics
+from .eval_protocol import canonical_json_hash, transform_config_payload
 from .inversion import partial_diffusion_inversion
 from .resource_guard import limit_cpu_threads
 from .utils import image_size_divisible_by_8, save_image, save_json, seed_everything, tensor_to_image
@@ -338,6 +338,7 @@ class RavenPipeline:
             "reference_latent_shape": list(inversion.noisy_latents.shape),
             "shifted_latent_shape": list(shifted_latents.shape),
             "timesteps": [int(t) for t in inversion.timesteps.detach().cpu().tolist()],
+            "steps": steps,
             "strength": strength,
             "selected_tau": int(inversion.start_timestep[0].detach().cpu().item()),
             "inversion_mode": inversion.mode,
@@ -419,24 +420,49 @@ class RavenPipeline:
             "color_transfer": color_transfer,
             "color_transfer_mode": "paper_exact_two_stage" if color_transfer else "none",
         }
+        planned_dx = dx if shift_space == "image_pixels" else float(dx) * self.vae_scale_factor
+        planned_dy = dy if shift_space == "image_pixels" else float(dy) * self.vae_scale_factor
+        debug_info.update({
+            "planned_flow_dx_image_px": float(planned_dx),
+            "planned_flow_dy_image_px": float(planned_dy),
+            "effective_source_dx_latent": float(
+                (nfpa_warp_metadata or {}).get(
+                    "effective_source_dx_latent", planned_dx / self.vae_scale_factor
+                )
+            ),
+            "effective_source_dy_latent": float(
+                (nfpa_warp_metadata or {}).get(
+                    "effective_source_dy_latent", planned_dy / self.vae_scale_factor
+                )
+            ),
+            "effective_source_flow_dx_image_px": float(
+                (nfpa_warp_metadata or {}).get(
+                    "effective_source_flow_dx_image_px", planned_dx
+                )
+            ),
+            "effective_source_flow_dy_image_px": float(
+                (nfpa_warp_metadata or {}).get(
+                    "effective_source_flow_dy_image_px", planned_dy
+                )
+            ),
+            "effective_visual_shift_dx_image_px": float(
+                (nfpa_warp_metadata or {}).get(
+                    "effective_visual_shift_dx_image_px",
+                    -planned_dx if inverse_sampling_warp else planned_dx,
+                )
+            ),
+            "effective_visual_shift_dy_image_px": float(
+                (nfpa_warp_metadata or {}).get(
+                    "effective_visual_shift_dy_image_px",
+                    -planned_dy if inverse_sampling_warp else planned_dy,
+                )
+            ),
+        })
 
 
-        debug_info["transform_config_hash"] = hashlib.sha256(json.dumps({
-            "warp_mode": debug_info["warp_mode"],
-            "transform_setting_name": debug_info["transform_setting_name"],
-            "grid_implementation_version": (nfpa_warp_metadata or {}).get("grid_implementation_version"),
-            "latent_sampling_mode": debug_info["interpolation_mode"],
-            "padding_mode": debug_info["padding_mode"],
-            "normalization_formula": debug_info["normalized_coordinate_formula"],
-            "align_corners": debug_info["align_corners"],
-            "flow_dx_image_px": debug_info["flow_dx_image_px"],
-            "flow_dy_image_px": debug_info["flow_dy_image_px"],
-            "shift_sampling": debug_info["shift_sampling"],
-            "strength": debug_info["strength"],
-            "guidance_scale": debug_info["guidance_scale"],
-            "steps": steps,
-            "prompt": prompt,
-        }, sort_keys=True).encode("utf-8")).hexdigest()
+        debug_info["transform_config_hash"] = canonical_json_hash(
+            transform_config_payload(debug_info)
+        )
 
         if debug:
             for key, value in debug_info.items():

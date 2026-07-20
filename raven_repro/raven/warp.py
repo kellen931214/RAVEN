@@ -74,6 +74,7 @@ def nfpa_warp_single_latent(
 ):
     """Warp a latent following NFPA utils.py coordinate and sampling convention."""
     try:
+        import torch
         import torch.nn.functional as F
     except ImportError as exc:
         raise ImportError("nfpa_warp_single_latent requires torch") from exc
@@ -120,6 +121,55 @@ def nfpa_warp_single_latent(
         padding_mode="reflection",
         align_corners=False,
     )
+    x_index = torch.arange(
+        latent_w, device=latent.device, dtype=latent.dtype
+    ).view(1, 1, 1, latent_w).expand(batch, 1, latent_h, latent_w)
+    y_index = torch.arange(
+        latent_h, device=latent.device, dtype=latent.dtype
+    ).view(1, 1, latent_h, 1).expand(batch, 1, latent_h, latent_w)
+    source_index_map = torch.cat([x_index, y_index], dim=1)
+    sampled_source_indices = F.grid_sample(
+        source_index_map,
+        grid,
+        mode=sampling_mode,
+        padding_mode="reflection",
+        align_corners=False,
+    )
+    continuous_source_x = ((grid[..., 0] + 1.0) * latent_w - 1.0) / 2.0
+    continuous_source_y = ((grid[..., 1] + 1.0) * latent_h - 1.0) / 2.0
+    center_y, center_x = latent_h // 2, latent_w // 2
+    center_is_interior = bool(
+        (
+            (continuous_source_x[:, center_y, center_x] >= 0)
+            & (continuous_source_x[:, center_y, center_x] <= latent_w - 1)
+            & (continuous_source_y[:, center_y, center_x] >= 0)
+            & (continuous_source_y[:, center_y, center_x] <= latent_h - 1)
+        )
+        .all()
+        .item()
+    )
+    if center_is_interior:
+        effective_dx = sampled_source_indices[:, 0, center_y, center_x] - center_x
+        effective_dy = sampled_source_indices[:, 1, center_y, center_x] - center_y
+        displacement_source = "actual_grid_sample_source_index_map_center"
+    else:
+        valid = (
+            (continuous_source_x >= 0)
+            & (continuous_source_x <= latent_w - 1)
+            & (continuous_source_y >= 0)
+            & (continuous_source_y <= latent_h - 1)
+        )
+        if not bool(valid.any().item()):
+            raise ValueError("NFPA grid has no unreflected interior displacement samples")
+        dx_map = sampled_source_indices[:, 0] - x_index[:, 0]
+        dy_map = sampled_source_indices[:, 1] - y_index[:, 0]
+        effective_dx = torch.stack([torch.mode(dx_map[index][valid[index]])[0] for index in range(batch)])
+        effective_dy = torch.stack([torch.mode(dy_map[index][valid[index]])[0] for index in range(batch)])
+        displacement_source = "actual_grid_sample_source_index_map_interior_mode"
+    if not torch.all(effective_dx == effective_dx[0]) or not torch.all(
+        effective_dy == effective_dy[0]
+    ):
+        raise RuntimeError("effective displacement differs across batch elements")
     metadata: dict[str, Any] = {
         "coordinate_space": "image_pixels",
         "image_coordinate_grid_shape": [batch, 2, flow_h, flow_w],
@@ -147,6 +197,12 @@ def nfpa_warp_single_latent(
         "nfpa_source_omitted_grid_sample_align_corners": True,
         "effective_grid_sample_align_corners": False,
         "grid_sample_inverse_sampling": True,
+        "effective_displacement_source": displacement_source,
+        "effective_displacement_center_is_unreflected": center_is_interior,
+        "effective_displacement_center_x": center_x,
+        "effective_displacement_center_y": center_y,
+        "effective_source_dx_latent": float(effective_dx[0].detach().float().cpu().item()),
+        "effective_source_dy_latent": float(effective_dy[0].detach().float().cpu().item()),
     }
     if return_metadata:
         return warped, metadata
@@ -207,7 +263,21 @@ def raven_paper_nfpa_gap_fill_warp(
             "NFP_XY_40",
             "NFPA checkpoint or inference hyperparameters",
         ],
+        "planned_flow_dx_image_px": float(dx_image_px),
+        "planned_flow_dy_image_px": float(dy_image_px),
+        "effective_source_flow_dx_image_px": (
+            metadata["effective_source_dx_latent"] * vae_scale_factor
+        ),
+        "effective_source_flow_dy_image_px": (
+            metadata["effective_source_dy_latent"] * vae_scale_factor
+        ),
     })
+    metadata["effective_visual_shift_dx_image_px"] = -metadata[
+        "effective_source_flow_dx_image_px"
+    ]
+    metadata["effective_visual_shift_dy_image_px"] = -metadata[
+        "effective_source_flow_dy_image_px"
+    ]
     if return_metadata:
         return warped, metadata
     return warped

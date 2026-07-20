@@ -21,7 +21,7 @@ PROVENANCE_FIELDS = [
     "scheduler", "inverse_scheduler", "steps", "resolution", "detector_dtype",
     "score_direction", "provider_parameters", "generation_seed", "attack_seed",
     "watermark_seed", "fix_gt", "offset", "key_hex", "nonce_hex",
-    "legacy_threshold", "target_fpr",
+    "legacy_threshold", "target_fpr", "provider_config_hash", "target_watermark_hash",
 ]
 PATH_FIELDS = [item for stage in STAGES for item in (f"{stage}_path", f"{stage}_sha256")]
 SCORE_FIELDS = [
@@ -212,12 +212,23 @@ def main() -> int:
 
     import torch
     from raven.resource_guard import CpuMemoryGuard, limit_cpu_threads
+    from raven.eval_protocol import require_uniform_provider_config
     from utils.pipe import pipe_utils
     from utils.utils import describe_legacy_detection_threshold
 
     limit_cpu_threads(1)
     guard = CpuMemoryGuard(args.min_cpu_mem_gb, args.max_process_ram_gb, args.warn_cpu_mem_gb)
     guard.check("detector extraction startup")
+    with args.metadata.open(newline="", encoding="utf-8-sig") as source:
+        manifest_rows = list(csv.DictReader(source))
+    if not manifest_rows:
+        raise ValueError(f"No rows in {args.metadata}")
+    method = args.method.upper()
+    uniform_kwargs, uniform_hash = require_uniform_provider_config(method, manifest_rows)
+    recorded_hashes = {row.get("provider_config_hash", "") for row in manifest_rows}
+    if recorded_hashes not in ({""}, {uniform_hash}):
+        raise ValueError(f"Manifest provider hashes do not match canonical config: {sorted(recorded_hashes)}")
+
     device_name = args.device if args.device != "auto" else ("cuda" if torch.cuda.is_available() else "cpu")
     device = torch.device(device_name)
     load_options = {"revision": args.model_revision} if args.model_revision else {}
@@ -231,7 +242,12 @@ def main() -> int:
     inverse_scheduler = type(pipe.scheduler_inverse).__name__
     legacy = describe_legacy_detection_threshold(args.method, args.model_id)
 
-    method, processed, errors = args.method.upper(), 0, 0
+    provider = provider_class(method)(
+        latent_shape=latent_shape, dtype=pipe.get_dtype(), device=device, **uniform_kwargs
+    )
+    target = getattr(provider, "gt_patch", None)
+    target_hash = hashlib.sha256(target.detach().cpu().numpy().tobytes()).hexdigest() if target is not None else ""
+    processed, errors = 0, 0
     completed: set[str] = set()
     output_mode, write_header = "x", True
     if args.output.exists():
@@ -249,13 +265,13 @@ def main() -> int:
         output_mode, write_header = "a", False
         print(f"resuming {args.output} after {len(completed)} completed rows", flush=True)
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    with args.metadata.open(newline="", encoding="utf-8-sig") as source, args.output.open(output_mode, newline="", encoding="utf-8") as output:
-        reader, writer = csv.DictReader(source), csv.DictWriter(output, fieldnames=FIELDNAMES)
+    with args.output.open(output_mode, newline="", encoding="utf-8") as output:
+        writer = csv.DictWriter(output, fieldnames=FIELDNAMES)
         if write_header:
             writer.writeheader()
             output.flush()
             os.fsync(output.fileno())
-        for index, row in enumerate(reader):
+        for index, row in enumerate(manifest_rows):
             if args.limit is not None and processed >= args.limit:
                 break
             identifier = first(row, "run_id", "sample_id", "id", "index") or str(index)
@@ -280,19 +296,24 @@ def main() -> int:
                     ("lower raw L1 means watermark; canonical=-L1" if method != "GS" else "higher bit accuracy means watermark"),
                 "generation_seed": row.get("generation_seed", ""), "attack_seed": row.get("attack_seed", ""),
                 "legacy_threshold": row.get("legacy_threshold") or legacy["threshold"], "target_fpr": args.target_fpr,
+                "provider_config_hash": uniform_hash,
+                "target_watermark_hash": target_hash,
             })
             try:
-                kwargs = provider_kwargs(method, row)
+                kwargs = uniform_kwargs
                 record["provider_parameters"] = json.dumps(kwargs, sort_keys=True)
                 record["watermark_seed"] = next((kwargs[key] for key in ("w_seed", "rid_seed", "hstr_seed", "hsqr_seed") if key in kwargs), "")
                 record["fix_gt"], record["offset"] = kwargs.get("fix_gt", ""), kwargs.get("offset", "")
-                provider = provider_class(method)(latent_shape=latent_shape, dtype=pipe.get_dtype(), device=device, **kwargs)
                 record["key_hex"], record["nonce_hex"] = secret_metadata(provider)
                 stage_results = {}
                 for stage in STAGES:
                     path = Path(row[f"{stage}_path"]).resolve()
                     record[f"{stage}_path"] = str(path)
-                    record[f"{stage}_sha256"] = row.get(f"{stage}_sha256") or sha256(path)
+                    actual_sha = sha256(path)
+                    expected_sha = row.get(f"{stage}_sha256")
+                    if expected_sha and expected_sha != actual_sha:
+                        raise RuntimeError(f"run_id={identifier}: {stage} SHA mismatch")
+                    record[f"{stage}_sha256"] = actual_sha
                     guard.check(f"{method}/{identifier}/{stage}")
                     result = evaluate_image(torch, provider, pipe, path, args.steps)
                     stage_results[stage] = result
@@ -306,7 +327,7 @@ def main() -> int:
                     record["ground_truth_bits"] = bits_from_bytes(provider.messages[offset], expected)
                     for stage in STAGES:
                         record[f"{stage}_predicted_bits"] = stage_results[stage]["message_bits_str_list"][0]
-                del stage_results, provider
+                del stage_results
             except Exception as exc:
                 errors += 1
                 record["error"] = f"{type(exc).__name__}: {exc}"

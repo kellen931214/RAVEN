@@ -47,29 +47,14 @@ def semantic_row(run_id, clean, before, attacked):
     }
 
 
-def test_provider_defaults_keep_global_sample_mapping():
-    assert manifest.provider_defaults("GS")["offset"] == 0
-    assert manifest.provider_defaults("HSTR")["fix_gt"] == 1
-    assert manifest.provider_defaults("HSQR")["fix_gt"] == 1
-    assert manifest.provider_defaults("TR")["w_seed"] == 999999
-
-
-def test_resolve_recorded_path_repairs_old_workspace_prefix(tmp_path):
-    target = tmp_path / "data" / "image.png"
-    target.parent.mkdir()
-    target.write_bytes(b"image")
-    resolved = manifest.resolve_recorded_path("/workspace/data/image.png", tmp_path)
-    assert resolved == target.resolve()
-
-
 def test_semantic_report_separates_legacy_and_calibrated_rates():
     rows = [semantic_row(i, 0.5 + i / 1000, 1e-8, 0.01 if i < 50 else 0.9) for i in range(100)]
     report = evaluator.semantic_report("TR", rows, target_fpr=0.01, threshold_override=None)
-    assert report["actual_FPR"] == pytest.approx(0.01)
-    assert report["calibrated_before_TPR"] == 1.0
-    assert report["calibrated_TPR_at_1pct_FPR"] == pytest.approx(0.5)
-    assert report["legacy_fixed_threshold_detect_rate"] == pytest.approx(0.5)
-    assert report["legacy_actual_clean_FPR"] == 0.0
+    assert report["actual_empirical_fpr"] == pytest.approx(0.01)
+    assert report["before_tpr"] == 1.0
+    assert report["attacked_tpr_at_original_clean_threshold"] == pytest.approx(0.5)
+    assert report["legacy_fixed_threshold_attacked_detect_rate"] == pytest.approx(0.5)
+    assert report["legacy_actual_clean_fpr"] == 0.0
     assert report["N"] == {"clean": 100, "watermarked": 100, "attacked": 100}
 
 

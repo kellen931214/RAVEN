@@ -384,6 +384,15 @@ def test_raven_gap_fill_nearest_and_bilinear_only_change_sampling_mode():
     )
     assert nearest.shape == bilinear.shape == latent.shape
     assert not torch.equal(nearest, bilinear)
-    comparable = set(nearest_meta) - {"latent_sampling_mode"}
+    sampling_derived = {
+        "latent_sampling_mode",
+        "effective_source_dx_latent",
+        "effective_source_dy_latent",
+        "effective_source_flow_dx_image_px",
+        "effective_source_flow_dy_image_px",
+        "effective_visual_shift_dx_image_px",
+        "effective_visual_shift_dy_image_px",
+    }
+    comparable = set(nearest_meta) - sampling_derived
     for key in comparable:
         assert nearest_meta[key] == bilinear_meta[key]
