@@ -92,6 +92,57 @@ def load_snapshot_rows(root: Path) -> dict[str, dict[str, str]]:
     return rows
 
 
+def create_evaluation_snapshot(
+    formal_root: Path,
+    output_root: Path,
+    run_ids: set[str],
+) -> tuple[Path, str, str]:
+    """Create an immutable exact-ID snapshot for this evaluation cohort."""
+    source_index = formal_root / "snapshots" / "snapshot_index.jsonl"
+    source_entries = [
+        json.loads(line)
+        for line in source_index.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    metadata_paths = {entry["source_metadata_path"] for entry in source_entries}
+    metadata_hashes = {entry["source_metadata_sha256"] for entry in source_entries}
+    if len(metadata_paths) != 1 or len(metadata_hashes) != 1:
+        raise RuntimeError("source snapshot index has mixed metadata provenance")
+    source_rows = load_snapshot_rows(formal_root)
+    if not run_ids or not run_ids.issubset(source_rows):
+        raise RuntimeError("evaluation snapshot run IDs are absent from source")
+    selected = [source_rows[run_id] for run_id in sorted(run_ids, key=int)]
+    snapshot_root = output_root / "snapshots"
+    snapshot_root.mkdir(parents=True)
+    snapshot_path = snapshot_root / "cohort.csv"
+    with snapshot_path.open("x", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(selected[0]))
+        writer.writeheader()
+        writer.writerows(selected)
+        handle.flush()
+        os.fsync(handle.fileno())
+    snapshot_sha = sha256_path(snapshot_path)
+    index_path = snapshot_root / "snapshot_index.jsonl"
+    entry = {
+        "batch_id": "aligned_evaluation_cohort",
+        "created_utc": utc_now(),
+        "row_count": len(selected),
+        "run_id_min": str(selected[0]["run_id"]),
+        "run_id_max": str(selected[-1]["run_id"]),
+        "snapshot_path": str(snapshot_path.resolve()),
+        "snapshot_sha256": snapshot_sha,
+        "source_metadata_path": next(iter(metadata_paths)),
+        "source_metadata_sha256": next(iter(metadata_hashes)),
+        "source_snapshot_index_path": str(source_index.resolve()),
+        "source_snapshot_index_sha256": sha256_path(source_index),
+        "run_ids_hash": canonical_json_hash(
+            {"run_ids": [str(row["run_id"]) for row in selected]}
+        ),
+    }
+    write_jsonl(index_path, [entry])
+    return index_path, snapshot_sha, sha256_path(index_path)
+
+
 def load_records(root: Path, config_hash: str, role: str) -> dict[str, dict[str, Any]]:
     result: dict[str, dict[str, Any]] = {}
     for path in sorted((root / "attack_cache" / config_hash).glob(f"*/{role}/record.json")):
@@ -310,11 +361,22 @@ def main() -> int:
         formal_root, output_root, args.expected_count, source_manifest_sha,
         str(source_manifest["git_head"]),
     )
+    selected_run_ids = {str(record["run_id"]) for record in variant_wm}
+    snapshot_index, cohort_snapshot_sha, cohort_index_sha = (
+        create_evaluation_snapshot(formal_root, output_root, selected_run_ids)
+    )
+    for record in variant_wm + variant_clean:
+        record["source_snapshot_sha256"] = record["snapshot_sha256"]
+        record["snapshot_sha256"] = cohort_snapshot_sha
+        record["evaluation_snapshot_index_sha256"] = cohort_index_sha
     provenance = {
         "status": "aligned_color_evaluation_in_progress",
         "variant": "shift_aligned_color_transfer",
         "formal_source_root": str(formal_root),
         "formal_run_config_sha256": sha256_path(formal_root / "run_config.json"),
+        "evaluation_snapshot_index_path": str(snapshot_index.resolve()),
+        "evaluation_snapshot_index_sha256": cohort_index_sha,
+        "evaluation_snapshot_sha256": cohort_snapshot_sha,
         "entrypoint": str(Path(__file__).resolve()),
         "entrypoint_sha256": sha256_path(Path(__file__)),
         "variant_config_hash": variant_hash,
@@ -339,7 +401,6 @@ def main() -> int:
     write_jsonl(wm_records, variant_wm)
     write_jsonl(clean_records, variant_clean)
     manifest = output_root / "verification" / "manifest.csv"
-    snapshot_index = formal_root / "snapshots" / "snapshot_index.jsonl"
     run([
         sys.executable, str(REPO / "raven_repro/scripts/build_verification_manifest.py"),
         "--dataset", "diffusiondb", "--method", "TR", "--metadata", str(snapshot_index),

@@ -334,8 +334,9 @@ flow, prove planned flow is ignored by the alignment selector, and reject
 attacked-clean/watermarked effective-flow drift.
 
 ### Validation
-Targeted aligned/effective-flow tests: 75 passed. Full repository suite: 142
-passed. The 2/10/1001 aligned evaluation results remain pending execution.
+Targeted aligned/effective-flow tests: 75 passed. Full repository suite: 143
+passed after the gate-exposed snapshot fix. The replacement 2-sample and
+1001-sample aligned evaluation results remain pending execution.
 
 ### Watermark integrity
 - Source data: unchanged immutable 1001-sample paired cohort.
@@ -347,6 +348,15 @@ passed. The 2/10/1001 aligned evaluation results remain pending execution.
 - Quality: watermarked input versus aligned attacked-watermarked valid overlap.
 - CLIP: aligned attacked-watermarked image versus original prompt.
 - FID: fresh watermarked-versus-aligned-attacked staging.
+
+### Gate-exposed snapshot fix
+The first 2-sample gate at
+`outputs/raven_aligned_color_eval/diffusiondb/TR/2_20260720T081355Z` failed
+before detector scoring because the strict manifest builder received the full
+1001-row source snapshot index with a 2-row attack record set. The failed root
+and log are preserved. The runner now creates an immutable exact-ID cohort
+snapshot and index, preserves the source snapshot SHA separately, and retains
+strict equality between snapshot and attack run-ID sets.
 
 ### Git provenance
 - Repository: `kellen931214/RAVEN`

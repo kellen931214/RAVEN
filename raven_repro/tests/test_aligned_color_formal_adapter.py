@@ -1,3 +1,5 @@
+import csv
+import json
 import os
 import sys
 from pathlib import Path
@@ -10,6 +12,7 @@ from raven.eval_protocol import canonical_json_hash, sha256_path
 from experiments.run_raven_aligned_color_eval import (
     build_aligned_records,
     configure_single_gpu,
+    create_evaluation_snapshot,
     paired_effective_source_flow,
     select_expected_run_ids,
 )
@@ -84,3 +87,48 @@ def test_gate_cohort_selection_rejects_coverage_drift_and_invalid_count():
         select_expected_run_ids(source, {"0": {}}, dict(source), 1)
     with pytest.raises(RuntimeError, match="between 1 and 2"):
         select_expected_run_ids(source, dict(source), dict(source), 3)
+
+
+def test_evaluation_snapshot_contains_exact_selected_run_ids(tmp_path):
+    formal_root = tmp_path / "formal"
+    snapshots = formal_root / "snapshots"
+    snapshots.mkdir(parents=True)
+    source_snapshot = snapshots / "source.csv"
+    rows = [
+        {"run_id": str(index), "dataset": "diffusiondb", "method": "TR"}
+        for index in range(4)
+    ]
+    with source_snapshot.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+    source_sha = sha256_path(source_snapshot)
+    source_index = snapshots / "snapshot_index.jsonl"
+    source_index.write_text(
+        json.dumps(
+            {
+                "batch_id": 0,
+                "row_count": 4,
+                "snapshot_path": str(source_snapshot),
+                "snapshot_sha256": source_sha,
+                "source_metadata_path": "/immutable/metadata.csv",
+                "source_metadata_sha256": "a" * 64,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    index_path, snapshot_sha, index_sha = create_evaluation_snapshot(
+        formal_root, tmp_path / "output", {"0", "2"}
+    )
+
+    with (index_path.parent / "cohort.csv").open(
+        newline="", encoding="utf-8"
+    ) as handle:
+        selected = list(csv.DictReader(handle))
+    entry = json.loads(index_path.read_text(encoding="utf-8"))
+    assert [row["run_id"] for row in selected] == ["0", "2"]
+    assert entry["row_count"] == 2
+    assert entry["snapshot_sha256"] == snapshot_sha
+    assert sha256_path(index_path) == index_sha
