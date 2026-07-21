@@ -23,6 +23,7 @@ CORE_FILES = (
     "raven_repro/raven/eval_protocol.py",
     "raven_repro/raven/inversion.py",
     "raven_repro/raven/metrics.py",
+    "raven_repro/raven/pairing_provenance.py",
     "raven_repro/raven/pipeline_raven.py",
     "raven_repro/raven/quality.py",
     "raven_repro/raven/resource_guard.py",

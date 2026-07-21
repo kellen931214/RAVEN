@@ -4,7 +4,7 @@ Before reviewing, modifying, debugging, testing, rerunning, or evaluating this r
 
 `skills/experiment-integrity/SKILL.md`
 
-You must also read the entries in `debug.md` that are relevant to the current task.
+You must also read the entries in `DEBUG_CHANGELOG.md` that are relevant to the current task.
 
 If the task involves any of the following:
 

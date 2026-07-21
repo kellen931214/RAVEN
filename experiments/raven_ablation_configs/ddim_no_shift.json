@@ -24,7 +24,7 @@
     32
   ],
   "shift_plan_mode": "zero",
-  "shift_sign_policy": "deterministic_four_quadrant_schedule",
+  "shift_sign_policy": "independent_uniform_random_per_axis",
   "shift_space": "image_pixels",
   "steps": 50,
   "strength": 0.15,

@@ -8,6 +8,7 @@ import json
 import math
 import os
 import shutil
+import subprocess
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -31,8 +32,8 @@ FORMAL_ATTACK_CONFIG: dict[str, Any] = {
     "inversion_mode": "ddim",
     "prompt": "",
     "negative_prompt": "",
-    "shift_magnitudes_image_px": [24, 27, 28, 29, 32],
-    "shift_sign_policy": "deterministic_four_quadrant_schedule",
+    "shift_magnitudes_image_px": list(range(24, 33)),
+    "shift_sign_policy": "independent_uniform_random_per_axis",
     "seed_policy": "base_seed_plus_numeric_run_id",
     "base_seed": 42,
 }
@@ -104,6 +105,13 @@ FORMAL_DEBUG_FIELDS = (
     "inversion_prompt",
     "reconstruction_prompt",
     "transform_config_hash",
+    "attack_device_class",
+    "attack_dtype",
+    "scheduler_class",
+    "scheduler_config",
+    "scheduler_config_hash",
+    "torch_version",
+    "diffusers_version",
 )
 
 
@@ -182,6 +190,53 @@ def load_and_validate_source_manifest(
     return payload, actual_manifest_sha
 
 
+def require_clean_git_worktree(repo_root: str | Path) -> str:
+    """Return current commit only when tracked and untracked source state is clean."""
+    root = Path(repo_root).resolve()
+    status = subprocess.run(
+        ["git", "status", "--porcelain", "--untracked-files=all"],
+        cwd=root, check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    if status:
+        raise RuntimeError(
+            "formal evaluation requires a clean working tree; commit or remove drift first:\n"
+            + status
+        )
+    return subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=root, check=True, capture_output=True, text=True,
+    ).stdout.strip()
+
+
+def formal_runtime_provenance(
+    *, scheduler_mode: str, device_class: str, attack_dtype: str
+) -> dict[str, Any]:
+    """Build the immutable runtime selector stored before model construction."""
+    if device_class != "cuda":
+        raise RuntimeError("formal RAVEN attack forbids CPU fallback; device class must be cuda")
+    if attack_dtype != "torch.float16":
+        raise RuntimeError("formal RAVEN attack dtype must be torch.float16")
+    scheduler_classes = {"ddim": "DDIMScheduler", "ddpm": "DDPMScheduler"}
+    if scheduler_mode not in scheduler_classes:
+        raise ValueError(f"unsupported scheduler mode: {scheduler_mode}")
+    scheduler_config = {
+        "scheduler_mode": scheduler_mode,
+        "scheduler_class": scheduler_classes[scheduler_mode],
+        "model_id": FORMAL_ATTACK_CONFIG["model_id"],
+        "model_revision": FORMAL_ATTACK_CONFIG["model_revision"],
+        "source": "pinned model scheduler config; exact resolved config is recorded per attack",
+    }
+    return {
+        "attack_device_class": device_class,
+        "attack_dtype": attack_dtype,
+        "scheduler_class": scheduler_classes[scheduler_mode],
+        "scheduler_config": scheduler_config,
+        "scheduler_config_hash": canonical_json_hash(scheduler_config),
+        "torch_version": importlib.metadata.version("torch"),
+        "diffusers_version": importlib.metadata.version("diffusers"),
+    }
+
+
 def normalize_formal_attack_config(payload: Mapping[str, Any]) -> dict[str, Any]:
     """Validate a formal attack variant without weakening the baseline protocol."""
     config = dict(payload)
@@ -193,7 +248,7 @@ def normalize_formal_attack_config(payload: Mapping[str, Any]) -> dict[str, Any]
             f"invalid formal attack config missing={missing} extra={extra}"
         )
     config.setdefault("scheduler_mode", "ddim")
-    config.setdefault("shift_plan_mode", "formal_deterministic")
+    config.setdefault("shift_plan_mode", "paper_random_independent_axes")
     config.setdefault("variant_name", "formal_baseline")
     variant_fields = {
         "latent_sampling_mode", "inversion_mode", "scheduler_mode",
@@ -217,8 +272,13 @@ def normalize_formal_attack_config(payload: Mapping[str, Any]) -> dict[str, Any]
         raise ValueError("inversion_mode and scheduler_mode must match")
     if config["latent_sampling_mode"] not in {"nearest", "bilinear"}:
         raise ValueError("latent_sampling_mode must be nearest or bilinear")
-    if config["shift_plan_mode"] not in {"formal_deterministic", "zero"}:
-        raise ValueError("shift_plan_mode must be formal_deterministic or zero")
+    if config["shift_plan_mode"] not in {
+        "paper_random_independent_axes", "balanced_deterministic_schedule", "zero"
+    }:
+        raise ValueError(
+            "shift_plan_mode must be paper_random_independent_axes, "
+            "balanced_deterministic_schedule, or zero"
+        )
     if config["warp_mode"] != "raven_paper_nfpa_gap_fill":
         raise ValueError("formal variants require raven_paper_nfpa_gap_fill")
     if config["padding_mode"] != "reflection":
@@ -237,7 +297,7 @@ def load_formal_attack_config(path: str | Path) -> dict[str, Any]:
 
 def formal_attack_config_hash(config: Mapping[str, Any] | None = None) -> str:
     return canonical_json_hash(
-        FORMAL_ATTACK_CONFIG if config is None else normalize_formal_attack_config(config)
+        normalize_formal_attack_config(FORMAL_ATTACK_CONFIG if config is None else config)
     )
 
 
@@ -269,6 +329,13 @@ def transform_config_payload(debug_info: Mapping[str, Any]) -> dict[str, Any]:
         "view_guided_attention": bool(debug_info["view_guided_attention"]),
         "color_transfer": bool(debug_info["color_transfer"]),
         "color_transfer_mode": debug_info["color_transfer_mode"],
+        "attack_device_class": debug_info["attack_device_class"],
+        "attack_dtype": debug_info["attack_dtype"],
+        "scheduler_class": debug_info["scheduler_class"],
+        "scheduler_config": debug_info["scheduler_config"],
+        "scheduler_config_hash": debug_info["scheduler_config_hash"],
+        "torch_version": debug_info["torch_version"],
+        "diffusers_version": debug_info["diffusers_version"],
     }
 
 
@@ -279,10 +346,8 @@ def assert_formal_debug_info(
     planned_flow_dy_image_px: float | None = None,
     attack_config: Mapping[str, Any] | None = None,
 ) -> str:
-    config = (
-        FORMAL_ATTACK_CONFIG
-        if attack_config is None
-        else normalize_formal_attack_config(attack_config)
+    config = normalize_formal_attack_config(
+        FORMAL_ATTACK_CONFIG if attack_config is None else attack_config
     )
     missing = [field for field in FORMAL_DEBUG_FIELDS if field not in debug_info]
     if missing:
@@ -313,6 +378,21 @@ def assert_formal_debug_info(
             raise RuntimeError(
                 f"formal debug mismatch: {field}={actual!r}, expected {expected_value!r}"
             )
+    runtime_expected = {
+        "attack_device_class": "cuda",
+        "attack_dtype": "torch.float16",
+        "scheduler_class": "DDIMScheduler" if config["scheduler_mode"] == "ddim" else "DDPMScheduler",
+    }
+    for field, expected_value in runtime_expected.items():
+        if debug_info.get(field) != expected_value:
+            raise RuntimeError(
+                f"formal debug runtime mismatch: {field}={debug_info.get(field)!r}, "
+                f"expected {expected_value!r}"
+            )
+    if canonical_json_hash(debug_info["scheduler_config"]) != debug_info["scheduler_config_hash"]:
+        raise RuntimeError("formal debug scheduler_config_hash mismatch")
+    if not debug_info.get("torch_version") or not debug_info.get("diffusers_version"):
+        raise RuntimeError("formal debug package version provenance is missing")
     if not isinstance(debug_info["exact_timestep"], int):
         raise RuntimeError("formal debug exact_timestep must be an integer")
     if not debug_info["normalized_coordinate_formula"]:
@@ -452,6 +532,7 @@ def validate_resume_record(
     run_id = str(expected["run_id"])
     for path_field, hash_field in (
         ("attacked_path", "attacked_sha256"),
+        ("pre_color_attacked_path", "pre_color_attacked_sha256"),
         ("debug_info_path", "debug_info_sha256"),
     ):
         path = Path(str(record.get(path_field, "")))
@@ -473,6 +554,42 @@ def validate_resume_record(
     )
     if record.get("transform_config_hash") != transform_hash:
         raise RuntimeError(f"resume debug transform hash mismatch run_id={run_id}")
+    for record_field, debug_field in (
+        ("resolved_scheduler_config", "scheduler_config"),
+        ("resolved_scheduler_config_hash", "scheduler_config_hash"),
+        ("torch_version", "torch_version"),
+        ("diffusers_version", "diffusers_version"),
+        ("attack_device_class", "attack_device_class"),
+        ("attack_dtype", "attack_dtype"),
+    ):
+        if record.get(record_field) != debug_info.get(debug_field):
+            raise RuntimeError(
+                f"resume runtime/debug mismatch run_id={run_id}: {record_field}/{debug_field}"
+            )
+
+
+NO_COLOR_FID_ATTACKED_DEFINITION = (
+    "formal RAVEN pre-color view_guided_output attacked-watermarked images"
+)
+
+
+def bind_pre_color_attack_record(record: Mapping[str, Any]) -> dict[str, Any]:
+    """Return a no-color metric record only after validating explicit pre-color provenance."""
+    path = Path(str(record.get("pre_color_attacked_path", "")))
+    expected_sha = str(record.get("pre_color_attacked_sha256", ""))
+    if not path.is_file() or not expected_sha:
+        raise RuntimeError("no-color record is missing explicit pre-color path/SHA provenance")
+    actual_sha = sha256_path(path)
+    if actual_sha != expected_sha:
+        raise RuntimeError(
+            f"pre-color attacked SHA mismatch: stored={expected_sha} actual={actual_sha}"
+        )
+    return {
+        **dict(record),
+        "attacked_path": str(path.resolve()),
+        "attacked_sha256": expected_sha,
+        "fid_attacked_definition": NO_COLOR_FID_ATTACKED_DEFINITION,
+    }
 
 
 def stage_fid_records(
@@ -481,6 +598,8 @@ def stage_fid_records(
     formal_output: str | Path,
     quality_config_hash: str,
     expected_count: int,
+    reference_definition: str = "original watermarked images from immutable formal snapshots",
+    attacked_definition: str = "formal RAVEN final post-color-transfer attacked images",
 ) -> tuple[Path, dict[str, Any]]:
     fid_root = Path(formal_output) / "metrics" / "fid" / quality_config_hash
     if fid_root.exists():
@@ -542,8 +661,8 @@ def stage_fid_records(
     manifest_payload = {
         "metric_name": "per_method_fid_watermarked_vs_raven",
         "image_count": expected_count,
-        "reference_definition": "original watermarked images from immutable formal snapshots",
-        "attacked_definition": "formal RAVEN final post-color-transfer attacked images",
+        "reference_definition": reference_definition,
+        "attacked_definition": attacked_definition,
         "quality_config_hash": quality_config_hash,
         "records": manifest_rows,
     }
@@ -561,3 +680,23 @@ def stage_fid_records(
         os.fsync(handle.fileno())
     manifest_payload["manifest_file_sha256"] = manifest_file_sha
     return fid_root, manifest_payload
+
+
+def stage_no_color_fid_records(
+    records: Sequence[Mapping[str, Any]],
+    *,
+    formal_output: str | Path,
+    quality_config_hash: str,
+    expected_count: int,
+    reference_definition: str = "original watermarked images from immutable formal snapshots",
+) -> tuple[Path, dict[str, Any]]:
+    """Reuse strict FID staging with explicitly verified pre-color attack records."""
+    bound_records = [bind_pre_color_attack_record(record) for record in records]
+    return stage_fid_records(
+        bound_records,
+        formal_output=formal_output,
+        quality_config_hash=quality_config_hash,
+        expected_count=expected_count,
+        reference_definition=reference_definition,
+        attacked_definition=NO_COLOR_FID_ATTACKED_DEFINITION,
+    )

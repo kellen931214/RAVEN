@@ -50,3 +50,18 @@ Historical gate results are not substituted for new-runner gates. Status is ther
 `NOT SAFE TO RUN FULL EVAL`.
 
 - Color alignment flow source: effective source flow from actual warp grid; planned flow fallback is forbidden.
+
+
+## Shift-plan provenance clarification (2026-07-21)
+
+The paper states that translations along each axis are randomly sampled from the
+full integer ranges [24,32] or [-32,-24]. Formal future runs therefore use
+`shift_plan_mode=paper_random_independent_axes`: each axis independently draws a magnitude from every integer 24
+through 32 and a sign, using a deterministic RNG keyed by run ID and the
+recorded attack seed. Planned flow remains the attack input; quality overlap
+continues to use actual-grid effective source flow.
+
+The earlier `formal_deterministic` five-magnitude/four-quadrant schedule is now classified as
+`balanced_deterministic_schedule`. Existing outputs are retained as historical ablations and are not
+relabeled or modified, but that schedule must not be described as paper-exact
+random sampling.

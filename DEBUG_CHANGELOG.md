@@ -6,12 +6,88 @@ This file records implementation bugs, validated non-bugs, ablations, and the ev
 
 | Date | Area | Status | Evidence |
 | --- | --- | --- | --- |
+| 2026-07-21 | Formal provenance and validation hardening | Source HEAD self-reference removed; runtime manifest copy, clean-tree/current-commit binding, pairing re-audit, detector tensor target/mask checks, explicit pre-color hashes, runtime scheduler/device/dtype/package provenance, threshold-specific table fields, and accurate no-color FID definitions added. CPU regression suite evidence is recorded below. | audit/formal_eval_protocol.md; formal runner and protocol regression tests |
 | 2026-07-18 | Formal evaluation protocol audit | Implemented immutable snapshots, explicit formal attack/debug assertions, effective-grid quality flow, strict resume/FID/provider/CLIP provenance, full/rounded TR reporting, formal waiter/table, and quarantined pre-audit derived outputs. Complete CPU suite: 148 passed; new 2/10/30 GPU gates remain blocked by unavailable NVML, so full eval is not safe. | `audit/formal_eval_protocol.md`; `audit/current_eval_processes.md`; `outputs/legacy_invalid/20260718T072817Z/DO_NOT_USE.md` |
 | 2026-07-17 | Tree-Ring paired generation and formal provenance | Shared-latent source and every derived `TPR=0.177822` result rejected. Per-sample paired latent generation, two-GPU pair sharding, orphan quarantine, fail-closed provenance gates, paired attack config hashes, and two aligned-color-only variants implemented; formal rerun in progress. | `raven_repro/raven/pairing_provenance.py`; `raven_repro/scripts/paired_generation_shards.py`; `raven_repro/scripts/run_diffusiondb_chain_after_clean.py`; `outputs/raven_paired_formal_smoke/diffusiondb/20260717T033000Z/data/watermarked/diffusiondb/TR/shard_merge_audit.json` |
 | 2026-07-15 | DiffusionDB latest RAVEN-paper/NFPA-gap-fill Tree-Ring L1 rerun preparation | Fixed attacked-clean config drift, verified 2-sample smoke and 10-sample validation; full 1001 run prepared for nohup. | `raven_repro/scripts/raven_nfpa_tr_eval.py`; `raven_repro/scripts/raven_p1_full.py`; `outputs/raven_tr_full_diffusiondb/20260715T060017Z/validation10_eval/aggregate_results.json` |
 | 2026-07-15 | RAVEN-paper / NFPA-gap-fill warp and inverse-overlap quality | Implemented and verified on focused tests plus 10-sample DiffusionDB validation. Existing 1001 DiffusionDB P1 outputs were quality-recomputed without rerunning attack. | `raven_repro/raven/warp.py`; `raven_repro/raven/metrics.py`; `raven_repro/scripts/raven_paper_nfpa_gap_fill_eval.py`; `outputs/raven_paper_nfpa_gap_fill/audit_report_20260715T040535Z.md` |
 | 2026-07-15 | RAVEN exact two-stage color transfer | Implemented and verified. Existing 10 validation pre-color outputs were reused; no DDIM inversion or denoising was rerun. | `raven_repro/raven/color_transfer.py`; `raven_repro/scripts/raven_color_transfer_validation.py`; `outputs/raven_color_transfer_validation/diffusiondb_20260715T042018Z/aggregate_results.md` |
 | 2026-07-14 | NFPA-style Tree-Ring complex L1 evaluation | Completed for DiffusionDB only. MS-COCO was not run after scope was corrected. | `outputs/raven_nfpa_tr_eval/diffusiondb/20260714T161952Z/aggregate_results.json` |
+
+
+
+## 2026-07-21 - Formal provenance and validation hardening
+
+### Confirmed root causes
+
+- The committed source manifest recorded its build commit and the runner required
+  that value to equal current HEAD. Committing the manifest necessarily advanced
+  HEAD, creating a permanent self-reference failure despite unchanged source
+  files.
+- Formal snapshots did not invoke the existing paired-base-latent audit, attack
+  records omitted part of the generation pairing provenance, and final
+  validation did not repeat a full-cohort pairing audit.
+- The formal TR detector hashed raw target bytes, while generation used the
+  canonical tensor hash containing shape, dtype, and bytes. The detector did
+  not verify its target or mask against generation before scoring.
+- Pre-color images were inferred from a debug directory rather than bound by
+  path and SHA in the attack record. Runtime device, dtype, resolved scheduler,
+  torch, and diffusers provenance were also absent from transform hashes.
+- The table collapsed two empirical FPRs and two threshold bases into ambiguous
+  columns. FID staging hard-coded post-color wording even for no-color inputs.
+- The prior five-magnitude/four-quadrant deterministic plan did not sample every
+  integer in the paper's independent per-axis ranges.
+
+### Fix and validation behavior
+
+Formal execution now requires a clean working tree, validates every source
+manifest file SHA and size, copies the exact manifest and companion SHA into the
+output root, and binds the run/resume to that runtime manifest SHA plus current
+commit. The manifest's historical build HEAD is informational only.
+
+TR snapshot and final validation both run the complete pairing audit. Attack and
+verification records retain pairing/base-latent/target/mask/generation/watermark
+hashes; attacked-clean and attacked-watermarked must share pairing SHA. The TR
+provider uses generation's canonical tensor hash function and checks target and
+mask before creating its score directory.
+
+Pre-color path/SHA, CUDA device class, float16 dtype, scheduler selector and
+resolved config/hash, torch version, and diffusers version are hashed and
+resume-validated. No-color binding accepts only the explicit pre-color fields.
+FID callers provide their reference/attacked definitions, and the formal table
+reports both actual FPRs and both attack-success threshold bases.
+
+New future paper-protocol shifts use deterministic per-sample RNG over every
+integer magnitude 24 through 32 with independently selected signs per axis. The
+old five-magnitude balanced schedule remains historical evidence under the
+explicit name balanced_deterministic_schedule; running outputs are not modified.
+
+### Affected existing outputs
+
+The following in-progress roots were launched from commit 9a8a6c7 and were left
+running without source changes:
+
+- outputs/raven_ablation_eval/diffusiondb/TR/nfpa_bilinear_reflection_ddim_aligned/1001_20260721T110735Z
+- outputs/raven_ablation_eval/diffusiondb/TR/nfpa_nearest_reflection_ddpm_aligned/1001_20260721T110735Z
+- outputs/raven_ablation_eval/diffusiondb/TR/nfpa_nearest_reflection_ddim_no_shift_aligned/1001_20260721T110735Z
+
+Their images, immutable snapshots, attack records, manifests, logs, and metrics
+remain preserved historical artifacts. They used the earlier balanced shift
+schedule and lack the new runtime/pre-color/detector tensor provenance, so they
+must not receive a new strict VALIDATED.json. Attack images need not be deleted
+or silently rerun. Formal detector score records/aggregates must be regenerated
+with target/mask checks; FID must be freshly staged with the correct definition;
+CLIP and quality values may remain historical but require fresh
+provenance-bound records and validation before inclusion in a new formal table.
+
+### Regression coverage
+
+Negative tests cover source-manifest companion/source drift, dirty-tree
+preflight, duplicate/shared base latents, clean/watermarked latent mismatch,
+target hash mismatch, mask hash mismatch, replaced pre-color images,
+dtype/scheduler drift, both actual-FPR table columns, and no-color FID wording.
+No GPU evaluation was started for this change.
+
 
 ## 2026-07-21 — Formal NFPA/DDPM/no-shift ablation variants
 

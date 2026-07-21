@@ -51,7 +51,14 @@ def debug_payload(config):
         "view_guided_attention": True,
         "color_transfer": True,
         "color_transfer_mode": config["color_transfer_mode"],
+        "attack_device_class": "cuda",
+        "attack_dtype": "torch.float16",
+        "scheduler_class": "DDIMScheduler",
+        "scheduler_config": {"beta_start": 0.00085},
+        "torch_version": "2.test",
+        "diffusers_version": "0.test",
     }
+    payload["scheduler_config_hash"] = canonical_json_hash(payload["scheduler_config"])
     payload["transform_config_hash"] = canonical_json_hash(
         transform_config_payload(payload)
     )
@@ -64,7 +71,7 @@ def test_variant_config_hash_and_debug_assertion_are_config_specific():
             latent_sampling_mode="bilinear",
             inversion_mode="ddim",
             scheduler_mode="ddim",
-            shift_plan_mode="formal_deterministic",
+            shift_plan_mode="paper_random_independent_axes",
         )
     )
     payload = debug_payload(config)
@@ -103,7 +110,7 @@ def test_immutable_source_index_requires_original_snapshot_and_metadata_sha(tmp_
 
 def test_zero_shift_plan_preserves_seed_and_uses_zero_effective_plan():
     baseline = normalize_formal_attack_config(
-        variant_config(scheduler_mode="ddim", shift_plan_mode="formal_deterministic")
+        variant_config(scheduler_mode="ddim", shift_plan_mode="paper_random_independent_axes")
     )
     zero = normalize_formal_attack_config(
         variant_config(scheduler_mode="ddim", shift_plan_mode="zero")

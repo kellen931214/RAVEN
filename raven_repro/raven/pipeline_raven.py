@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib.metadata
 import inspect
 import json
 import math
@@ -90,6 +91,10 @@ class RavenPipeline:
         )
         scheduler_class = DDIMScheduler if scheduler_mode == "ddim" else DDPMScheduler
         self.pipe.scheduler = scheduler_class.from_config(self.pipe.scheduler.config)
+        self.scheduler_config = json.loads(
+            json.dumps(dict(self.pipe.scheduler.config), sort_keys=True, default=str)
+        )
+        self.scheduler_config_hash = canonical_json_hash(self.scheduler_config)
         self.pipe = self.pipe.to(device)
         self.pipe.vae.requires_grad_(False)
         self.pipe.text_encoder.requires_grad_(False)
@@ -350,6 +355,13 @@ class RavenPipeline:
             },
             "device": self.device,
             "dtype": str(self.dtype),
+            "attack_device_class": self.torch.device(self.device).type,
+            "attack_dtype": str(self.dtype),
+            "scheduler_class": type(self.pipe.scheduler).__name__,
+            "scheduler_config": self.scheduler_config,
+            "scheduler_config_hash": self.scheduler_config_hash,
+            "torch_version": importlib.metadata.version("torch"),
+            "diffusers_version": importlib.metadata.version("diffusers"),
             "inversion_prompt": "",
             "reconstruction_prompt": prompt,
             "negative_prompt": negative_prompt,

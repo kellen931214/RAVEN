@@ -41,3 +41,19 @@ def test_nfpa_strict_threshold_and_rounded_ties_report_actual_fpr():
     assert result["attacked_clean_recalibrated_threshold"] == 1.0
     assert result["attacked_clean_actual_fpr"] == 0.0
     assert result["attacked_clean_fp_count"] == 0
+
+
+
+def test_detector_target_and_mask_hash_mismatch_fail_closed():
+    rows = [{"watermark_target_sha256": "target", "watermark_mask_sha256": "mask"}]
+    nfpa.assert_detector_source_tensor_hashes(
+        rows, detector_target_sha256="target", detector_mask_sha256="mask"
+    )
+    with pytest.raises(RuntimeError, match="target tensor SHA mismatch"):
+        nfpa.assert_detector_source_tensor_hashes(
+            rows, detector_target_sha256="different", detector_mask_sha256="mask"
+        )
+    with pytest.raises(RuntimeError, match="mask tensor SHA mismatch"):
+        nfpa.assert_detector_source_tensor_hashes(
+            rows, detector_target_sha256="target", detector_mask_sha256="different"
+        )

@@ -134,6 +134,9 @@ def main() -> int:
         watermarked = checked_file(attack, "watermarked_path", "watermarked_sha256")
         attacked = checked_file(attack, "attacked_path", "attacked_sha256")
         debug_path = checked_file(attack, "debug_info_path", "debug_info_sha256")
+        pre_color_path = checked_file(
+            attack, "pre_color_attacked_path", "pre_color_attacked_sha256"
+        )
         if args.clean_dir is not None and args.clean_dir.resolve() not in clean.parents:
             raise ValueError(f"run_id={run_id}: clean path is outside --clean-dir")
         debug = json.loads(debug_path.read_text(encoding="utf-8"))
@@ -168,6 +171,8 @@ def main() -> int:
             "attacked_sha256": attack["attacked_sha256"],
             "debug_info_path": str(debug_path),
             "debug_info_sha256": attack["debug_info_sha256"],
+            "pre_color_attacked_path": str(pre_color_path),
+            "pre_color_attacked_sha256": attack["pre_color_attacked_sha256"],
             "model_id": attack["model_id"],
             "model_revision": attack["model_revision"],
             "attack_seed": attack["attack_seed"],
@@ -184,6 +189,13 @@ def main() -> int:
             "provider_config": json.dumps(provider, sort_keys=True, separators=(",", ":")),
             "provider_config_hash": expected_provider_hash,
             "target_watermark_hash": attack.get("target_watermark_hash", ""),
+            "pairing_sha256": attack.get("pairing_sha256", ""),
+            "base_latent_seed": attack.get("base_latent_seed", ""),
+            "base_latent_sha256": attack.get("base_latent_sha256", ""),
+            "watermark_target_sha256": attack.get("watermark_target_sha256", ""),
+            "watermark_mask_sha256": attack.get("watermark_mask_sha256", ""),
+            "generation_config_sha256": attack.get("generation_config_sha256", ""),
+            "watermark_config_sha256": attack.get("watermark_config_sha256", ""),
             **provider,
         })
 

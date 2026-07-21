@@ -100,6 +100,16 @@ def test_pairing_audit_rejects_shared_latent(tmp_path):
         audit_pairing_rows(rows, expected_count=2)
 
 
+
+
+def test_pairing_audit_rejects_clean_watermarked_latent_mismatch(tmp_path):
+    row = _pair(tmp_path, 0)
+    row["watermarked_base_latent_sha256"] = "different-base"
+    row["pairing_sha256"] = build_pairing_sha256(row)
+    with pytest.raises(ValueError, match="watermarked/base latent mismatch"):
+        audit_pairing_rows([row], expected_count=1)
+
+
 def test_pairing_audit_rejects_missing_or_broken_pairing(tmp_path):
     row = _pair(tmp_path, 0)
     row.pop("pairing_sha256")

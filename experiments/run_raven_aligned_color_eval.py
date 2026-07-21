@@ -237,8 +237,12 @@ def build_aligned_records(
             ("watermarked", wm[run_id], variant_wm),
             ("clean", clean[run_id], variant_clean),
         ):
-            pre_color = Path(base["debug_info_path"]).parent / "view_guided_output.png"
+            pre_color = Path(base["pre_color_attacked_path"])
             pre_color_sha = require_image(pre_color)
+            if pre_color_sha != base["pre_color_attacked_sha256"]:
+                raise RuntimeError(
+                    f"run_id={run_id}: explicit pre-color attacked SHA mismatch"
+                )
             source_debug_path = Path(base["debug_info_path"])
             source_debug = json.loads(source_debug_path.read_text(encoding="utf-8"))
             for field, value in (
@@ -427,6 +431,8 @@ def main() -> int:
     fid_root, fid_manifest = stage_fid_records(
         variant_wm, formal_output=output_root, quality_config_hash=variant_hash,
         expected_count=args.expected_count,
+        reference_definition="original watermarked images from immutable formal snapshots",
+        attacked_definition="effective-flow aligned post-color-transfer attacked-watermarked images",
     )
     from raven.quality import clean_fid, openclip_text_image_scores
     fid_result = clean_fid(fid_root / "reference_watermarked", fid_root / "attacked", device=args.device)

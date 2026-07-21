@@ -23,8 +23,8 @@
     29,
     32
   ],
-  "shift_plan_mode": "formal_deterministic",
-  "shift_sign_policy": "deterministic_four_quadrant_schedule",
+  "shift_plan_mode": "paper_random_independent_axes",
+  "shift_sign_policy": "independent_uniform_random_per_axis",
   "shift_space": "image_pixels",
   "steps": 50,
   "strength": 0.15,

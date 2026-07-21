@@ -13,6 +13,8 @@ import gc
 import json
 import math
 import os
+import random
+import shutil
 import subprocess
 import sys
 import time
@@ -33,18 +35,24 @@ from raven.eval_protocol import (  # noqa: E402
     canonical_json_hash,
     current_clip_provenance,
     formal_attack_config_hash,
+    formal_runtime_provenance,
     load_and_validate_source_manifest,
     load_formal_attack_config,
     normalize_formal_attack_config,
     provider_config,
     provider_config_hash,
     require_uniform_clip_provenance,
+    require_clean_git_worktree,
     require_uniform_provider_config,
     sha256_path,
     stage_fid_records,
     validate_resume_record,
 )
 from raven.metrics import pair_quality_metrics  # noqa: E402
+from raven.pairing_provenance import (  # noqa: E402
+    PAIRING_REQUIRED_FIELDS,
+    audit_pairing_rows,
+)
 
 
 STAGES = (
@@ -58,7 +66,8 @@ STAGES = (
     "aggregate",
     "validate",
 )
-SHIFT_MAGNITUDES = (24, 27, 28, 29, 32)
+SHIFT_MAGNITUDES = tuple(range(24, 33))
+BALANCED_SHIFT_MAGNITUDES = (24, 27, 28, 29, 32)
 SHIFT_SIGNS = ((1, 1), (1, -1), (-1, 1), (-1, -1))
 
 
@@ -190,7 +199,41 @@ def normalize_snapshot_row(
     }
 
 
-def run_config(args: argparse.Namespace) -> dict[str, Any]:
+def prepare_runtime_source_manifest(
+    args: argparse.Namespace, output: Path
+) -> tuple[Path, str, str]:
+    """Copy and validate the exact source manifest used by this output root."""
+    head = require_clean_git_worktree(REPO)
+    _, supplied_sha = load_and_validate_source_manifest(args.source_manifest, repo_root=REPO)
+    runtime_dir = output / "provenance"
+    runtime_path = runtime_dir / "formal_source_manifest.json"
+    runtime_sha_path = runtime_path.with_suffix(".sha256")
+    if runtime_path.exists() or runtime_sha_path.exists():
+        if not runtime_path.is_file() or not runtime_sha_path.is_file():
+            raise RuntimeError("runtime source manifest is incomplete")
+        _, runtime_sha = load_and_validate_source_manifest(runtime_path, repo_root=REPO)
+        if runtime_sha != supplied_sha:
+            raise RuntimeError(
+                f"runtime/supplied source manifest mismatch: {runtime_sha} != {supplied_sha}"
+            )
+        return runtime_path, runtime_sha, head
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(args.source_manifest.resolve(), runtime_path)
+    shutil.copyfile(args.source_manifest.resolve().with_suffix(".sha256"), runtime_sha_path)
+    _, runtime_sha = load_and_validate_source_manifest(runtime_path, repo_root=REPO)
+    if runtime_sha != supplied_sha:
+        raise RuntimeError("copied runtime source manifest SHA changed")
+    fsync_dir(runtime_dir)
+    return runtime_path, runtime_sha, head
+
+
+def run_config(
+    args: argparse.Namespace,
+    *,
+    runtime_source_manifest: Path,
+    source_manifest_sha: str,
+    head: str,
+) -> dict[str, Any]:
     attack_config = (
         load_formal_attack_config(args.attack_config)
         if args.attack_config is not None
@@ -199,14 +242,11 @@ def run_config(args: argparse.Namespace) -> dict[str, Any]:
     attack_config_source = (
         args.attack_config.resolve() if args.attack_config is not None else None
     )
-    source_manifest, source_manifest_sha = load_and_validate_source_manifest(
-        args.source_manifest, repo_root=REPO
+    runtime = formal_runtime_provenance(
+        scheduler_mode=attack_config["scheduler_mode"],
+        device_class="cuda",
+        attack_dtype="torch.float16",
     )
-    head = git_head()
-    if source_manifest.get("git_head") != head:
-        raise RuntimeError(
-            f"source manifest git HEAD mismatch: {source_manifest.get('git_head')} != {head}"
-        )
     return {
         "metric_protocol_version": METRIC_PROTOCOL_VERSION,
         "dataset": args.dataset,
@@ -232,6 +272,8 @@ def run_config(args: argparse.Namespace) -> dict[str, Any]:
         "attack_config_source_sha256": (
             sha256_path(attack_config_source) if attack_config_source is not None else None
         ),
+        "attack_runtime": runtime,
+        **runtime,
         "detector_config_hash": canonical_json_hash(
             {"method": args.method, "target_fpr": 0.01, "score_source": "strict manifest"}
         ),
@@ -246,7 +288,10 @@ def run_config(args: argparse.Namespace) -> dict[str, Any]:
             }
         ),
         "git_head": head,
-        "source_code_manifest_path": str(args.source_manifest.resolve()),
+        "source_manifest_build_git_head": load_and_validate_source_manifest(
+            runtime_source_manifest, repo_root=REPO
+        )[0].get("git_head"),
+        "source_code_manifest_path": str(runtime_source_manifest),
         "source_code_manifest_sha256": source_manifest_sha,
         "formal_source_config_hash": source_manifest_sha,
     }
@@ -255,17 +300,25 @@ def run_config(args: argparse.Namespace) -> dict[str, Any]:
 def initialize_or_validate_run(args: argparse.Namespace) -> dict[str, Any]:
     output = args.output_root.resolve()
     path = output / "run_config.json"
-    expected = run_config(args)
+    if not path.exists() and output.exists() and any(output.iterdir()):
+        raise FileExistsError(f"refusing non-empty uninitialized output root: {output}")
+    output.mkdir(parents=True, exist_ok=True)
+    runtime_path, runtime_sha, head = prepare_runtime_source_manifest(args, output)
+    expected = run_config(
+        args,
+        runtime_source_manifest=runtime_path,
+        source_manifest_sha=runtime_sha,
+        head=head,
+    )
     if path.exists():
         if not args.resume:
-            raise FileExistsError(f"formal output exists; use --resume only for an identical run: {output}")
+            raise FileExistsError(
+                f"formal output exists; use --resume only for an identical run: {output}"
+            )
         stored = json.loads(path.read_text(encoding="utf-8"))
         if stored != expected:
             raise RuntimeError(f"formal run config mismatch: stored={stored} expected={expected}")
         return stored
-    if output.exists() and any(output.iterdir()):
-        raise FileExistsError(f"refusing non-empty uninitialized output root: {output}")
-    output.mkdir(parents=True, exist_ok=True)
     write_json_exclusive(path, expected)
     return expected
 
@@ -362,6 +415,10 @@ def snapshot_stage(args: argparse.Namespace, config: dict[str, Any]) -> int:
         )
         for row in source_rows
     ]
+    if args.method == "TR":
+        audit_pairing_rows(
+            normalized, expected_count=len(normalized), verify_files=True
+        )
     source_ids = [row["run_id"] for row in normalized]
     if len(set(source_ids)) != len(source_ids):
         raise ValueError("duplicate run IDs in committed source metadata")
@@ -371,7 +428,7 @@ def snapshot_stage(args: argparse.Namespace, config: dict[str, Any]) -> int:
         if run_id not in source_by_id:
             raise RuntimeError(f"live metadata lost already snapshotted run_id={run_id}")
         new = source_by_id[run_id]
-        for field in (
+        drift_fields = [
             "prompt",
             "prompt_id",
             "clean_path",
@@ -379,8 +436,11 @@ def snapshot_stage(args: argparse.Namespace, config: dict[str, Any]) -> int:
             "watermarked_path",
             "watermarked_sha256",
             "provider_config_hash",
-        ):
-            if str(old[field]) != str(new[field]):
+        ]
+        if args.method == "TR":
+            drift_fields.extend(PAIRING_REQUIRED_FIELDS)
+        for field in dict.fromkeys(drift_fields):
+            if str(old.get(field, "")) != str(new.get(field, "")):
                 raise RuntimeError(f"snapshotted source drift run_id={run_id}: {field}")
     new_rows = [row for row in normalized if row["run_id"] not in existing]
     remaining = max(0, args.expected_count - len(existing))
@@ -434,16 +494,33 @@ def planned_shift(
     index: int, run_id: str, attack_config: dict[str, Any]
 ) -> tuple[float, float, int]:
     base_seed = int(attack_config["base_seed"])
-    magnitude_x = SHIFT_MAGNITUDES[index % len(SHIFT_MAGNITUDES)]
-    magnitude_y = SHIFT_MAGNITUDES[(index // len(SHIFT_MAGNITUDES)) % len(SHIFT_MAGNITUDES)]
-    sign_x, sign_y = SHIFT_SIGNS[index % len(SHIFT_SIGNS)]
     try:
         numeric_id = int(run_id)
     except ValueError:
         numeric_id = int(canonical_json_hash({"run_id": run_id})[:8], 16)
-    if attack_config["shift_plan_mode"] == "zero":
-        return 0.0, 0.0, base_seed + numeric_id
-    return float(sign_x * magnitude_x), float(sign_y * magnitude_y), base_seed + numeric_id
+    attack_seed = base_seed + numeric_id
+    mode = attack_config["shift_plan_mode"]
+    if mode == "zero":
+        return 0.0, 0.0, attack_seed
+    if mode == "balanced_deterministic_schedule":
+        magnitude_x = BALANCED_SHIFT_MAGNITUDES[index % len(BALANCED_SHIFT_MAGNITUDES)]
+        magnitude_y = BALANCED_SHIFT_MAGNITUDES[
+            (index // len(BALANCED_SHIFT_MAGNITUDES)) % len(BALANCED_SHIFT_MAGNITUDES)
+        ]
+        sign_x, sign_y = SHIFT_SIGNS[index % len(SHIFT_SIGNS)]
+        return float(sign_x * magnitude_x), float(sign_y * magnitude_y), attack_seed
+    if mode != "paper_random_independent_axes":
+        raise ValueError(f"unsupported shift plan mode: {mode}")
+    rng_seed = int(
+        canonical_json_hash(
+            {"protocol": mode, "run_id": run_id, "attack_seed": attack_seed}
+        )[:16],
+        16,
+    )
+    rng = random.Random(rng_seed)
+    dx = rng.choice(SHIFT_MAGNITUDES) * rng.choice((-1, 1))
+    dy = rng.choice(SHIFT_MAGNITUDES) * rng.choice((-1, 1))
+    return float(dx), float(dy), attack_seed
 
 
 def expected_resume_fields(
@@ -469,6 +546,7 @@ def expected_resume_fields(
         "attack_seed": seed,
         "planned_flow_dx_image_px": dx,
         "planned_flow_dy_image_px": dy,
+        **config["attack_runtime"],
     }
 
 
@@ -523,7 +601,7 @@ def attack_stage(args: argparse.Namespace, config: dict[str, Any], role: str) ->
         revision=config["attack_config"]["model_revision"],
         scheduler_mode=config["attack_config"]["scheduler_mode"],
         device=args.device,
-        dtype="float16" if args.device.startswith("cuda") else "float32",
+        dtype="float16",
     )
     for position, (row, item, expected) in enumerate(pending, start=1):
         input_path = Path(expected["input_path"])
@@ -555,6 +633,7 @@ def attack_stage(args: argparse.Namespace, config: dict[str, Any], role: str) ->
         )
         del attacked, image
         attacked_path = output_dir / "final_color_corrected.png"
+        pre_color_path = output_dir / "view_guided_output.png"
         debug_path = output_dir / "debug_info.json"
         debug = json.loads(debug_path.read_text(encoding="utf-8"))
         transform_hash = assert_formal_debug_info(
@@ -575,6 +654,15 @@ def attack_stage(args: argparse.Namespace, config: dict[str, Any], role: str) ->
             "provider_config": json.loads(row["provider_config"]),
             "provider_config_hash": row["provider_config_hash"],
             "target_watermark_hash": row.get("watermark_target_sha256", ""),
+            "pairing_sha256": row.get("pairing_sha256", ""),
+            "base_latent_seed": row.get("base_latent_seed", ""),
+            "base_latent_sha256": row.get("base_latent_sha256", ""),
+            "watermark_target_sha256": row.get("watermark_target_sha256", ""),
+            "watermark_mask_sha256": row.get("watermark_mask_sha256", ""),
+            "generation_config_sha256": row.get("generation_config_sha256", ""),
+            "watermark_config_sha256": row.get("watermark_config_sha256", ""),
+            "pre_color_attacked_path": str(pre_color_path.resolve()),
+            "pre_color_attacked_sha256": sha256_path(pre_color_path),
             "attacked_path": str(attacked_path.resolve()),
             "attacked_sha256": sha256_path(attacked_path),
             "debug_info_path": str(debug_path.resolve()),
@@ -587,6 +675,9 @@ def attack_stage(args: argparse.Namespace, config: dict[str, Any], role: str) ->
             "effective_visual_shift_dx_image_px": float(debug["effective_visual_shift_dx_image_px"]),
             "effective_visual_shift_dy_image_px": float(debug["effective_visual_shift_dy_image_px"]),
             "formal_attack_config": config["attack_config"],
+            **config["attack_runtime"],
+            "resolved_scheduler_config": debug["scheduler_config"],
+            "resolved_scheduler_config_hash": debug["scheduler_config_hash"],
             "transform_config_hash": transform_hash,
             "formal_config_hash": expected["attack_config_hash"],
             "source_code_manifest_sha": expected["source_code_manifest_sha256"],
@@ -687,6 +778,8 @@ def fid_stage(args: argparse.Namespace, config: dict[str, Any]) -> int:
         formal_output=args.output_root,
         quality_config_hash=config["quality_config_hash"],
         expected_count=args.expected_count,
+        reference_definition="original watermarked images from immutable formal snapshots",
+        attacked_definition="formal RAVEN final post-color-transfer attacked-watermarked images",
     )
     from raven.quality import clean_fid
 
@@ -867,6 +960,16 @@ def aggregate_stage(args: argparse.Namespace, config: dict[str, Any]) -> int:
 
 
 def validate_stage(args: argparse.Namespace, config: dict[str, Any]) -> int:
+    snapshot_rows = load_snapshot_rows(args.output_root)
+    if len(snapshot_rows) != args.expected_count:
+        raise RuntimeError("final pairing audit requires the full expected snapshot cohort")
+    pairing_summary = (
+        audit_pairing_rows(
+            snapshot_rows, expected_count=args.expected_count, verify_files=True
+        )
+        if args.method == "TR"
+        else None
+    )
     records = require_complete_records(args, config, "watermarked")
     run_ids = {str(row["run_id"]) for row in records}
     hashes = {row["attack_config_hash"] for row in records}
@@ -904,6 +1007,7 @@ def validate_stage(args: argparse.Namespace, config: dict[str, Any]) -> int:
             ("clean_path", "clean_sha256"),
             ("watermarked_path", "watermarked_sha256"),
             ("attacked_path", "attacked_sha256"),
+            ("pre_color_attacked_path", "pre_color_attacked_sha256"),
             ("debug_info_path", "debug_info_sha256"),
         ):
             path = Path(record[path_field])
@@ -919,7 +1023,7 @@ def validate_stage(args: argparse.Namespace, config: dict[str, Any]) -> int:
             for field in (
                 "attack_config_hash", "source_code_manifest_sha256", "model_id",
                 "model_revision", "attack_seed", "planned_flow_dx_image_px",
-                "planned_flow_dy_image_px", "transform_config_hash",
+                "planned_flow_dy_image_px", "pairing_sha256", "transform_config_hash",
             ):
                 if clean.get(field) != watermarked.get(field):
                     raise RuntimeError(
@@ -991,8 +1095,20 @@ def validate_stage(args: argparse.Namespace, config: dict[str, Any]) -> int:
             raise RuntimeError("TR verification count/run-ID mismatch")
         if {row["provider_config_hash"] for row in score_rows} != providers:
             raise RuntimeError("TR verification provider config mismatch")
-        if len({row["target_watermark_hash"] for row in score_rows}) != 1:
-            raise RuntimeError("mixed TR detector target hashes")
+        source_target_hash = next(iter(target_hashes))
+        source_mask_hashes = {str(row["watermark_mask_sha256"]) for row in records}
+        if len(source_mask_hashes) != 1:
+            raise RuntimeError("missing or mixed source watermark mask hashes")
+        source_mask_hash = next(iter(source_mask_hashes))
+        for score in score_rows:
+            if score.get("detector_target_watermark_sha256") != source_target_hash:
+                raise RuntimeError("TR detector/source target hash mismatch")
+            if score.get("source_watermark_target_sha256") != source_target_hash:
+                raise RuntimeError("TR score/source target hash mismatch")
+            if score.get("detector_watermark_mask_sha256") != source_mask_hash:
+                raise RuntimeError("TR detector/source mask hash mismatch")
+            if score.get("source_watermark_mask_sha256") != source_mask_hash:
+                raise RuntimeError("TR score/source mask hash mismatch")
         for protocol_name in ("full_precision_protocol", "nfpa_rounded2_protocol"):
             protocol = detector_payload[protocol_name]
             for key in (
@@ -1039,6 +1155,7 @@ def validate_stage(args: argparse.Namespace, config: dict[str, Any]) -> int:
         "fid_attacked_count": args.expected_count,
         "provider_config_hash": next(iter(providers)),
         "target_watermark_hash": next(iter(target_hashes)),
+        "pairing_audit": pairing_summary,
         "source_code_manifest_sha256": config["source_code_manifest_sha256"],
         "gate_only": args.expected_count < 1000,
         "paper_comparable": False,
@@ -1064,6 +1181,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--dtype", default="float16", choices=["float16"])
     parser.add_argument("--gpu", default=None)
     parser.add_argument("--stage", required=True, choices=STAGES)
     return parser
@@ -1074,6 +1192,10 @@ def main(argv: Iterable[str] | None = None) -> int:
     if args.expected_count <= 0 or args.batch_size <= 0:
         raise ValueError("expected-count and batch-size must be positive")
     args.method = args.method.upper()
+    if not args.device.startswith("cuda"):
+        raise RuntimeError("formal RAVEN evaluation forbids CPU fallback")
+    if args.dtype != "float16":
+        raise RuntimeError("formal RAVEN evaluation requires float16")
     args.output_root = args.output_root.resolve()
     if args.gpu is not None:
         # Keep --gpu tied to the physical nvidia-smi index used in provenance.

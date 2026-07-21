@@ -57,7 +57,7 @@ A formal run should not silently use a dirty working tree.
 
 Before modifying code:
 
-1. Read relevant entries in `debug.md`.
+1. Read relevant entries in `DEBUG_CHANGELOG.md`.
 2. Identify previously fixed bugs related to the task.
 3. Search the repository for the old buggy patterns.
 4. Check whether any formal, legacy, debug, ablation, notebook, provider, or launcher path still contains them.
@@ -124,7 +124,7 @@ Legacy code may remain only when it is:
 * clearly labeled
 * unreachable from formal pipelines
 * excluded from formal aggregation
-* documented in `debug.md`
+* documented in `DEBUG_CHANGELOG.md`
 
 ---
 
@@ -357,9 +357,9 @@ The pipeline must stop.
 
 ---
 
-## 12. Mandatory `debug.md` Update
+## 12. Mandatory `DEBUG_CHANGELOG.md` Update
 
-Every code modification must update `debug.md` in the same commit.
+Every code modification must update `DEBUG_CHANGELOG.md` in the same commit.
 
 Use this format:
 
@@ -403,7 +403,7 @@ Commands and test results.
 - Formal output eligibility:
 ```
 
-A code change without a corresponding `debug.md` entry is incomplete.
+A code change without a corresponding `DEBUG_CHANGELOG.md` entry is incomplete.
 
 ---
 
@@ -454,7 +454,7 @@ A modification is complete only when:
 ```text
 repository and remote inspected
 +
-debug.md reviewed
+DEBUG_CHANGELOG.md reviewed
 +
 existing code searched
 +
@@ -470,7 +470,7 @@ provenance and resume gates passed
 +
 affected outputs separated
 +
-debug.md updated
+DEBUG_CHANGELOG.md updated
 +
 commit created
 +
@@ -493,7 +493,7 @@ After modifying code, report:
 
 ### Historical coverage
 
-* relevant `debug.md` entries
+* relevant `DEBUG_CHANGELOG.md` entries
 * old patterns searched
 * remaining legacy paths
 
@@ -519,4 +519,4 @@ After modifying code, report:
 * remote branch
 * push status
 * remote verification
-* `debug.md` entry location
+* `DEBUG_CHANGELOG.md` entry location

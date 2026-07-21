@@ -10,9 +10,12 @@ from pathlib import Path
 
 
 FIELDS = (
-    "Dataset", "Watermark", "Variant", "N", "Metric protocol", "Target FPR", "Actual FPR",
+    "Dataset", "Watermark", "Variant", "N", "Metric protocol", "Target FPR",
+    "Original-clean actual FPR", "Attacked-clean recalibrated actual FPR",
     "Before TPR", "Attacked TPR at original threshold",
-    "Attacked TPR at recalibrated threshold", "Attack success rate", "ROC-AUC",
+    "Attacked TPR at recalibrated threshold",
+    "Attack success at original-clean threshold",
+    "Attack success at attacked-clean recalibrated threshold", "ROC-AUC",
     "GS bit accuracy before", "GS bit accuracy attacked", "FID reference", "FID",
     "CLIP model", "CLIP score", "Quality reference", "Overlap protocol", "PSNR",
     "SSIM", "Manifest SHA", "Attack config hash", "Detector config hash", "Git SHA", "Status",
@@ -75,20 +78,36 @@ def table_row(root: Path) -> dict:
         row["GS bit accuracy attacked"] = metric["micro_bit_accuracy_attacked"]
     elif method == "TR":
         row.update({
-            "Target FPR": metric["target_fpr"], "Actual FPR": metric["before_actual_fpr"],
+            "Target FPR": metric["target_fpr"],
+            "Original-clean actual FPR": metric["original_clean_actual_fpr"],
+            "Attacked-clean recalibrated actual FPR": metric["attacked_clean_actual_fpr"],
             "Before TPR": metric["before_tpr"],
             "Attacked TPR at original threshold": metric["attacked_tpr_at_original_clean_threshold"],
             "Attacked TPR at recalibrated threshold": metric["attacked_tpr_at_attacked_clean_recalibrated_threshold"],
-            "Attack success rate": metric["attack_success_rate_at_recalibrated_threshold"],
+            "Attack success at original-clean threshold": (
+                1.0 - metric["attacked_tpr_at_original_clean_threshold"]
+            ),
+            "Attack success at attacked-clean recalibrated threshold": metric[
+                "attack_success_rate_at_recalibrated_threshold"
+            ],
             "ROC-AUC": metric["attacked_roc_auc"],
         })
     else:
         row.update({
-            "Target FPR": metric["target_fpr"], "Actual FPR": metric["actual_empirical_fpr"],
+            "Target FPR": metric["target_fpr"],
+            "Original-clean actual FPR": metric["actual_empirical_fpr"],
+            "Attacked-clean recalibrated actual FPR": metric.get(
+                "attacked_clean_actual_fpr", ""
+            ),
             "Before TPR": metric["before_tpr"],
             "Attacked TPR at original threshold": metric["attacked_tpr_at_original_clean_threshold"],
             "Attacked TPR at recalibrated threshold": metric["attacked_tpr_at_recalibrated_threshold"],
-            "Attack success rate": metric["attack_success_rate_at_original_clean_threshold"],
+            "Attack success at original-clean threshold": metric[
+                "attack_success_rate_at_original_clean_threshold"
+            ],
+            "Attack success at attacked-clean recalibrated threshold": metric.get(
+                "attack_success_rate_at_recalibrated_threshold", ""
+            ),
             "ROC-AUC": metric["attacked_roc_auc"],
         })
     return row
@@ -113,7 +132,10 @@ def aligned_color_table_row(root: Path, validation: dict) -> dict:
         "N": aggregate["sample_count"],
         "Metric protocol": aggregate["detector"]["protocol"],
         "Target FPR": detector["target_fpr"],
-        "Actual FPR": detector["original_clean_actual_fpr"],
+        "Original-clean actual FPR": detector["original_clean_actual_fpr"],
+        "Attacked-clean recalibrated actual FPR": detector[
+            "attacked_clean_actual_fpr"
+        ],
         "Before TPR": detector["before_tpr"],
         "Attacked TPR at original threshold": detector[
             "attacked_tpr_at_original_clean_threshold"
@@ -121,7 +143,10 @@ def aligned_color_table_row(root: Path, validation: dict) -> dict:
         "Attacked TPR at recalibrated threshold": detector[
             "attacked_tpr_at_attacked_clean_recalibrated_threshold"
         ],
-        "Attack success rate": detector[
+        "Attack success at original-clean threshold": (
+            1.0 - detector["attacked_tpr_at_original_clean_threshold"]
+        ),
+        "Attack success at attacked-clean recalibrated threshold": detector[
             "attack_success_rate_at_recalibrated_threshold"
         ],
         "ROC-AUC": detector["attacked_roc_auc"],

@@ -39,6 +39,7 @@ from raven.pairing_provenance import (
     assert_attack_pair_config_match as assert_attack_pair_provenance,
     audit_pairing_rows,
     build_attack_config_sha256,
+    tensor_sha256,
 )
 from raven.pipeline_raven import RavenPipeline, require_effective_source_flow
 from raven.eval_protocol import (
@@ -786,6 +787,24 @@ def aggregate_nfpa_protocol(rows: list[dict], suffix: str) -> dict:
     }
 
 
+def assert_detector_source_tensor_hashes(
+    rows: list[dict[str, Any]], *, detector_target_sha256: str, detector_mask_sha256: str
+) -> None:
+    """Fail before scoring when detector tensors differ from generation tensors."""
+    source_target_hashes = {row.get("watermark_target_sha256", "") for row in rows}
+    source_mask_hashes = {row.get("watermark_mask_sha256", "") for row in rows}
+    if source_target_hashes != {detector_target_sha256}:
+        raise RuntimeError(
+            "detector/source target tensor SHA mismatch before scoring: "
+            f"detector={detector_target_sha256} source={sorted(source_target_hashes)}"
+        )
+    if source_mask_hashes != {detector_mask_sha256}:
+        raise RuntimeError(
+            "detector/source mask tensor SHA mismatch before scoring: "
+            f"detector={detector_mask_sha256} source={sorted(source_mask_hashes)}"
+        )
+
+
 def command_score_formal(args) -> int:
     import torch
 
@@ -830,8 +849,13 @@ def command_score_formal(args) -> int:
         device=device,
         **config,
     )
-    target_bytes = provider.gt_patch.detach().cpu().numpy().tobytes()
-    target_hash = hashlib.sha256(target_bytes).hexdigest()
+    target_hash = tensor_sha256(provider.gt_patch)
+    mask_hash = tensor_sha256(provider.watermarking_mask)
+    assert_detector_source_tensor_hashes(
+        manifest_rows,
+        detector_target_sha256=target_hash,
+        detector_mask_sha256=mask_hash,
+    )
     args.output_dir.mkdir(parents=True)
     output_path = args.output_dir / "l1_scores.jsonl"
     rows = []
@@ -845,7 +869,7 @@ def command_score_formal(args) -> int:
                 raise ValueError(f"run_id={run_id}: attacked clean/watermarked config mismatch")
             for field in (
                 "attack_seed", "planned_flow_dx_image_px", "planned_flow_dy_image_px",
-                "transform_config_hash",
+                "transform_config_hash", "pairing_sha256",
             ):
                 if str(clean_attack.get(field)) != str(row.get(field)):
                     raise ValueError(f"run_id={run_id}: attacked pair {field} mismatch")
@@ -877,7 +901,12 @@ def command_score_formal(args) -> int:
                 "provider_config": config,
                 "provider_config_hash": config_hash,
                 "target_watermark_hash": target_hash,
-                "source_target_watermark_hash": row.get("target_watermark_hash", ""),
+                "detector_target_watermark_sha256": target_hash,
+                "source_watermark_target_sha256": row["watermark_target_sha256"],
+                "detector_watermark_mask_sha256": mask_hash,
+                "source_watermark_mask_sha256": row["watermark_mask_sha256"],
+                "source_target_watermark_hash": row["watermark_target_sha256"],
+                "pairing_sha256": row["pairing_sha256"],
                 "score_direction": "lower means watermark",
             }
             for stage, value in scores.items():
@@ -904,6 +933,10 @@ def command_score_formal(args) -> int:
         "provider_config": config,
         "provider_config_hash": config_hash,
         "target_watermark_hash": target_hash,
+        "detector_target_watermark_sha256": target_hash,
+        "source_watermark_target_sha256": target_hash,
+        "detector_watermark_mask_sha256": mask_hash,
+        "source_watermark_mask_sha256": mask_hash,
         "full_precision_protocol": aggregate_nfpa_protocol(rows, "full_precision"),
         "nfpa_rounded2_protocol": aggregate_nfpa_protocol(rows, "nfpa_rounded2"),
         "primary_protocol": "nfpa_rounded2_protocol",

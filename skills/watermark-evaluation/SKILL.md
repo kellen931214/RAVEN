@@ -508,9 +508,9 @@ Do not select a result because its value looks better.
 
 ---
 
-## 16. Watermark `debug.md` Requirements
+## 16. Watermark `DEBUG_CHANGELOG.md` Requirements
 
-For watermark-related changes, the `debug.md` entry must additionally include:
+For watermark-related changes, the `DEBUG_CHANGELOG.md` entry must additionally include:
 
 ```text
 source-data validity
@@ -578,4 +578,4 @@ After completing watermark work, report:
 * commit SHA
 * push status
 * remote verification
-* `debug.md` entry
+* `DEBUG_CHANGELOG.md` entry

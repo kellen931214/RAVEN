@@ -29,7 +29,14 @@ def debug_payload(dx=27.0, dy=-29.0):
         "effective_visual_shift_dy_image_px": 32.0,
         "view_guided_attention": True, "color_transfer": True,
         "color_transfer_mode": "paper_exact_two_stage_aligned",
+        "attack_device_class": "cuda",
+        "attack_dtype": "torch.float16",
+        "scheduler_class": "DDIMScheduler",
+        "scheduler_config": {"beta_start": 0.00085},
+        "torch_version": "2.test",
+        "diffusers_version": "0.test",
     }
+    payload["scheduler_config_hash"] = canonical_json_hash(payload["scheduler_config"])
     payload["transform_config_hash"] = canonical_json_hash(transform_config_payload(payload))
     return payload
 
@@ -37,6 +44,8 @@ def debug_payload(dx=27.0, dy=-29.0):
 def test_resume_rejects_config_seed_manifest_and_debug_drift(tmp_path):
     attacked = tmp_path / "attacked.png"
     attacked.write_bytes(b"attacked")
+    pre_color = tmp_path / "pre-color.png"
+    pre_color.write_bytes(b"pre-color")
     debug_path = tmp_path / "debug.json"
     debug_path.write_text(json.dumps(debug_payload()))
     expected = {
@@ -46,7 +55,15 @@ def test_resume_rejects_config_seed_manifest_and_debug_drift(tmp_path):
     }
     record = {
         **expected, "attacked_path": str(attacked), "attacked_sha256": sha256_path(attacked),
+        "pre_color_attacked_path": str(pre_color),
+        "pre_color_attacked_sha256": sha256_path(pre_color),
         "debug_info_path": str(debug_path), "debug_info_sha256": sha256_path(debug_path),
+        "resolved_scheduler_config": debug_payload()["scheduler_config"],
+        "resolved_scheduler_config_hash": debug_payload()["scheduler_config_hash"],
+        "torch_version": debug_payload()["torch_version"],
+        "diffusers_version": debug_payload()["diffusers_version"],
+        "attack_device_class": "cuda",
+        "attack_dtype": "torch.float16",
         "transform_config_hash": debug_payload()["transform_config_hash"],
     }
     validate_resume_record(record, expected=expected)
@@ -63,3 +80,49 @@ def test_resume_rejects_config_seed_manifest_and_debug_drift(tmp_path):
     record["debug_info_sha256"] = sha256_path(debug_path)
     with pytest.raises(RuntimeError, match="formal debug mismatch"):
         validate_resume_record(record, expected=expected)
+
+
+
+def test_resume_rejects_pre_color_dtype_and_scheduler_drift(tmp_path):
+    attacked = tmp_path / "attacked.png"
+    attacked.write_bytes(b"attacked")
+    pre_color = tmp_path / "pre.png"
+    pre_color.write_bytes(b"pre")
+    debug = debug_payload()
+    debug_path = tmp_path / "debug.json"
+    debug_path.write_text(json.dumps(debug))
+    expected = {
+        "run_id": "1",
+        "planned_flow_dx_image_px": 27.0,
+        "planned_flow_dy_image_px": -29.0,
+        "attack_dtype": "torch.float16",
+        "scheduler_config_hash": "selector-a",
+    }
+    record = {
+        **expected,
+        "attacked_path": str(attacked),
+        "attacked_sha256": sha256_path(attacked),
+        "pre_color_attacked_path": str(pre_color),
+        "pre_color_attacked_sha256": sha256_path(pre_color),
+        "debug_info_path": str(debug_path),
+        "debug_info_sha256": sha256_path(debug_path),
+        "resolved_scheduler_config": debug["scheduler_config"],
+        "resolved_scheduler_config_hash": debug["scheduler_config_hash"],
+        "torch_version": debug["torch_version"],
+        "diffusers_version": debug["diffusers_version"],
+        "attack_device_class": "cuda",
+        "transform_config_hash": debug["transform_config_hash"],
+    }
+    validate_resume_record(record, expected=expected)
+    pre_color.write_bytes(b"replaced")
+    with pytest.raises(RuntimeError, match="pre_color_attacked_sha256 mismatch"):
+        validate_resume_record(record, expected=expected)
+    pre_color.write_bytes(b"pre")
+    with pytest.raises(RuntimeError, match="resume mismatch for attack_dtype"):
+        validate_resume_record(
+            record, expected={**expected, "attack_dtype": "torch.bfloat16"}
+        )
+    with pytest.raises(RuntimeError, match="resume mismatch for scheduler_config_hash"):
+        validate_resume_record(
+            record, expected={**expected, "scheduler_config_hash": "selector-b"}
+        )
