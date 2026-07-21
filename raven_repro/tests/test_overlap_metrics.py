@@ -77,7 +77,24 @@ def test_inverse_warp_overlap_quality_synthetic_perfect_translation():
     assert metrics["valid_overlap_height"] == height - abs(dy)
 
 
-def test_inverse_warp_rejects_non_integer_flow_for_metrics():
-    image = np.zeros((16, 16, 3), dtype=np.float32)
-    with pytest.raises(ValueError):
-        crop_overlap_inverse_warp(image, image, 3.5, 0)
+def test_inverse_warp_fractional_effective_flow_uses_bilinear_source_samples():
+    height = width = 16
+    yy, xx = np.mgrid[:height, :width]
+    reference = np.stack((xx, yy, xx + 2 * yy), axis=2).astype(np.float32)
+    dx, dy = 3.5, -2.5
+    from raven.metrics import sample_inverse_warp_reference
+
+    sampled, (y0, y1, x0, x1) = sample_inverse_warp_reference(reference, dx, dy)
+    attacked = np.full_like(reference, -999.0)
+    attacked[y0:y1, x0:x1] = sampled
+    reference_crop, attacked_crop = crop_overlap_inverse_warp(reference, attacked, dx, dy)
+    assert np.array_equal(reference_crop, attacked_crop)
+    assert reference_crop.shape[:2] == (height - 3, width - 4)
+    assert math_is_inf(psnr(reference_crop, attacked_crop, data_range=float(reference.max())))
+    metrics = pair_quality_metrics(reference, attacked, dx, dy)
+    # pair_quality_metrics normalizes RGB inputs before resampling; this only
+    # changes floating-point operation order, not the effective-flow pairing.
+    assert metrics["overlap_psnr"] > 100.0
+    assert metrics["overlap_ssim"] == pytest.approx(1.0)
+    assert metrics["valid_overlap_width"] == width - 4
+    assert metrics["valid_overlap_height"] == height - 3

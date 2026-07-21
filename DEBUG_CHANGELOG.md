@@ -39,6 +39,17 @@ metadata SHA before selecting a gate cohort, and records that index SHA in each
 new snapshot. Source manifests include tracked variant configs, and result
 tables identify the exact variant.
 
+### Gate-exposed bilinear fix
+The first bilinear smoke failed before an attack record was committed because
+its actual-grid effective source flow was fractional (`23.5 px`) while aligned
+color transfer and overlap quality rejected non-integers. The shared metrics
+module now samples the reference/chroma at continuous effective source
+coordinates with bilinear interpolation over the real valid rectangle; it does
+not round to planned flow or include reflected padding. Integer flows still
+reduce to direct correspondence. Focused regression tests cover fractional
+alignment, valid bounds, exact synthetic crop correspondence, and quality
+metadata provenance.
+
 ### Regression prevention
 `test_formal_variant_config.py` checks config/debug hashing, zero-shift seed
 stability, DDPM validation, and the DDPM inversion path. Full formal tests and

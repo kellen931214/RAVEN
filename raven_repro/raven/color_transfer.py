@@ -6,6 +6,8 @@ from typing import Literal
 
 from PIL import Image
 
+from .metrics import inverse_warp_valid_bounds, sample_inverse_warp_reference
+
 ColorTransferMode = Literal["paper_exact_two_stage_aligned"]
 
 PAPER_EXACT_TWO_STAGE_ALIGNED = "paper_exact_two_stage_aligned"
@@ -52,25 +54,17 @@ def _lab_stats(channel) -> dict:
     }
 
 
-def _integer_flow(value: float, name: str) -> int:
-    rounded = int(round(float(value)))
-    if abs(float(value) - rounded) > 1e-6:
-        raise ValueError(f"{name} must be an integer image-pixel flow, got {value}")
-    return rounded
-
-
 def align_original_chroma_to_generated(
     original_chroma,
     generated_chroma,
     effective_source_flow_dx_image_px: float,
     effective_source_flow_dy_image_px: float,
 ):
-    """Align original LAB a/b to an inverse-warped generated view.
+    """Align original LAB a/b with actual inverse-warp effective flow.
 
-    The formal warp convention is generated[y, x] corresponds to
-    original[y + flow_dy, x + flow_dx]. Only valid source coordinates are
-    used. Non-overlap pixels retain generated chroma, so reflected padding is
-    never treated as a real correspondence and no circular wrap can occur.
+    Fractional effective flow is sampled bilinearly from real source pixels;
+    invalid targets retain generated chroma so reflected padding never enters
+    color transfer.
     """
     import numpy as np
 
@@ -81,27 +75,15 @@ def align_original_chroma_to_generated(
             "original_chroma and generated_chroma must have matching HxWx2 shapes, "
             f"got {original.shape} and {generated.shape}"
         )
-    dx = _integer_flow(
-        effective_source_flow_dx_image_px, "effective_source_flow_dx_image_px"
+    sampled, (y0, y1, x0, x1) = sample_inverse_warp_reference(
+        original,
+        effective_source_flow_dx_image_px,
+        effective_source_flow_dy_image_px,
     )
-    dy = _integer_flow(
-        effective_source_flow_dy_image_px, "effective_source_flow_dy_image_px"
-    )
-    height, width, _ = generated.shape
-    target_x0 = max(0, -dx)
-    target_x1 = min(width, width - dx)
-    target_y0 = max(0, -dy)
-    target_y1 = min(height, height - dy)
-    if target_x0 >= target_x1 or target_y0 >= target_y1:
-        raise ValueError(f"flow ({dx}, {dy}) leaves no overlap for {width}x{height}")
-    source_x0, source_x1 = target_x0 + dx, target_x1 + dx
-    source_y0, source_y1 = target_y0 + dy, target_y1 + dy
-
     result = generated.copy()
-    valid = np.zeros((height, width), dtype=bool)
-    valid[target_y0:target_y1, target_x0:target_x1] = True
-    source = original[source_y0:source_y1, source_x0:source_x1]
-    result[target_y0:target_y1, target_x0:target_x1] = source
+    valid = np.zeros(generated.shape[:2], dtype=bool)
+    valid[y0:y1, x0:x1] = True
+    result[y0:y1, x0:x1] = sampled
     return result, valid
 
 
@@ -156,6 +138,12 @@ def _paper_aligned_two_stage_transfer(
         ),
         "alignment_formula": "generated[y,x] <- original[y+flow_dy,x+flow_dx]",
         "alignment_flow_source": "effective source flow from actual warp grid",
+        "alignment_interpolation": (
+            "direct_integer_effective_flow"
+            if float(effective_source_flow_dx_image_px).is_integer()
+            and float(effective_source_flow_dy_image_px).is_integer()
+            else "bilinear_continuous_effective_flow"
+        ),
         "alignment_alpha": 1.0,
         "valid_overlap_ratio": float(valid.mean()),
         "mean_abs_a_difference_vs_generated": float(np.abs(chroma_delta[..., 0]).mean()),

@@ -112,6 +112,25 @@ def test_aligned_chroma_uses_effective_inverse_warp_correspondence(dx, dy):
                 assert np.array_equal(aligned[y, x], generated[y, x])
 
 
+def test_aligned_chroma_uses_fractional_effective_flow_without_rounding():
+    height, width = 9, 11
+    yy, xx = np.mgrid[:height, :width]
+    original = np.stack((xx + 10 * yy, -xx - 10 * yy), axis=2).astype(np.float32)
+    generated = np.full_like(original, -777.0)
+    dx, dy = 1.5, -2.5
+    aligned, valid = align_original_chroma_to_generated(
+        original,
+        generated,
+        effective_source_flow_dx_image_px=dx,
+        effective_source_flow_dy_image_px=dy,
+    )
+    assert valid[3, 0]
+    expected = np.array([0 + dx + 10 * (3 + dy), -(0 + dx + 10 * (3 + dy))])
+    assert np.allclose(aligned[3, 0], expected)
+    assert not valid[0, 0]
+    assert np.array_equal(aligned[0, 0], generated[0, 0])
+
+
 def test_effective_flow_changes_alignment_and_preserves_non_overlap():
     original = np.arange(8 * 9 * 2, dtype=np.float32).reshape(8, 9, 2)
     generated = np.full_like(original, 777.0)

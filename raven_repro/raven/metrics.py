@@ -181,43 +181,80 @@ def crop_overlap(first, second, dx: int, dy: int):
     )
 
 
-def _require_integer_flow(value: float, name: str) -> int:
-    rounded = int(round(float(value)))
-    if abs(float(value) - rounded) > 1e-6:
-        raise ValueError(f"{name} must be an integer image-pixel flow for overlap metrics, got {value}")
-    return rounded
+def inverse_warp_valid_bounds(
+    height: int, width: int, flow_dx_px: float, flow_dy_px: float
+) -> tuple[int, int, int, int]:
+    """Return target bounds whose inverse-warp source coordinates are real."""
+    dx, dy = float(flow_dx_px), float(flow_dy_px)
+    if not math.isfinite(dx) or not math.isfinite(dy):
+        raise ValueError(f"non-finite inverse-warp flow: ({dx}, {dy})")
+    target_x0 = max(0, math.ceil(-dx))
+    target_x1 = min(width, math.floor((width - 1) - dx) + 1)
+    target_y0 = max(0, math.ceil(-dy))
+    target_y1 = min(height, math.floor((height - 1) - dy) + 1)
+    if target_x0 >= target_x1 or target_y0 >= target_y1:
+        raise ValueError(
+            f"flow ({dx}, {dy}) leaves no overlapping region for {width}x{height}"
+        )
+    return target_y0, target_y1, target_x0, target_x1
+
+
+def sample_inverse_warp_reference(reference, flow_dx_px: float, flow_dy_px: float):
+    """Sample reference at actual inverse-warp coordinates without padding.
+
+    The returned array covers only the valid target rectangle. Integer flows
+    reduce exactly to slicing; fractional flows use bilinear interpolation,
+    matching the continuous effective source flow reported by a bilinear warp.
+    """
+    import numpy as np
+
+    source = np.asarray(reference)
+    if source.ndim < 2:
+        raise ValueError(f"reference must have at least two dimensions, got {source.shape}")
+    height, width = source.shape[:2]
+    y0, y1, x0, x1 = inverse_warp_valid_bounds(
+        height, width, flow_dx_px, flow_dy_px
+    )
+    yy = np.arange(y0, y1, dtype=np.float64) + float(flow_dy_px)
+    xx = np.arange(x0, x1, dtype=np.float64) + float(flow_dx_px)
+    y_floor = np.floor(yy).astype(np.intp)
+    x_floor = np.floor(xx).astype(np.intp)
+    y_ceil = np.minimum(y_floor + 1, height - 1)
+    x_ceil = np.minimum(x_floor + 1, width - 1)
+    wy = yy - y_floor
+    wx = xx - x_floor
+    tail = (1,) * max(0, source.ndim - 2)
+    wy = wy.reshape((-1, 1) + tail)
+    wx = wx.reshape((1, -1) + tail)
+    source = source.astype(np.float32, copy=False)
+    top_left = source[y_floor[:, None], x_floor[None, :]]
+    top_right = source[y_floor[:, None], x_ceil[None, :]]
+    bottom_left = source[y_ceil[:, None], x_floor[None, :]]
+    bottom_right = source[y_ceil[:, None], x_ceil[None, :]]
+    sampled = (
+        top_left * (1.0 - wy) * (1.0 - wx)
+        + top_right * (1.0 - wy) * wx
+        + bottom_left * wy * (1.0 - wx)
+        + bottom_right * wy * wx
+    )
+    return sampled, (y0, y1, x0, x1)
 
 
 def crop_overlap_inverse_warp(reference, attacked, flow_dx_px: float, flow_dy_px: float):
-    """Crop arrays to valid correspondence under inverse-warp flow.
+    """Crop valid inverse-warp correspondence using the effective source flow.
 
-    The convention is ``attacked[y, x]`` corresponds to
-    ``reference[y + flow_dy_px, x + flow_dx_px]``. Only pixels with a real
-    reference/attacked pair are retained; padding or reflected boundary values
-    are excluded from quality metrics.
+    ``attacked[y, x]`` corresponds to ``reference[y + flow_dy, x + flow_dx]``.
+    No reflected/padded boundary participates. Fractional actual-grid flow uses
+    bilinear reference sampling rather than rounding a planned displacement.
     """
-    dx = _require_integer_flow(flow_dx_px, "flow_dx_px")
-    dy = _require_integer_flow(flow_dy_px, "flow_dy_px")
     height = min(reference.shape[0], attacked.shape[0])
     width = min(reference.shape[1], attacked.shape[1])
     reference = reference[:height, :width]
     attacked = attacked[:height, :width]
-
-    attacked_x0 = max(0, -dx)
-    attacked_x1 = min(width, width - dx)
-    attacked_y0 = max(0, -dy)
-    attacked_y1 = min(height, height - dy)
-    if attacked_x0 >= attacked_x1 or attacked_y0 >= attacked_y1:
-        raise ValueError(f"flow ({dx}, {dy}) leaves no overlapping region for {width}x{height}")
-
-    reference_x0 = attacked_x0 + dx
-    reference_x1 = attacked_x1 + dx
-    reference_y0 = attacked_y0 + dy
-    reference_y1 = attacked_y1 + dy
-    return (
-        reference[reference_y0:reference_y1, reference_x0:reference_x1],
-        attacked[attacked_y0:attacked_y1, attacked_x0:attacked_x1],
+    sampled_reference, (y0, y1, x0, x1) = sample_inverse_warp_reference(
+        reference, flow_dx_px, flow_dy_px
     )
+    return sampled_reference, attacked[y0:y1, x0:x1]
 
 
 def rgb_float_array(image):
@@ -255,6 +292,11 @@ def pair_quality_metrics(reference, attacked, flow_dx_px: float | None = None, f
             "valid_overlap_height": int(reference_crop.shape[0]),
             "valid_overlap_area_ratio": float(reference_crop.shape[0] * reference_crop.shape[1] / (height * width)),
             "overlap_protocol": "inverse_warp_valid_correspondence",
+            "reference_sampling": (
+                "direct_integer_effective_flow"
+                if float(flow_dx_px).is_integer() and float(flow_dy_px).is_integer()
+                else "bilinear_continuous_effective_flow"
+            ),
             "flow_dx_px": float(flow_dx_px),
             "flow_dy_px": float(flow_dy_px),
         })
