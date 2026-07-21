@@ -52,23 +52,23 @@ def partial_diffusion_inversion(
     generator,
     device,
     dtype,
-    mode: Literal["ddim", "forward_noise"] = "ddim",
+    mode: Literal["ddim", "ddpm", "forward_noise"] = "ddim",
     unet=None,
     prompt_embeds=None,
     guidance_scale: float = 2.5,
 ) -> PartialInversionResult:
-    """Partially invert an image with DDIM or Equation-(4) forward noising.
+    """Partially invert an image with DDIM, DDPM, or forward noising.
 
-    ``ddim`` follows the paper's Implementation Details. ``forward_noise``
-    preserves the stochastic formulation in Equation (4) as an explicit
-    reproduction ablation.
+    ``ddim`` uses deterministic DDIM inversion. ``ddpm`` uses the DDPM
+    scheduler's forward noising process before DDPM denoising.
+    ``forward_noise`` remains the historical diagnostic ablation.
     """
     try:
         import torch
     except ImportError as exc:
         raise ImportError("partial_diffusion_inversion requires torch") from exc
 
-    if mode not in {"ddim", "forward_noise"}:
+    if mode not in {"ddim", "ddpm", "forward_noise"}:
         raise ValueError(f"Unsupported inversion mode: {mode}")
     clean_latents = encode_image_to_latents(vae, image, device=device, dtype=dtype)
     timesteps, _ = retrieve_img2img_timesteps(scheduler, num_inference_steps, strength, device)
@@ -80,7 +80,7 @@ def partial_diffusion_inversion(
     denoise_scheduler_name = type(scheduler).__name__
     inverse_scheduler_name = ""
     prediction_type = str(getattr(scheduler.config, "prediction_type", "unspecified"))
-    if mode == "forward_noise":
+    if mode in {"ddpm", "forward_noise"}:
         noise = torch.randn(clean_latents.shape, generator=generator, device=device, dtype=dtype)
         noisy_latents = scheduler.add_noise(clean_latents, noise, start_timestep)
     else:

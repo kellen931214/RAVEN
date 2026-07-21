@@ -15,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from raven.eval_protocol import (  # noqa: E402
     FORMAL_ATTACK_CONFIG,
+    load_formal_attack_config,
     assert_formal_debug_info,
     canonical_json_hash,
     provider_config,
@@ -33,6 +34,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--snapshot-manifest", type=Path, required=True, help="Snapshot index JSONL")
     parser.add_argument("--clean-dir", type=Path, default=None, help="Optional additional clean-root constraint")
     parser.add_argument("--watermark-config", type=Path, default=None, help="Optional config whose SHA is recorded")
+    parser.add_argument("--attack-config", type=Path, default=None, help="Optional immutable formal attack config JSON")
     parser.add_argument("--output", type=Path, required=True)
     return parser
 
@@ -101,6 +103,11 @@ def main() -> int:
         raise FileExistsError(f"refusing to overwrite {args.output}")
     if args.metadata.resolve() != args.snapshot_manifest.resolve():
         raise ValueError("--metadata and --snapshot-manifest must identify the same immutable index")
+    attack_config = (
+        load_formal_attack_config(args.attack_config)
+        if args.attack_config is not None
+        else FORMAL_ATTACK_CONFIG
+    )
     snapshots, snapshot_index_sha = load_snapshots(args.snapshot_manifest)
     snapshot_by_id = unique_index(snapshots, args.snapshot_manifest)
     attacks = unique_index(load_jsonl(args.attack_records), args.attack_records)
@@ -134,12 +141,13 @@ def main() -> int:
             debug,
             planned_flow_dx_image_px=float(attack["planned_flow_dx_image_px"]),
             planned_flow_dy_image_px=float(attack["planned_flow_dy_image_px"]),
+            attack_config=attack_config,
         )
         if attack.get("transform_config_hash") != transform_hash:
             raise RuntimeError(f"run_id={run_id}: transform config hash mismatch")
-        if attack.get("model_id") != FORMAL_ATTACK_CONFIG["model_id"]:
+        if attack.get("model_id") != attack_config["model_id"]:
             raise RuntimeError(f"run_id={run_id}: model ID mismatch")
-        if attack.get("model_revision") != FORMAL_ATTACK_CONFIG["model_revision"]:
+        if attack.get("model_revision") != attack_config["model_revision"]:
             raise RuntimeError(f"run_id={run_id}: model revision mismatch")
         provider = provider_config(args.method, source)
         expected_provider_hash = provider_config_hash(args.method, source)

@@ -13,6 +13,34 @@ This file records implementation bugs, validated non-bugs, ablations, and the ev
 | 2026-07-15 | RAVEN exact two-stage color transfer | Implemented and verified. Existing 10 validation pre-color outputs were reused; no DDIM inversion or denoising was rerun. | `raven_repro/raven/color_transfer.py`; `raven_repro/scripts/raven_color_transfer_validation.py`; `outputs/raven_color_transfer_validation/diffusiondb_20260715T042018Z/aggregate_results.md` |
 | 2026-07-14 | NFPA-style Tree-Ring complex L1 evaluation | Completed for DiffusionDB only. MS-COCO was not run after scope was corrected. | `outputs/raven_nfpa_tr_eval/diffusiondb/20260714T161952Z/aggregate_results.json` |
 
+## 2026-07-21 — Formal NFPA/DDPM/no-shift ablation variants
+
+### Scope
+The formal evaluator now accepts a complete, validated attack-config file. The
+only supported ablation deltas are `latent_sampling_mode=bilinear`,
+`inversion_mode=scheduler_mode=ddpm`, and `shift_plan_mode=zero`; all retain
+the pinned model revision, 512px inputs, 50 steps, strength 0.15, CFG 2.5,
+reflection padding, view-guided attention, aligned color transfer, detector,
+CLIP, FID, and effective-flow overlap metrics.
+
+### Root cause
+The baseline runner used a module-level configuration directly. That made a
+controlled sampler/inversion/shift ablation impossible without duplicating
+or weakening formal attack, resume, debug, and manifest checks.
+
+### Fix
+`eval_protocol.py` centrally validates and hashes each complete variant config;
+the existing formal runner, pipeline, manifest builder, and resume validation
+consume that config. DDPM uses the existing forward-noise inversion primitive
+and a `DDPMScheduler`; DDIM is unchanged. The zero-shift plan keeps the same
+per-run seed but records `(0, 0)`. Source manifests include tracked variant
+configs, and result tables identify the exact variant.
+
+### Regression prevention
+`test_formal_variant_config.py` checks config/debug hashing, zero-shift seed
+stability, DDPM validation, and the DDPM inversion path. Full formal tests and
+10-sample GPU gates must pass before any 1001-sample variant launch.
+
 ## Confirmed Issues And Fixes
 
 ### 2026-07-17 - Corrected Paired DDIM-Shift No-Color Evaluation

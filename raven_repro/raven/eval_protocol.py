@@ -182,8 +182,63 @@ def load_and_validate_source_manifest(
     return payload, actual_manifest_sha
 
 
-def formal_attack_config_hash() -> str:
-    return canonical_json_hash(FORMAL_ATTACK_CONFIG)
+def normalize_formal_attack_config(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate a formal attack variant without weakening the baseline protocol."""
+    config = dict(payload)
+    required = set(FORMAL_ATTACK_CONFIG)
+    missing = sorted(required - set(config))
+    extra = sorted(set(config) - required - {"scheduler_mode", "shift_plan_mode", "variant_name"})
+    if missing or extra:
+        raise ValueError(
+            f"invalid formal attack config missing={missing} extra={extra}"
+        )
+    config.setdefault("scheduler_mode", "ddim")
+    config.setdefault("shift_plan_mode", "formal_deterministic")
+    config.setdefault("variant_name", "formal_baseline")
+    variant_fields = {
+        "latent_sampling_mode", "inversion_mode", "scheduler_mode",
+        "shift_plan_mode", "variant_name",
+    }
+    drift = {
+        key: (FORMAL_ATTACK_CONFIG[key], config[key])
+        for key in FORMAL_ATTACK_CONFIG
+        if key not in variant_fields and config[key] != FORMAL_ATTACK_CONFIG[key]
+    }
+    if drift:
+        raise ValueError(
+            "formal ablation config changes non-variant fields: "
+            + ", ".join(sorted(drift))
+        )
+    if config["inversion_mode"] not in {"ddim", "ddpm"}:
+        raise ValueError(f"unsupported inversion_mode={config['inversion_mode']!r}")
+    if config["scheduler_mode"] not in {"ddim", "ddpm"}:
+        raise ValueError(f"unsupported scheduler_mode={config['scheduler_mode']!r}")
+    if config["inversion_mode"] != config["scheduler_mode"]:
+        raise ValueError("inversion_mode and scheduler_mode must match")
+    if config["latent_sampling_mode"] not in {"nearest", "bilinear"}:
+        raise ValueError("latent_sampling_mode must be nearest or bilinear")
+    if config["shift_plan_mode"] not in {"formal_deterministic", "zero"}:
+        raise ValueError("shift_plan_mode must be formal_deterministic or zero")
+    if config["warp_mode"] != "raven_paper_nfpa_gap_fill":
+        raise ValueError("formal variants require raven_paper_nfpa_gap_fill")
+    if config["padding_mode"] != "reflection":
+        raise ValueError("formal variants require reflection padding")
+    return config
+
+
+def load_formal_attack_config(path: str | Path) -> dict[str, Any]:
+    """Load and normalize a tracked, immutable formal attack configuration."""
+    config_path = Path(path).resolve()
+    payload = json.loads(config_path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError(f"formal attack config is not an object: {config_path}")
+    return normalize_formal_attack_config(payload)
+
+
+def formal_attack_config_hash(config: Mapping[str, Any] | None = None) -> str:
+    return canonical_json_hash(
+        FORMAL_ATTACK_CONFIG if config is None else normalize_formal_attack_config(config)
+    )
 
 
 def transform_config_payload(debug_info: Mapping[str, Any]) -> dict[str, Any]:
@@ -222,22 +277,28 @@ def assert_formal_debug_info(
     *,
     planned_flow_dx_image_px: float | None = None,
     planned_flow_dy_image_px: float | None = None,
+    attack_config: Mapping[str, Any] | None = None,
 ) -> str:
+    config = (
+        FORMAL_ATTACK_CONFIG
+        if attack_config is None
+        else normalize_formal_attack_config(attack_config)
+    )
     missing = [field for field in FORMAL_DEBUG_FIELDS if field not in debug_info]
     if missing:
         raise RuntimeError(f"formal debug info missing fields: {missing}")
     expected = {
-        "model_id": FORMAL_ATTACK_CONFIG["model_id"],
-        "model_revision": FORMAL_ATTACK_CONFIG["model_revision"],
-        "steps": FORMAL_ATTACK_CONFIG["steps"],
-        "strength": FORMAL_ATTACK_CONFIG["strength"],
-        "guidance_scale": FORMAL_ATTACK_CONFIG["guidance_scale"],
-        "inversion_mode": FORMAL_ATTACK_CONFIG["inversion_mode"],
-        "warp_mode": FORMAL_ATTACK_CONFIG["warp_mode"],
-        "interpolation_mode": FORMAL_ATTACK_CONFIG["latent_sampling_mode"],
-        "padding_mode": FORMAL_ATTACK_CONFIG["padding_mode"],
+        "model_id": config["model_id"],
+        "model_revision": config["model_revision"],
+        "steps": config["steps"],
+        "strength": config["strength"],
+        "guidance_scale": config["guidance_scale"],
+        "inversion_mode": config["inversion_mode"],
+        "warp_mode": config["warp_mode"],
+        "interpolation_mode": config["latent_sampling_mode"],
+        "padding_mode": config["padding_mode"],
         "align_corners": False,
-        "color_transfer_mode": FORMAL_ATTACK_CONFIG["color_transfer_mode"],
+        "color_transfer_mode": config["color_transfer_mode"],
         "inversion_prompt": "",
         "reconstruction_prompt": "",
     }
@@ -380,6 +441,7 @@ def validate_resume_record(
     record: Mapping[str, Any],
     *,
     expected: Mapping[str, Any],
+    attack_config: Mapping[str, Any] | None = None,
 ) -> None:
     for field, expected_value in expected.items():
         if record.get(field) != expected_value:
@@ -407,6 +469,7 @@ def validate_resume_record(
         debug_info,
         planned_flow_dx_image_px=float(expected["planned_flow_dx_image_px"]),
         planned_flow_dy_image_px=float(expected["planned_flow_dy_image_px"]),
+        attack_config=attack_config,
     )
     if record.get("transform_config_hash") != transform_hash:
         raise RuntimeError(f"resume debug transform hash mismatch run_id={run_id}")

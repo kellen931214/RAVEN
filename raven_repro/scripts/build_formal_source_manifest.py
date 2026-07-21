@@ -59,6 +59,10 @@ def build_payload() -> dict:
         str(path.relative_to(REPO))
         for path in sorted((REPO / "raven_repro" / "tests").glob("test_*.py"))
     )
+    paths.extend(
+        str(path.relative_to(REPO))
+        for path in sorted((REPO / "experiments" / "raven_ablation_configs").glob("*.json"))
+    )
     if len(paths) != len(set(paths)):
         raise RuntimeError("duplicate formal source path")
     files = []

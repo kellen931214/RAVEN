@@ -1,0 +1,34 @@
+{
+  "base_seed": 42,
+  "color_transfer": true,
+  "color_transfer_mode": "paper_exact_two_stage_aligned",
+  "guidance_scale": 2.5,
+  "image_size": [
+    512,
+    512
+  ],
+  "inversion_mode": "ddim",
+  "latent_sampling_mode": "bilinear",
+  "model_id": "RedbeardNZ/stable-diffusion-2-1-base",
+  "model_revision": "c6a5e9bab8d874d081de76fa270ae0aefa5410ff",
+  "negative_prompt": "",
+  "padding_mode": "reflection",
+  "prompt": "",
+  "scheduler_mode": "ddim",
+  "seed_policy": "base_seed_plus_numeric_run_id",
+  "shift_magnitudes_image_px": [
+    24,
+    27,
+    28,
+    29,
+    32
+  ],
+  "shift_plan_mode": "formal_deterministic",
+  "shift_sign_policy": "deterministic_four_quadrant_schedule",
+  "shift_space": "image_pixels",
+  "steps": 50,
+  "strength": 0.15,
+  "variant_name": "nfpa_bilinear_reflection_ddim_aligned",
+  "view_guided_attention": true,
+  "warp_mode": "raven_paper_nfpa_gap_fill"
+}

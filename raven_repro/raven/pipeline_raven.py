@@ -51,10 +51,11 @@ class RavenPipeline:
         device: str = "cuda",
         dtype: Optional[str] = None,
         revision: Optional[str] = None,
+        scheduler_mode: str = "ddim",
     ):
         try:
             import torch
-            from diffusers import DDIMScheduler, StableDiffusionPipeline
+            from diffusers import DDPMScheduler, DDIMScheduler, StableDiffusionPipeline
         except ImportError as exc:
             raise ImportError(
                 "RavenPipeline requires torch and diffusers. Install raven_repro/requirements.txt first."
@@ -71,6 +72,9 @@ class RavenPipeline:
         self.model_id = model_id
         self.model_revision = revision
         self.model_variant = "default"
+        if scheduler_mode not in {"ddim", "ddpm"}:
+            raise ValueError(f"Unsupported scheduler_mode: {scheduler_mode}")
+        self.scheduler_mode = scheduler_mode
 
         # This checkpoint has standard safetensors but no filename-level fp16 variant.
         model_variant = None
@@ -84,7 +88,8 @@ class RavenPipeline:
             low_cpu_mem_usage=True,
             revision=revision,
         )
-        self.pipe.scheduler = DDIMScheduler.from_config(self.pipe.scheduler.config)
+        scheduler_class = DDIMScheduler if scheduler_mode == "ddim" else DDPMScheduler
+        self.pipe.scheduler = scheduler_class.from_config(self.pipe.scheduler.config)
         self.pipe = self.pipe.to(device)
         self.pipe.vae.requires_grad_(False)
         self.pipe.text_encoder.requires_grad_(False)

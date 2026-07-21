@@ -34,6 +34,8 @@ from raven.eval_protocol import (  # noqa: E402
     current_clip_provenance,
     formal_attack_config_hash,
     load_and_validate_source_manifest,
+    load_formal_attack_config,
+    normalize_formal_attack_config,
     provider_config,
     provider_config_hash,
     require_uniform_clip_provenance,
@@ -129,7 +131,9 @@ def first(row: dict[str, str], *names: str) -> str:
     return ""
 
 
-def verified_image(path_value: str, run_id: str, label: str) -> tuple[str, str]:
+def verified_image(
+    path_value: str, run_id: str, label: str, image_size: list[int]
+) -> tuple[str, str]:
     path = Path(path_value).expanduser().resolve()
     if not path.is_file():
         raise FileNotFoundError(f"run_id={run_id}: missing {label}: {path}")
@@ -139,16 +143,16 @@ def verified_image(path_value: str, run_id: str, label: str) -> tuple[str, str]:
     with Image.open(path) as opened:
         decoded = ImageOps.exif_transpose(opened).convert("RGB")
         decoded.load()
-        if list(decoded.size) != FORMAL_ATTACK_CONFIG["image_size"]:
+        if list(decoded.size) != image_size:
             raise ValueError(
                 f"run_id={run_id}: {label} size={decoded.size}, "
-                f"expected={tuple(FORMAL_ATTACK_CONFIG['image_size'])}"
+                f"expected={tuple(image_size)}"
             )
     return str(path), sha256_path(path)
 
 
 def normalize_snapshot_row(
-    row: dict[str, str], *, dataset: str, method: str
+    row: dict[str, str], *, dataset: str, method: str, attack_config: dict[str, Any]
 ) -> dict[str, Any]:
     run_id = first(row, "run_id", "sample_id", "id")
     if not run_id:
@@ -164,10 +168,10 @@ def normalize_snapshot_row(
     if not prompt or not prompt_id:
         raise ValueError(f"run_id={run_id}: prompt and prompt_id are required")
     clean_path, clean_sha = verified_image(
-        first(row, "clean_path", "clean_image_path"), run_id, "clean image"
+        first(row, "clean_path", "clean_image_path"), run_id, "clean image", attack_config["image_size"]
     )
     watermarked_path, watermarked_sha = verified_image(
-        first(row, "watermarked_path", "watermarked_image_path"), run_id, "watermarked image"
+        first(row, "watermarked_path", "watermarked_image_path"), run_id, "watermarked image", attack_config["image_size"]
     )
     config = provider_config(method, row)
     return {
@@ -187,6 +191,14 @@ def normalize_snapshot_row(
 
 
 def run_config(args: argparse.Namespace) -> dict[str, Any]:
+    attack_config = (
+        load_formal_attack_config(args.attack_config)
+        if args.attack_config is not None
+        else normalize_formal_attack_config(FORMAL_ATTACK_CONFIG)
+    )
+    attack_config_source = (
+        args.attack_config.resolve() if args.attack_config is not None else None
+    )
     source_manifest, source_manifest_sha = load_and_validate_source_manifest(
         args.source_manifest, repo_root=REPO
     )
@@ -201,8 +213,14 @@ def run_config(args: argparse.Namespace) -> dict[str, Any]:
         "method": args.method,
         "expected_count": args.expected_count,
         "source_metadata": str(args.source_metadata.resolve()),
-        "attack_config": FORMAL_ATTACK_CONFIG,
-        "attack_config_hash": formal_attack_config_hash(),
+        "attack_config": attack_config,
+        "attack_config_hash": formal_attack_config_hash(attack_config),
+        "attack_config_source_path": (
+            str(attack_config_source) if attack_config_source is not None else None
+        ),
+        "attack_config_source_sha256": (
+            sha256_path(attack_config_source) if attack_config_source is not None else None
+        ),
         "detector_config_hash": canonical_json_hash(
             {"method": args.method, "target_fpr": 0.01, "score_source": "strict manifest"}
         ),
@@ -213,6 +231,7 @@ def run_config(args: argparse.Namespace) -> dict[str, Any]:
                 "overlap": "effective source flow inverse warp",
                 "fid": "clean-fid watermarked-vs-raven",
                 "clip": CLIP_CONFIG,
+                "attack_config_hash": formal_attack_config_hash(attack_config),
             }
         ),
         "git_head": head,
@@ -276,7 +295,13 @@ def snapshot_stage(args: argparse.Namespace, config: dict[str, Any]) -> int:
     source_rows, partial_tail_ignored = read_committed_csv(args.source_metadata)
     source_rows = source_rows[: args.expected_count]
     normalized = [
-        normalize_snapshot_row(row, dataset=args.dataset, method=args.method) for row in source_rows
+        normalize_snapshot_row(
+            row,
+            dataset=args.dataset,
+            method=args.method,
+            attack_config=config["attack_config"],
+        )
+        for row in source_rows
     ]
     source_ids = [row["run_id"] for row in normalized]
     if len(set(source_ids)) != len(source_ids):
@@ -342,9 +367,10 @@ def snapshot_stage(args: argparse.Namespace, config: dict[str, Any]) -> int:
     return 0
 
 
-def planned_shift(index: int, run_id: str, base_seed: int | None = None) -> tuple[float, float, int]:
-    if base_seed is None:
-        base_seed = int(FORMAL_ATTACK_CONFIG["base_seed"])
+def planned_shift(
+    index: int, run_id: str, attack_config: dict[str, Any]
+) -> tuple[float, float, int]:
+    base_seed = int(attack_config["base_seed"])
     magnitude_x = SHIFT_MAGNITUDES[index % len(SHIFT_MAGNITUDES)]
     magnitude_y = SHIFT_MAGNITUDES[(index // len(SHIFT_MAGNITUDES)) % len(SHIFT_MAGNITUDES)]
     sign_x, sign_y = SHIFT_SIGNS[index % len(SHIFT_SIGNS)]
@@ -352,6 +378,8 @@ def planned_shift(index: int, run_id: str, base_seed: int | None = None) -> tupl
         numeric_id = int(run_id)
     except ValueError:
         numeric_id = int(canonical_json_hash({"run_id": run_id})[:8], 16)
+    if attack_config["shift_plan_mode"] == "zero":
+        return 0.0, 0.0, base_seed + numeric_id
     return float(sign_x * magnitude_x), float(sign_y * magnitude_y), base_seed + numeric_id
 
 
@@ -373,8 +401,8 @@ def expected_resume_fields(
         "git_head": config["git_head"],
         "formal_source_config_hash": config["formal_source_config_hash"],
         "source_code_manifest_sha256": config["source_code_manifest_sha256"],
-        "model_id": FORMAL_ATTACK_CONFIG["model_id"],
-        "model_revision": FORMAL_ATTACK_CONFIG["model_revision"],
+        "model_id": config["attack_config"]["model_id"],
+        "model_revision": config["attack_config"]["model_revision"],
         "attack_seed": seed,
         "planned_flow_dx_image_px": dx,
         "planned_flow_dy_image_px": dy,
@@ -391,14 +419,18 @@ def attack_stage(args: argparse.Namespace, config: dict[str, Any], role: str) ->
     pending = []
     reused_count = 0
     for index, row in enumerate(rows):
-        dx, dy, seed = planned_shift(index, str(row["run_id"]))
+        dx, dy, seed = planned_shift(index, str(row["run_id"]), config["attack_config"])
         item = cache / str(row["run_id"]) / role
         record_path = item / "record.json"
         expected = expected_resume_fields(row, role=role, dx=dx, dy=dy, seed=seed, config=config)
         if record_path.exists():
             if not args.resume:
                 raise FileExistsError(record_path)
-            validate_resume_record(json.loads(record_path.read_text(encoding="utf-8")), expected=expected)
+            validate_resume_record(
+                json.loads(record_path.read_text(encoding="utf-8")),
+                expected=expected,
+                attack_config=config["attack_config"],
+            )
             reused_count += 1
             continue
         if item.exists():
@@ -424,8 +456,9 @@ def attack_stage(args: argparse.Namespace, config: dict[str, Any], role: str) ->
     guard = CpuMemoryGuard(24.0, 48.0, 40.0)
     guard.check(f"formal attack-{role} startup")
     pipe = RavenPipeline(
-        model_id=FORMAL_ATTACK_CONFIG["model_id"],
-        revision=FORMAL_ATTACK_CONFIG["model_revision"],
+        model_id=config["attack_config"]["model_id"],
+        revision=config["attack_config"]["model_revision"],
+        scheduler_mode=config["attack_config"]["scheduler_mode"],
         device=args.device,
         dtype="float16" if args.device.startswith("cuda") else "float32",
     )
@@ -440,22 +473,22 @@ def attack_stage(args: argparse.Namespace, config: dict[str, Any], role: str) ->
         attacked = pipe.run(
             input_image=image,
             output_dir=output_dir,
-            steps=FORMAL_ATTACK_CONFIG["steps"],
-            strength=FORMAL_ATTACK_CONFIG["strength"],
-            guidance_scale=FORMAL_ATTACK_CONFIG["guidance_scale"],
-            shift_space=FORMAL_ATTACK_CONFIG["shift_space"],
-            warp_mode=FORMAL_ATTACK_CONFIG["warp_mode"],
-            padding_mode=FORMAL_ATTACK_CONFIG["padding_mode"],
-            latent_sampling_mode=FORMAL_ATTACK_CONFIG["latent_sampling_mode"],
+            steps=config["attack_config"]["steps"],
+            strength=config["attack_config"]["strength"],
+            guidance_scale=config["attack_config"]["guidance_scale"],
+            shift_space=config["attack_config"]["shift_space"],
+            warp_mode=config["attack_config"]["warp_mode"],
+            padding_mode=config["attack_config"]["padding_mode"],
+            latent_sampling_mode=config["attack_config"]["latent_sampling_mode"],
             shift_x=expected["planned_flow_dx_image_px"],
             shift_y=expected["planned_flow_dy_image_px"],
-            view_guided_attention=FORMAL_ATTACK_CONFIG["view_guided_attention"],
-            color_transfer=FORMAL_ATTACK_CONFIG["color_transfer"],
+            view_guided_attention=config["attack_config"]["view_guided_attention"],
+            color_transfer=config["attack_config"]["color_transfer"],
             seed=expected["attack_seed"],
-            prompt=FORMAL_ATTACK_CONFIG["prompt"],
-            negative_prompt=FORMAL_ATTACK_CONFIG["negative_prompt"],
+            prompt=config["attack_config"]["prompt"],
+            negative_prompt=config["attack_config"]["negative_prompt"],
             debug=False,
-            inversion_mode=FORMAL_ATTACK_CONFIG["inversion_mode"],
+            inversion_mode=config["attack_config"]["inversion_mode"],
         )
         del attacked, image
         attacked_path = output_dir / "final_color_corrected.png"
@@ -465,6 +498,7 @@ def attack_stage(args: argparse.Namespace, config: dict[str, Any], role: str) ->
             debug,
             planned_flow_dx_image_px=expected["planned_flow_dx_image_px"],
             planned_flow_dy_image_px=expected["planned_flow_dy_image_px"],
+            attack_config=config["attack_config"],
         )
         record = {
             **expected,
@@ -489,7 +523,7 @@ def attack_stage(args: argparse.Namespace, config: dict[str, Any], role: str) ->
             "effective_source_flow_dy_image_px": float(debug["effective_source_flow_dy_image_px"]),
             "effective_visual_shift_dx_image_px": float(debug["effective_visual_shift_dx_image_px"]),
             "effective_visual_shift_dy_image_px": float(debug["effective_visual_shift_dy_image_px"]),
-            "formal_attack_config": FORMAL_ATTACK_CONFIG,
+            "formal_attack_config": config["attack_config"],
             "transform_config_hash": transform_hash,
             "formal_config_hash": expected["attack_config_hash"],
             "source_code_manifest_sha": expected["source_code_manifest_sha256"],
@@ -527,7 +561,7 @@ def attack_records(root: Path, config: dict[str, Any], role: str) -> list[dict[s
     rows = load_snapshot_rows(root)
     records = []
     for index, row in enumerate(rows):
-        dx, dy, seed = planned_shift(index, str(row["run_id"]))
+        dx, dy, seed = planned_shift(index, str(row["run_id"]), config["attack_config"])
         path = root / "attack_cache" / config["attack_config_hash"] / str(row["run_id"]) / role / "record.json"
         if not path.is_file():
             raise FileNotFoundError(path)
@@ -535,6 +569,7 @@ def attack_records(root: Path, config: dict[str, Any], role: str) -> list[dict[s
         validate_resume_record(
             record,
             expected=expected_resume_fields(row, role=role, dx=dx, dy=dy, seed=seed, config=config),
+            attack_config=config["attack_config"],
         )
         records.append(record)
     return records
@@ -657,24 +692,26 @@ def verify_stage(args: argparse.Namespace, config: dict[str, Any]) -> int:
             handle.write(json.dumps(row, sort_keys=True, allow_nan=False) + "\n")
     snapshot_index = args.output_root / "snapshots" / "snapshot_index.jsonl"
     manifest = args.output_root / "verification" / "manifest.csv"
-    run_subprocess(
-        [
-            sys.executable,
-            str(RAVEN_REPRO / "scripts" / "build_verification_manifest.py"),
-            "--dataset",
-            args.dataset,
-            "--method",
-            args.method,
-            "--metadata",
-            str(snapshot_index),
-            "--attack-records",
-            str(records_path),
-            "--snapshot-manifest",
-            str(snapshot_index),
-            "--output",
-            str(manifest),
-        ]
-    )
+    manifest_command = [
+        sys.executable,
+        str(RAVEN_REPRO / "scripts" / "build_verification_manifest.py"),
+        "--dataset",
+        args.dataset,
+        "--method",
+        args.method,
+        "--metadata",
+        str(snapshot_index),
+        "--attack-records",
+        str(records_path),
+        "--snapshot-manifest",
+        str(snapshot_index),
+    ]
+    if config["attack_config_source_path"] is not None:
+        manifest_command.extend(
+            ["--attack-config", str(config["attack_config_source_path"])]
+        )
+    manifest_command.extend(["--output", str(manifest)])
+    run_subprocess(manifest_command)
     verification = args.output_root / "verification"
     if args.method == "TR":
         clean_records = require_complete_records(args, config, "clean")
@@ -710,7 +747,7 @@ def verify_stage(args: argparse.Namespace, config: dict[str, Any]) -> int:
                 "--output",
                 str(scores),
                 "--model-revision",
-                FORMAL_ATTACK_CONFIG["model_revision"],
+                config["attack_config"]["model_revision"],
                 "--device",
                 args.device,
             ]
@@ -954,6 +991,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--method", required=True, choices=["GS", "TR", "RID", "HSTR", "HSQR"])
     parser.add_argument("--source-metadata", type=Path, required=True)
     parser.add_argument("--source-manifest", type=Path, required=True)
+    parser.add_argument("--attack-config", type=Path, default=None)
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--expected-count", type=int, required=True)
     parser.add_argument("--batch-size", type=int, default=64)
@@ -971,6 +1009,8 @@ def main(argv: Iterable[str] | None = None) -> int:
     args.method = args.method.upper()
     args.output_root = args.output_root.resolve()
     if args.gpu is not None:
+        # Keep --gpu tied to the physical nvidia-smi index used in provenance.
+        os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
         os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
     config = initialize_or_validate_run(args)
     if args.stage == "snapshot":

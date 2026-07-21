@@ -10,7 +10,7 @@ from pathlib import Path
 
 
 FIELDS = (
-    "Dataset", "Watermark", "N", "Metric protocol", "Target FPR", "Actual FPR",
+    "Dataset", "Watermark", "Variant", "N", "Metric protocol", "Target FPR", "Actual FPR",
     "Before TPR", "Attacked TPR at original threshold",
     "Attacked TPR at recalibrated threshold", "Attack success rate", "ROC-AUC",
     "GS bit accuracy before", "GS bit accuracy attacked", "FID reference", "FID",
@@ -34,6 +34,8 @@ def mean_jsonl(path: Path, key: str) -> float:
 
 def table_row(root: Path) -> dict:
     validation = json.loads((root / "VALIDATED.json").read_text())
+    if validation.get("status") == "validated_aligned_color_evaluation":
+        return aligned_color_table_row(root, validation)
     if validation.get("status") != "validated_formal_result":
         raise ValueError(f"not a validated formal result: {root}")
     aggregate = json.loads((root / "formal_aggregate.json").read_text())
@@ -51,7 +53,9 @@ def table_row(root: Path) -> dict:
     manifest = root / "verification" / "manifest.csv"
     row = {field: "" for field in FIELDS}
     row.update({
-        "Dataset": aggregate["dataset"], "Watermark": method, "N": aggregate["N"],
+        "Dataset": aggregate["dataset"], "Watermark": method,
+        "Variant": aggregate["attack_config"].get("variant_name", "formal_variant"),
+        "N": aggregate["N"],
         "Metric protocol": aggregate["metric_protocol_version"],
         "FID reference": fid["reference_definition"],
         "FID": fid.get("value", fid.get("fid", fid.get("score", ""))),
@@ -89,6 +93,53 @@ def table_row(root: Path) -> dict:
         })
     return row
 
+
+
+def aligned_color_table_row(root: Path, validation: dict) -> dict:
+    """Adapt the retained aligned baseline without recomputing any metric."""
+    aggregate = json.loads((root / "aggregate_results.json").read_text())
+    source_manifest = json.loads(
+        Path(aggregate["source_code_manifest_path"]).read_text(encoding="utf-8")
+    )
+    detector = aggregate["detector"]["nfpa_rounded2_protocol"]
+    fid = aggregate["fid"]
+    clip = aggregate["clip"]
+    manifest = root / "verification" / "manifest.csv"
+    row = {field: "" for field in FIELDS}
+    row.update({
+        "Dataset": "diffusiondb",
+        "Watermark": "TR",
+        "Variant": "nfpa_nearest_reflection_ddim_aligned_reused",
+        "N": aggregate["sample_count"],
+        "Metric protocol": aggregate["detector"]["protocol"],
+        "Target FPR": detector["target_fpr"],
+        "Actual FPR": detector["original_clean_actual_fpr"],
+        "Before TPR": detector["before_tpr"],
+        "Attacked TPR at original threshold": detector[
+            "attacked_tpr_at_original_clean_threshold"
+        ],
+        "Attacked TPR at recalibrated threshold": detector[
+            "attacked_tpr_at_attacked_clean_recalibrated_threshold"
+        ],
+        "Attack success rate": detector[
+            "attack_success_rate_at_recalibrated_threshold"
+        ],
+        "ROC-AUC": detector["attacked_roc_auc"],
+        "FID reference": fid["reference_definition"],
+        "FID": fid["value"],
+        "CLIP model": f"{clip['clip_model_name']}/{clip['clip_pretrained']}",
+        "CLIP score": clip["mean"],
+        "Quality reference": aggregate["quality_reference"],
+        "Overlap protocol": aggregate["quality_overlap"],
+        "PSNR": aggregate["quality_psnr_mean"],
+        "SSIM": aggregate["quality_ssim_mean"],
+        "Manifest SHA": __import__("hashlib").sha256(manifest.read_bytes()).hexdigest(),
+        "Attack config hash": aggregate["formal_attack_config_hash"],
+        "Detector config hash": "",
+        "Git SHA": source_manifest["git_head"],
+        "Status": validation["status"],
+    })
+    return row
 
 def main() -> int:
     args = parser().parse_args()
