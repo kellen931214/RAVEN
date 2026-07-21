@@ -16,6 +16,22 @@ This file records implementation bugs, validated non-bugs, ablations, and the ev
 
 
 
+## 2026-07-21 - Idle-GPU strict protocol rerun dispatcher
+
+Added experiments/wait_and_run_raven_protocol_variants.py and
+experiments/run_raven_no_color_eval.py. The dispatcher never signals existing
+processes. It waits for GPUs with no compute PID, low utilization, and at least
+18 GiB free memory; it also waits for at least 64 GiB available CPU RAM and
+performs a CUDA allocation/kernel probe before launching a worker.
+
+Four attack workflows produce five complete evaluations. DDIM nearest shift
+aligned-color is shared with DDIM nearest shift no-color, whose detector, FID,
+CLIP, PSNR, and SSIM consume only the SHA-bound pre-color record. Every worker
+must pass a fresh 10-sample cohort before its 1001-sample cohort. Existing roots
+are reused only when their validation status, sample count, current commit,
+source manifest, and attack config agree; the old balanced-schedule roots do not
+qualify as strict paper-random results.
+
 ## 2026-07-21 - Formal provenance and validation hardening
 
 ### Confirmed root causes

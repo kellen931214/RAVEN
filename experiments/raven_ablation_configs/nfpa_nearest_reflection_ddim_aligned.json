@@ -7,14 +7,14 @@
     512,
     512
   ],
-  "inversion_mode": "ddpm",
+  "inversion_mode": "ddim",
   "latent_sampling_mode": "nearest",
   "model_id": "RedbeardNZ/stable-diffusion-2-1-base",
   "model_revision": "c6a5e9bab8d874d081de76fa270ae0aefa5410ff",
   "negative_prompt": "",
   "padding_mode": "reflection",
   "prompt": "",
-  "scheduler_mode": "ddpm",
+  "scheduler_mode": "ddim",
   "seed_policy": "base_seed_plus_numeric_run_id",
   "shift_magnitudes_image_px": [
     24,
@@ -32,7 +32,7 @@
   "shift_space": "image_pixels",
   "steps": 50,
   "strength": 0.15,
-  "variant_name": "nfpa_nearest_reflection_ddpm_aligned",
+  "variant_name": "nfpa_nearest_reflection_ddim_aligned",
   "view_guided_attention": true,
   "warp_mode": "raven_paper_nfpa_gap_fill"
 }

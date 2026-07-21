@@ -18,9 +18,13 @@
   "seed_policy": "base_seed_plus_numeric_run_id",
   "shift_magnitudes_image_px": [
     24,
+    25,
+    26,
     27,
     28,
     29,
+    30,
+    31,
     32
   ],
   "shift_plan_mode": "paper_random_independent_axes",
