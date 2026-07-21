@@ -70,3 +70,16 @@ def test_allowed_gpu_filter_excludes_incompatible_devices():
         locally_reserved=set(),
     )
     assert [gpu["index"] for gpu in result] == [4]
+
+
+
+def test_dispatcher_worker_log_parent_is_created_by_source():
+    source = (
+        Path(__file__).resolve().parents[2]
+        / "experiments"
+        / "wait_and_run_raven_protocol_variants.py"
+    ).read_text()
+    assert 'worker_log.parent.mkdir(parents=True, exist_ok=True)' in source
+    assert source.index('worker_log.parent.mkdir') < source.index(
+        'handle = worker_log.open'
+    )

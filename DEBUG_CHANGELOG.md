@@ -18,6 +18,14 @@ This file records implementation bugs, validated non-bugs, ablations, and the ev
 
 ## 2026-07-21 - Idle-GPU strict protocol rerun dispatcher
 
+### Dispatcher worker-log startup correction
+
+The compatible-GPU relaunch reached worker assignment but failed before spawning
+a worker because the parent opened the per-worker log before creating its
+directory. The parent now creates the log directory first. A regression test
+locks the required ordering. No attack process or output was created by either
+failed dispatcher root.
+
 ### Compatible-GPU allowlist correction
 
 The first dispatcher launch stopped before creating any worker because physical

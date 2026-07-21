@@ -405,6 +405,7 @@ def parent(args: argparse.Namespace) -> int:
                     return 2
                 name = pending.pop(0)
                 worker_log = args.state_root / "logs" / f"{name}.worker.log"
+                worker_log.parent.mkdir(parents=True, exist_ok=True)
                 handle = worker_log.open("a", encoding="utf-8")
                 command = [
                     sys.executable, str(Path(__file__).resolve()),
