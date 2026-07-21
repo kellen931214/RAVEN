@@ -213,6 +213,17 @@ def run_config(args: argparse.Namespace) -> dict[str, Any]:
         "method": args.method,
         "expected_count": args.expected_count,
         "source_metadata": str(args.source_metadata.resolve()),
+        "source_metadata_sha256": sha256_path(args.source_metadata),
+        "immutable_source_snapshot_index": (
+            str(args.immutable_source_snapshot_index.resolve())
+            if args.immutable_source_snapshot_index is not None
+            else None
+        ),
+        "immutable_source_snapshot_index_sha256": (
+            sha256_path(args.immutable_source_snapshot_index)
+            if args.immutable_source_snapshot_index is not None
+            else None
+        ),
         "attack_config": attack_config,
         "attack_config_hash": formal_attack_config_hash(attack_config),
         "attack_config_source_path": (
@@ -291,9 +302,57 @@ def load_snapshot_rows(root: Path) -> list[dict[str, Any]]:
     return result
 
 
+def load_immutable_source_rows(
+    snapshot_index: Path, *, source_metadata: Path, expected_count: int
+) -> tuple[list[dict[str, str]], str]:
+    """Load a prior immutable cohort and fail closed on file or source drift."""
+    entries = [
+        json.loads(line)
+        for line in snapshot_index.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    if not entries:
+        raise ValueError(f"empty immutable source snapshot index: {snapshot_index}")
+    source_sha = sha256_path(source_metadata)
+    rows: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for entry in entries:
+        if entry.get("source_metadata_path") != str(source_metadata.resolve()):
+            raise RuntimeError("immutable source snapshot metadata path mismatch")
+        if entry.get("source_metadata_sha256") != source_sha:
+            raise RuntimeError("immutable source snapshot metadata SHA mismatch")
+        batch_path = Path(entry["snapshot_path"])
+        if not batch_path.is_file() or sha256_path(batch_path) != entry.get("snapshot_sha256"):
+            raise RuntimeError(f"immutable source snapshot file/hash drift: {batch_path}")
+        batch_rows, partial = read_committed_csv(batch_path)
+        if partial or len(batch_rows) != int(entry["row_count"]):
+            raise RuntimeError(f"immutable source snapshot row-count drift: {batch_path}")
+        for row in batch_rows:
+            run_id = str(row.get("run_id", ""))
+            if not run_id or run_id in seen:
+                raise RuntimeError(f"immutable source duplicate/empty run_id={run_id!r}")
+            seen.add(run_id)
+            rows.append(row)
+    if len(rows) < expected_count:
+        raise RuntimeError(
+            f"immutable source cohort has {len(rows)} rows, expected at least {expected_count}"
+        )
+    return rows[:expected_count], source_sha
+
+
 def snapshot_stage(args: argparse.Namespace, config: dict[str, Any]) -> int:
-    source_rows, partial_tail_ignored = read_committed_csv(args.source_metadata)
-    source_rows = source_rows[: args.expected_count]
+    if args.immutable_source_snapshot_index is None:
+        source_rows, partial_tail_ignored = read_committed_csv(args.source_metadata)
+        source_rows = source_rows[: args.expected_count]
+    else:
+        source_rows, source_sha = load_immutable_source_rows(
+            args.immutable_source_snapshot_index,
+            source_metadata=args.source_metadata,
+            expected_count=args.expected_count,
+        )
+        if source_sha != config["source_metadata_sha256"]:
+            raise RuntimeError("immutable source metadata SHA changed after run initialization")
+        partial_tail_ignored = False
     normalized = [
         normalize_snapshot_row(
             row,
@@ -356,6 +415,10 @@ def snapshot_stage(args: argparse.Namespace, config: dict[str, Any]) -> int:
             "row_count": len(batch),
             "source_metadata_path": str(args.source_metadata.resolve()),
             "source_metadata_sha256": source_sha,
+            "immutable_source_snapshot_index": config["immutable_source_snapshot_index"],
+            "immutable_source_snapshot_index_sha256": config[
+                "immutable_source_snapshot_index_sha256"
+            ],
             "snapshot_path": str(path.resolve()),
             "snapshot_sha256": sha256_path(path),
             "created_utc": utc_now(),
@@ -991,6 +1054,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--method", required=True, choices=["GS", "TR", "RID", "HSTR", "HSQR"])
     parser.add_argument("--source-metadata", type=Path, required=True)
     parser.add_argument("--source-manifest", type=Path, required=True)
+    parser.add_argument(
+        "--immutable-source-snapshot-index", type=Path, default=None,
+        help="Optional verified prior formal snapshot index; prevents reading a mutable cohort.",
+    )
     parser.add_argument("--attack-config", type=Path, default=None)
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--expected-count", type=int, required=True)

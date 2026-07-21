@@ -7,7 +7,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 import torch
 from PIL import Image
 
-from experiments.run_raven_formal_eval import planned_shift
+from experiments.run_raven_formal_eval import load_immutable_source_rows, planned_shift
 from raven.eval_protocol import (
     FORMAL_ATTACK_CONFIG,
     assert_formal_debug_info,
@@ -72,6 +72,33 @@ def test_variant_config_hash_and_debug_assertion_are_config_specific():
         "transform_config_hash"
     ]
     assert formal_attack_config_hash(config) != formal_attack_config_hash()
+
+
+def test_immutable_source_index_requires_original_snapshot_and_metadata_sha(tmp_path):
+    source = tmp_path / "metadata.csv"
+    source.write_text("run_id,prompt\n0,one\n1,two\n")
+    batch = tmp_path / "batch.csv"
+    batch.write_text(source.read_text())
+    from raven.eval_protocol import sha256_path
+
+    index = tmp_path / "snapshot_index.jsonl"
+    entry = {
+        "snapshot_path": str(batch),
+        "snapshot_sha256": sha256_path(batch),
+        "row_count": 2,
+        "source_metadata_path": str(source.resolve()),
+        "source_metadata_sha256": sha256_path(source),
+    }
+    index.write_text(json.dumps(entry) + "\n")
+    rows, source_sha = load_immutable_source_rows(
+        index, source_metadata=source, expected_count=2
+    )
+    assert [row["run_id"] for row in rows] == ["0", "1"]
+    assert source_sha == sha256_path(source)
+    source.write_text("run_id,prompt\n0,changed\n1,two\n")
+    import pytest
+    with pytest.raises(RuntimeError, match="metadata SHA mismatch"):
+        load_immutable_source_rows(index, source_metadata=source, expected_count=2)
 
 
 def test_zero_shift_plan_preserves_seed_and_uses_zero_effective_plan():

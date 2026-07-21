@@ -33,8 +33,11 @@ or weakening formal attack, resume, debug, and manifest checks.
 the existing formal runner, pipeline, manifest builder, and resume validation
 consume that config. DDPM uses the existing forward-noise inversion primitive
 and a `DDPMScheduler`; DDIM is unchanged. The zero-shift plan keeps the same
-per-run seed but records `(0, 0)`. Source manifests include tracked variant
-configs, and result tables identify the exact variant.
+per-run seed but records `(0, 0)`. The runner can also consume the existing
+1001-row snapshot index, verifies every historical batch hash and the original
+metadata SHA before selecting a gate cohort, and records that index SHA in each
+new snapshot. Source manifests include tracked variant configs, and result
+tables identify the exact variant.
 
 ### Regression prevention
 `test_formal_variant_config.py` checks config/debug hashing, zero-shift seed
