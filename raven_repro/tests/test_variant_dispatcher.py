@@ -55,3 +55,18 @@ def test_all_tracked_dispatch_configs_are_formally_valid():
         assert config["shift_magnitudes_image_px"] == list(range(24, 33))
         if config["shift_plan_mode"] != "zero":
             assert config["shift_plan_mode"] == "paper_random_independent_axes"
+
+
+
+def test_allowed_gpu_filter_excludes_incompatible_devices():
+    gpus = [
+        {"index": 4, "uuid": "a", "free_mib": 24000, "total_mib": 24576, "utilization": 0},
+        {"index": 6, "uuid": "blackwell", "free_mib": 96000, "total_mib": 98304, "utilization": 0},
+    ]
+    allowed = {4, 5, 8}
+    filtered = [gpu for gpu in gpus if int(gpu["index"]) in allowed]
+    result = idle_candidates(
+        filtered, set(), min_free_mib=18000, max_utilization=5,
+        locally_reserved=set(),
+    )
+    assert [gpu["index"] for gpu in result] == [4]

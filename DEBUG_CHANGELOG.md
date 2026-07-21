@@ -18,6 +18,16 @@ This file records implementation bugs, validated non-bugs, ablations, and the ev
 
 ## 2026-07-21 - Idle-GPU strict protocol rerun dispatcher
 
+### Compatible-GPU allowlist correction
+
+The first dispatcher launch stopped before creating any worker because physical
+GPU 6 is a Blackwell sm_120 device while the installed PyTorch supports only
+through sm_90. The relaunch interface now accepts an explicit physical-GPU
+allowlist. This run is pinned to GPUs 4, 5, and 8, which previously completed
+the same formal workload successfully; GPU 6 is never considered. This is an
+explicit user-directed relaunch, not automatic fallback after the failure.
+
+
 Added experiments/wait_and_run_raven_protocol_variants.py and
 experiments/run_raven_no_color_eval.py. The dispatcher never signals existing
 processes. It waits for GPUs with no compute PID, low utilization, and at least

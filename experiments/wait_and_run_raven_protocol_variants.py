@@ -348,6 +348,7 @@ def parent(args: argparse.Namespace) -> int:
         "source_metadata": str(args.source_metadata),
         "snapshot_index": str(args.snapshot_index),
         "expected_count": args.expected_count,
+        "allowed_physical_gpus": args.allowed_gpus,
         "jobs": list(JOBS),
     }
     atomic_json(args.state_root / "dispatcher_state.json", state)
@@ -382,6 +383,9 @@ def parent(args: argparse.Namespace) -> int:
                 state["error"] = str(exc)
                 atomic_json(args.state_root / "dispatcher_state.json", state)
                 return 2
+            allowed = set(args.allowed_gpus) if args.allowed_gpus else None
+            if allowed is not None:
+                gpus = [gpu for gpu in gpus if int(gpu["index"]) in allowed]
             candidates = idle_candidates(
                 gpus,
                 active_uuids,
@@ -456,6 +460,7 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--min-free-mib", type=int, default=18000)
     result.add_argument("--max-utilization", type=int, default=5)
     result.add_argument("--min-available-ram-gib", type=float, default=64.0)
+    result.add_argument("--allowed-gpus", type=int, nargs="+", default=None)
     result.add_argument("--worker-job", choices=JOBS, default=None)
     result.add_argument("--worker-gpu", type=int, default=None)
     return result
