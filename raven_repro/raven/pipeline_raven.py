@@ -26,6 +26,7 @@ from .warp import (
     latent_grid_warp,
     latent_grid_warp_nearest_reflection,
     nfpa_warp_single_latent,
+    raven_paper_nfpa_gap_fill_centered_warp,
     raven_paper_nfpa_gap_fill_warp,
     sample_translation,
     translate_latent,
@@ -256,7 +257,7 @@ class RavenPipeline:
             shift_source = "explicit_plan"
         inverse_sampling_modes = {
             "nfpa_exact", "nfpa_pixel_center", "latent_grid_nearest_reflection", "latent_grid",
-            "raven_paper_nfpa_gap_fill",
+            "raven_paper_nfpa_gap_fill", "raven_paper_nfpa_gap_fill_centered",
         }
         inverse_sampling_warp = warp_mode in inverse_sampling_modes
         nfpa_warp_metadata = None
@@ -266,6 +267,19 @@ class RavenPipeline:
             if padding_mode != "reflection":
                 raise ValueError("raven_paper_nfpa_gap_fill requires padding_mode='reflection'")
             shifted_latents, nfpa_warp_metadata = raven_paper_nfpa_gap_fill_warp(
+                inversion.noisy_latents,
+                dx_image_px=float(dx),
+                dy_image_px=float(dy),
+                vae_scale_factor=self.vae_scale_factor,
+                sampling_mode=latent_sampling_mode or "nearest",
+                return_metadata=True,
+            )
+        elif warp_mode == "raven_paper_nfpa_gap_fill_centered":
+            if shift_space != "image_pixels":
+                raise ValueError("raven_paper_nfpa_gap_fill_centered requires image-space flow")
+            if padding_mode != "reflection":
+                raise ValueError("raven_paper_nfpa_gap_fill_centered requires padding_mode='reflection'")
+            shifted_latents, nfpa_warp_metadata = raven_paper_nfpa_gap_fill_centered_warp(
                 inversion.noisy_latents,
                 dx_image_px=float(dx),
                 dy_image_px=float(dy),
@@ -454,7 +468,24 @@ class RavenPipeline:
                 )
             ),
             "half_pixel_offset": (
-                0.5 if warp_mode == "nfpa_pixel_center" else (0.0 if inverse_sampling_warp else None)
+                nfpa_warp_metadata.get("pixel_center_offset_image_px")
+                if inverse_sampling_warp and nfpa_warp_metadata
+                else None
+            ),
+            "pixel_center_offset_image_px": (
+                nfpa_warp_metadata.get("pixel_center_offset_image_px")
+                if inverse_sampling_warp and nfpa_warp_metadata
+                else None
+            ),
+            "warp_coordinate_convention": (
+                nfpa_warp_metadata.get("pixel_center_coordinate_convention")
+                if inverse_sampling_warp and nfpa_warp_metadata
+                else None
+            ),
+            "warp_implementation_version": (
+                nfpa_warp_metadata.get("grid_implementation_version")
+                if inverse_sampling_warp and nfpa_warp_metadata
+                else None
             ),
             "nfpa_warp_metadata": nfpa_warp_metadata,
             "circular": False,

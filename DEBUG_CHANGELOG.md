@@ -559,3 +559,86 @@ README, plus `audit/output_directory_guide.md`. The main timestamped suite is
 identified as four attack generations producing five evaluation variants.
 Historical failed/stale roots and the two concurrently active paper-exact
 full1001 roots are labeled separately. No process was stopped.
+
+
+## 2026-07-22 - Centered NFPA bilinear warp ablation
+
+### Problem
+`nfpa_warp_single_latent()` uses `grid_sample(..., align_corners=False)` but the
+legacy NFPA image-grid normalization maps integer pixel indices with
+`2*x/W - 1`. For bilinear sampling this is half a pixel off; zero flow is not an
+identity warp. Nearest sampling can hide the issue through quantization.
+
+### Root cause
+The existing `raven_paper_nfpa_gap_fill` mode intentionally preserved the
+historical NFPA `/W` and `/H` coordinate convention. That mode did not expose a
+formal RAVEN-named centered variant, so bilinear ablations could not select the
+PyTorch pixel-center convention without using lower-level diagnostic modes.
+
+### Affected files
+- `raven_repro/raven/warp.py:nfpa_warp_single_latent`
+- `raven_repro/raven/warp.py:raven_paper_nfpa_gap_fill_centered_warp`
+- `raven_repro/raven/warp.py:translate_latent`
+- `raven_repro/raven/pipeline_raven.py:RavenPipeline.run`
+- `raven_repro/raven/eval_protocol.py:normalize_formal_attack_config`
+- `experiments/raven_ablation_configs/nfpa_centered_bilinear_reflection.json`
+
+### Affected outputs
+Existing `raven_paper_nfpa_gap_fill` outputs remain immutable and are still valid
+for the legacy coordinate convention they recorded. They are not corrected in
+place and must not be relabeled as centered. Any centered-bilinear comparison
+requires a new output root generated with
+`warp_mode=raven_paper_nfpa_gap_fill_centered`.
+
+### Fix
+Added `raven_paper_nfpa_gap_fill_centered` as a separate warp mode. It reuses the
+same NFPA image-coordinate flow, reflection padding, inverse `grid_sample`, and
+sampling-mode plumbing, but calls `nfpa_warp_single_latent(...,
+pixel_center_offset=0.5)`. Debug metadata and transform hashes now record the
+pixel-center offset, coordinate convention, and grid implementation version.
+Formal ablation config validation now permits only the legacy and centered RAVEN
+NFPA gap-fill modes.
+
+### Reused code
+The existing NFPA flow builder, `nfpa_warp_single_latent()`, direct
+`latent_grid_warp()` reference helper, RavenPipeline attack body, detector,
+quality, FID, and CLIP workflows were reused. No DDIM/DDPM, shift, attention,
+detector, or metric protocol was changed.
+
+### Historical bug coverage
+Reviewed the 2026-07-15 NFPA gap-fill entries and the 2026-07-20 effective-flow
+aligned color-transfer entry. Searched reachable `warp_mode` validation and
+formal ablation config paths. The legacy `raven_paper_nfpa_gap_fill` reference
+test remains unchanged to prevent accidental result drift.
+
+### Regression prevention
+New tests cover centered zero-flow identity for nearest and bilinear sampling,
+centered RAVEN/NFPA equivalence to `latent_grid_warp`, bilinear effective source
+flow matching the planned flow, centered formal ablation config hashing, and
+legacy reference behavior preservation.
+
+### Validation
+- `python -m py_compile raven_repro/raven/warp.py raven_repro/raven/pipeline_raven.py raven_repro/raven/eval_protocol.py`: passed.
+- `PYTHONPATH=raven_repro pytest -q raven_repro/tests/test_warp.py`: 41 passed, 1 warning.
+- `PYTHONPATH=raven_repro pytest -q raven_repro/tests/test_formal_variant_config.py raven_repro/tests/test_formal_resume.py`: 8 passed.
+- `PYTHONPATH=raven_repro pytest -q raven_repro/tests/test_effective_displacement.py raven_repro/tests/test_formal_variant_config.py raven_repro/tests/test_formal_resume.py`: 48 passed, 40 expected PSNR infinity warnings.
+- `git diff --check`: passed.
+
+### Watermark integrity
+- Source data: unchanged; no dataset, clean image, or watermarked image touched.
+- Attack pairing: not rerun; new mode only changes recorded warp implementation
+  when explicitly selected.
+- Detector: unchanged Tree-Ring complex L1 protocol.
+- Threshold: unchanged original-clean and attacked-clean calibration reporting.
+- Quality: unchanged use of actual-grid effective source flow.
+- CLIP: unchanged prompt-image metric.
+- FID: unchanged watermarked-versus-attacked staging protocol.
+
+### Git provenance
+- Repository: `kellen931214/RAVEN`
+- Branch: `agent/cleanup-quality-decomposition`
+- Commit: pending
+- Remote branch: `origin/agent/cleanup-quality-decomposition`
+- Push status: pending
+- Entry point: `experiments/run_raven_formal_eval.py`
+- Formal output eligibility: code change validated; centered full evaluation not run.

@@ -14,15 +14,21 @@ LatentSamplingMode = Literal["nearest", "bilinear"]
 WarpMode = Literal[
     "integer", "grid_sample", "nfpa_exact", "nfpa_pixel_center",
     "latent_grid_nearest_reflection", "latent_grid",
-    "raven_paper_nfpa_gap_fill",
+    "raven_paper_nfpa_gap_fill", "raven_paper_nfpa_gap_fill_centered",
 ]
 
 RAVEN_PAPER_NFPA_GAP_FILL = "raven_paper_nfpa_gap_fill"
+RAVEN_PAPER_NFPA_GAP_FILL_CENTERED = "raven_paper_nfpa_gap_fill_centered"
 RAVEN_PAPER_NFPA_GAP_FILL_CLASSIFICATION = (
     "RAVEN paper-faithful settings with NFPA-based gap filling "
     "for underspecified warp implementation details."
 )
+RAVEN_PAPER_NFPA_GAP_FILL_CENTERED_CLASSIFICATION = (
+    "RAVEN paper settings with NFPA-style gap filling corrected for "
+    "PyTorch align_corners=False pixel-center coordinates."
+)
 NFPA_IMAGE_GRID_IMPLEMENTATION_VERSION = "nfpa_image_grid_w_h_norm_v1"
+NFPA_IMAGE_GRID_CENTERED_IMPLEMENTATION_VERSION = "nfpa_image_grid_w_h_norm_centered_v2"
 
 
 
@@ -180,6 +186,11 @@ def nfpa_warp_single_latent(
             else "x_norm = 2*x_pixel/W - 1; y_norm = 2*y_pixel/H - 1"
         ),
         "pixel_center_offset_image_px": float(pixel_center_offset),
+        "pixel_center_coordinate_convention": (
+            "centered_align_corners_false"
+            if float(pixel_center_offset) == 0.5
+            else "legacy_nfpa_w_h_norm"
+        ),
         "normalized_flow_dx": float((reference_flow[:, 0].detach().float().mean() * 2.0 / flow_w).cpu().item()),
         "normalized_flow_dy": float((reference_flow[:, 1].detach().float().mean() * 2.0 / flow_h).cpu().item()),
         "coordinate_grid_minmax_before_norm": coords_minmax_before_norm,
@@ -191,7 +202,11 @@ def nfpa_warp_single_latent(
         "coordinate_resize_mode": "bilinear",
         "nfpa_source_omitted_interpolate_align_corners": True,
         "effective_interpolate_align_corners": False,
-        "grid_implementation_version": NFPA_IMAGE_GRID_IMPLEMENTATION_VERSION,
+        "grid_implementation_version": (
+            NFPA_IMAGE_GRID_CENTERED_IMPLEMENTATION_VERSION
+            if float(pixel_center_offset) == 0.5
+            else NFPA_IMAGE_GRID_IMPLEMENTATION_VERSION
+        ),
         "latent_sampling_mode": sampling_mode,
         "padding_mode": "reflection",
         "nfpa_source_omitted_grid_sample_align_corners": True,
@@ -209,6 +224,33 @@ def nfpa_warp_single_latent(
     return warped
 
 
+def raven_paper_nfpa_gap_fill_centered_warp(
+    latent,
+    dx_image_px: float,
+    dy_image_px: float,
+    vae_scale_factor: int = 8,
+    sampling_mode: LatentSamplingMode = "nearest",
+    return_metadata: bool = False,
+):
+    """Centered variant of the RAVEN/NFPA gap-fill warp.
+
+    With ``align_corners=False``, PyTorch grid coordinates refer to pixel
+    centers. This variant preserves the existing NFPA construction but adds the
+    required +0.5 image-pixel offset before W/H normalization.
+    """
+    return raven_paper_nfpa_gap_fill_warp(
+        latent,
+        dx_image_px,
+        dy_image_px,
+        vae_scale_factor=vae_scale_factor,
+        sampling_mode=sampling_mode,
+        return_metadata=return_metadata,
+        pixel_center_offset=0.5,
+        transform_setting_name=RAVEN_PAPER_NFPA_GAP_FILL_CENTERED,
+        implementation_classification=RAVEN_PAPER_NFPA_GAP_FILL_CENTERED_CLASSIFICATION,
+    )
+
+
 def raven_paper_nfpa_gap_fill_warp(
     latent,
     dx_image_px: float,
@@ -216,6 +258,9 @@ def raven_paper_nfpa_gap_fill_warp(
     vae_scale_factor: int = 8,
     sampling_mode: LatentSamplingMode = "nearest",
     return_metadata: bool = False,
+    pixel_center_offset: float = 0.0,
+    transform_setting_name: str = RAVEN_PAPER_NFPA_GAP_FILL,
+    implementation_classification: str = RAVEN_PAPER_NFPA_GAP_FILL_CLASSIFICATION,
 ):
     """RAVEN paper shift plan with NFPA coordinate/sampling gap filling.
 
@@ -243,12 +288,17 @@ def raven_paper_nfpa_gap_fill_warp(
         latent,
         flow,
         return_metadata=True,
-        pixel_center_offset=0.0,
+        pixel_center_offset=pixel_center_offset,
         sampling_mode=sampling_mode,
     )
     metadata.update({
-        "transform_setting_name": RAVEN_PAPER_NFPA_GAP_FILL,
-        "implementation_classification": RAVEN_PAPER_NFPA_GAP_FILL_CLASSIFICATION,
+        "transform_setting_name": transform_setting_name,
+        "implementation_classification": implementation_classification,
+        "pixel_center_coordinate_convention": (
+            "centered_align_corners_false"
+            if float(pixel_center_offset) == 0.5
+            else "legacy_nfpa_w_h_norm"
+        ),
         "raven_shift_unit": "image_pixels",
         "raven_shift_rule": (
             "dx and dy sampled independently from [24,32] or [-32,-24] image pixels"
@@ -425,7 +475,7 @@ def translate_latent(
     if warp_mode not in {
         "integer", "grid_sample", "nfpa_exact", "nfpa_pixel_center",
         "latent_grid_nearest_reflection", "latent_grid",
-        "raven_paper_nfpa_gap_fill",
+        "raven_paper_nfpa_gap_fill", "raven_paper_nfpa_gap_fill_centered",
     }:
         raise ValueError(f"Unsupported warp_mode: {warp_mode}")
     if vae_scale_factor <= 0:
@@ -436,6 +486,16 @@ def translate_latent(
         if shift_space != "image_pixels":
             raise ValueError("raven_paper_nfpa_gap_fill requires image-pixel flow")
         return raven_paper_nfpa_gap_fill_warp(
+            latents,
+            dx,
+            dy,
+            vae_scale_factor=vae_scale_factor,
+            sampling_mode="nearest",
+        )
+    if warp_mode == "raven_paper_nfpa_gap_fill_centered":
+        if shift_space != "image_pixels":
+            raise ValueError("raven_paper_nfpa_gap_fill_centered requires image-pixel flow")
+        return raven_paper_nfpa_gap_fill_centered_warp(
             latents,
             dx,
             dy,

@@ -4,8 +4,11 @@ torch = pytest.importorskip("torch")
 
 from raven.warp import (
     RAVEN_PAPER_NFPA_GAP_FILL,
+    RAVEN_PAPER_NFPA_GAP_FILL_CENTERED,
     create_nfpa_translation_flow,
+    latent_grid_warp,
     nfpa_warp_single_latent,
+    raven_paper_nfpa_gap_fill_centered_warp,
     raven_paper_nfpa_gap_fill_warp,
     sample_translation,
     translate_latent,
@@ -362,6 +365,74 @@ def test_raven_paper_nfpa_gap_fill_matches_reference_helper(mode):
     assert metadata["padding_mode"] == "reflection"
     assert metadata["normalization_formula"] == "x_norm = 2*x_pixel/W - 1; y_norm = 2*y_pixel/H - 1"
 
+
+
+@pytest.mark.parametrize("sampling_mode", ["nearest", "bilinear"])
+def test_centered_zero_flow_is_identity_for_nearest_and_bilinear(sampling_mode):
+    torch.manual_seed(21)
+    latent = torch.randn(1, 3, 16, 16)
+    flow = create_nfpa_translation_flow(
+        0, 0, height=128, width=128, device=latent.device, dtype=latent.dtype
+    )
+    actual, metadata = nfpa_warp_single_latent(
+        latent,
+        flow,
+        return_metadata=True,
+        pixel_center_offset=0.5,
+        sampling_mode=sampling_mode,
+    )
+    assert torch.equal(actual, latent)
+    assert metadata["pixel_center_offset_image_px"] == 0.5
+    assert metadata["normalization_formula"] == (
+        "x_norm = 2*(x_pixel+0.5)/W - 1; y_norm = 2*(y_pixel+0.5)/H - 1"
+    )
+
+
+@pytest.mark.parametrize("sampling_mode", ["nearest", "bilinear"])
+def test_centered_raven_gap_fill_equals_direct_latent_grid(sampling_mode):
+    torch.manual_seed(22)
+    latent = torch.randn(1, 2, 32, 32)
+    centered, centered_meta = raven_paper_nfpa_gap_fill_centered_warp(
+        latent,
+        27,
+        -29,
+        vae_scale_factor=8,
+        sampling_mode=sampling_mode,
+        return_metadata=True,
+    )
+    direct, direct_meta = latent_grid_warp(
+        latent,
+        27,
+        -29,
+        vae_scale_factor=8,
+        sampling_mode=sampling_mode,
+        padding_mode="reflection",
+        return_metadata=True,
+    )
+    assert torch.equal(centered, direct)
+    assert centered_meta["transform_setting_name"] == RAVEN_PAPER_NFPA_GAP_FILL_CENTERED
+    assert centered_meta["pixel_center_coordinate_convention"] == "centered_align_corners_false"
+    assert centered_meta["pixel_center_offset_image_px"] == 0.5
+    assert centered_meta["grid_implementation_version"] == "nfpa_image_grid_w_h_norm_centered_v2"
+    assert direct_meta["effective_grid_sample_align_corners"] is False
+
+
+def test_centered_bilinear_effective_flow_matches_planned_flow():
+    latent = torch.zeros(1, 1, 64, 64)
+    _, metadata = raven_paper_nfpa_gap_fill_centered_warp(
+        latent,
+        27,
+        -29,
+        vae_scale_factor=8,
+        sampling_mode="bilinear",
+        return_metadata=True,
+    )
+    assert metadata["planned_flow_dx_image_px"] == pytest.approx(27.0)
+    assert metadata["planned_flow_dy_image_px"] == pytest.approx(-29.0)
+    assert metadata["effective_source_flow_dx_image_px"] == pytest.approx(27.0)
+    assert metadata["effective_source_flow_dy_image_px"] == pytest.approx(-29.0)
+    assert metadata["effective_visual_shift_dx_image_px"] == pytest.approx(-27.0)
+    assert metadata["effective_visual_shift_dy_image_px"] == pytest.approx(29.0)
 
 def test_raven_paper_nfpa_gap_fill_inverse_warp_direction():
     latent = torch.zeros(1, 1, 64, 64)

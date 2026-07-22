@@ -40,7 +40,24 @@ def debug_payload(config):
         "interpolation_mode": config["latent_sampling_mode"],
         "padding_mode": config["padding_mode"],
         "align_corners": False,
-        "normalized_coordinate_formula": "x_norm = 2*x_pixel/W - 1",
+        "normalized_coordinate_formula": (
+            "x_norm = 2*(x_pixel+0.5)/W - 1; y_norm = 2*(y_pixel+0.5)/H - 1"
+            if config["warp_mode"] == "raven_paper_nfpa_gap_fill_centered"
+            else "x_norm = 2*x_pixel/W - 1"
+        ),
+        "pixel_center_offset_image_px": (
+            0.5 if config["warp_mode"] == "raven_paper_nfpa_gap_fill_centered" else 0.0
+        ),
+        "warp_coordinate_convention": (
+            "centered_align_corners_false"
+            if config["warp_mode"] == "raven_paper_nfpa_gap_fill_centered"
+            else "legacy_nfpa_w_h_norm"
+        ),
+        "warp_implementation_version": (
+            "nfpa_image_grid_w_h_norm_centered_v2"
+            if config["warp_mode"] == "raven_paper_nfpa_gap_fill_centered"
+            else "nfpa_image_grid_w_h_norm_v1"
+        ),
         "planned_flow_dx_image_px": 27.0,
         "planned_flow_dy_image_px": -29.0,
         "effective_source_dx_latent": 3.0,
@@ -104,6 +121,25 @@ def test_scheduler_config_hash_ignores_private_metadata_order_only():
         canonical_scheduler_config(changed)
     )
 
+
+def test_centered_bilinear_variant_config_is_allowed_and_hash_distinct():
+    config = normalize_formal_attack_config(
+        variant_config(
+            warp_mode="raven_paper_nfpa_gap_fill_centered",
+            latent_sampling_mode="bilinear",
+            inversion_mode="ddim",
+            scheduler_mode="ddim",
+            shift_plan_mode="paper_random_independent_axes",
+            variant_name="nfpa_centered_bilinear_reflection_ddim_aligned",
+        )
+    )
+    payload = debug_payload(config)
+    assert payload["pixel_center_offset_image_px"] == 0.5
+    assert payload["warp_coordinate_convention"] == "centered_align_corners_false"
+    assert assert_formal_debug_info(payload, attack_config=config) == payload[
+        "transform_config_hash"
+    ]
+    assert formal_attack_config_hash(config) != formal_attack_config_hash()
 
 def test_immutable_source_index_requires_original_snapshot_and_metadata_sha(tmp_path):
     source = tmp_path / "metadata.csv"

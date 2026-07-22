@@ -101,6 +101,9 @@ FORMAL_DEBUG_FIELDS = (
     "padding_mode",
     "align_corners",
     "normalized_coordinate_formula",
+    "pixel_center_offset_image_px",
+    "warp_coordinate_convention",
+    "warp_implementation_version",
     "color_transfer_mode",
     "inversion_prompt",
     "reconstruction_prompt",
@@ -267,7 +270,7 @@ def normalize_formal_attack_config(payload: Mapping[str, Any]) -> dict[str, Any]
     config.setdefault("variant_name", "formal_baseline")
     variant_fields = {
         "latent_sampling_mode", "inversion_mode", "scheduler_mode",
-        "shift_plan_mode", "variant_name",
+        "shift_plan_mode", "variant_name", "warp_mode",
     }
     drift = {
         key: (FORMAL_ATTACK_CONFIG[key], config[key])
@@ -294,8 +297,14 @@ def normalize_formal_attack_config(payload: Mapping[str, Any]) -> dict[str, Any]
             "shift_plan_mode must be paper_random_independent_axes, "
             "balanced_deterministic_schedule, or zero"
         )
-    if config["warp_mode"] != "raven_paper_nfpa_gap_fill":
-        raise ValueError("formal variants require raven_paper_nfpa_gap_fill")
+    if config["warp_mode"] not in {
+        "raven_paper_nfpa_gap_fill",
+        "raven_paper_nfpa_gap_fill_centered",
+    }:
+        raise ValueError(
+            "formal variants require raven_paper_nfpa_gap_fill or "
+            "raven_paper_nfpa_gap_fill_centered"
+        )
     if config["padding_mode"] != "reflection":
         raise ValueError("formal variants require reflection padding")
     return config
@@ -333,6 +342,13 @@ def transform_config_payload(debug_info: Mapping[str, Any]) -> dict[str, Any]:
         "padding_mode": debug_info["padding_mode"],
         "align_corners": debug_info["align_corners"],
         "normalized_coordinate_formula": debug_info["normalized_coordinate_formula"],
+        "pixel_center_offset_image_px": (
+            None
+            if debug_info["pixel_center_offset_image_px"] is None
+            else float(debug_info["pixel_center_offset_image_px"])
+        ),
+        "warp_coordinate_convention": debug_info["warp_coordinate_convention"],
+        "warp_implementation_version": debug_info["warp_implementation_version"],
         "planned_flow_dx_image_px": float(debug_info["planned_flow_dx_image_px"]),
         "planned_flow_dy_image_px": float(debug_info["planned_flow_dy_image_px"]),
         "effective_source_flow_dx_image_px": float(
