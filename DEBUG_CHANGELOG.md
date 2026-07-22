@@ -548,3 +548,14 @@ order/version drift and public scheduler parameter drift. Focused tests: 15
 passed. Full CPU suite: 163 passed with 44 existing warnings. `py_compile` and
 `git diff --check` passed. Replacement GPU smoke/full runs require a new source
 manifest and new timestamped output root; the failed root is not resumable.
+
+## 2026-07-22 - Human-readable output aliases
+
+The timestamped formal output roots were difficult to interpret, but the active
+waiter and evaluators reference them by absolute path. To avoid interrupting or
+invalidating those processes, no output was renamed or moved. Added
+`outputs/RAVEN_EVALS_READABLE/` with descriptive symlink aliases and an output
+README, plus `audit/output_directory_guide.md`. The main timestamped suite is
+identified as four attack generations producing five evaluation variants.
+Historical failed/stale roots and the two concurrently active paper-exact
+full1001 roots are labeled separately. No process was stopped.
