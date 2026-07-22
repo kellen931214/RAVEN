@@ -1,369 +1,385 @@
 {
-  "created_utc": "2026-07-22T01:27:23Z",
-  "file_count": 45,
+  "created_utc": "2026-07-22T07:43:08Z",
+  "file_count": 47,
   "files": [
     {
-      "git_dirty": true,
-      "git_head": "4133b009c9686d0cc69bb906d124a0cbb159b5f0",
+      "git_dirty": false,
+      "git_head": "f32cd51855e3e47a4cb82c49c6752b3fb1fef772",
       "relative_path": "experiments/build_raven_formal_eval_table.py",
-      "sha256": "ee37ea86cc2adc91e2c696d631411689b5cee197fa3b28c5408e9b57dab88edd",
-      "size_bytes": 8293,
+      "sha256": "9b73e756b27dd6588939a1e87bb8465ca63e9824479ccf025ebecd2235b8470c",
+      "size_bytes": 11043,
       "tracked_or_untracked": "tracked"
     },
     {
-      "git_dirty": true,
-      "git_head": "4133b009c9686d0cc69bb906d124a0cbb159b5f0",
+      "git_dirty": false,
+      "git_head": "f32cd51855e3e47a4cb82c49c6752b3fb1fef772",
       "relative_path": "experiments/raven_ablation_configs/ddim_no_shift.json",
       "sha256": "2c53404a9d744f12dc943b2b54a064e8ed4562d8193d6c4c78db43aecefd13f8",
       "size_bytes": 917,
       "tracked_or_untracked": "tracked"
     },
     {
-      "git_dirty": true,
-      "git_head": "4133b009c9686d0cc69bb906d124a0cbb159b5f0",
+      "git_dirty": false,
+      "git_head": "f32cd51855e3e47a4cb82c49c6752b3fb1fef772",
       "relative_path": "experiments/raven_ablation_configs/ddpm_reflection.json",
       "sha256": "abc3bbb182a65a16762619cead5e5ad0e80ba86468a33c8d21c0905a449df55c",
       "size_bytes": 933,
       "tracked_or_untracked": "tracked"
     },
     {
-      "git_dirty": true,
-      "git_head": "4133b009c9686d0cc69bb906d124a0cbb159b5f0",
+      "git_dirty": false,
+      "git_head": "f32cd51855e3e47a4cb82c49c6752b3fb1fef772",
       "relative_path": "experiments/raven_ablation_configs/nfpa_bilinear_reflection.json",
       "sha256": "e0ce29e5d82536ed508213281e9cb1cdc7355fd27cd81b6e00dbf11369722b26",
       "size_bytes": 935,
       "tracked_or_untracked": "tracked"
     },
     {
-      "git_dirty": true,
-      "git_head": "4133b009c9686d0cc69bb906d124a0cbb159b5f0",
+      "git_dirty": false,
+      "git_head": "f32cd51855e3e47a4cb82c49c6752b3fb1fef772",
       "relative_path": "experiments/raven_ablation_configs/nfpa_nearest_reflection_ddim_aligned.json",
       "sha256": "c102592445e505e2567687bf9d03c47b7d7db2a35075fe57f5a41b31f441e1b7",
       "size_bytes": 933,
       "tracked_or_untracked": "tracked"
     },
     {
-      "git_dirty": true,
-      "git_head": "4133b009c9686d0cc69bb906d124a0cbb159b5f0",
+      "git_dirty": false,
+      "git_head": "f32cd51855e3e47a4cb82c49c6752b3fb1fef772",
+      "relative_path": "experiments/raven_ablation_configs/nfpa_nearest_reflection_ddim_paper_exact.json",
+      "sha256": "9f8a6f9050e5623726994cc9db57c2b2da82c173a3b4cb9b66ae860ab14d65d0",
+      "size_bytes": 929,
+      "tracked_or_untracked": "tracked"
+    },
+    {
+      "git_dirty": false,
+      "git_head": "f32cd51855e3e47a4cb82c49c6752b3fb1fef772",
       "relative_path": "experiments/run_raven_aligned_color_eval.py",
-      "sha256": "af4771ab2418d73419caef055732e611e355d24a7fcd0b313f3267db81a26a15",
-      "size_bytes": 24637,
+      "sha256": "39e1410fc8a6b673fbf7728e79d3f2545b0aba7ad8a772f046485a0fce128c98",
+      "size_bytes": 26800,
       "tracked_or_untracked": "tracked"
     },
     {
-      "git_dirty": true,
-      "git_head": "4133b009c9686d0cc69bb906d124a0cbb159b5f0",
+      "git_dirty": false,
+      "git_head": "f32cd51855e3e47a4cb82c49c6752b3fb1fef772",
+      "relative_path": "experiments/run_raven_color_transfer_eval.py",
+      "sha256": "b8632e3cfff066211c2d14d9b7aac27724967d3dcd19a98f5b76ce81017ff843",
+      "size_bytes": 339,
+      "tracked_or_untracked": "tracked"
+    },
+    {
+      "git_dirty": false,
+      "git_head": "f32cd51855e3e47a4cb82c49c6752b3fb1fef772",
       "relative_path": "experiments/run_raven_formal_eval.py",
-      "sha256": "b3ae36e8c5afc574b435a4fd5b4e7f2dcfb7ebacf81495feca917c319c8aa7cd",
-      "size_bytes": 54573,
+      "sha256": "f326e003fe64f3fe9af20c1fc0c0f4cd65524b30a1a0a77e167729011490f501",
+      "size_bytes": 54653,
       "tracked_or_untracked": "tracked"
     },
     {
-      "git_dirty": true,
-      "git_head": "4133b009c9686d0cc69bb906d124a0cbb159b5f0",
+      "git_dirty": false,
+      "git_head": "f32cd51855e3e47a4cb82c49c6752b3fb1fef772",
       "relative_path": "experiments/run_raven_no_color_eval.py",
       "sha256": "d6f94c72e23926b2b18068c8d08044f0f621a4c24e17bcc0d2c448307b9c9c84",
       "size_bytes": 13016,
       "tracked_or_untracked": "tracked"
     },
     {
-      "git_dirty": true,
-      "git_head": "4133b009c9686d0cc69bb906d124a0cbb159b5f0",
+      "git_dirty": false,
+      "git_head": "f32cd51855e3e47a4cb82c49c6752b3fb1fef772",
       "relative_path": "experiments/wait_and_run_raven_eval_all_datasets.py",
       "sha256": "66286ec6dd3d1ea24b39332ab13122c00ecd862e408408f1755238c5d6434b6b",
       "size_bytes": 5906,
       "tracked_or_untracked": "tracked"
     },
     {
-      "git_dirty": true,
-      "git_head": "4133b009c9686d0cc69bb906d124a0cbb159b5f0",
+      "git_dirty": false,
+      "git_head": "f32cd51855e3e47a4cb82c49c6752b3fb1fef772",
       "relative_path": "experiments/wait_and_run_raven_protocol_variants.py",
       "sha256": "634a8c1e8b4b59734edc235e21ac89bb678589fe9deb442f9f3627e4c357fa7c",
       "size_bytes": 17357,
       "tracked_or_untracked": "tracked"
     },
     {
-      "git_dirty": true,
-      "git_head": "4133b009c9686d0cc69bb906d124a0cbb159b5f0",
+      "git_dirty": false,
+      "git_head": "f32cd51855e3e47a4cb82c49c6752b3fb1fef772",
       "relative_path": "raven_repro/raven/attention.py",
       "sha256": "fc60d6ce3c16cb3066b5fba547b2b771a66ffe5db06a1dd6fcc1b87724227f4e",
       "size_bytes": 7631,
       "tracked_or_untracked": "tracked"
     },
     {
-      "git_dirty": true,
-      "git_head": "4133b009c9686d0cc69bb906d124a0cbb159b5f0",
+      "git_dirty": false,
+      "git_head": "f32cd51855e3e47a4cb82c49c6752b3fb1fef772",
       "relative_path": "raven_repro/raven/color_transfer.py",
-      "sha256": "47b2d432583e3bf3fdd703afe0e5a7df2df58e18a56236dab0902bfe070ce0a1",
-      "size_bytes": 11996,
+      "sha256": "ae14f99299bd01d2bc28942e1533515a1df500794a1095f5f14c44476bca726d",
+      "size_bytes": 15511,
       "tracked_or_untracked": "tracked"
     },
     {
-      "git_dirty": true,
-      "git_head": "4133b009c9686d0cc69bb906d124a0cbb159b5f0",
+      "git_dirty": false,
+      "git_head": "f32cd51855e3e47a4cb82c49c6752b3fb1fef772",
       "relative_path": "raven_repro/raven/eval_protocol.py",
-      "sha256": "6b7ba292ed6d8868b20501b9331c2ff3aa7e482686f2b5444e7786347c9a197a",
-      "size_bytes": 29195,
+      "sha256": "c7612b7e31888ff83c6c3f1ffb94ddae7cd8b0640893d345c8a097dbc291cd2e",
+      "size_bytes": 29484,
       "tracked_or_untracked": "tracked"
     },
     {
-      "git_dirty": true,
-      "git_head": "4133b009c9686d0cc69bb906d124a0cbb159b5f0",
+      "git_dirty": false,
+      "git_head": "f32cd51855e3e47a4cb82c49c6752b3fb1fef772",
       "relative_path": "raven_repro/raven/inversion.py",
       "sha256": "22822e2d50ea068a272ca8a450965571a550e9c3ac8070d3a4b7a469b2123863",
       "size_bytes": 5855,
       "tracked_or_untracked": "tracked"
     },
     {
-      "git_dirty": true,
-      "git_head": "4133b009c9686d0cc69bb906d124a0cbb159b5f0",
+      "git_dirty": false,
+      "git_head": "f32cd51855e3e47a4cb82c49c6752b3fb1fef772",
       "relative_path": "raven_repro/raven/metrics.py",
       "sha256": "a6e938e30d24a9ad98b9b1705d83e9fae2a5b447856cc99bbf11054b2bd18321",
       "size_bytes": 13475,
       "tracked_or_untracked": "tracked"
     },
     {
-      "git_dirty": true,
-      "git_head": "4133b009c9686d0cc69bb906d124a0cbb159b5f0",
+      "git_dirty": false,
+      "git_head": "f32cd51855e3e47a4cb82c49c6752b3fb1fef772",
       "relative_path": "raven_repro/raven/pairing_provenance.py",
       "sha256": "d31344e913d9a19c7e5cdfdea84d12ab5aa47999acb8f0dd4023528bbfd89b1e",
       "size_bytes": 10237,
       "tracked_or_untracked": "tracked"
     },
     {
-      "git_dirty": true,
-      "git_head": "4133b009c9686d0cc69bb906d124a0cbb159b5f0",
+      "git_dirty": false,
+      "git_head": "f32cd51855e3e47a4cb82c49c6752b3fb1fef772",
       "relative_path": "raven_repro/raven/pipeline_raven.py",
-      "sha256": "0a85a2dc52da41258246386528a7f1e88cb7326fa66d4d7a8310f82ec19a2ed0",
-      "size_bytes": 28727,
+      "sha256": "191c7e0daa198247ddee96d22368fb59ee8101abd3ba842190392ced9dcb0660",
+      "size_bytes": 29222,
       "tracked_or_untracked": "tracked"
     },
     {
-      "git_dirty": true,
-      "git_head": "4133b009c9686d0cc69bb906d124a0cbb159b5f0",
+      "git_dirty": false,
+      "git_head": "f32cd51855e3e47a4cb82c49c6752b3fb1fef772",
       "relative_path": "raven_repro/raven/quality.py",
       "sha256": "eb77818dcf84aa6cca386975e6867308678e4ee0adc51ea9467bb0dce81bc268",
       "size_bytes": 3335,
       "tracked_or_untracked": "tracked"
     },
     {
-      "git_dirty": true,
-      "git_head": "4133b009c9686d0cc69bb906d124a0cbb159b5f0",
+      "git_dirty": false,
+      "git_head": "f32cd51855e3e47a4cb82c49c6752b3fb1fef772",
       "relative_path": "raven_repro/raven/resource_guard.py",
       "sha256": "74b52e918b6b69204aa28081349d8bfc8dcc9d0b2b45fc4a9828ac76ad3c65a0",
       "size_bytes": 4391,
       "tracked_or_untracked": "tracked"
     },
     {
-      "git_dirty": true,
-      "git_head": "4133b009c9686d0cc69bb906d124a0cbb159b5f0",
+      "git_dirty": false,
+      "git_head": "f32cd51855e3e47a4cb82c49c6752b3fb1fef772",
       "relative_path": "raven_repro/raven/utils.py",
       "sha256": "ae3d80aab8ca00d1b51a3ad9692982bfa1517e0abeded108dc05ef369a730419",
       "size_bytes": 4362,
       "tracked_or_untracked": "tracked"
     },
     {
-      "git_dirty": true,
-      "git_head": "4133b009c9686d0cc69bb906d124a0cbb159b5f0",
+      "git_dirty": false,
+      "git_head": "f32cd51855e3e47a4cb82c49c6752b3fb1fef772",
       "relative_path": "raven_repro/raven/warp.py",
       "sha256": "7f2b7b97c0bf7c489fb87280d45092609d2406d88de4d011e565eeab53b1cd12",
       "size_bytes": 21470,
       "tracked_or_untracked": "tracked"
     },
     {
-      "git_dirty": true,
-      "git_head": "4133b009c9686d0cc69bb906d124a0cbb159b5f0",
+      "git_dirty": false,
+      "git_head": "f32cd51855e3e47a4cb82c49c6752b3fb1fef772",
       "relative_path": "raven_repro/scripts/build_formal_source_manifest.py",
-      "sha256": "0d6a0a7f1188e30737328cc0cee2ccc360ef76e506249186e3eff9667322f32f",
-      "size_bytes": 4176,
+      "sha256": "28bd637ef43eaca89069f9142a2cd87c8a4040a4816051c2938fa889476ac0b1",
+      "size_bytes": 4228,
       "tracked_or_untracked": "tracked"
     },
     {
-      "git_dirty": true,
-      "git_head": "4133b009c9686d0cc69bb906d124a0cbb159b5f0",
+      "git_dirty": false,
+      "git_head": "f32cd51855e3e47a4cb82c49c6752b3fb1fef772",
       "relative_path": "raven_repro/scripts/build_verification_manifest.py",
       "sha256": "55cab030632361c326f6bb7d796573c711992ce10d38d127e558aea62d714c10",
       "size_bytes": 11220,
       "tracked_or_untracked": "tracked"
     },
     {
-      "git_dirty": true,
-      "git_head": "4133b009c9686d0cc69bb906d124a0cbb159b5f0",
+      "git_dirty": false,
+      "git_head": "f32cd51855e3e47a4cb82c49c6752b3fb1fef772",
       "relative_path": "raven_repro/scripts/evaluate_verification.py",
       "sha256": "8462d8acd7ebce47459bb088397c13812b954bd578c05eb04a7caea92eb6aa7a",
       "size_bytes": 9730,
       "tracked_or_untracked": "tracked"
     },
     {
-      "git_dirty": true,
-      "git_head": "4133b009c9686d0cc69bb906d124a0cbb159b5f0",
+      "git_dirty": false,
+      "git_head": "f32cd51855e3e47a4cb82c49c6752b3fb1fef772",
       "relative_path": "raven_repro/scripts/extract_verification_scores.py",
       "sha256": "01dc76112b40c9e4f59e9b3802f74408fed343c8bd952d6db09cad5ff3163c4f",
       "size_bytes": 17000,
       "tracked_or_untracked": "tracked"
     },
     {
-      "git_dirty": true,
-      "git_head": "4133b009c9686d0cc69bb906d124a0cbb159b5f0",
+      "git_dirty": false,
+      "git_head": "f32cd51855e3e47a4cb82c49c6752b3fb1fef772",
       "relative_path": "raven_repro/scripts/raven_nfpa_tr_eval.py",
       "sha256": "be75e465bf28546fe6c0e95248b3e1a30db430597ec973bd15fe0336186d20da",
       "size_bytes": 61373,
       "tracked_or_untracked": "tracked"
     },
     {
-      "git_dirty": true,
-      "git_head": "4133b009c9686d0cc69bb906d124a0cbb159b5f0",
+      "git_dirty": false,
+      "git_head": "f32cd51855e3e47a4cb82c49c6752b3fb1fef772",
       "relative_path": "raven_repro/tests/test_aligned_color_formal_adapter.py",
-      "sha256": "f1827bd0370f01b8cc9c29432e9f36aa3d2827195251a8df9f193736f0f44993",
-      "size_bytes": 4504,
+      "sha256": "1d928984aaad32504e13f4ab48e8eceb3cd39d535d7328c12bf95078ab1422d2",
+      "size_bytes": 4646,
       "tracked_or_untracked": "tracked"
     },
     {
-      "git_dirty": true,
-      "git_head": "4133b009c9686d0cc69bb906d124a0cbb159b5f0",
+      "git_dirty": false,
+      "git_head": "f32cd51855e3e47a4cb82c49c6752b3fb1fef772",
       "relative_path": "raven_repro/tests/test_attention_shapes.py",
       "sha256": "1b7374c6b1755a5092919aa482471c05fef6ff8843d8549abbe634e16bc00ddd",
       "size_bytes": 5432,
       "tracked_or_untracked": "tracked"
     },
     {
-      "git_dirty": true,
-      "git_head": "4133b009c9686d0cc69bb906d124a0cbb159b5f0",
+      "git_dirty": false,
+      "git_head": "f32cd51855e3e47a4cb82c49c6752b3fb1fef772",
       "relative_path": "raven_repro/tests/test_color_transfer.py",
-      "sha256": "5a9db1441b34ecb4e75a83cdbbd0ce6c4a81f85482d084c6db0be2e3d67c756e",
-      "size_bytes": 5916,
+      "sha256": "45365e487c5e76b118ec40ea913536b9af54035dbdeecaa3c142b5f59d9237f6",
+      "size_bytes": 8173,
       "tracked_or_untracked": "tracked"
     },
     {
-      "git_dirty": true,
-      "git_head": "4133b009c9686d0cc69bb906d124a0cbb159b5f0",
+      "git_dirty": false,
+      "git_head": "f32cd51855e3e47a4cb82c49c6752b3fb1fef772",
       "relative_path": "raven_repro/tests/test_effective_displacement.py",
       "sha256": "b90e609359904221754d7df49120ebbd04b333a9c973eca54b0126d3001e108d",
       "size_bytes": 2455,
       "tracked_or_untracked": "tracked"
     },
     {
-      "git_dirty": true,
-      "git_head": "4133b009c9686d0cc69bb906d124a0cbb159b5f0",
+      "git_dirty": false,
+      "git_head": "f32cd51855e3e47a4cb82c49c6752b3fb1fef772",
       "relative_path": "raven_repro/tests/test_fid_staging.py",
       "sha256": "2bd9284b164da3c6b408cfb92b7b7043572b6ff283f0fccb1f8286c6c901a412",
       "size_bytes": 3323,
       "tracked_or_untracked": "tracked"
     },
     {
-      "git_dirty": true,
-      "git_head": "4133b009c9686d0cc69bb906d124a0cbb159b5f0",
+      "git_dirty": false,
+      "git_head": "f32cd51855e3e47a4cb82c49c6752b3fb1fef772",
       "relative_path": "raven_repro/tests/test_formal_manifest.py",
       "sha256": "768548f417f0c25a09a513fe6e401da073c44942d98464c63f2db87ec77b9967",
       "size_bytes": 3812,
       "tracked_or_untracked": "tracked"
     },
     {
-      "git_dirty": true,
-      "git_head": "4133b009c9686d0cc69bb906d124a0cbb159b5f0",
+      "git_dirty": false,
+      "git_head": "f32cd51855e3e47a4cb82c49c6752b3fb1fef772",
       "relative_path": "raven_repro/tests/test_formal_resume.py",
       "sha256": "241c025c47925dc0602b1eefb2fc9806edb657e3b0b5a4a84762ffc1ab58a91c",
       "size_bytes": 5737,
       "tracked_or_untracked": "tracked"
     },
     {
-      "git_dirty": true,
-      "git_head": "4133b009c9686d0cc69bb906d124a0cbb159b5f0",
+      "git_dirty": false,
+      "git_head": "f32cd51855e3e47a4cb82c49c6752b3fb1fef772",
       "relative_path": "raven_repro/tests/test_formal_table.py",
-      "sha256": "f2b102c30f19bf83829f9875fe34076b47afb3f674002e4eb3ae0b2e01c2fe74",
-      "size_bytes": 2324,
+      "sha256": "e818b26cf46d5ec86c85bd90b81d7bf0d1ff7f9ad6e4843326bfbccc2ced685c",
+      "size_bytes": 5261,
       "tracked_or_untracked": "tracked"
     },
     {
-      "git_dirty": true,
-      "git_head": "4133b009c9686d0cc69bb906d124a0cbb159b5f0",
+      "git_dirty": false,
+      "git_head": "f32cd51855e3e47a4cb82c49c6752b3fb1fef772",
       "relative_path": "raven_repro/tests/test_formal_variant_config.py",
-      "sha256": "87d6349e33561953aaee44e6f88468bbdc8c2cd20fc060de01225bb6925ee038",
-      "size_bytes": 7047,
+      "sha256": "4819b9dec78cff54fc1b3a7634a8af82538fdf4fd33c24c35f6888c7650ff452",
+      "size_bytes": 7807,
       "tracked_or_untracked": "tracked"
     },
     {
-      "git_dirty": true,
-      "git_head": "4133b009c9686d0cc69bb906d124a0cbb159b5f0",
+      "git_dirty": false,
+      "git_head": "f32cd51855e3e47a4cb82c49c6752b3fb1fef772",
       "relative_path": "raven_repro/tests/test_metrics.py",
       "sha256": "27ff20e96a1e5fd065eaa16f13b806916d1332db300b2dfb1004bf00a0f47647",
       "size_bytes": 1671,
       "tracked_or_untracked": "tracked"
     },
     {
-      "git_dirty": true,
-      "git_head": "4133b009c9686d0cc69bb906d124a0cbb159b5f0",
+      "git_dirty": false,
+      "git_head": "f32cd51855e3e47a4cb82c49c6752b3fb1fef772",
       "relative_path": "raven_repro/tests/test_overlap_metrics.py",
       "sha256": "e0f656f672085613665a1e4e4fbe479871f6c7c536779ea27cba6cf3d50a7019",
       "size_bytes": 4269,
       "tracked_or_untracked": "tracked"
     },
     {
-      "git_dirty": true,
-      "git_head": "4133b009c9686d0cc69bb906d124a0cbb159b5f0",
+      "git_dirty": false,
+      "git_head": "f32cd51855e3e47a4cb82c49c6752b3fb1fef772",
       "relative_path": "raven_repro/tests/test_paired_generation_shards.py",
       "sha256": "b3c95a09770e2b4d5d95e2d89b70d8782b7606c54ea15e8ba48f7ec4457d29c9",
       "size_bytes": 5468,
       "tracked_or_untracked": "tracked"
     },
     {
-      "git_dirty": true,
-      "git_head": "4133b009c9686d0cc69bb906d124a0cbb159b5f0",
+      "git_dirty": false,
+      "git_head": "f32cd51855e3e47a4cb82c49c6752b3fb1fef772",
       "relative_path": "raven_repro/tests/test_pairing_provenance.py",
       "sha256": "46301ce31a2b86d7e0a4b4a1abb6aa891624ee5c4c3b1a8c5ac9e3a1ec7f7c58",
       "size_bytes": 4651,
       "tracked_or_untracked": "tracked"
     },
     {
-      "git_dirty": true,
-      "git_head": "4133b009c9686d0cc69bb906d124a0cbb159b5f0",
+      "git_dirty": false,
+      "git_head": "f32cd51855e3e47a4cb82c49c6752b3fb1fef772",
       "relative_path": "raven_repro/tests/test_parallel_attack_orchestrator.py",
       "sha256": "c4b40a7bae46b1940b5f1841589f6deff58077e3bd3d6c11bc102c25dbd3396f",
       "size_bytes": 4245,
       "tracked_or_untracked": "tracked"
     },
     {
-      "git_dirty": true,
-      "git_head": "4133b009c9686d0cc69bb906d124a0cbb159b5f0",
+      "git_dirty": false,
+      "git_head": "f32cd51855e3e47a4cb82c49c6752b3fb1fef772",
       "relative_path": "raven_repro/tests/test_provider_config_invariants.py",
       "sha256": "c9cd123f4b4e8f3518cd6b0fa33ce451eb2c74fdb4cb4e50150f7272cf90fd84",
       "size_bytes": 778,
       "tracked_or_untracked": "tracked"
     },
     {
-      "git_dirty": true,
-      "git_head": "4133b009c9686d0cc69bb906d124a0cbb159b5f0",
+      "git_dirty": false,
+      "git_head": "f32cd51855e3e47a4cb82c49c6752b3fb1fef772",
       "relative_path": "raven_repro/tests/test_tr_nfpa_protocol.py",
       "sha256": "588e5854f5cf49400b2e17bb9ecbcc8e4e57044ec94060d1d28890bcdd07f3a1",
       "size_bytes": 2301,
       "tracked_or_untracked": "tracked"
     },
     {
-      "git_dirty": true,
-      "git_head": "4133b009c9686d0cc69bb906d124a0cbb159b5f0",
+      "git_dirty": false,
+      "git_head": "f32cd51855e3e47a4cb82c49c6752b3fb1fef772",
       "relative_path": "raven_repro/tests/test_variant_dispatcher.py",
       "sha256": "5960d2e711e60daab5072b70bdb1d2b2320bd2db429dc829224b4b0dc8850a5f",
       "size_bytes": 2954,
       "tracked_or_untracked": "tracked"
     },
     {
-      "git_dirty": true,
-      "git_head": "4133b009c9686d0cc69bb906d124a0cbb159b5f0",
+      "git_dirty": false,
+      "git_head": "f32cd51855e3e47a4cb82c49c6752b3fb1fef772",
       "relative_path": "raven_repro/tests/test_verification_pipeline.py",
       "sha256": "11ac61805f86add0d9e87eda6d56ebf523566b1536f646a181d61ff7457859b7",
       "size_bytes": 3041,
       "tracked_or_untracked": "tracked"
     },
     {
-      "git_dirty": true,
-      "git_head": "4133b009c9686d0cc69bb906d124a0cbb159b5f0",
+      "git_dirty": false,
+      "git_head": "f32cd51855e3e47a4cb82c49c6752b3fb1fef772",
       "relative_path": "raven_repro/tests/test_warp.py",
       "sha256": "4bbd9954f84b5f479798b4cc04b97e58cc71145c5db5e7241d49d4784fc1a980",
       "size_bytes": 15290,
       "tracked_or_untracked": "tracked"
     }
   ],
-  "git_dirty": true,
-  "git_head": "4133b009c9686d0cc69bb906d124a0cbb159b5f0",
+  "git_dirty": false,
+  "git_head": "f32cd51855e3e47a4cb82c49c6752b3fb1fef772",
   "schema_version": "raven_formal_source_manifest_v1"
 }
