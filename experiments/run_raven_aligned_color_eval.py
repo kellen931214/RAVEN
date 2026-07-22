@@ -362,6 +362,27 @@ def build_aligned_records(
     return variant_wm, variant_clean, variant_hash
 
 
+def write_variant_attack_config(
+    output_root: Path,
+    records: list[dict[str, Any]],
+    expected_hash: str,
+) -> Path:
+    """Persist the exact variant config consumed by strict manifest validation."""
+    if not records:
+        raise RuntimeError("cannot write color-transfer config without records")
+    config = normalize_formal_attack_config(records[0]["formal_attack_config"])
+    if formal_attack_config_hash(config) != expected_hash:
+        raise RuntimeError("color-transfer variant config hash mismatch")
+    for record in records:
+        if record.get("formal_attack_config") != config:
+            raise RuntimeError("mixed color-transfer attack configs")
+        if record.get("attack_config_hash") != expected_hash:
+            raise RuntimeError("mixed color-transfer attack config hashes")
+    path = output_root / "color_transfer_attack_config.json"
+    write_json(path, config)
+    return path
+
+
 def run(command: list[str]) -> None:
     print("$ " + " ".join(command), flush=True)
     subprocess.run(command, cwd=REPO, check=True)
@@ -404,6 +425,9 @@ def main() -> int:
         formal_root, output_root, args.expected_count, source_manifest_sha,
         git_head,
         args.color_transfer_mode,
+    )
+    variant_config_path = write_variant_attack_config(
+        output_root, variant_wm + variant_clean, variant_hash
     )
     is_aligned = args.color_transfer_mode == PAPER_EXACT_TWO_STAGE_ALIGNED
     variant_name = (
@@ -449,6 +473,8 @@ def main() -> int:
         "git_head": git_head,
         "formal_attack_config": variant_wm[0]["formal_attack_config"],
         "formal_attack_config_hash": variant_hash,
+        "color_transfer_attack_config_path": str(variant_config_path.resolve()),
+        "color_transfer_attack_config_sha256": sha256_path(variant_config_path),
         "alignment_flow_source": flow_source,
         "physical_gpu": args.gpu,
         "cuda_visible_devices": os.environ["CUDA_VISIBLE_DEVICES"],
@@ -469,7 +495,7 @@ def main() -> int:
         sys.executable, str(REPO / "raven_repro/scripts/build_verification_manifest.py"),
         "--dataset", "diffusiondb", "--method", "TR", "--metadata", str(snapshot_index),
         "--attack-records", str(wm_records), "--snapshot-manifest", str(snapshot_index),
-        "--output", str(manifest),
+        "--attack-config", str(variant_config_path), "--output", str(manifest),
     ])
     run([
         sys.executable, str(REPO / "raven_repro/scripts/raven_nfpa_tr_eval.py"),

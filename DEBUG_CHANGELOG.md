@@ -576,8 +576,20 @@ seeds, planned shifts, pre-color image SHAs, and source attack config hashes
 match. PSNR/SSIM overlap continues to use actual-grid effective source flow;
 color transfer in paper-exact mode does not.
 
+### Gate-exposed manifest config bug
+The first 10-sample smoke root failed closed before detector scoring because the
+color-transfer adapter did not pass its paper-exact variant config to
+`build_verification_manifest.py`; the strict builder correctly compared debug
+metadata against the aligned default and rejected it. The failed output root is
+preserved. The adapter now persists the exact normalized variant config, checks
+its hash across attacked-clean and attacked-watermarked records, records its
+path/SHA, and passes it explicitly through `--attack-config`.
+
 ### Validation
 Focused CPU tests cover the paper formula pixel-for-pixel, reject flow in the
 unaligned mode, preserve aligned effective-flow tests, validate config hashing,
-and reject comparison pre-color drift. GPU smoke/full result paths and final
-metric status are recorded after execution rather than predeclared here.
+require exact manifest config forwarding, and reject comparison pre-color
+drift. The failed smoke root is
+`outputs/raven_color_transfer_comparison/diffusiondb/TR/paper_exact_vs_aligned/smoke10_20260722T074425Z/paper_exact`.
+GPU replacement-smoke/full result paths and final metric status are recorded
+after execution rather than predeclared here.

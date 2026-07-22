@@ -15,6 +15,7 @@ from experiments.run_raven_aligned_color_eval import (
     create_evaluation_snapshot,
     paired_effective_source_flow,
     select_expected_run_ids,
+    write_variant_attack_config,
 )
 
 
@@ -136,3 +137,40 @@ def test_evaluation_snapshot_contains_exact_selected_run_ids(tmp_path):
     assert entry["row_count"] == 2
     assert entry["snapshot_sha256"] == snapshot_sha
     assert sha256_path(index_path) == index_sha
+
+
+
+def test_variant_attack_config_is_persisted_for_strict_manifest_validation(tmp_path):
+    from raven.eval_protocol import (
+        FORMAL_ATTACK_CONFIG,
+        formal_attack_config_hash,
+        normalize_formal_attack_config,
+    )
+
+    config = normalize_formal_attack_config({
+        **FORMAL_ATTACK_CONFIG,
+        "color_transfer_mode": "paper_exact_two_stage",
+        "variant_name": "paper_exact_test",
+    })
+    config_hash = formal_attack_config_hash(config)
+    records = [
+        {"formal_attack_config": config, "attack_config_hash": config_hash},
+        {"formal_attack_config": config, "attack_config_hash": config_hash},
+    ]
+    path = write_variant_attack_config(tmp_path, records, config_hash)
+    assert json.loads(path.read_text()) == config
+    assert sha256_path(path)
+
+
+def test_variant_attack_config_rejects_hash_drift(tmp_path):
+    import pytest
+    from raven.eval_protocol import FORMAL_ATTACK_CONFIG, normalize_formal_attack_config
+
+    config = normalize_formal_attack_config({
+        **FORMAL_ATTACK_CONFIG,
+        "color_transfer_mode": "paper_exact_two_stage",
+        "variant_name": "paper_exact_test",
+    })
+    records = [{"formal_attack_config": config, "attack_config_hash": "wrong"}]
+    with pytest.raises(RuntimeError, match="variant config hash mismatch"):
+        write_variant_attack_config(tmp_path, records, "wrong")
