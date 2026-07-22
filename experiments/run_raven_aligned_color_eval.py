@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Evaluate effective-flow aligned color transfer from immutable RAVEN views.
+"""Evaluate paper-faithful or aligned color transfer from immutable RAVEN views.
 
 This reuses completed DDIM/shift/attention outputs without changing the attack
-body, then rebuilds both attacked-clean and attacked-watermarked postprocessing
-with the sole supported paper_exact_two_stage_aligned mode.
+body, then rebuilds attacked-clean and attacked-watermarked postprocessing with
+one explicitly selected color-transfer mode.
 """
 
 from __future__ import annotations
@@ -32,11 +32,14 @@ from raven.eval_protocol import (  # noqa: E402
     current_clip_provenance,
     formal_attack_config_hash,
     load_and_validate_source_manifest,
+    normalize_formal_attack_config,
+    require_clean_git_worktree,
     sha256_path,
     stage_fid_records,
     transform_config_payload,
 )
 from raven.color_transfer import (  # noqa: E402
+    PAPER_EXACT_TWO_STAGE,
     PAPER_EXACT_TWO_STAGE_ALIGNED,
     color_contrast_transfer_pil,
     color_transfer_diagnostics,
@@ -209,13 +212,32 @@ def build_aligned_records(
     expected_count: int,
     source_code_manifest_sha256: str,
     git_head: str,
+    color_transfer_mode: str = PAPER_EXACT_TWO_STAGE_ALIGNED,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], str]:
     run_config = json.loads((formal_root / "run_config.json").read_text(encoding="utf-8"))
     source = load_snapshot_rows(formal_root)
     wm = load_records(formal_root, run_config["attack_config_hash"], "watermarked")
     clean = load_records(formal_root, run_config["attack_config_hash"], "clean")
     run_ids = select_expected_run_ids(source, wm, clean, expected_count)
-    aligned_config_hash = formal_attack_config_hash()
+    variant_config = normalize_formal_attack_config({
+        **FORMAL_ATTACK_CONFIG,
+        "color_transfer_mode": color_transfer_mode,
+        "variant_name": (
+            "nfpa_nearest_reflection_ddim_paper_exact"
+            if color_transfer_mode == PAPER_EXACT_TWO_STAGE
+            else "nfpa_nearest_reflection_ddim_aligned"
+        ),
+    })
+    variant_hash = formal_attack_config_hash(variant_config)
+    is_aligned = color_transfer_mode == PAPER_EXACT_TWO_STAGE_ALIGNED
+    evaluation_variant = (
+        "shift_aligned_color_transfer"
+        if is_aligned
+        else "shift_paper_faithful_unaligned_color_transfer"
+    )
+    flow_source = (
+        "effective source flow from actual warp grid" if is_aligned else "none"
+    )
     variant_wm: list[dict[str, Any]] = []
     variant_clean: list[dict[str, Any]] = []
     paired_fields = (
@@ -251,71 +273,82 @@ def build_aligned_records(
             ):
                 if float(source_debug[field]) != value:
                     raise RuntimeError(f"run_id={run_id}: record/debug {field} mismatch")
-            item_dir = output_root / "aligned_outputs" / run_id / role
+            item_dir = output_root / "color_transfer_outputs" / run_id / role
             item_dir.mkdir(parents=True)
-            output_path = item_dir / "final_aligned_color_corrected.png"
+            output_path = item_dir / f"final_{color_transfer_mode}.png"
             reference_path = Path(
                 base["watermarked_path"] if role == "watermarked" else base["clean_path"]
             )
             with Image.open(pre_color) as generated, Image.open(reference_path) as reference:
                 generated_rgb = generated.convert("RGB")
                 reference_rgb = reference.convert("RGB")
-                aligned = color_contrast_transfer_pil(
+                transfer_kwargs = (
+                    {
+                        "effective_source_flow_dx_image_px": effective_dx,
+                        "effective_source_flow_dy_image_px": effective_dy,
+                    }
+                    if is_aligned
+                    else {}
+                )
+                transferred = color_contrast_transfer_pil(
                     generated_rgb,
                     reference_rgb,
-                    mode=PAPER_EXACT_TWO_STAGE_ALIGNED,
-                    effective_source_flow_dx_image_px=effective_dx,
-                    effective_source_flow_dy_image_px=effective_dy,
+                    mode=color_transfer_mode,
+                    **transfer_kwargs,
                 )
-                aligned.save(output_path)
+                transferred.save(output_path)
                 diagnostics = color_transfer_diagnostics(
                     generated_rgb,
                     reference_rgb,
-                    aligned,
-                    mode=PAPER_EXACT_TWO_STAGE_ALIGNED,
-                    effective_source_flow_dx_image_px=effective_dx,
-                    effective_source_flow_dy_image_px=effective_dy,
+                    transferred,
+                    mode=color_transfer_mode,
+                    **transfer_kwargs,
                 )
             output_sha = require_image(output_path)
-            aligned_debug = {
+            variant_debug = {
                 **source_debug,
                 "color_transfer": True,
-                "color_transfer_mode": PAPER_EXACT_TWO_STAGE_ALIGNED,
+                "color_transfer_mode": color_transfer_mode,
                 "color_transfer_diagnostics": diagnostics,
                 "source_debug_info_path": str(source_debug_path.resolve()),
                 "source_debug_info_sha256": base["debug_info_sha256"],
                 "source_transform_config_hash": base["transform_config_hash"],
             }
-            aligned_debug["transform_config_hash"] = canonical_json_hash(
-                transform_config_payload(aligned_debug)
+            variant_debug["transform_config_hash"] = canonical_json_hash(
+                transform_config_payload(variant_debug)
             )
             assert_formal_debug_info(
-                aligned_debug,
+                variant_debug,
                 planned_flow_dx_image_px=float(base["planned_flow_dx_image_px"]),
                 planned_flow_dy_image_px=float(base["planned_flow_dy_image_px"]),
+                attack_config=variant_config,
             )
-            aligned_debug_path = item_dir / "debug_info.json"
-            write_json(aligned_debug_path, aligned_debug)
-            debug_sha = sha256_path(aligned_debug_path)
+            variant_debug_path = item_dir / "debug_info.json"
+            write_json(variant_debug_path, variant_debug)
+            debug_sha = sha256_path(variant_debug_path)
             variant = {
                 **base,
-                "attack_config_hash": aligned_config_hash,
-                "formal_config_hash": aligned_config_hash,
-                "formal_attack_config": FORMAL_ATTACK_CONFIG,
+                "attack_config_hash": variant_hash,
+                "formal_config_hash": variant_hash,
+                "formal_attack_config": variant_config,
                 "attacked_path": str(output_path.resolve()),
                 "attacked_sha256": output_sha,
                 "output_sha256": output_sha,
-                "debug_info_path": str(aligned_debug_path.resolve()),
+                "debug_info_path": str(variant_debug_path.resolve()),
                 "debug_info_sha256": debug_sha,
                 "debug_sha256": debug_sha,
-                "transform_config_hash": aligned_debug["transform_config_hash"],
-                "transform_hash": aligned_debug["transform_config_hash"],
-                "evaluation_variant": "shift_aligned_color_transfer",
-                "color_transfer_mode": PAPER_EXACT_TWO_STAGE_ALIGNED,
+                "transform_config_hash": variant_debug["transform_config_hash"],
+                "transform_hash": variant_debug["transform_config_hash"],
+                "evaluation_variant": evaluation_variant,
+                "color_transfer_mode": color_transfer_mode,
                 "output_color_transfer": True,
-                "output_color_transfer_mode": PAPER_EXACT_TWO_STAGE_ALIGNED,
-                "output_source": "view_guided_output.png + effective-flow aligned color transfer",
-                "alignment_flow_source": "effective source flow from actual warp grid",
+                "output_color_transfer_mode": color_transfer_mode,
+                "output_source": (
+                    "view_guided_output.png + effective-flow aligned color transfer"
+                    if is_aligned
+                    else "view_guided_output.png + paper-faithful unaligned paper-exact color transfer"
+                ),
+                "alignment_flow_source": flow_source,
                 "source_pre_color_path": str(pre_color.resolve()),
                 "source_pre_color_sha256": pre_color_sha,
                 "source_attack_config_hash": base["attack_config_hash"],
@@ -326,7 +359,7 @@ def build_aligned_records(
                 "git_head": git_head,
             }
             destination.append(variant)
-    return variant_wm, variant_clean, aligned_config_hash
+    return variant_wm, variant_clean, variant_hash
 
 
 def run(command: list[str]) -> None:
@@ -348,6 +381,11 @@ def main() -> int:
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--expected-count", type=int, required=True)
     parser.add_argument("--source-manifest", type=Path, required=True)
+    parser.add_argument(
+        "--color-transfer-mode",
+        choices=[PAPER_EXACT_TWO_STAGE, PAPER_EXACT_TWO_STAGE_ALIGNED],
+        default=PAPER_EXACT_TWO_STAGE_ALIGNED,
+    )
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--gpu", type=int, required=True)
     args = parser.parse_args()
@@ -357,13 +395,34 @@ def main() -> int:
     output_root = args.output_root.resolve()
     if output_root.exists():
         raise FileExistsError(output_root)
-    source_manifest, source_manifest_sha = load_and_validate_source_manifest(
+    _, source_manifest_sha = load_and_validate_source_manifest(
         args.source_manifest.resolve(), repo_root=REPO
     )
+    git_head = require_clean_git_worktree(REPO)
     output_root.mkdir(parents=True)
     variant_wm, variant_clean, variant_hash = build_aligned_records(
         formal_root, output_root, args.expected_count, source_manifest_sha,
-        str(source_manifest["git_head"]),
+        git_head,
+        args.color_transfer_mode,
+    )
+    is_aligned = args.color_transfer_mode == PAPER_EXACT_TWO_STAGE_ALIGNED
+    variant_name = (
+        "shift_aligned_color_transfer"
+        if is_aligned
+        else "shift_paper_faithful_unaligned_color_transfer"
+    )
+    validation_status = (
+        "validated_aligned_color_evaluation"
+        if is_aligned
+        else "validated_paper_exact_color_evaluation"
+    )
+    flow_source = (
+        "effective source flow from actual warp grid" if is_aligned else "none"
+    )
+    attacked_definition = (
+        "effective-flow aligned post-color-transfer attacked-watermarked images"
+        if is_aligned
+        else "paper-faithful unaligned paper-exact post-color attacked-watermarked images"
     )
     selected_run_ids = {str(record["run_id"]) for record in variant_wm}
     snapshot_index, cohort_snapshot_sha, cohort_index_sha = (
@@ -374,8 +433,8 @@ def main() -> int:
         record["snapshot_sha256"] = cohort_snapshot_sha
         record["evaluation_snapshot_index_sha256"] = cohort_index_sha
     provenance = {
-        "status": "aligned_color_evaluation_in_progress",
-        "variant": "shift_aligned_color_transfer",
+        "status": "color_transfer_evaluation_in_progress",
+        "variant": variant_name,
         "formal_source_root": str(formal_root),
         "formal_run_config_sha256": sha256_path(formal_root / "run_config.json"),
         "evaluation_snapshot_index_path": str(snapshot_index.resolve()),
@@ -387,9 +446,10 @@ def main() -> int:
         "sample_count": args.expected_count,
         "source_code_manifest_path": str(args.source_manifest.resolve()),
         "source_code_manifest_sha256": source_manifest_sha,
-        "formal_attack_config": FORMAL_ATTACK_CONFIG,
+        "git_head": git_head,
+        "formal_attack_config": variant_wm[0]["formal_attack_config"],
         "formal_attack_config_hash": variant_hash,
-        "alignment_flow_source": "effective source flow from actual warp grid",
+        "alignment_flow_source": flow_source,
         "physical_gpu": args.gpu,
         "cuda_visible_devices": os.environ["CUDA_VISIBLE_DEVICES"],
         "created_utc": utc_now(),
@@ -400,8 +460,8 @@ def main() -> int:
         "detector_protocol": "formal Tree-Ring complex-L1, strict score < threshold",
     }
     write_json(output_root / "provenance.json", provenance)
-    wm_records = output_root / "attack_records_aligned_watermarked.jsonl"
-    clean_records = output_root / "attack_records_aligned_clean.jsonl"
+    wm_records = output_root / "attack_records_color_watermarked.jsonl"
+    clean_records = output_root / "attack_records_color_clean.jsonl"
     write_jsonl(wm_records, variant_wm)
     write_jsonl(clean_records, variant_clean)
     manifest = output_root / "verification" / "manifest.csv"
@@ -432,16 +492,16 @@ def main() -> int:
         variant_wm, formal_output=output_root, quality_config_hash=variant_hash,
         expected_count=args.expected_count,
         reference_definition="original watermarked images from immutable formal snapshots",
-        attacked_definition="effective-flow aligned post-color-transfer attacked-watermarked images",
+        attacked_definition=attacked_definition,
     )
     from raven.quality import clean_fid, openclip_text_image_scores
     fid_result = clean_fid(fid_root / "reference_watermarked", fid_root / "attacked", device=args.device)
     fid_result.update({
         "image_count": args.expected_count,
         "manifest_hash": fid_manifest["manifest_hash"],
-        "metric_name": "aligned_fid_watermarked_vs_raven",
+        "metric_name": "color_transfer_fid_watermarked_vs_raven",
         "reference_definition": "original watermarked images from immutable formal snapshots",
-        "attacked_definition": "effective-flow aligned post-color-transfer attacked-watermarked images",
+        "attacked_definition": attacked_definition,
         "config_hash": variant_hash,
     })
     write_json(fid_root / "fid_result.json", fid_result)
@@ -454,7 +514,7 @@ def main() -> int:
     detector = json.loads((output_root / "verification" / "tr_nfpa" / "aggregate_results.json").read_text())
     aggregate = {
         **provenance,
-        "status": "aligned_color_evaluation_complete",
+        "status": "color_transfer_evaluation_complete",
         "detector": detector,
         "fid": fid_result,
         "clip": {**clip, **current_clip_provenance()},
@@ -463,24 +523,31 @@ def main() -> int:
         "quality_ssim_mean": sum(float(row["overlap_ssim"]) for row in quality_rows) / len(quality_rows),
     }
     if not all(math.isfinite(float(value)) for value in (aggregate["quality_psnr_mean"], aggregate["quality_ssim_mean"], fid_result["value"], clip["mean"])):
-        raise RuntimeError("non-finite aligned-color aggregate metric")
+        raise RuntimeError("non-finite color-transfer aggregate metric")
     protocol = detector["nfpa_rounded2_protocol"]
     run_ids = [str(record["run_id"]) for record in variant_wm]
     validation = {
-        "status": "validated_aligned_color_evaluation",
+        "status": validation_status,
         "sample_count": args.expected_count,
         "unique_run_ids": len(set(run_ids)),
         "duplicate_run_ids": len(run_ids) - len(set(run_ids)),
-        "aligned_attack_config_hashes": sorted(
+        "color_transfer_config_hashes": sorted(
             {record["attack_config_hash"] for record in variant_wm + variant_clean}
         ),
         "source_attack_config_hashes": sorted(
             {record["source_attack_config_hash"] for record in variant_wm + variant_clean}
         ),
         "source_code_manifest_sha256": source_manifest_sha,
+        "git_head": git_head,
+        "color_transfer_mode": args.color_transfer_mode,
+        "protocol_classification": (
+            "effective-flow aligned color-transfer ablation"
+            if is_aligned
+            else "paper-faithful unaligned paper-exact color transfer"
+        ),
         "provider_config_hash": detector["provider_config_hash"],
         "target_watermark_hash": detector["target_watermark_hash"],
-        "alignment_flow_source": "effective source flow from actual warp grid",
+        "alignment_flow_source": flow_source,
         "attacked_pair_effective_flow_mismatches": 0,
         "attacked_pair_transform_hash_mismatches": sum(
             left["transform_config_hash"] != right["transform_config_hash"]
@@ -490,15 +557,15 @@ def main() -> int:
         "inf_count": 0,
     }
     if validation["unique_run_ids"] != args.expected_count:
-        raise RuntimeError("aligned validation run-ID coverage mismatch")
+        raise RuntimeError("color-transfer validation run-ID coverage mismatch")
     if validation["duplicate_run_ids"] or validation["attacked_pair_transform_hash_mismatches"]:
-        raise RuntimeError("aligned validation pairing mismatch")
-    if validation["aligned_attack_config_hashes"] != [variant_hash]:
-        raise RuntimeError("aligned validation mixed attack config hashes")
+        raise RuntimeError("color-transfer validation pairing mismatch")
+    if validation["color_transfer_config_hashes"] != [variant_hash]:
+        raise RuntimeError("color-transfer validation mixed config hashes")
     table_row = {
         "Dataset": "diffusiondb",
         "Watermark": "TR",
-        "Variant": "shift + paper_exact_two_stage_aligned",
+        "Variant": f"shift + {args.color_transfer_mode}",
         "Status": validation["status"],
         "N": args.expected_count,
         "Target FPR": protocol["target_fpr"],
@@ -528,7 +595,7 @@ def main() -> int:
     aggregate["result_table"] = table_row
     write_json(output_root / "aggregate_results.json", aggregate)
     write_json(output_root / "VALIDATED.json", validation)
-    write_csv(output_root / "aligned_result_table.csv", table_row)
+    write_csv(output_root / "color_transfer_result_table.csv", table_row)
     return 0
 
 

@@ -52,12 +52,23 @@ Check `free -h` and GPU availability before every gate. The runner processes one
 image at a time, limits CPU threads, avoids DataLoader workers and dataset caches, and
 hashes files incrementally. Use fresh timestamped roots for 2-, 10-, and 30-sample gates.
 
-## Aligned Color Transfer
+## Color Transfer Modes
 
-The only supported color-transfer mode is `paper_exact_two_stage_aligned`. It
-uses `effective_source_flow_dx_image_px` and
+`paper_exact_two_stage` is the paper-faithful, unaligned mode. Following RAVEN
+Section 4.2.4, stage 1 builds `x_c = F_RGB(L_a, a_o, b_o)` from attacked
+luminance and original chroma at the same pixel coordinates. After converting
+`x_c` back to LAB, stage 2 uses
+`L' = sigma(L_o)/sigma(L_c) * (L_c - mu(L_c)) + mu(L_o)` and reconstructs with
+`a_o,b_o`. This mode does not accept planned or effective flow.
+
+`paper_exact_two_stage_aligned` is the existing effective-flow aligned
+ablation. It uses `effective_source_flow_dx_image_px` and
 `effective_source_flow_dy_image_px` derived from the actual warp grid for both
 attacked-clean and attacked-watermarked outputs. Planned flow and visual shift
-are provenance fields only and must never drive alignment or quality overlap.
-Use `experiments/run_raven_aligned_color_eval.py` to reprocess immutable
-pre-color formal attack views without rerunning DDIM, shift, or attention.
+remain provenance fields only. Quality overlap uses effective source flow for
+both modes, independently of color-transfer alignment.
+
+Use `experiments/run_raven_color_transfer_eval.py` to reprocess immutable
+pre-color formal attack views without rerunning DDIM, shift, attention, or
+sampling. Attack records, debug info, transform hashes, FID definitions, and
+aggregate tables preserve the explicit selected mode.

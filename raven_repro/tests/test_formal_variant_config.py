@@ -146,6 +146,27 @@ def test_zero_shift_plan_preserves_seed_and_uses_zero_effective_plan():
     assert zero_seed == base_seed == 49
 
 
+def test_paper_exact_color_mode_is_a_hashed_formal_ablation():
+    paper = normalize_formal_attack_config(
+        variant_config(
+            color_transfer_mode="paper_exact_two_stage",
+            variant_name="nfpa_nearest_reflection_ddim_paper_exact",
+        )
+    )
+    aligned = normalize_formal_attack_config(variant_config())
+    assert paper["color_transfer_mode"] == "paper_exact_two_stage"
+    assert formal_attack_config_hash(paper) != formal_attack_config_hash(aligned)
+
+
+def test_variant_config_rejects_unknown_color_transfer_mode():
+    import pytest
+
+    with pytest.raises(ValueError, match="color_transfer_mode"):
+        normalize_formal_attack_config(
+            variant_config(color_transfer_mode="improved_untracked_mode")
+        )
+
+
 def test_variant_config_rejects_mixed_scheduler_and_inversion_modes():
     import pytest
 

@@ -23,9 +23,13 @@ def _image(path: Path, color: tuple[int, int, int]) -> str:
     return sha256_path(path)
 
 
-def test_aligned_adapter_is_declared():
-    from raven.color_transfer import PAPER_EXACT_TWO_STAGE_ALIGNED
+def test_color_transfer_adapter_declares_paper_exact_and_aligned_modes():
+    from raven.color_transfer import (
+        PAPER_EXACT_TWO_STAGE,
+        PAPER_EXACT_TWO_STAGE_ALIGNED,
+    )
 
+    assert PAPER_EXACT_TWO_STAGE == "paper_exact_two_stage"
     assert PAPER_EXACT_TWO_STAGE_ALIGNED == "paper_exact_two_stage_aligned"
 
 

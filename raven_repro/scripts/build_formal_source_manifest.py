@@ -16,6 +16,7 @@ REPO = Path(__file__).resolve().parents[2]
 CORE_FILES = (
     "experiments/run_raven_formal_eval.py",
     "experiments/run_raven_aligned_color_eval.py",
+    "experiments/run_raven_color_transfer_eval.py",
     "experiments/run_raven_no_color_eval.py",
     "experiments/wait_and_run_raven_eval_all_datasets.py",
     "experiments/wait_and_run_raven_protocol_variants.py",

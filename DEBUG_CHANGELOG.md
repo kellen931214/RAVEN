@@ -548,3 +548,36 @@ order/version drift and public scheduler parameter drift. Focused tests: 15
 passed. Full CPU suite: 163 passed with 44 existing warnings. `py_compile` and
 `git diff --check` passed. Replacement GPU smoke/full runs require a new source
 manifest and new timestamped output root; the failed root is not resumable.
+
+
+## 2026-07-22 - Paper-faithful unaligned color-transfer comparison
+
+### Scope
+Added the user-requested `paper_exact_two_stage` mode without changing DDIM,
+DDPM, shift planning, warp, latent sampling, view-guided attention, prompts, or
+seeds. The completed immutable pre-color attacked-clean and
+attacked-watermarked images are reused.
+
+### Formula and classification
+The implementation follows RAVEN Section 4.2.4. Stage 1 constructs
+`x_c = F_RGB(L_a, a_o, b_o)` using attacked luminance and original chroma at
+identical pixel coordinates. Stage 2 converts `x_c` back to LAB and applies
+`L' = sigma(L_o)/sigma(L_c) * (L_c - mu(L_c)) + mu(L_o)`, then reconstructs
+with original chroma. The mode is recorded as `paper-faithful unaligned
+paper-exact color transfer` and rejects any supplied effective flow. The
+existing `paper_exact_two_stage_aligned` path remains a separately named
+alignment ablation.
+
+### Provenance and comparison
+The formal config hash, per-sample attack records, debug info, transform hash,
+FID manifest, aggregate, and result table record the selected color-transfer
+mode. The comparison table fails closed unless run IDs, pairing hashes, attack
+seeds, planned shifts, pre-color image SHAs, and source attack config hashes
+match. PSNR/SSIM overlap continues to use actual-grid effective source flow;
+color transfer in paper-exact mode does not.
+
+### Validation
+Focused CPU tests cover the paper formula pixel-for-pixel, reject flow in the
+unaligned mode, preserve aligned effective-flow tests, validate config hashing,
+and reject comparison pre-color drift. GPU smoke/full result paths and final
+metric status are recorded after execution rather than predeclared here.

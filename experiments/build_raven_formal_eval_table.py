@@ -37,8 +37,11 @@ def mean_jsonl(path: Path, key: str) -> float:
 
 def table_row(root: Path) -> dict:
     validation = json.loads((root / "VALIDATED.json").read_text())
-    if validation.get("status") == "validated_aligned_color_evaluation":
-        return aligned_color_table_row(root, validation)
+    if validation.get("status") in {
+        "validated_aligned_color_evaluation",
+        "validated_paper_exact_color_evaluation",
+    }:
+        return color_transfer_table_row(root, validation)
     if validation.get("status") != "validated_formal_result":
         raise ValueError(f"not a validated formal result: {root}")
     aggregate = json.loads((root / "formal_aggregate.json").read_text())
@@ -114,12 +117,9 @@ def table_row(root: Path) -> dict:
 
 
 
-def aligned_color_table_row(root: Path, validation: dict) -> dict:
-    """Adapt the retained aligned baseline without recomputing any metric."""
+def color_transfer_table_row(root: Path, validation: dict) -> dict:
+    """Adapt a validated color-transfer result without recomputing metrics."""
     aggregate = json.loads((root / "aggregate_results.json").read_text())
-    source_manifest = json.loads(
-        Path(aggregate["source_code_manifest_path"]).read_text(encoding="utf-8")
-    )
     detector = aggregate["detector"]["nfpa_rounded2_protocol"]
     fid = aggregate["fid"]
     clip = aggregate["clip"]
@@ -128,7 +128,7 @@ def aligned_color_table_row(root: Path, validation: dict) -> dict:
     row.update({
         "Dataset": "diffusiondb",
         "Watermark": "TR",
-        "Variant": "nfpa_nearest_reflection_ddim_aligned_reused",
+        "Variant": aggregate["result_table"]["Variant"],
         "N": aggregate["sample_count"],
         "Metric protocol": aggregate["detector"]["protocol"],
         "Target FPR": detector["target_fpr"],
@@ -161,16 +161,82 @@ def aligned_color_table_row(root: Path, validation: dict) -> dict:
         "Manifest SHA": __import__("hashlib").sha256(manifest.read_bytes()).hexdigest(),
         "Attack config hash": aggregate["formal_attack_config_hash"],
         "Detector config hash": "",
-        "Git SHA": source_manifest["git_head"],
+        "Git SHA": aggregate["git_head"],
         "Status": validation["status"],
     })
     return row
+
+
+def _load_comparison_records(root: Path) -> tuple[dict[str, dict], str] | None:
+    """Load records needed to prove two color variants share one pre-color attack."""
+    color_records = root / "attack_records_color_watermarked.jsonl"
+    formal_records = root / "attack_records_watermarked.jsonl"
+    if color_records.exists():
+        path = color_records
+        kind = "color"
+    elif formal_records.exists():
+        path = formal_records
+        kind = "formal"
+    else:
+        return None
+    rows = [json.loads(line) for line in path.read_text().splitlines() if line]
+    by_run_id = {str(row["run_id"]): row for row in rows}
+    if len(by_run_id) != len(rows):
+        raise RuntimeError(f"duplicate run IDs in comparison records: {path}")
+    return by_run_id, kind
+
+
+def validate_color_transfer_comparison(roots: list[Path]) -> None:
+    """Fail closed unless compared variants reuse the identical pre-color cohort."""
+    loaded = [(root, _load_comparison_records(root)) for root in roots]
+    available = [(root, value) for root, value in loaded if value is not None]
+    if len(available) < 2:
+        return
+    reference_root, (reference, reference_kind) = available[0]
+    reference_ids = set(reference)
+    shared_fields = (
+        "pairing_sha256",
+        "attack_seed",
+        "planned_flow_dx_image_px",
+        "planned_flow_dy_image_px",
+        "pre_color_attacked_sha256",
+    )
+    for candidate_root, (candidate, candidate_kind) in available[1:]:
+        if set(candidate) != reference_ids:
+            raise RuntimeError(
+                f"color-transfer comparison run-ID mismatch: {reference_root} vs {candidate_root}"
+            )
+        for run_id in sorted(reference_ids, key=int):
+            left = reference[run_id]
+            right = candidate[run_id]
+            for field in shared_fields:
+                if not left.get(field) or not right.get(field):
+                    raise RuntimeError(f"run_id={run_id}: missing comparison {field}")
+                if left[field] != right[field]:
+                    raise RuntimeError(f"run_id={run_id}: comparison {field} mismatch")
+            left_source_hash = (
+                left.get("source_attack_config_hash")
+                if reference_kind == "color"
+                else left.get("attack_config_hash")
+            )
+            right_source_hash = (
+                right.get("source_attack_config_hash")
+                if candidate_kind == "color"
+                else right.get("attack_config_hash")
+            )
+            if not left_source_hash or left_source_hash != right_source_hash:
+                raise RuntimeError(
+                    f"run_id={run_id}: source attack config hash mismatch"
+                )
+
 
 def main() -> int:
     args = parser().parse_args()
     if args.output.exists():
         raise FileExistsError(args.output)
-    rows = [table_row(root.resolve()) for root in args.formal_roots]
+    roots = [root.resolve() for root in args.formal_roots]
+    validate_color_transfer_comparison(roots)
+    rows = [table_row(root) for root in roots]
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with args.output.open("x", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=FIELDS)

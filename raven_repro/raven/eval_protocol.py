@@ -267,7 +267,7 @@ def normalize_formal_attack_config(payload: Mapping[str, Any]) -> dict[str, Any]
     config.setdefault("variant_name", "formal_baseline")
     variant_fields = {
         "latent_sampling_mode", "inversion_mode", "scheduler_mode",
-        "shift_plan_mode", "variant_name",
+        "shift_plan_mode", "color_transfer_mode", "variant_name",
     }
     drift = {
         key: (FORMAL_ATTACK_CONFIG[key], config[key])
@@ -287,6 +287,13 @@ def normalize_formal_attack_config(payload: Mapping[str, Any]) -> dict[str, Any]
         raise ValueError("inversion_mode and scheduler_mode must match")
     if config["latent_sampling_mode"] not in {"nearest", "bilinear"}:
         raise ValueError("latent_sampling_mode must be nearest or bilinear")
+    if config["color_transfer_mode"] not in {
+        "paper_exact_two_stage", "paper_exact_two_stage_aligned"
+    }:
+        raise ValueError(
+            "color_transfer_mode must be paper_exact_two_stage or "
+            "paper_exact_two_stage_aligned"
+        )
     if config["shift_plan_mode"] not in {
         "paper_random_independent_axes", "balanced_deterministic_schedule", "zero"
     }:

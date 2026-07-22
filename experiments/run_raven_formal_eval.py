@@ -625,6 +625,7 @@ def attack_stage(args: argparse.Namespace, config: dict[str, Any], role: str) ->
             shift_y=expected["planned_flow_dy_image_px"],
             view_guided_attention=config["attack_config"]["view_guided_attention"],
             color_transfer=config["attack_config"]["color_transfer"],
+            color_transfer_mode=config["attack_config"]["color_transfer_mode"],
             seed=expected["attack_seed"],
             prompt=config["attack_config"]["prompt"],
             negative_prompt=config["attack_config"]["negative_prompt"],

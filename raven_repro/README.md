@@ -89,9 +89,14 @@ python experiments/run_raven_formal_eval.py \
 
 Then run `attack-watermarked`, `attack-clean` for TR, `verify`, `quality`, `fid`,
 `clip`, `aggregate`, and `validate` with the identical arguments plus `--resume`.
-Formal color transfer is exclusively `paper_exact_two_stage_aligned` and consumes
-`effective_source_flow_dx_image_px` / `effective_source_flow_dy_image_px`.
-Do not run a full cohort until the 2/10/30 gates pass in fresh output roots.
+Formal color transfer must name one centralized mode explicitly. The
+`paper_exact_two_stage` mode is the paper-faithful unaligned implementation: it
+combines attacked luminance with original chroma at identical pixel coordinates,
+then matches realized intermediate luminance statistics to the original. The
+`paper_exact_two_stage_aligned` mode is the existing effective-flow aligned
+ablation. Only the aligned mode consumes `effective_source_flow_dx_image_px` /
+`effective_source_flow_dy_image_px`; quality overlap uses effective source flow in
+both cases. Do not run a full cohort until a fresh smoke gate passes.
 
 ## Key Files
 
@@ -99,7 +104,7 @@ Do not run a full cohort until the 2/10/30 gates pass in fresh output roots.
 - `raven/inversion.py`: VAE encoding plus partial DDIM inversion or Equation-(4) forward noising.
 - `raven/warp.py`: integer zero-padded latent translation plus an explicit `grid_sample` ablation.
 - `raven/attention.py`: view-guided self-attention processor. Text cross-attention is left unchanged.
-- `raven/color_transfer.py`: effective-source-flow aligned LAB luminance/chroma transfer; unaligned modes are unsupported.
+- `raven/color_transfer.py`: paper-faithful unaligned and effective-flow aligned LAB two-stage transfer.
 - `scripts/run_raven.py`: single-image CLI.
 - `scripts/attack_folder.py`: folder CLI with failure logging.
 - `scripts/eval_quality.py`: PSNR/SSIM helper.
@@ -108,7 +113,8 @@ Do not run a full cohort until the 2/10/30 gates pass in fresh output roots.
 - `raven/eval_protocol.py`: centralized formal attack, detector, FID, resume, provider, and CLIP provenance.
 - `scripts/raven_nfpa_tr_eval.py`: Tree-Ring complex-L1 detector helper used by the formal runner.
 - `scripts/run_diffusiondb_chain_after_clean.py`: disabled historical chain retained only for helper-level research evidence.
-- `../experiments/run_raven_aligned_color_eval.py`: the sole effective-flow aligned postprocessing evaluator.
+- `../experiments/run_raven_color_transfer_eval.py`: shared paper-exact/aligned postprocessing evaluator; it reuses immutable pre-color attacks and all formal detector/metric helpers.
+- `../experiments/run_raven_aligned_color_eval.py`: implementation module retained for import compatibility; use the shared entrypoint above.
 - `scripts/paired_generation_shards.py`: migrates committed rows into shard metadata, quarantines crash-written images without provenance, and merges shards only when run-ID coverage, latent uniqueness, image hashes, target/config hashes, and model revision all pass.
 - `raven/pairing_provenance.py`: fail-closed latent, image, target, pairing, and attack-config audits.
 - `scripts/build_verification_manifest.py` and `scripts/evaluate_verification.py`: strict pairing and calibrated verification utilities.
@@ -127,6 +133,26 @@ debug_info.json
 ```
 
 `latent_shift_only.png` is emitted only with debug mode enabled; it is not a formal attack output or quality input.
+
+## Color-Transfer Comparison
+
+Reuse one validated pre-color attack cohort without rerunning DDIM, shift, VGA,
+or sampling:
+
+```bash
+python experiments/run_raven_color_transfer_eval.py \
+  --formal-root /absolute/path/to/validated/formal_attack \
+  --output-root outputs/raven_color_transfer_comparison/paper_exact_<UTC> \
+  --expected-count 1001 \
+  --source-manifest audit/formal_source_manifest.json \
+  --color-transfer-mode paper_exact_two_stage \
+  --device cuda --gpu 0
+```
+
+`paper_exact_two_stage` is classified as **paper-faithful unaligned paper-exact
+color transfer**. Its color transfer never receives planned or effective flow.
+The comparison builder rejects cohorts whose pairing, seed, planned shift,
+pre-color image SHA, or source attack config differ.
 
 ## Ablations
 

@@ -8,6 +8,7 @@ pytest.importorskip("skimage")
 from raven.pipeline_raven import require_effective_source_flow
 
 from raven.color_transfer import (
+    PAPER_EXACT_TWO_STAGE,
     PAPER_EXACT_TWO_STAGE_ALIGNED,
     align_original_chroma_to_generated,
     color_contrast_transfer,
@@ -23,7 +24,8 @@ def _images(seed=11, shape=(32, 33, 3)):
     )
 
 
-def test_aligned_mode_is_the_only_public_mode():
+def test_paper_exact_and_aligned_modes_are_public():
+    assert PAPER_EXACT_TWO_STAGE == "paper_exact_two_stage"
     assert PAPER_EXACT_TWO_STAGE_ALIGNED == "paper_exact_two_stage_aligned"
     signature = inspect.signature(color_contrast_transfer)
     assert "effective_source_flow_dx_image_px" in signature.parameters
@@ -35,7 +37,7 @@ def test_aligned_mode_is_the_only_public_mode():
 
 @pytest.mark.parametrize(
     "legacy_mode",
-    ["paper_exact_two_stage", "paper_exact_two_stage_aligned_blend", "direct_stats"],
+    ["paper_exact_two_stage_aligned_blend", "direct_stats"],
 )
 def test_legacy_color_transfer_modes_are_rejected(legacy_mode):
     generated, original = _images()
@@ -46,6 +48,62 @@ def test_legacy_color_transfer_modes_are_rejected(legacy_mode):
             mode=legacy_mode,
             effective_source_flow_dx_image_px=3,
             effective_source_flow_dy_image_px=-2,
+        )
+
+
+def test_paper_exact_two_stage_matches_raven_formula_without_alignment():
+    from skimage import color
+
+    generated, original = _images(seed=29)
+    actual = color_contrast_transfer(
+        generated, original, mode=PAPER_EXACT_TWO_STAGE
+    )
+
+    attacked_lab = color.rgb2lab(generated.astype(np.float32) / 255.0)
+    original_lab = color.rgb2lab(original.astype(np.float32) / 255.0)
+    # RAVEN Sec. 4.2.4 stage 1: x_c = F_RGB(L_a, a_o, b_o).
+    intermediate_lab = np.empty_like(attacked_lab, dtype=np.float32)
+    intermediate_lab[..., 0] = attacked_lab[..., 0]
+    intermediate_lab[..., 1:3] = original_lab[..., 1:3]
+    intermediate_rgb = color.lab2rgb(intermediate_lab)
+    intermediate_l = color.rgb2lab(intermediate_rgb.astype(np.float32))[..., 0]
+    original_l = original_lab[..., 0]
+    # Stage 2: L' = sigma_o/sigma_c * (L_c - mu_c) + mu_o.
+    final_l = (
+        original_l.std() / (intermediate_l.std() + 1e-6)
+        * (intermediate_l - intermediate_l.mean())
+        + original_l.mean()
+    )
+    expected_lab = np.empty_like(attacked_lab, dtype=np.float32)
+    expected_lab[..., 0] = np.clip(final_l, 0.0, 100.0)
+    expected_lab[..., 1:3] = original_lab[..., 1:3]
+    expected = (
+        np.clip(color.lab2rgb(expected_lab) * 255.0, 0, 255)
+        .round()
+        .astype(np.uint8)
+    )
+    assert np.array_equal(actual, expected)
+
+    diagnostics = color_transfer_diagnostics(
+        generated, original, actual, mode=PAPER_EXACT_TWO_STAGE
+    )
+    assert diagnostics["protocol_classification"] == (
+        "paper-faithful unaligned paper-exact color transfer"
+    )
+    assert diagnostics["alignment_flow_source"] == "none"
+    assert "effective_source_flow_dx_image_px" not in diagnostics
+    assert diagnostics["output_matches_computed_transfer"]
+
+
+def test_paper_exact_two_stage_rejects_effective_flow():
+    generated, original = _images()
+    with pytest.raises(ValueError, match="must not receive effective flow"):
+        color_contrast_transfer(
+            generated,
+            original,
+            mode=PAPER_EXACT_TWO_STAGE,
+            effective_source_flow_dx_image_px=24.0,
+            effective_source_flow_dy_image_px=-24.0,
         )
 
 

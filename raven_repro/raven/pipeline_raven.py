@@ -12,7 +12,12 @@ from typing import Any, Dict, Optional
 from PIL import Image
 
 from .attention import install_view_guided_attention, restore_default_attention
-from .color_transfer import color_contrast_transfer_pil, color_transfer_diagnostics
+from .color_transfer import (
+    PAPER_EXACT_TWO_STAGE,
+    PAPER_EXACT_TWO_STAGE_ALIGNED,
+    color_contrast_transfer_pil,
+    color_transfer_diagnostics,
+)
 from .eval_protocol import (
     canonical_json_hash,
     canonical_scheduler_config,
@@ -209,6 +214,7 @@ class RavenPipeline:
         shift_y: Optional[float] = None,
         view_guided_attention: bool = True,
         color_transfer: bool = True,
+        color_transfer_mode: str = PAPER_EXACT_TWO_STAGE_ALIGNED,
         seed: int = 42,
         prompt: str = "",
         negative_prompt: str = "",
@@ -316,10 +322,24 @@ class RavenPipeline:
                 padding_mode=padding_mode,
                 warp_mode=warp_mode,
             )
+        supported_color_modes = {
+            PAPER_EXACT_TWO_STAGE, PAPER_EXACT_TWO_STAGE_ALIGNED
+        }
+        if color_transfer and color_transfer_mode not in supported_color_modes:
+            raise ValueError(f"Unsupported color transfer mode: {color_transfer_mode}")
         aligned_effective_flow = (
             require_effective_source_flow(nfpa_warp_metadata)
             if color_transfer
+            and color_transfer_mode == PAPER_EXACT_TWO_STAGE_ALIGNED
             else None
+        )
+        color_transfer_kwargs = (
+            {
+                "effective_source_flow_dx_image_px": aligned_effective_flow[0],
+                "effective_source_flow_dy_image_px": aligned_effective_flow[1],
+            }
+            if aligned_effective_flow is not None
+            else {}
         )
         if debug:
             save_image(self._decode_latents(shifted_latents), output_dir / "latent_shift_only.png")
@@ -462,9 +482,7 @@ class RavenPipeline:
             "overlap_handling": "valid overlap crop for paired quality metrics",
             "view_guided_attention": view_guided_attention,
             "color_transfer": color_transfer,
-            "color_transfer_mode": (
-                "paper_exact_two_stage_aligned" if color_transfer else "none"
-            ),
+            "color_transfer_mode": color_transfer_mode if color_transfer else "none",
         }
         planned_dx = dx if shift_space == "image_pixels" else float(dx) * self.vae_scale_factor
         planned_dy = dy if shift_space == "image_pixels" else float(dy) * self.vae_scale_factor
@@ -548,9 +566,8 @@ class RavenPipeline:
             color_contrast_transfer_pil(
                 view_image,
                 input_image,
-                mode="paper_exact_two_stage_aligned",
-                effective_source_flow_dx_image_px=aligned_effective_flow[0],
-                effective_source_flow_dy_image_px=aligned_effective_flow[1],
+                mode=color_transfer_mode,
+                **color_transfer_kwargs,
             )
             if color_transfer
             else view_image
@@ -563,9 +580,8 @@ class RavenPipeline:
                 view_image,
                 input_image,
                 final_image,
-                mode="paper_exact_two_stage_aligned",
-                effective_source_flow_dx_image_px=aligned_effective_flow[0],
-                effective_source_flow_dy_image_px=aligned_effective_flow[1],
+                mode=color_transfer_mode,
+                **color_transfer_kwargs,
             )
 
         if processors:
