@@ -138,6 +138,21 @@ def canonical_json_hash(payload: Mapping[str, Any]) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+def canonical_scheduler_config(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Return only deterministic scheduler parameters that affect inference.
+
+    Diffusers materializes ``_use_default_values`` from a set, so its list order
+    can differ between otherwise identical scheduler instances. Package and
+    class provenance are recorded separately and must not make paired attack
+    transform hashes depend on non-semantic private metadata.
+    """
+    return {
+        str(key): value
+        for key, value in payload.items()
+        if not str(key).startswith("_")
+    }
+
+
 def sha256_path(path: str | Path) -> str:
     path = Path(path)
     digest = hashlib.sha256()

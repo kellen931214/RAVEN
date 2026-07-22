@@ -518,3 +518,33 @@ strict equality between snapshot and attack run-ID sets.
 - Push status: pending
 - Entry point: `experiments/run_raven_aligned_color_eval.py`
 - Formal output eligibility: pending tests, gates, and aligned full evaluation
+
+## 2026-07-22 — Deterministic scheduler provenance hashing
+
+### Gate failure
+The formal protocol dispatcher root
+`outputs/raven_formal_protocol_rerun/diffusiondb/TR/run_20260721T185822Z`
+failed both active 10-sample smoke workflows before detector scores. The strict
+TR verifier reported `run_id=0: attacked pair transform_config_hash mismatch`.
+The two pending variants never launched and no 1001-sample workflow started.
+All failed logs and partial attack outputs remain preserved.
+
+### Root cause and impact
+Diffusers stores `_use_default_values` as private scheduler metadata derived from
+an unordered set. Identical clean and watermarked `DDPMScheduler` instances
+serialized that list in different orders, producing different scheduler and
+transform hashes even though every inference-relevant scheduler parameter,
+seed, shift, dtype, package version, and attack configuration matched. This was
+a provenance false positive; no detector or aggregate result was produced.
+
+### Fix and regression coverage
+`canonical_scheduler_config()` now excludes Diffusers private underscore-prefixed
+metadata before scheduler hashing. Scheduler class and Diffusers version remain
+separate required provenance fields. All public inference parameters remain in
+the hash, so a real change such as `variance_type` still changes the hash and is
+rejected by pairing/resume validation. `RavenPipeline` applies this canonicalizer
+before writing debug and attack records. Regression tests cover private metadata
+order/version drift and public scheduler parameter drift. Focused tests: 15
+passed. Full CPU suite: 163 passed with 44 existing warnings. `py_compile` and
+`git diff --check` passed. Replacement GPU smoke/full runs require a new source
+manifest and new timestamped output root; the failed root is not resumable.

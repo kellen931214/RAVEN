@@ -13,7 +13,11 @@ from PIL import Image
 
 from .attention import install_view_guided_attention, restore_default_attention
 from .color_transfer import color_contrast_transfer_pil, color_transfer_diagnostics
-from .eval_protocol import canonical_json_hash, transform_config_payload
+from .eval_protocol import (
+    canonical_json_hash,
+    canonical_scheduler_config,
+    transform_config_payload,
+)
 from .inversion import partial_diffusion_inversion
 from .resource_guard import limit_cpu_threads
 from .utils import image_size_divisible_by_8, save_image, save_json, seed_everything, tensor_to_image
@@ -91,9 +95,9 @@ class RavenPipeline:
         )
         scheduler_class = DDIMScheduler if scheduler_mode == "ddim" else DDPMScheduler
         self.pipe.scheduler = scheduler_class.from_config(self.pipe.scheduler.config)
-        self.scheduler_config = json.loads(
+        self.scheduler_config = canonical_scheduler_config(json.loads(
             json.dumps(dict(self.pipe.scheduler.config), sort_keys=True, default=str)
-        )
+        ))
         self.scheduler_config_hash = canonical_json_hash(self.scheduler_config)
         self.pipe = self.pipe.to(device)
         self.pipe.vae.requires_grad_(False)

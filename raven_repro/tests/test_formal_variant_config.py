@@ -12,6 +12,7 @@ from raven.eval_protocol import (
     FORMAL_ATTACK_CONFIG,
     assert_formal_debug_info,
     canonical_json_hash,
+    canonical_scheduler_config,
     formal_attack_config_hash,
     normalize_formal_attack_config,
     transform_config_payload,
@@ -79,6 +80,29 @@ def test_variant_config_hash_and_debug_assertion_are_config_specific():
         "transform_config_hash"
     ]
     assert formal_attack_config_hash(config) != formal_attack_config_hash()
+
+
+def test_scheduler_config_hash_ignores_private_metadata_order_only():
+    first = {
+        "_class_name": "DDPMScheduler",
+        "_diffusers_version": "old-build-tag",
+        "_use_default_values": ["variance_type", "timestep_spacing"],
+        "beta_start": 0.00085,
+        "variance_type": "fixed_small",
+    }
+    second = {
+        **first,
+        "_diffusers_version": "new-build-tag",
+        "_use_default_values": ["timestep_spacing", "variance_type"],
+    }
+    assert canonical_json_hash(canonical_scheduler_config(first)) == canonical_json_hash(
+        canonical_scheduler_config(second)
+    )
+
+    changed = {**second, "variance_type": "fixed_large"}
+    assert canonical_json_hash(canonical_scheduler_config(first)) != canonical_json_hash(
+        canonical_scheduler_config(changed)
+    )
 
 
 def test_immutable_source_index_requires_original_snapshot_and_metadata_sha(tmp_path):
