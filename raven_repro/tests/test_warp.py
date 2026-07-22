@@ -434,6 +434,56 @@ def test_centered_bilinear_effective_flow_matches_planned_flow():
     assert metadata["effective_visual_shift_dx_image_px"] == pytest.approx(-27.0)
     assert metadata["effective_visual_shift_dy_image_px"] == pytest.approx(29.0)
 
+
+def test_translate_latent_centered_respects_bilinear_sampling():
+    torch.manual_seed(23)
+    latent = torch.randn(1, 4, 64, 64)
+
+    via_translate = translate_latent(
+        latent,
+        dx=27,
+        dy=-29,
+        shift_space="image_pixels",
+        vae_scale_factor=8,
+        padding_mode="reflection",
+        warp_mode="raven_paper_nfpa_gap_fill_centered",
+        latent_sampling_mode="bilinear",
+    )
+
+    direct_bilinear = raven_paper_nfpa_gap_fill_centered_warp(
+        latent,
+        dx_image_px=27,
+        dy_image_px=-29,
+        vae_scale_factor=8,
+        sampling_mode="bilinear",
+    )
+
+    via_nearest = translate_latent(
+        latent,
+        dx=27,
+        dy=-29,
+        shift_space="image_pixels",
+        vae_scale_factor=8,
+        padding_mode="reflection",
+        warp_mode="raven_paper_nfpa_gap_fill_centered",
+        latent_sampling_mode="nearest",
+    )
+
+    assert torch.equal(via_translate, direct_bilinear)
+    assert not torch.equal(via_translate, via_nearest)
+
+
+def test_translate_latent_rejects_invalid_latent_sampling_mode():
+    latent = torch.randn(1, 1, 8, 8)
+    with pytest.raises(ValueError, match="Unsupported latent_sampling_mode"):
+        translate_latent(
+            latent,
+            dx=0,
+            dy=0,
+            warp_mode="raven_paper_nfpa_gap_fill_centered",
+            latent_sampling_mode="bicubic",
+        )
+
 def test_raven_paper_nfpa_gap_fill_inverse_warp_direction():
     latent = torch.zeros(1, 1, 64, 64)
     latent[0, 0, 32, 32] = 1.0

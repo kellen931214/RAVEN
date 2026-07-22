@@ -452,6 +452,7 @@ def translate_latent(
     vae_scale_factor: int = 8,
     padding_mode: PaddingMode = "zeros",
     warp_mode: WarpMode = "integer",
+    latent_sampling_mode: LatentSamplingMode = "nearest",
 ):
     """Translate BCHW latents using a right/down-positive convention.
 
@@ -478,6 +479,8 @@ def translate_latent(
         "raven_paper_nfpa_gap_fill", "raven_paper_nfpa_gap_fill_centered",
     }:
         raise ValueError(f"Unsupported warp_mode: {warp_mode}")
+    if latent_sampling_mode not in {"nearest", "bilinear"}:
+        raise ValueError(f"Unsupported latent_sampling_mode: {latent_sampling_mode}")
     if vae_scale_factor <= 0:
         raise ValueError("vae_scale_factor must be positive")
 
@@ -490,7 +493,7 @@ def translate_latent(
             dx,
             dy,
             vae_scale_factor=vae_scale_factor,
-            sampling_mode="nearest",
+            sampling_mode=latent_sampling_mode,
         )
     if warp_mode == "raven_paper_nfpa_gap_fill_centered":
         if shift_space != "image_pixels":
@@ -500,7 +503,7 @@ def translate_latent(
             dx,
             dy,
             vae_scale_factor=vae_scale_factor,
-            sampling_mode="nearest",
+            sampling_mode=latent_sampling_mode,
         )
     if warp_mode in {"nfpa_exact", "nfpa_pixel_center"}:
         if shift_space != "image_pixels":
