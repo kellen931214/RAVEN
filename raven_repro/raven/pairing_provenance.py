@@ -1,4 +1,4 @@
-"""Fail-closed provenance helpers for paired Tree-Ring experiments."""
+"""Fail-closed provenance helpers for paired watermark experiments."""
 
 from __future__ import annotations
 
@@ -9,7 +9,22 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 
-PAIRING_PROTOCOL = "tree_ring_paired_base_latent_v1"
+TR_PAIRING_PROTOCOL = "tree_ring_paired_base_latent_v1"
+GS_PAIRING_PROTOCOL = "gaussian_shading_shared_uniform_v1"
+PAIRING_PROTOCOL = TR_PAIRING_PROTOCOL
+PAIRING_PROTOCOLS = {"TR": TR_PAIRING_PROTOCOL, "GS": GS_PAIRING_PROTOCOL}
+GS_REQUIRED_FIELDS = (
+    "gs_protocol_mode",
+    "gs_secret_index",
+    "gs_message_sha256",
+    "gs_key_sha256",
+    "gs_nonce_sha256",
+    "gs_secret_bundle_sha256",
+    "gs_sampling_seed",
+    "gs_sampling_uniform_sha256",
+    "gs_payload_layout",
+    "gs_cipher",
+)
 
 PAIRING_REQUIRED_FIELDS = (
     "dataset",
@@ -99,11 +114,27 @@ def tensor_sha256(tensor) -> str:
     return digest.hexdigest()
 
 
+def pairing_method(row: Mapping[str, Any]) -> str:
+    method = str(row.get("wm_type") or row.get("method") or "").upper()
+    if method:
+        return method
+    protocol = str(row.get("protocol") or "")
+    if protocol == TR_PAIRING_PROTOCOL:
+        return "TR"
+    if protocol == GS_PAIRING_PROTOCOL:
+        return "GS"
+    return ""
+
+
 def build_pairing_sha256(row: Mapping[str, Any]) -> str:
     # CSV is the durable provenance format. Canonicalize scalar types exactly
     # as they will be interpreted after a CSV round trip.
-    payload = {field: str(row[field]) for field in PAIRING_HASH_FIELDS}
+    fields = PAIRING_HASH_FIELDS + (GS_REQUIRED_FIELDS if pairing_method(row) == "GS" else ())
+    payload = {field: str(row[field]) for field in fields}
     payload["base_latent_seed"] = int(row["base_latent_seed"])
+    if pairing_method(row) == "GS":
+        payload["gs_secret_index"] = int(row["gs_secret_index"])
+        payload["gs_sampling_seed"] = int(row["gs_sampling_seed"])
     return canonical_json_sha256(payload)
 
 
@@ -148,18 +179,49 @@ def audit_pairing_rows(
     generation_hashes: set[str] = set()
     watermark_hashes: set[str] = set()
     revisions: set[str] = set()
+    methods: set[str] = set()
+    gs_secret_indexes: set[int] = set()
+    gs_secret_hashes: set[str] = set()
+    gs_sampling_seeds: set[int] = set()
+    gs_sampling_hashes: set[str] = set()
     count = 0
 
     for row in rows:
         run_id = str(_required(row, "run_id", "unknown"))
         for field in PAIRING_REQUIRED_FIELDS:
             _required(row, field, run_id)
+        method = pairing_method(row)
+        if method not in PAIRING_PROTOCOLS:
+            raise ValueError(f"unsupported pairing method run_id={run_id}: {method!r}")
+        methods.add(method)
         protocol = str(row.get("protocol") or "")
-        if protocol != PAIRING_PROTOCOL:
+        expected_protocol = PAIRING_PROTOCOLS[method]
+        if protocol != expected_protocol:
             raise ValueError(
                 f"unsupported pairing protocol run_id={run_id}: {protocol!r}; "
-                f"expected {PAIRING_PROTOCOL!r}"
+                f"expected {expected_protocol!r}"
             )
+        if method == "GS":
+            for field in GS_REQUIRED_FIELDS:
+                _required(row, field, run_id)
+            if str(row["gs_protocol_mode"]) != "official_compatible":
+                raise ValueError(f"formal GS requires official_compatible mode run_id={run_id}")
+            secret_index = int(row["gs_secret_index"])
+            sampling_seed = int(row["gs_sampling_seed"])
+            secret_hash = str(row["gs_secret_bundle_sha256"])
+            sampling_hash = str(row["gs_sampling_uniform_sha256"])
+            if secret_index in gs_secret_indexes:
+                raise ValueError(f"duplicate GS secret index run_id={run_id}: {secret_index}")
+            if secret_hash in gs_secret_hashes:
+                raise ValueError(f"duplicate GS secret bundle run_id={run_id}: {secret_hash}")
+            if sampling_seed in gs_sampling_seeds:
+                raise ValueError(f"duplicate GS sampling seed run_id={run_id}: {sampling_seed}")
+            if sampling_hash in gs_sampling_hashes:
+                raise ValueError(f"duplicate GS sampling uniforms run_id={run_id}: {sampling_hash}")
+            gs_secret_indexes.add(secret_index)
+            gs_secret_hashes.add(secret_hash)
+            gs_sampling_seeds.add(sampling_seed)
+            gs_sampling_hashes.add(sampling_hash)
         if run_id in seen_run_ids:
             raise ValueError(f"duplicate run_id in pairing provenance: {run_id}")
         seen_run_ids.add(run_id)
@@ -217,8 +279,10 @@ def audit_pairing_rows(
 
     if count != expected_count:
         raise ValueError(f"expected {expected_count} pairing rows, got {count}")
+    if len(methods) != 1:
+        raise ValueError(f"mixed pairing methods: {sorted(methods)}")
+    method = next(iter(methods))
     for label, values in (
-        ("watermark_target_sha256", target_hashes),
         ("watermark_mask_sha256", mask_hashes),
         ("generation_config_sha256", generation_hashes),
         ("watermark_config_sha256", watermark_hashes),
@@ -226,10 +290,17 @@ def audit_pairing_rows(
     ):
         if len(values) != 1:
             raise ValueError(f"inconsistent {label}: {sorted(values)}")
+    if method == "TR" and len(target_hashes) != 1:
+        raise ValueError(f"inconsistent watermark_target_sha256: {sorted(target_hashes)}")
+    if method == "GS" and len(target_hashes) != count:
+        raise ValueError(
+            f"GS requires one target per run: unique={len(target_hashes)} count={count}"
+        )
 
-    return {
+    result = {
         "passed": True,
-        "protocol": PAIRING_PROTOCOL,
+        "method": method,
+        "protocol": PAIRING_PROTOCOLS[method],
         "count": count,
         "unique_run_ids": len(seen_run_ids),
         "unique_base_latent_seeds": len(seen_seeds),
@@ -237,12 +308,21 @@ def audit_pairing_rows(
         "duplicate_base_latent_hashes": 0,
         "unique_clean_image_hashes": len(seen_clean_hashes),
         "unique_watermarked_image_hashes": len(seen_watermarked_hashes),
-        "watermark_target_sha256": next(iter(target_hashes)),
+        "unique_watermark_target_hashes": len(target_hashes),
+        "watermark_target_sha256": next(iter(target_hashes)) if method == "TR" else None,
         "watermark_mask_sha256": next(iter(mask_hashes)),
         "generation_config_sha256": next(iter(generation_hashes)),
         "watermark_config_sha256": next(iter(watermark_hashes)),
         "model_revision": next(iter(revisions)),
     }
+    if method == "GS":
+        result.update({
+            "unique_gs_secret_indexes": len(gs_secret_indexes),
+            "unique_gs_secret_bundle_hashes": len(gs_secret_hashes),
+            "unique_gs_sampling_seeds": len(gs_sampling_seeds),
+            "unique_gs_sampling_uniform_hashes": len(gs_sampling_hashes),
+        })
+    return result
 
 
 def assert_attack_pair_config_match(

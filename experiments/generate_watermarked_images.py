@@ -29,6 +29,7 @@ for root in (str(RAVEN_ROOT), str(BENCH_ROOT)):
 
 from raven.gpu_utils import configure_gpu, finalize_gpu_logging, setup_run_logging, utc_timestamp, write_experiment_records
 from raven.pairing_provenance import (
+    GS_PAIRING_PROTOCOL,
     PAIRING_PROTOCOL,
     audit_pairing_rows,
     build_pairing_sha256,
@@ -109,6 +110,39 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--resolution", type=int, default=512)
     parser.add_argument("--validate_before", type=str_to_bool, default=True)
     return parser.parse_args()
+
+
+def deterministic_gs_sampling_seed(base_seed: int, run_id: int) -> int:
+    digest = hashlib.sha256(
+        f"gaussian-shading-official-sampling-v1:{int(base_seed)}:{int(run_id)}".encode("utf-8")
+    ).digest()
+    return int.from_bytes(digest[:8], "big") & ((1 << 63) - 1)
+
+
+def validate_gs_resume_provenance(
+    stored: Dict[str, Any],
+    *,
+    run_id: int,
+    sampling_seed: int,
+    wm_results: Dict[str, Any],
+) -> Dict[str, str]:
+    secret = wm_results["secret_provenance_list"][0]
+    checks = {
+        "gs_secret_index": str(run_id),
+        "gs_sampling_seed": str(sampling_seed),
+        "gs_sampling_uniform_sha256": wm_results["sampling_uniform_sha256_list"][0],
+        "gs_message_sha256": secret["message_sha256"],
+        "gs_key_sha256": secret["key_sha256"],
+        "gs_nonce_sha256": secret["nonce_sha256"],
+        "gs_secret_bundle_sha256": secret["secret_bundle_sha256"],
+        "watermarked_latent_sha256": tensor_sha256(wm_results["zT_torch"]),
+    }
+    for field, expected in checks.items():
+        if str(stored.get(field, "")) != str(expected):
+            raise RuntimeError(
+                f"GS resume provenance mismatch run_id={run_id} field={field}"
+            )
+    return checks
 
 
 def bool_for_json(value: Any) -> Any:
@@ -306,7 +340,13 @@ def run_method(args: argparse.Namespace, dataset_dir: Path, wm_type: str, prompt
     import torch
     from utils.imprint_utils import validate
     from utils.pipe import pipe_utils
-    from utils.utils import check_if_detection_successful, get_detection_threshold, seed_everything, set_random_seed
+    from utils.utils import (
+        check_if_detection_successful,
+        describe_legacy_detection_threshold,
+        get_detection_threshold,
+        seed_everything,
+        set_random_seed,
+    )
     from utils.wm.wm_utils import WmProviders
 
     wm_provider_cls = WmProviders[wm_type].value
@@ -320,12 +360,15 @@ def run_method(args: argparse.Namespace, dataset_dir: Path, wm_type: str, prompt
         if args.clean_output_dir
         else Path(args.output_dir).resolve().parent / "generated"
     ) / args.dataset_name
+    if wm_type == "GS":
+        clean_root = clean_root / "GS"
     clean_root.mkdir(parents=True, exist_ok=True)
     suffix = shard_suffix(args.num_shards, args.shard_index)
     metadata_csv = method_dir / f"metadata{suffix}.csv"
     summary_json = method_dir / f"summary{suffix}.json"
     completed = existing_completed_rows(metadata_csv)
     detection_threshold = get_detection_threshold(wm_type, args.modelid_target)
+    legacy_threshold = describe_legacy_detection_threshold(wm_type, args.modelid_target)
 
     print(f"[{wm_type}] loading target pipeline: {args.modelid_target}", flush=True)
     set_random_seed(args.seed)
@@ -341,16 +384,28 @@ def run_method(args: argparse.Namespace, dataset_dir: Path, wm_type: str, prompt
     provider_kwargs = vars(args).copy()
     for reserved_key in ("latent_shape", "dtype", "device"):
         provider_kwargs.pop(reserved_key, None)
-    wm_provider = wm_provider_cls(
-        latent_shape=pipe_provider_target.get_latent_shape(),
-        dtype=pipe_provider_target.get_dtype(),
-        device=device,
-        **provider_kwargs,
-    )
-    if wm_type != "TR":
-        raise ValueError("paired formal generation currently supports only Tree-Ring (TR)")
-    watermark_target_sha256 = tensor_sha256(wm_provider.gt_patch)
-    watermark_mask_sha256 = tensor_sha256(wm_provider.watermarking_mask)
+    if wm_type not in {"TR", "GS"}:
+        raise ValueError("paired formal generation currently supports only TR and GS")
+    if wm_type == "GS" and args.gs_protocol_mode != "official_compatible":
+        raise ValueError(
+            "formal GS generation requires --gs_protocol_mode official_compatible; "
+            "legacy remains available only through explicitly legacy-labeled runners"
+        )
+    wm_provider = None
+    if wm_type == "TR":
+        wm_provider = wm_provider_cls(
+            latent_shape=pipe_provider_target.get_latent_shape(),
+            dtype=pipe_provider_target.get_dtype(),
+            device=device,
+            **provider_kwargs,
+        )
+        watermark_target_sha256 = tensor_sha256(wm_provider.gt_patch)
+        watermark_mask_sha256 = tensor_sha256(wm_provider.watermarking_mask)
+    else:
+        watermark_target_sha256 = None
+        watermark_mask_sha256 = canonical_json_sha256(
+            {"method": "GS", "mask": "not_applicable", "version": 1}
+        )
     generation_config = {
         "model_id": args.modelid_target,
         "model_revision": args.model_revision,
@@ -361,19 +416,39 @@ def run_method(args: argparse.Namespace, dataset_dir: Path, wm_type: str, prompt
         "dtype": str(pipe_provider_target.get_dtype()),
     }
     generation_config_sha256 = canonical_json_sha256(generation_config)
-    watermark_config = {
-        "wm_type": "TR",
-        "w_seed": int(args.w_seed),
-        "w_channel": int(args.w_channel),
-        "w_pattern": str(args.w_pattern),
-        "w_mask_shape": str(args.w_mask_shape),
-        "w_radius": int(args.w_radius),
-        "w_measurement": str(args.w_measurement),
-        "w_injection": str(args.w_injection),
-        "w_pattern_const": float(args.w_pattern_const),
-        "watermark_target_sha256": watermark_target_sha256,
-        "watermark_mask_sha256": watermark_mask_sha256,
-    }
+    if wm_type == "TR":
+        watermark_config = {
+            "wm_type": "TR",
+            "w_seed": int(args.w_seed),
+            "w_channel": int(args.w_channel),
+            "w_pattern": str(args.w_pattern),
+            "w_mask_shape": str(args.w_mask_shape),
+            "w_radius": int(args.w_radius),
+            "w_measurement": str(args.w_measurement),
+            "w_injection": str(args.w_injection),
+            "w_pattern_const": float(args.w_pattern_const),
+            "watermark_target_sha256": watermark_target_sha256,
+            "watermark_mask_sha256": watermark_mask_sha256,
+        }
+    else:
+        watermark_config = {
+            "wm_type": "GS",
+            "gs_protocol_mode": "official_compatible",
+            "official_source_repository": "bsmhmmlf/Gaussian-Shading",
+            "official_source_commit": "09c678fadc7545acf7be12647ddf2a5e66f6a9dc",
+            "message_width_in_bytes": int(args.message_width_in_bytes),
+            "channel_copy": int(args.gs_channel_copy),
+            "hw_copy": int(args.gs_hw_copy),
+            "payload_layout": "torch.repeat(1,channel_copy,hw_copy,hw_copy)",
+            "cipher": "PyCryptodome.ChaCha20",
+            "key_bytes": 32,
+            "nonce_bytes": 12,
+            "sampling": "norm.ppf((u+encrypted_bit)/2)",
+            "majority_vote": "strict_gt_half_ties_zero",
+            "secret_mapping": "secret_index=run_id",
+            "sampling_seed_policy": "sha256(base_seed,run_id,protocol)",
+            "watermark_mask_sha256": watermark_mask_sha256,
+        }
     watermark_config_sha256 = canonical_json_sha256(watermark_config)
     message_bits_str_initial = None
 
@@ -384,7 +459,33 @@ def run_method(args: argparse.Namespace, dataset_dir: Path, wm_type: str, prompt
             item_dir = method_dir / f"{run_id:06d}"
             image_path = item_dir / "watermarked.png"
             clean_path = clean_root / f"{run_id:06d}.png"
+            run_provider = wm_provider
+            gs_results = None
+            if wm_type == "GS":
+                gs_sampling_seed = deterministic_gs_sampling_seed(args.seed, run_id)
+                run_kwargs = provider_kwargs.copy()
+                run_kwargs.update({
+                    "offset": run_id,
+                    "gs_secret_index": run_id,
+                    "gs_sampling_seed": gs_sampling_seed,
+                    "gs_protocol_mode": "official_compatible",
+                })
+                run_provider = wm_provider_cls(
+                    latent_shape=pipe_provider_target.get_latent_shape(),
+                    dtype=pipe_provider_target.get_dtype(),
+                    device=device,
+                    **run_kwargs,
+                )
+                gs_results = run_provider.get_wm_latents()
             if run_id in completed:
+                if wm_type == "GS":
+                    validate_gs_resume_provenance(
+                        completed[run_id],
+                        run_id=run_id,
+                        sampling_seed=gs_sampling_seed,
+                        wm_results=gs_results,
+                    )
+                del gs_results, run_provider
                 if local_idx == 0 or (local_idx + 1) % 25 == 0:
                     print(f"[{wm_type}] skip existing run_id={run_id}", flush=True)
                 continue
@@ -398,16 +499,22 @@ def run_method(args: argparse.Namespace, dataset_dir: Path, wm_type: str, prompt
                     f"unrecorded paired output exists for run_id={run_id}: "
                     f"clean={clean_path.exists()} watermarked={image_path.exists()}"
                 )
-            base_latent_seed = int(args.seed) + run_id
-            generator = torch.Generator(device="cpu").manual_seed(base_latent_seed)
-            base_cpu = torch.randn(
-                tuple(pipe_provider_target.get_latent_shape()),
-                generator=generator,
-                dtype=torch.float32,
-                device="cpu",
-            )
-            base_latent = base_cpu.to(device=device, dtype=pipe_provider_target.get_dtype())
-            wm_results = wm_provider.get_wm_latents(latents_clean=base_latent)
+            if wm_type == "TR":
+                base_latent_seed = int(args.seed) + run_id
+                generator = torch.Generator(device="cpu").manual_seed(base_latent_seed)
+                base_cpu = torch.randn(
+                    tuple(pipe_provider_target.get_latent_shape()),
+                    generator=generator,
+                    dtype=torch.float32,
+                    device="cpu",
+                )
+                base_latent = base_cpu.to(device=device, dtype=pipe_provider_target.get_dtype())
+                wm_results = run_provider.get_wm_latents(latents_clean=base_latent)
+            else:
+                base_latent_seed = gs_sampling_seed
+                wm_results = gs_results
+                base_cpu = wm_results["zT_clean_torch"].detach().to("cpu", dtype=torch.float32)
+                base_latent = wm_results["zT_clean_torch"]
             clean_zT = wm_results["zT_clean_torch"]
             wm_zT = wm_results["zT_torch"]
             base_latent_sha256 = tensor_sha256(base_latent)
@@ -415,10 +522,17 @@ def run_method(args: argparse.Namespace, dataset_dir: Path, wm_type: str, prompt
             watermarked_base_latent_sha256 = tensor_sha256(base_latent)
             if clean_base_latent_sha256 != base_latent_sha256:
                 raise RuntimeError(f"provider changed clean base latent run_id={run_id}")
-            injection_max_abs_error = verify_tree_ring_injection(torch, wm_provider, clean_zT, wm_zT)
+            if wm_type == "TR":
+                injection_max_abs_error = verify_tree_ring_injection(
+                    torch, run_provider, clean_zT, wm_zT
+                )
+            else:
+                injection_max_abs_error = None
+                watermark_target_sha256 = tensor_sha256(wm_results["barcodes_torch"])
+                secret_provenance = wm_results["secret_provenance_list"][0]
             watermarked_latent_sha256 = tensor_sha256(wm_zT)
             if watermarked_latent_sha256 == base_latent_sha256:
-                raise RuntimeError(f"Tree-Ring injection made no latent change run_id={run_id}")
+                raise RuntimeError(f"watermark made no latent change run_id={run_id}")
 
             print(
                 f"[{wm_type}] generating paired {local_idx + 1}/{len(prompt_rows)} "
@@ -429,7 +543,7 @@ def run_method(args: argparse.Namespace, dataset_dir: Path, wm_type: str, prompt
                 pipe_provider_target, prompt_row["prompt"], clean_zT, args
             )
             watermarked_image = generate_watermarked(
-                pipe_provider_target, wm_provider, prompt_row["prompt"], wm_zT, args
+                pipe_provider_target, run_provider, prompt_row["prompt"], wm_zT, args
             )
             item_dir.mkdir(parents=True, exist_ok=True)
             clean_image.save(clean_path)
@@ -440,11 +554,13 @@ def run_method(args: argparse.Namespace, dataset_dir: Path, wm_type: str, prompt
                     out_dir=str(method_dir),
                     image_to_verify_PIL=watermarked_image,
                     original_PIL=watermarked_image,
-                    wm_provider=wm_provider,
+                    wm_provider=run_provider,
                     pipe_provider_target=pipe_provider_target,
                     num_inference_steps_target=args.num_inference_steps_target,
                     step=-1,
-                    message_bits_str_initial=message_bits_str_initial,
+                    message_bits_str_initial=(
+                        wm_results.get("message_bits_str_list", [message_bits_str_initial])[0]
+                    ),
                     do_psnr=False,
                     do_ssim=False,
                     do_msssim=False,
@@ -464,7 +580,7 @@ def run_method(args: argparse.Namespace, dataset_dir: Path, wm_type: str, prompt
                 before_compact = {}
 
             row = {
-                "protocol": PAIRING_PROTOCOL,
+                "protocol": GS_PAIRING_PROTOCOL if wm_type == "GS" else PAIRING_PROTOCOL,
                 "dataset_name": args.dataset_name,
                 "dataset": args.dataset_name,
                 "run_id": run_id,
@@ -484,6 +600,8 @@ def run_method(args: argparse.Namespace, dataset_dir: Path, wm_type: str, prompt
                 "guidance_scale_target": args.guidance_scale_target,
                 "resolution": args.resolution,
                 "detection_threshold": detection_threshold,
+                "detection_threshold_type": legacy_threshold["threshold_type"],
+                "threshold_calibrated_from_current_clean_negatives": False,
                 "detection_metric": METRIC_MAP[wm_type],
                 "before_detection_successful": bool_for_json(before_successful),
                 "before_detection_metric_value": bool_for_json(before_metric_value),
@@ -497,21 +615,43 @@ def run_method(args: argparse.Namespace, dataset_dir: Path, wm_type: str, prompt
                 "watermark_mask_sha256": watermark_mask_sha256,
                 "generation_config_sha256": generation_config_sha256,
                 "watermark_config_sha256": watermark_config_sha256,
-                "injection_only_difference_verified": True,
+                "injection_only_difference_verified": wm_type == "TR",
+                "pairing_relation": (
+                    "shared_sampling_uniforms_distribution_preserving_partition"
+                    if wm_type == "GS" else "shared_base_latent_fft_injection_only"
+                ),
                 "injection_max_abs_error": injection_max_abs_error,
                 "clean_path": str(clean_path.resolve()),
                 "clean_sha256": sha256_path(clean_path),
                 "watermarked_path": str(image_path.resolve()),
                 "watermarked_image_path": str(image_path.resolve()),
                 "watermarked_sha256": sha256_path(image_path),
-                "w_seed": int(args.w_seed),
-                "w_channel": int(args.w_channel),
-                "w_pattern": str(args.w_pattern),
-                "w_mask_shape": str(args.w_mask_shape),
-                "w_radius": int(args.w_radius),
-                "w_measurement": str(args.w_measurement),
-                "w_injection": str(args.w_injection),
             }
+            if wm_type == "TR":
+                row.update({
+                    "w_seed": int(args.w_seed),
+                    "w_channel": int(args.w_channel),
+                    "w_pattern": str(args.w_pattern),
+                    "w_mask_shape": str(args.w_mask_shape),
+                    "w_radius": int(args.w_radius),
+                    "w_measurement": str(args.w_measurement),
+                    "w_injection": str(args.w_injection),
+                })
+            else:
+                row.update({
+                    "gs_protocol_mode": "official_compatible",
+                    "gs_secret_index": run_id,
+                    "gs_message_sha256": secret_provenance["message_sha256"],
+                    "gs_key_sha256": secret_provenance["key_sha256"],
+                    "gs_nonce_sha256": secret_provenance["nonce_sha256"],
+                    "gs_secret_bundle_sha256": secret_provenance["secret_bundle_sha256"],
+                    "gs_sampling_seed": gs_sampling_seed,
+                    "gs_sampling_uniform_sha256": wm_results["sampling_uniform_sha256_list"][0],
+                    "gs_payload_layout": "channel_spatial_repeat",
+                    "gs_cipher": "PyCryptodome_ChaCha20_32byte_key_12byte_nonce",
+                    "gs_official_tau_onebit": run_provider.official_thresholds()["tau_onebit"],
+                    "gs_official_tau_bits": run_provider.official_thresholds()["tau_bits"],
+                })
             row["pairing_sha256"] = build_pairing_sha256(row)
             row.update({f"before_{key}": bool_for_json(value) for key, value in before_compact.items()})
             append_row(metadata_csv, row)
@@ -524,6 +664,8 @@ def run_method(args: argparse.Namespace, dataset_dir: Path, wm_type: str, prompt
             )
             guard.check(f"{args.dataset_name}/{wm_type}/run_id={run_id}/done")
             del base_cpu, base_latent, clean_zT, wm_zT, wm_results, clean_image, watermarked_image
+            if wm_type == "GS":
+                del run_provider, gs_results
             gc.collect()
             torch.cuda.empty_cache()
     finally:
@@ -549,7 +691,12 @@ def run_method(args: argparse.Namespace, dataset_dir: Path, wm_type: str, prompt
         "num_shards": int(args.num_shards),
         "shard_index": int(args.shard_index),
         "pairing_audit": audit,
-        "paper_setting_note": "Per-sample paired clean/Tree-Ring generation; RAVEN/removal not run in this step.",
+        "paper_setting_note": (
+            "Per-sample official-compatible Gaussian Shading with shared sampling uniforms; "
+            "RAVEN/removal not run in this step."
+            if wm_type == "GS" else
+            "Per-sample paired clean/Tree-Ring generation; RAVEN/removal not run in this step."
+        ),
     })
     save_json(summary_json, summary)
     print(f"[{wm_type}] summary: {summary}", flush=True)

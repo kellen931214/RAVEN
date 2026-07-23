@@ -68,7 +68,16 @@ PROVIDER_FIELDS_BY_METHOD = {
     "RID": ("rid_seed", "fix_gt", "time_shift", "time_shift_factor"),
     "HSTR": ("hstr_seed", "fix_gt"),
     "HSQR": ("hsqr_seed", "fix_gt", "delta"),
-    "GS": ("offset", "message_width_in_bytes", "num_replications"),
+    "GS": (
+        "gs_protocol_mode",
+        "message_width_in_bytes",
+        "l",
+        "num_replications",
+        "gs_channel_copy",
+        "gs_hw_copy",
+        "gs_fpr",
+        "gs_user_number",
+    ),
 }
 
 PROVIDER_DEFAULTS = {
@@ -85,7 +94,16 @@ PROVIDER_DEFAULTS = {
     "RID": {"rid_seed": 999999, "fix_gt": 1, "time_shift": 1, "time_shift_factor": 1},
     "HSTR": {"hstr_seed": 999999, "fix_gt": 1},
     "HSQR": {"hsqr_seed": 999999, "fix_gt": 1, "delta": 0},
-    "GS": {"offset": 0, "message_width_in_bytes": 32, "num_replications": 1},
+    "GS": {
+        "gs_protocol_mode": "legacy",
+        "message_width_in_bytes": 32,
+        "l": 1,
+        "num_replications": 64,
+        "gs_channel_copy": 1,
+        "gs_hw_copy": 8,
+        "gs_fpr": 1e-6,
+        "gs_user_number": 1000000,
+    },
 }
 
 FORMAL_DEBUG_FIELDS = (

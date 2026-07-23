@@ -20,8 +20,13 @@ PROVENANCE_FIELDS = [
     "model_id", "model_revision", "vae_id", "vae_scaling_factor",
     "scheduler", "inverse_scheduler", "steps", "resolution", "detector_dtype",
     "score_direction", "provider_parameters", "generation_seed", "attack_seed",
-    "watermark_seed", "fix_gt", "offset", "key_hex", "nonce_hex",
-    "legacy_threshold", "target_fpr", "provider_config_hash", "target_watermark_hash",
+    "watermark_seed", "fix_gt", "offset", "legacy_threshold", "target_fpr",
+    "provider_config_hash", "target_watermark_hash", "source_watermark_target_sha256",
+    "detector_watermark_target_sha256", "source_watermark_mask_sha256",
+    "detector_watermark_mask_sha256", "gs_protocol_mode", "gs_secret_index",
+    "gs_message_sha256", "gs_key_sha256", "gs_nonce_sha256",
+    "gs_secret_bundle_sha256", "gs_sampling_seed", "gs_sampling_uniform_sha256",
+    "gs_official_tau_onebit", "gs_official_tau_bits",
 ]
 PATH_FIELDS = [item for stage in STAGES for item in (f"{stage}_path", f"{stage}_sha256")]
 SCORE_FIELDS = [
@@ -30,7 +35,7 @@ SCORE_FIELDS = [
         "tr_statistic", "tr_df", "tr_p_underflow",
     )
 ]
-GS_FIELDS = ["ground_truth_bits"] + [f"{stage}_predicted_bits" for stage in STAGES]
+GS_FIELDS = [f"{stage}_decoded_bits_sha256" for stage in STAGES]
 FIELDNAMES = PROVENANCE_FIELDS + PATH_FIELDS + SCORE_FIELDS + GS_FIELDS + ["error"]
 
 
@@ -70,7 +75,12 @@ def integer(row: dict[str, str], names: tuple[str, ...], default: int) -> int:
 
 def provider_kwargs(method: str, row: dict[str, str]) -> dict:
     if method == "GS":
-        return {"offset": integer(row, ("offset",), 0)}
+        secret_index = integer(row, ("gs_secret_index", "offset"), 0)
+        return {
+            "offset": secret_index,
+            "gs_secret_index": secret_index,
+            "gs_sampling_seed": integer(row, ("gs_sampling_seed",), 0),
+        }
     if method == "TR":
         return {
             "w_seed": integer(row, ("w_seed", "watermark_seed"), 999999),
@@ -141,10 +151,6 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def bits_from_bytes(value: bytes, length: int) -> str:
-    return "".join(f"{byte:08b}" for byte in value)[:length]
-
-
 def evaluate_image(torch, provider, pipe, path: Path, steps: int) -> dict:
     if not path.is_file():
         raise FileNotFoundError(path)
@@ -182,14 +188,6 @@ def evaluate_image(torch, provider, pipe, path: Path, steps: int) -> dict:
     return result
 
 
-def secret_metadata(provider) -> tuple[str, str]:
-    offset = int(getattr(provider, "offset", 0))
-    keys, nonces = getattr(provider, "keys", None), getattr(provider, "nonces", None)
-    key = keys[offset].hex() if keys is not None and offset < len(keys) else ""
-    nonce = nonces[offset].hex() if nonces is not None and offset < len(nonces) else ""
-    return key, nonce
-
-
 def add_tr_diagnostics(record: dict, stage: str, result: dict) -> None:
     diagnostics = result.get("p_value_diagnostics") or []
     if not diagnostics:
@@ -212,7 +210,8 @@ def main() -> int:
 
     import torch
     from raven.resource_guard import CpuMemoryGuard, limit_cpu_threads
-    from raven.eval_protocol import require_uniform_provider_config
+    from raven.eval_protocol import canonical_json_hash, require_uniform_provider_config
+    from raven.pairing_provenance import tensor_sha256
     from utils.pipe import pipe_utils
     from utils.utils import describe_legacy_detection_threshold
 
@@ -242,11 +241,14 @@ def main() -> int:
     inverse_scheduler = type(pipe.scheduler_inverse).__name__
     legacy = describe_legacy_detection_threshold(args.method, args.model_id)
 
-    provider = provider_class(method)(
-        latent_shape=latent_shape, dtype=pipe.get_dtype(), device=device, **uniform_kwargs
-    )
-    target = getattr(provider, "gt_patch", None)
-    target_hash = hashlib.sha256(target.detach().cpu().numpy().tobytes()).hexdigest() if target is not None else ""
+    provider = None
+    target_hash = ""
+    if method != "GS":
+        provider = provider_class(method)(
+            latent_shape=latent_shape, dtype=pipe.get_dtype(), device=device, **uniform_kwargs
+        )
+        target = getattr(provider, "gt_patch", None)
+        target_hash = tensor_sha256(target) if target is not None else ""
     processed, errors = 0, 0
     completed: set[str] = set()
     output_mode, write_header = "x", True
@@ -297,14 +299,72 @@ def main() -> int:
                 "generation_seed": row.get("generation_seed", ""), "attack_seed": row.get("attack_seed", ""),
                 "legacy_threshold": row.get("legacy_threshold") or legacy["threshold"], "target_fpr": args.target_fpr,
                 "provider_config_hash": uniform_hash,
-                "target_watermark_hash": target_hash,
+                "target_watermark_hash": (
+                    row.get("watermark_target_sha256", "") if method == "GS" else target_hash
+                ),
             })
             try:
-                kwargs = uniform_kwargs
-                record["provider_parameters"] = json.dumps(kwargs, sort_keys=True)
+                kwargs = dict(uniform_kwargs)
+                if method == "GS":
+                    kwargs.update(provider_kwargs(method, row))
+                    provider = provider_class(method)(
+                        latent_shape=latent_shape,
+                        dtype=pipe.get_dtype(),
+                        device=device,
+                        **kwargs,
+                    )
+                    secret = provider.secret_provenance()
+                    for field in (
+                        "gs_secret_index", "gs_message_sha256", "gs_key_sha256",
+                        "gs_nonce_sha256", "gs_secret_bundle_sha256",
+                    ):
+                        source_field = field
+                        expected = str(row.get(source_field, ""))
+                        actual = str(
+                            secret[{
+                                "gs_secret_index": "secret_index",
+                                "gs_message_sha256": "message_sha256",
+                                "gs_key_sha256": "key_sha256",
+                                "gs_nonce_sha256": "nonce_sha256",
+                                "gs_secret_bundle_sha256": "secret_bundle_sha256",
+                            }[field]]
+                        )
+                        if not expected or expected != actual:
+                            raise RuntimeError(
+                                f"run_id={identifier}: detector/source {field} mismatch"
+                            )
+                        record[field] = actual
+                    record["gs_protocol_mode"] = provider.gs_protocol_mode
+                    for field in ("gs_sampling_seed", "gs_sampling_uniform_sha256"):
+                        if not str(row.get(field, "")):
+                            raise RuntimeError(f"run_id={identifier}: missing {field}")
+                        record[field] = row[field]
+                    thresholds = provider.official_thresholds()
+                    record["gs_official_tau_onebit"] = thresholds["tau_onebit"]
+                    record["gs_official_tau_bits"] = thresholds["tau_bits"]
+                    source_target_hash = str(row.get("watermark_target_sha256", ""))
+                    detector_target_hash = tensor_sha256(provider.watermark_target_tensor())
+                    source_mask_hash = str(row.get("watermark_mask_sha256", ""))
+                    detector_mask_hash = canonical_json_hash(
+                        {"method": "GS", "mask": "not_applicable", "version": 1}
+                    )
+                    if not source_target_hash or source_target_hash != detector_target_hash:
+                        raise RuntimeError(
+                            f"run_id={identifier}: detector/source target SHA mismatch"
+                        )
+                    if not source_mask_hash or source_mask_hash != detector_mask_hash:
+                        raise RuntimeError(
+                            f"run_id={identifier}: detector/source mask SHA mismatch"
+                        )
+                    record.update({
+                        "source_watermark_target_sha256": source_target_hash,
+                        "detector_watermark_target_sha256": detector_target_hash,
+                        "source_watermark_mask_sha256": source_mask_hash,
+                        "detector_watermark_mask_sha256": detector_mask_hash,
+                    })
+                record["provider_parameters"] = json.dumps(uniform_kwargs, sort_keys=True)
                 record["watermark_seed"] = next((kwargs[key] for key in ("w_seed", "rid_seed", "hstr_seed", "hsqr_seed") if key in kwargs), "")
                 record["fix_gt"], record["offset"] = kwargs.get("fix_gt", ""), kwargs.get("offset", "")
-                record["key_hex"], record["nonce_hex"] = secret_metadata(provider)
                 stage_results = {}
                 for stage in STAGES:
                     path = Path(row[f"{stage}_path"]).resolve()
@@ -323,10 +383,11 @@ def main() -> int:
                     if method == "TR":
                         add_tr_diagnostics(record, stage, result)
                 if method == "GS":
-                    offset, expected = int(getattr(provider, "offset", 0)), int(provider.message_width_in_bits)
-                    record["ground_truth_bits"] = bits_from_bytes(provider.messages[offset], expected)
                     for stage in STAGES:
-                        record[f"{stage}_predicted_bits"] = stage_results[stage]["message_bits_str_list"][0]
+                        decoded = stage_results[stage]["message_bits_str_list"][0]
+                        record[f"{stage}_decoded_bits_sha256"] = hashlib.sha256(
+                            decoded.encode("ascii")
+                        ).hexdigest()
                 del stage_results
             except Exception as exc:
                 errors += 1

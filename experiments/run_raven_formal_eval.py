@@ -50,6 +50,7 @@ from raven.eval_protocol import (  # noqa: E402
 )
 from raven.metrics import pair_quality_metrics  # noqa: E402
 from raven.pairing_provenance import (  # noqa: E402
+    GS_REQUIRED_FIELDS,
     PAIRING_REQUIRED_FIELDS,
     audit_pairing_rows,
 )
@@ -415,7 +416,7 @@ def snapshot_stage(args: argparse.Namespace, config: dict[str, Any]) -> int:
         )
         for row in source_rows
     ]
-    if args.method == "TR":
+    if args.method in {"TR", "GS"}:
         audit_pairing_rows(
             normalized, expected_count=len(normalized), verify_files=True
         )
@@ -437,8 +438,10 @@ def snapshot_stage(args: argparse.Namespace, config: dict[str, Any]) -> int:
             "watermarked_sha256",
             "provider_config_hash",
         ]
-        if args.method == "TR":
+        if args.method in {"TR", "GS"}:
             drift_fields.extend(PAIRING_REQUIRED_FIELDS)
+        if args.method == "GS":
+            drift_fields.extend(GS_REQUIRED_FIELDS)
         for field in dict.fromkeys(drift_fields):
             if str(old.get(field, "")) != str(new.get(field, "")):
                 raise RuntimeError(f"snapshotted source drift run_id={run_id}: {field}")
@@ -546,6 +549,11 @@ def expected_resume_fields(
         "attack_seed": seed,
         "planned_flow_dx_image_px": dx,
         "planned_flow_dy_image_px": dy,
+        "pairing_sha256": str(row.get("pairing_sha256", "")),
+        "provider_config_hash": str(row.get("provider_config_hash", "")),
+        "watermark_target_sha256": str(row.get("watermark_target_sha256", "")),
+        "watermark_mask_sha256": str(row.get("watermark_mask_sha256", "")),
+        **({field: row.get(field, "") for field in GS_REQUIRED_FIELDS} if config["method"] == "GS" else {}),
         **config["attack_runtime"],
     }
 
@@ -661,6 +669,7 @@ def attack_stage(args: argparse.Namespace, config: dict[str, Any], role: str) ->
             "watermark_mask_sha256": row.get("watermark_mask_sha256", ""),
             "generation_config_sha256": row.get("generation_config_sha256", ""),
             "watermark_config_sha256": row.get("watermark_config_sha256", ""),
+            **({field: row.get(field, "") for field in GS_REQUIRED_FIELDS} if args.method == "GS" else {}),
             "pre_color_attacked_path": str(pre_color_path.resolve()),
             "pre_color_attacked_sha256": sha256_path(pre_color_path),
             "attacked_path": str(attacked_path.resolve()),
@@ -967,7 +976,7 @@ def validate_stage(args: argparse.Namespace, config: dict[str, Any]) -> int:
         audit_pairing_rows(
             snapshot_rows, expected_count=args.expected_count, verify_files=True
         )
-        if args.method == "TR"
+        if args.method in {"TR", "GS"}
         else None
     )
     records = require_complete_records(args, config, "watermarked")
@@ -980,8 +989,15 @@ def validate_stage(args: argparse.Namespace, config: dict[str, Any]) -> int:
         raise RuntimeError(f"mixed provider configs: {sorted(providers)}")
     require_uniform_provider_config(args.method, records)
     target_hashes = {str(row.get("target_watermark_hash", "")) for row in records}
-    if "" in target_hashes or len(target_hashes) != 1:
-        raise RuntimeError(f"missing or mixed target watermark hashes: {sorted(target_hashes)}")
+    if "" in target_hashes:
+        raise RuntimeError("missing target watermark hash")
+    if args.method == "TR" and len(target_hashes) != 1:
+        raise RuntimeError(f"mixed Tree-Ring target watermark hashes: {sorted(target_hashes)}")
+    if args.method == "GS" and len(target_hashes) != args.expected_count:
+        raise RuntimeError(
+            f"GS requires one target per run: unique={len(target_hashes)} "
+            f"expected={args.expected_count}"
+        )
     alias_pairs = (
         ("formal_config_hash", "attack_config_hash"),
         ("source_code_manifest_sha", "source_code_manifest_sha256"),

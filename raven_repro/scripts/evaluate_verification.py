@@ -12,7 +12,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from raven.metrics import bit_accuracy, summarize_detection
+from raven.metrics import summarize_detection
 
 SEMANTIC_METHODS = {"TR", "RID", "HSTR", "HSQR"}
 QUANTILES = (0.0, 0.01, 0.05, 0.25, 0.5, 0.75, 0.95, 0.99, 1.0)
@@ -141,47 +141,84 @@ def semantic_report(method: str, rows: list[dict[str, str]], target_fpr: float, 
     return metric
 
 
-def gs_report(rows: list[dict[str, str]], expected_bits: int) -> tuple[dict, list[dict]]:
-    audited, stage_results = [], {stage: [] for stage in ("clean", "watermarked", "attacked")}
+def gs_report(
+    rows: list[dict[str, str]], expected_bits: int, target_fpr: float = 0.01
+) -> tuple[dict, list[dict]]:
+    raw = {
+        stage: [finite_float(row, f"{stage}_raw_score") for row in rows]
+        for stage in ("clean", "watermarked", "attacked")
+    }
+    summary = summarize_detection(
+        raw["clean"], raw["watermarked"], raw["attacked"], target_fpr
+    )
+    legacy_thresholds = {finite_float(row, "legacy_threshold") for row in rows}
+    if len(legacy_thresholds) != 1:
+        raise ValueError(f"Expected one GS legacy threshold, got {sorted(legacy_thresholds)}")
+    legacy_threshold = next(iter(legacy_thresholds))
+    official_onebit = {finite_float(row, "gs_official_tau_onebit") for row in rows}
+    official_bits = {finite_float(row, "gs_official_tau_bits") for row in rows}
+    if len(official_onebit) != 1 or len(official_bits) != 1:
+        raise ValueError("Mixed official GS threshold provenance")
+    tau_onebit = next(iter(official_onebit))
+    tau_bits = next(iter(official_bits))
+
+    audited = []
     for index, row in enumerate(rows):
-        run_id = row.get("run_id") or str(index)
-        ground_truth = row.get("ground_truth_bits", "")
         item = {
-            "run_id": run_id,
-            "key_hex": row.get("key_hex", ""),
-            "nonce_hex": row.get("nonce_hex", ""),
-            "offset": row.get("offset", ""),
-            "ground_truth_bits": ground_truth,
+            "run_id": row.get("run_id") or str(index),
+            "gs_secret_index": row.get("gs_secret_index", ""),
+            "gs_secret_bundle_sha256": row.get("gs_secret_bundle_sha256", ""),
         }
-        for stage in stage_results:
-            prediction = row.get(f"{stage}_predicted_bits", "")
-            result = bit_accuracy(ground_truth, prediction, expected_length=expected_bits)
-            stage_results[stage].append(result)
-            item[f"{stage}_decoded_bits"] = prediction
-            item[f"{stage}_bit_errors"] = result["error_indices"]
-            item[f"{stage}_num_errors"] = result["num_errors"]
-            item[f"{stage}_bit_accuracy"] = result["accuracy"]
+        for stage in raw:
+            item[f"{stage}_bit_accuracy"] = finite_float(row, f"{stage}_raw_score")
+            item[f"{stage}_decoded_bits_sha256"] = row.get(
+                f"{stage}_decoded_bits_sha256", ""
+            )
         audited.append(item)
 
-    stages = {}
-    for stage, results in stage_results.items():
-        total_bits = sum(result["num_bits"] for result in results)
-        total_errors = sum(result["num_errors"] for result in results)
-        stages[stage] = {
-            "N": len(results),
-            "macro_bit_accuracy": sum(result["accuracy"] for result in results) / len(results),
-            "micro_bit_accuracy": 1.0 - total_errors / total_bits,
-            "total_bits": total_bits,
-            "total_errors": total_errors,
+    stages = {
+        stage: {
+            "N": len(values),
+            "macro_bit_accuracy": sum(values) / len(values),
+            "distribution": distribution(values),
         }
+        for stage, values in raw.items()
+    }
+    legacy_rates = {
+        stage: sum(value > legacy_threshold for value in values) / len(values)
+        for stage, values in raw.items()
+    }
+    official_onebit_rates = {
+        stage: sum(value >= tau_onebit for value in values) / len(values)
+        for stage, values in raw.items()
+    }
+    official_traceability_rates = {
+        stage: sum(value >= tau_bits for value in values) / len(values)
+        for stage, values in raw.items()
+    }
     return {
         "N": len(rows),
         "num_bits_per_sample": expected_bits,
         "stages": stages,
         "macro_bit_accuracy_before": stages["watermarked"]["macro_bit_accuracy"],
         "macro_bit_accuracy_attacked": stages["attacked"]["macro_bit_accuracy"],
-        "micro_bit_accuracy_before": stages["watermarked"]["micro_bit_accuracy"],
-        "micro_bit_accuracy_attacked": stages["attacked"]["micro_bit_accuracy"],
+        "target_fpr": target_fpr,
+        "clean_calibrated_threshold_at_target_fpr": summary.calibration.threshold,
+        "clean_calibrated_actual_empirical_fpr": summary.calibration.actual_fpr,
+        "clean_calibrated_false_positive_count": summary.calibration.false_positives,
+        "before_tpr_at_clean_calibrated_threshold": summary.watermarked_tpr,
+        "attacked_tpr_at_clean_calibrated_threshold": summary.attacked_tpr,
+        "before_roc_auc": summary.watermarked_auc,
+        "attacked_roc_auc": summary.attacked_auc,
+        "legacy_fixed_threshold": legacy_threshold,
+        "legacy_fixed_threshold_comparison_operator": ">",
+        "legacy_fixed_threshold_rates": legacy_rates,
+        "official_tau_onebit": tau_onebit,
+        "official_tau_bits": tau_bits,
+        "official_threshold_comparison_operator": ">=",
+        "official_onebit_rates": official_onebit_rates,
+        "official_traceability_rates": official_traceability_rates,
+        "statistically_valid_for_target_fpr": len(rows) >= math.ceil(1.0 / target_fpr),
     }, audited
 
 
@@ -203,10 +240,13 @@ def main() -> int:
     if args.method in SEMANTIC_METHODS:
         metric, detailed = semantic_report(args.method, rows, args.target_fpr, args.legacy_threshold), []
     else:
-        metric, detailed = gs_report(rows, args.expected_gs_bits)
+        metric, detailed = gs_report(rows, args.expected_gs_bits, args.target_fpr)
     report = {
         "protocol_version": 2,
-        "paper_comparable": args.method == "GS" or args.target_fpr == 0.01,
+        "paper_comparable": (
+            args.target_fpr == 0.01
+            and (args.method != "GS" or len(rows) >= math.ceil(1.0 / args.target_fpr))
+        ),
         "method": args.method,
         "dataset": consistent_value(rows, "dataset"),
         "records": str(args.records.resolve()),

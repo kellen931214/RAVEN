@@ -120,6 +120,11 @@ if args.modelid_target == "stabilityai/stable-diffusion-3.5-medium":
         args.guidance_scale_target = 4.5
 
 wm_provider_cls = WmProviders[args.wm_type].value
+if args.wm_type == "GS" and int(args.num) != 1:
+    raise RuntimeError(
+        "Generic GS runners allow only an explicitly single-sample legacy/debug run; "
+        "use experiments/generate_watermarked_images.py for auditable per-run GS state"
+    )
 if hasattr(wm_provider_cls, "apply_arg_defaults"):
     wm_provider_cls.apply_arg_defaults(args, sys.argv)
     

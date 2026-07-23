@@ -58,18 +58,39 @@ def test_semantic_report_separates_legacy_and_calibrated_rates():
     assert report["N"] == {"clean": 100, "watermarked": 100, "attacked": 100}
 
 
-def test_gs_reports_macro_micro_and_per_sample_errors():
+def test_gs_separates_legacy_official_and_clean_calibrated_thresholds():
     rows = [{
-        "run_id": "0", "ground_truth_bits": "0011", "clean_predicted_bits": "0011",
-        "watermarked_predicted_bits": "0011", "attacked_predicted_bits": "0111",
-        "key_hex": "aa", "nonce_hex": "bb", "offset": "0",
+        "run_id": "0",
+        "clean_raw_score": "0.50",
+        "watermarked_raw_score": "1.0",
+        "attacked_raw_score": "0.75",
+        "legacy_threshold": "0.70703125",
+        "gs_official_tau_onebit": "0.65",
+        "gs_official_tau_bits": "0.75",
+        "gs_secret_index": "0",
+        "gs_secret_bundle_sha256": "secret-0",
+        "clean_decoded_bits_sha256": "clean-0",
+        "watermarked_decoded_bits_sha256": "wm-0",
+        "attacked_decoded_bits_sha256": "attack-0",
     }, {
-        "run_id": "1", "ground_truth_bits": "1111", "clean_predicted_bits": "1111",
-        "watermarked_predicted_bits": "1111", "attacked_predicted_bits": "1100",
-        "key_hex": "aa", "nonce_hex": "bb", "offset": "0",
+        "run_id": "1",
+        "clean_raw_score": "0.55",
+        "watermarked_raw_score": "1.0",
+        "attacked_raw_score": "0.50",
+        "legacy_threshold": "0.70703125",
+        "gs_official_tau_onebit": "0.65",
+        "gs_official_tau_bits": "0.75",
+        "gs_secret_index": "1",
+        "gs_secret_bundle_sha256": "secret-1",
+        "clean_decoded_bits_sha256": "clean-1",
+        "watermarked_decoded_bits_sha256": "wm-1",
+        "attacked_decoded_bits_sha256": "attack-1",
     }]
-    report, audited = evaluator.gs_report(rows, expected_bits=4)
+    report, audited = evaluator.gs_report(rows, expected_bits=256, target_fpr=0.01)
     assert report["macro_bit_accuracy_attacked"] == pytest.approx(0.625)
-    assert report["micro_bit_accuracy_attacked"] == pytest.approx(0.625)
-    assert audited[0]["attacked_bit_errors"] == [1]
-    assert audited[1]["attacked_bit_errors"] == [2, 3]
+    assert report["legacy_fixed_threshold_rates"]["attacked"] == pytest.approx(0.5)
+    assert report["official_onebit_rates"]["attacked"] == pytest.approx(0.5)
+    assert "clean_calibrated_threshold_at_target_fpr" in report
+    assert report["statistically_valid_for_target_fpr"] is False
+    assert "key_hex" not in audited[0]
+    assert audited[0]["attacked_decoded_bits_sha256"] == "attack-0"

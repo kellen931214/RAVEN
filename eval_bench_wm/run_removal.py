@@ -138,6 +138,11 @@ def main():
     args = parse_args()
 
     wm_provider_cls = WmProviders[args.wm_type].value
+    if args.wm_type == "GS" and int(args.num) != 1:
+        raise RuntimeError(
+            "Generic GS runners allow only an explicitly single-sample legacy/debug run; "
+            "use experiments/generate_watermarked_images.py for auditable per-run GS state"
+        )
     if hasattr(wm_provider_cls, "apply_arg_defaults"):
         wm_provider_cls.apply_arg_defaults(args, sys.argv)
         
@@ -178,20 +183,6 @@ def main():
 
     wm_initial_results = wm_provider.get_wm_latents()
     wm_zT = wm_initial_results["zT_torch"]
-    message_bits_str_initial = (
-        wm_initial_results["message_bits_str_list"][0]
-        if "message_bits_str_list" in wm_initial_results
-        else None
-    )
-
-    # wm_provider = WmProviders[args.wm_type].value(
-    #     latent_shape=pipe_provider_target.get_latent_shape(),
-    #     device=device,
-    #     **vars(args),
-    # )
-    wm_initial_results = wm_provider.get_wm_latents()
-    wm_zT = wm_initial_results["zT_torch"]
-    
     message_bits_str_initial = (
         wm_initial_results["message_bits_str_list"][0]
         if "message_bits_str_list" in wm_initial_results

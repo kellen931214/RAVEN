@@ -3,6 +3,8 @@ Original by https://github.com/lthero-big/A-watermark-for-Diffusion-Models and h
 Please give them credit and adhere to their license agreement.
 """
 
+import hashlib
+import json
 import typing
 
 import argparse
@@ -11,6 +13,7 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms
 from cryptography.hazmat.backends import default_backend
 
 import numpy as np
+from scipy.special import betainc
 from scipy.stats import norm
 
 import torch
@@ -28,6 +31,18 @@ parser = argparse.ArgumentParser(add_help=False)
 parser.add_argument('--l', default=1, type=int, help="The size of slide windows for m")
 parser.add_argument('--num_replications', default=64, type=int, help="The number of replications of the message bits to get barcode image")
 parser.add_argument('--message_width_in_bytes', default=32, type=int, help="Message width in bytes")
+parser.add_argument(
+    '--gs_protocol_mode',
+    default='legacy',
+    choices=('legacy', 'official_compatible'),
+    help='Explicit Gaussian Shading implementation; legacy remains the default.',
+)
+parser.add_argument('--gs_channel_copy', default=1, type=int)
+parser.add_argument('--gs_hw_copy', default=8, type=int)
+parser.add_argument('--gs_fpr', default=1e-6, type=float)
+parser.add_argument('--gs_user_number', default=1000000, type=int)
+parser.add_argument('--gs_sampling_seed', default=None, type=int)
+parser.add_argument('--gs_secret_index', default=None, type=int)
 
 
 
@@ -44,6 +59,13 @@ class GsProvider(WmProvider):
                  message: typing.Optional[str] = None,
                  key: str = None,
                  nonce: str = None,
+                 gs_protocol_mode: str = "legacy",
+                 gs_channel_copy: int = 1,
+                 gs_hw_copy: int = 8,
+                 gs_fpr: float = 1e-6,
+                 gs_user_number: int = 1000000,
+                 gs_sampling_seed: typing.Optional[int] = None,
+                 gs_secret_index: typing.Optional[int] = None,
                  **kwargs):
         """
         This provider uses a fixed list of keys, messages, and nonces for the watermarking process to eliminate every possibliy of false negatives due to wrong seeds.
@@ -87,8 +109,37 @@ class GsProvider(WmProvider):
         self.num_replications = num_replications
         self.l = l
         self.offset = offset  # the exact messages, keys, nonces used when calling get_wm_latents are decided by batch_size starting from offset
+        self.gs_protocol_mode = str(gs_protocol_mode)
+        if self.gs_protocol_mode not in {"legacy", "official_compatible"}:
+            raise ValueError(f"unsupported gs_protocol_mode: {self.gs_protocol_mode!r}")
+        self.gs_channel_copy = int(gs_channel_copy)
+        self.gs_hw_copy = int(gs_hw_copy)
+        self.gs_fpr = float(gs_fpr)
+        self.gs_user_number = int(gs_user_number)
+        self.gs_sampling_seed = None if gs_sampling_seed is None else int(gs_sampling_seed)
+        self.gs_secret_index = int(offset if gs_secret_index is None else gs_secret_index)
 
-        assert self.message_width_in_bits * self.num_replications // self.l == self.num_channels * self.latent_resolution * self.latent_resolution
+        if self.gs_protocol_mode == "legacy":
+            assert self.message_width_in_bits * self.num_replications // self.l == self.num_channels * self.latent_resolution * self.latent_resolution
+        else:
+            if self.l != 1:
+                raise ValueError("official_compatible Gaussian Shading requires l=1")
+            if self.num_channels % self.gs_channel_copy:
+                raise ValueError("latent channels must be divisible by gs_channel_copy")
+            if self.latent_resolution % self.gs_hw_copy:
+                raise ValueError("latent resolution must be divisible by gs_hw_copy")
+            official_bits = (
+                self.num_channels
+                * self.latent_resolution
+                * self.latent_resolution
+                // (self.gs_channel_copy * self.gs_hw_copy * self.gs_hw_copy)
+            )
+            if official_bits != self.message_width_in_bits:
+                raise ValueError(
+                    "official payload size mismatch: "
+                    f"layout requires {official_bits} bits but message_width_in_bytes="
+                    f"{self.message_width_in_bytes} provides {self.message_width_in_bits}"
+                )
 
         # use a predefined list of crypto params
         if message is None:
@@ -107,9 +158,168 @@ class GsProvider(WmProvider):
             self.keys = [key for _ in range(self.batch_size)]
             self.nonces = [nonce for _ in range(self.batch_size)]
 
+        if self.gs_protocol_mode == "official_compatible":
+            for index in range(self.offset, self.offset + self.batch_size):
+                message_bytes, key_bytes, nonce_bytes = self._secret_bytes(index)
+                if len(message_bytes) != self.message_width_in_bytes:
+                    raise ValueError("official message length does not match configured payload")
+                if len(key_bytes) != 32:
+                    raise ValueError("official-compatible ChaCha20 requires a 32-byte key")
+                if len(nonce_bytes) != 12:
+                    raise ValueError("official-compatible ChaCha20 requires a 12-byte nonce")
+
 
     def get_wm_type(self) -> str:
         return "GS"
+
+
+    @staticmethod
+    def _sha256_bytes(value: bytes) -> str:
+        return hashlib.sha256(value).hexdigest()
+
+
+    def _secret_bytes(self, index: int) -> typing.Tuple[bytes, bytes, bytes]:
+        message = self.messages[index]
+        key = self.keys[index]
+        nonce = self.nonces[index]
+        if isinstance(message, str):
+            message = self.__character_str_to_bytes(message)
+        if isinstance(key, str):
+            key = bytes.fromhex(key)
+        if isinstance(nonce, str):
+            nonce = bytes.fromhex(nonce)
+        message = bytes(message[:self.message_width_in_bytes])
+        key = bytes(key)
+        nonce = bytes(nonce[:12] if self.gs_protocol_mode == "official_compatible" else nonce)
+        return message, key, nonce
+
+
+    def secret_provenance(self, index: typing.Optional[int] = None) -> typing.Dict[str, typing.Any]:
+        """Return auditable identifiers without exposing raw secret material."""
+        secret_index = self.gs_secret_index if index is None else int(index)
+        message, key, nonce = self._secret_bytes(secret_index)
+        hashes = {
+            "message_sha256": self._sha256_bytes(message),
+            "key_sha256": self._sha256_bytes(key),
+            "nonce_sha256": self._sha256_bytes(nonce),
+        }
+        combined = hashlib.sha256(
+            json.dumps(hashes, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        return {
+            "secret_index": secret_index,
+            **hashes,
+            "secret_bundle_sha256": combined,
+        }
+
+
+    def _official_payload(self, message_bytes: bytes) -> typing.Tuple[torch.Tensor, torch.Tensor]:
+        """Match official `watermark.repeat(1, ch, hw, hw)` layout exactly."""
+        payload_bits = np.unpackbits(np.frombuffer(message_bytes, dtype=np.uint8))
+        payload = torch.from_numpy(payload_bits.copy()).reshape(
+            1,
+            self.num_channels // self.gs_channel_copy,
+            self.latent_resolution // self.gs_hw_copy,
+            self.latent_resolution // self.gs_hw_copy,
+        ).to(torch.uint8)
+        diffused = payload.repeat(
+            1, self.gs_channel_copy, self.gs_hw_copy, self.gs_hw_copy
+        )
+        return payload, diffused
+
+
+    def watermark_target_tensor(self, index: typing.Optional[int] = None) -> torch.Tensor:
+        secret_index = self.gs_secret_index if index is None else int(index)
+        message, _, _ = self._secret_bytes(secret_index)
+        if self.gs_protocol_mode == "official_compatible":
+            payload, _ = self._official_payload(message)
+            return payload.to(device=self.device)
+        bits = np.unpackbits(np.frombuffer(message, dtype=np.uint8))
+        return torch.from_numpy(bits.copy()).reshape(1, -1).to(
+            device=self.device, dtype=torch.uint8
+        )
+
+
+    def _official_encrypt_bits(self, diffused: torch.Tensor, key: bytes, nonce: bytes) -> np.ndarray:
+        from Crypto.Cipher import ChaCha20
+
+        cipher = ChaCha20.new(key=key, nonce=nonce)
+        encrypted = cipher.encrypt(np.packbits(diffused.flatten().cpu().numpy()).tobytes())
+        return np.unpackbits(np.frombuffer(encrypted, dtype=np.uint8))
+
+
+    def _official_latent_from_bits(self, bits: np.ndarray, uniforms: np.ndarray) -> torch.Tensor:
+        # Official truncnorm sampling for one bit is mathematically
+        # norm.ppf((u + bit) / 2), with u ~ Uniform[0, 1).
+        sampled = norm.ppf((uniforms + bits.astype(np.float64)) / 2.0)
+        return torch.tensor(
+            sampled.reshape(self.latent_shape[1:]), dtype=self.dtype, device=self.device
+        )
+
+
+    def _get_official_wm_latents(self) -> typing.Dict[str, typing.Any]:
+        latents = []
+        clean_latents = []
+        targets = []
+        target_strings = []
+        uniform_hashes = []
+        secret_records = []
+        for batch_index, secret_index in enumerate(range(self.offset, self.offset + self.batch_size)):
+            message, key, nonce = self._secret_bytes(secret_index)
+            payload, diffused = self._official_payload(message)
+            encrypted_bits = self._official_encrypt_bits(diffused, key, nonce)
+            sampling_seed = None if self.gs_sampling_seed is None else self.gs_sampling_seed + batch_index
+            if sampling_seed is None:
+                uniforms = np.random.uniform(0.0, 1.0, size=encrypted_bits.size)
+            else:
+                uniforms = np.random.default_rng(sampling_seed).uniform(
+                    0.0, 1.0, size=encrypted_bits.size
+                )
+            latents.append(self._official_latent_from_bits(encrypted_bits, uniforms))
+            clean_latents.append(
+                torch.tensor(
+                    norm.ppf(uniforms).reshape(self.latent_shape[1:]),
+                    dtype=self.dtype,
+                    device=self.device,
+                )
+            )
+            targets.append(payload.squeeze(0).to(device=self.device))
+            target_strings.append("".join(f"{byte:08b}" for byte in message))
+            uniform_hashes.append(self._sha256_bytes(uniforms.astype(np.float64).tobytes()))
+            secret_records.append(self.secret_provenance(secret_index))
+        latents_torch = torch.stack(latents, dim=0)
+        clean_latents_torch = torch.stack(clean_latents, dim=0)
+        targets_torch = torch.stack(targets, dim=0)
+        return {
+            "zT_torch": latents_torch,
+            "zT_clean_torch": clean_latents_torch,
+            "barcodes_torch": targets_torch,
+            "message_bits_str_list": target_strings,
+            "sampling_uniform_sha256_list": uniform_hashes,
+            "secret_provenance_list": secret_records,
+            "gs_protocol_mode": self.gs_protocol_mode,
+        }
+
+
+    def official_thresholds(self) -> typing.Dict[str, typing.Any]:
+        """Reproduce the official beta-tail detection/traceability thresholds."""
+        mark_length = self.message_width_in_bits
+        tau_onebit = None
+        tau_bits = None
+        for errors in range(mark_length):
+            single_user_fpr = float(betainc(errors + 1, mark_length - errors, 0.5))
+            if tau_onebit is None and single_user_fpr <= self.gs_fpr:
+                tau_onebit = errors / mark_length
+            if tau_bits is None and single_user_fpr * self.gs_user_number <= self.gs_fpr:
+                tau_bits = errors / mark_length
+        return {
+            "fpr": self.gs_fpr,
+            "user_number": self.gs_user_number,
+            "tau_onebit": tau_onebit,
+            "tau_bits": tau_bits,
+            "comparison_operator": ">=",
+            "source": "bsmhmmlf/Gaussian-Shading watermark.py@09c678f",
+        }
 
 
     def __character_str_to_bytes(self,
@@ -138,6 +348,10 @@ class GsProvider(WmProvider):
                         
         @return: dict
         """
+        if self.gs_protocol_mode == "official_compatible":
+            return self._get_official_wm_latents()
+
+        # Legacy implementation intentionally retained byte-for-byte in behavior.
         # iterate message, keys, nonces
         latents_torch = []
         barcodes_torch = []
@@ -294,7 +508,64 @@ class GsProvider(WmProvider):
         return {"messages_bits_str": recovered_messages_bits_str,
                 "barcodes_torch": recovered_barcodes_torch,
                 "barcodes_PIL": recovered_barcodes_PIL}
-    
+
+
+    def _official_decrypt_diffused(
+        self, reversed_latent: torch.Tensor, key: bytes, nonce: bytes
+    ) -> torch.Tensor:
+        from Crypto.Cipher import ChaCha20
+
+        encrypted_bits = (reversed_latent > 0).to(torch.uint8).flatten().cpu().numpy()
+        cipher = ChaCha20.new(key=key, nonce=nonce)
+        decrypted = cipher.decrypt(np.packbits(encrypted_bits).tobytes())
+        bits = np.unpackbits(np.frombuffer(decrypted, dtype=np.uint8))
+        return torch.from_numpy(bits.copy()).reshape(
+            1, self.num_channels, self.latent_resolution, self.latent_resolution
+        ).to(device=self.device, dtype=torch.uint8)
+
+
+    def _official_majority_vote(self, diffused: torch.Tensor) -> torch.Tensor:
+        ch_stride = self.num_channels // self.gs_channel_copy
+        hw_stride = self.latent_resolution // self.gs_hw_copy
+        split_ch = torch.cat(
+            torch.split(diffused, tuple([ch_stride] * self.gs_channel_copy), dim=1),
+            dim=0,
+        )
+        split_h = torch.cat(
+            torch.split(split_ch, tuple([hw_stride] * self.gs_hw_copy), dim=2),
+            dim=0,
+        )
+        split_w = torch.cat(
+            torch.split(split_h, tuple([hw_stride] * self.gs_hw_copy), dim=3),
+            dim=0,
+        )
+        votes = torch.sum(split_w, dim=0)
+        threshold = self.gs_channel_copy * self.gs_hw_copy * self.gs_hw_copy // 2
+        # Match official code: ties (vote <= threshold) decode to zero.
+        return (votes > threshold).to(torch.uint8)
+
+
+    def _get_official_accuracies(self, latents: torch.Tensor) -> typing.Dict[str, typing.Any]:
+        bit_accuracies = []
+        recovered_strings = []
+        recovered_targets = []
+        for batch_index, secret_index in enumerate(range(self.offset, self.offset + self.batch_size)):
+            message, key, nonce = self._secret_bytes(secret_index)
+            diffused = self._official_decrypt_diffused(latents[batch_index], key, nonce)
+            recovered = self._official_majority_vote(diffused)
+            target, _ = self._official_payload(message)
+            target = target.squeeze(0).to(device=self.device)
+            bit_accuracies.append(float((recovered == target).float().mean().item()))
+            recovered_strings.append("".join(str(int(bit)) for bit in recovered.flatten().cpu()))
+            recovered_targets.append(recovered)
+        return {
+            "accuracies": bit_accuracies,
+            "bit_accuracies": bit_accuracies,
+            "barcodes_torch": torch.stack(recovered_targets, dim=0),
+            "message_bits_str_list": recovered_strings,
+            "gs_protocol_mode": self.gs_protocol_mode,
+        }
+
 
     def __calculate_bit_accuracy(self,
                                  original_message_hex: any,  # no idea what datatype
@@ -329,6 +600,11 @@ class GsProvider(WmProvider):
         @param latents: latent either tensor with batch dim or numpy with batch dim
         @return: dict
         """
+        if self.gs_protocol_mode == "official_compatible":
+            if isinstance(latents, np.ndarray):
+                latents = torch.from_numpy(latents).to(device=self.device, dtype=self.dtype)
+            return self._get_official_accuracies(latents)
+
         # get the extracted message
         recovered = self.__recover_messages_from_latents(latents)
         recovered_messages_bits_str = recovered["messages_bits_str"]
