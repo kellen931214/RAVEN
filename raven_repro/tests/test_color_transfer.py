@@ -8,6 +8,7 @@ pytest.importorskip("skimage")
 from raven.pipeline_raven import require_effective_source_flow
 
 from raven.color_transfer import (
+    PAPER_EXACT_TWO_STAGE,
     PAPER_EXACT_TWO_STAGE_ALIGNED,
     align_original_chroma_to_generated,
     color_contrast_transfer,
@@ -23,7 +24,8 @@ def _images(seed=11, shape=(32, 33, 3)):
     )
 
 
-def test_aligned_mode_is_the_only_public_mode():
+def test_color_transfer_public_modes_are_explicit():
+    assert PAPER_EXACT_TWO_STAGE == "paper_exact_two_stage"
     assert PAPER_EXACT_TWO_STAGE_ALIGNED == "paper_exact_two_stage_aligned"
     signature = inspect.signature(color_contrast_transfer)
     assert "effective_source_flow_dx_image_px" in signature.parameters
@@ -35,7 +37,7 @@ def test_aligned_mode_is_the_only_public_mode():
 
 @pytest.mark.parametrize(
     "legacy_mode",
-    ["paper_exact_two_stage", "paper_exact_two_stage_aligned_blend", "direct_stats"],
+    ["paper_exact_two_stage_aligned_blend", "direct_stats"],
 )
 def test_legacy_color_transfer_modes_are_rejected(legacy_mode):
     generated, original = _images()
@@ -53,6 +55,28 @@ def test_aligned_color_transfer_requires_effective_flow():
     generated, original = _images()
     with pytest.raises(ValueError, match="requires effective source flow"):
         color_contrast_transfer(generated, original)
+
+
+def test_paper_exact_unaligned_rejects_effective_flow_and_records_no_alignment():
+    generated, original = _images()
+    output = color_contrast_transfer(generated, original, mode=PAPER_EXACT_TWO_STAGE)
+    diagnostics = color_transfer_diagnostics(
+        generated, original, output, mode=PAPER_EXACT_TWO_STAGE
+    )
+    assert output.shape == generated.shape
+    assert diagnostics["color_transfer_mode"] == PAPER_EXACT_TWO_STAGE
+    assert diagnostics["alignment_flow_source"] == "none"
+    assert diagnostics["protocol_classification"] == (
+        "paper-faithful unaligned paper-exact color transfer"
+    )
+    with pytest.raises(ValueError, match="must not receive effective flow"):
+        color_contrast_transfer(
+            generated,
+            original,
+            mode=PAPER_EXACT_TWO_STAGE,
+            effective_source_flow_dx_image_px=3,
+            effective_source_flow_dy_image_px=-2,
+        )
 
 
 def test_aligned_color_transfer_is_deterministic_and_finite():
