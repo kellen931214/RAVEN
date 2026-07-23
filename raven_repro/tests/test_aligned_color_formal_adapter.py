@@ -132,3 +132,19 @@ def test_evaluation_snapshot_contains_exact_selected_run_ids(tmp_path):
     assert entry["row_count"] == 2
     assert entry["snapshot_sha256"] == snapshot_sha
     assert sha256_path(index_path) == index_sha
+
+
+def test_color_transfer_adapter_backfills_legacy_nfpa_metadata():
+    from experiments.run_raven_color_transfer_eval import (
+        backfill_legacy_nfpa_debug_metadata,
+    )
+
+    debug = {
+        "warp_mode": "raven_paper_nfpa_gap_fill",
+        "normalized_coordinate_formula": "x_norm = 2*x_pixel/W - 1; y_norm = 2*y_pixel/H - 1",
+    }
+    result = backfill_legacy_nfpa_debug_metadata(debug)
+    assert result["pixel_center_offset_image_px"] == 0.0
+    assert result["warp_coordinate_convention"] == "legacy_nfpa_w_h_norm"
+    assert result["warp_implementation_version"] == "nfpa_image_grid_w_h_norm_v1"
+    assert "pixel_center_offset_image_px" not in debug

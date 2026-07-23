@@ -168,6 +168,26 @@ def require_image(path: Path) -> str:
     return sha256_path(path)
 
 
+def backfill_legacy_nfpa_debug_metadata(debug_info: dict[str, Any]) -> dict[str, Any]:
+    """Add explicit legacy NFPA coordinate metadata to pre-centered records.
+
+    Older validated non-centered RAVEN/NFPA records predate the centered-warp
+    provenance fields. They still declare the legacy normalization formula and
+    `raven_paper_nfpa_gap_fill`; this backfill makes that convention explicit
+    for color-transfer-only adapter records without changing the source attack.
+    """
+    result = dict(debug_info)
+    if result.get("warp_mode") != "raven_paper_nfpa_gap_fill":
+        return result
+    if "pixel_center_offset_image_px" not in result:
+        result["pixel_center_offset_image_px"] = 0.0
+    if "warp_coordinate_convention" not in result:
+        result["warp_coordinate_convention"] = "legacy_nfpa_w_h_norm"
+    if "warp_implementation_version" not in result:
+        result["warp_implementation_version"] = "nfpa_image_grid_w_h_norm_v1"
+    return result
+
+
 def paired_effective_source_flow(
     watermarked: dict[str, Any], clean: dict[str, Any], run_id: str
 ) -> tuple[float, float]:
@@ -271,7 +291,9 @@ def build_color_transfer_records(
                     f"run_id={run_id}: explicit pre-color attacked SHA mismatch"
                 )
             source_debug_path = Path(base["debug_info_path"])
-            source_debug = json.loads(source_debug_path.read_text(encoding="utf-8"))
+            source_debug = backfill_legacy_nfpa_debug_metadata(
+                json.loads(source_debug_path.read_text(encoding="utf-8"))
+            )
             for field, value in (
                 ("effective_source_flow_dx_image_px", effective_dx),
                 ("effective_source_flow_dy_image_px", effective_dy),
