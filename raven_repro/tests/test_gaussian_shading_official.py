@@ -54,6 +54,10 @@ def official_provider(*, secret_index=0, sampling_seed=1234, message=None, key=N
     )
 
 
+# For l=1, norm.ppf((u + bit) / 2) is distribution-equivalent to
+# sampling the corresponding negative or positive truncated half
+# of a standard Gaussian. It is not RNG bit-exact with the
+# upstream scipy.stats.truncnorm.rvs implementation.
 def independent_official_reference(message, key, nonce, sampling_seed):
     payload = torch.from_numpy(np.unpackbits(np.frombuffer(message, dtype=np.uint8)).copy()).reshape(
         1, 4, 8, 8
@@ -70,7 +74,7 @@ def independent_official_reference(message, key, nonce, sampling_seed):
     return payload, encrypted, uniforms, latent
 
 
-def test_official_reference_payload_cipher_sampling_and_decode_parity():
+def test_official_layout_cipher_decode_and_inverse_cdf_reference():
     message = bytes(range(32))
     key = bytes(range(32, 64))
     nonce = bytes(range(12))

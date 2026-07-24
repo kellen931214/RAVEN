@@ -37,6 +37,8 @@ CORE_FILES = (
     "raven_repro/scripts/evaluate_verification.py",
     "raven_repro/scripts/extract_verification_scores.py",
     "raven_repro/scripts/raven_nfpa_tr_eval.py",
+    "experiments/generate_watermarked_images.py",
+    "eval_bench_wm/utils/wm/gs_provider.py",
 )
 
 

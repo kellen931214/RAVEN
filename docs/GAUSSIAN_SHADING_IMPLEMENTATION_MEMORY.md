@@ -6,7 +6,7 @@ additional GS memory files; update this one.
 
 ## Branch / HEAD / provenance
 - Branch: `agent/cleanup-quality-decomposition`
-- HEAD at time of work: `7fe1d031938e94b7ffdd67f4ed9758a40ac83e6e`
+- GS implementation commit reviewed: `a69e517fc99b7b4bfbcbfc1f687599de84cc9ca4`
 - Official reference asserted in code/metadata: `bsmhmmlf/Gaussian-Shading`,
   commit `09c678fadc7545acf7be12647ddf2a5e66f6a9dc` (`watermark.py`,
   `run_gaussian_shading.py`, `inverse_stable_diffusion.py`).
@@ -49,6 +49,9 @@ never change silently.
   **PyCryptodome `ChaCha20.new(key=32B, nonce=12B)`** on packed bits.
 - **Sampling**: `_official_latent_from_bits` = `norm.ppf((u + encrypted_bit) / 2)`,
   `u ~ Uniform[0,1)` from a per-run seeded `np.random.default_rng`.
+  Payload layout、ChaCha20 cipher、sign decoding 與 majority vote 對齊官方。
+  對 l=1，inverse-CDF sampling 與官方 positive/negative half-Gaussian
+  truncnorm sampling 分布等價，但不宣稱與 upstream scipy RNG bit-exact。
 - **Paired clean latent**: `zT_clean_torch = norm.ppf(u)` — the SAME uniforms as the
   watermarked latent, a distribution-preserving partition (this is the GS pairing, NOT a
   TR FFT injection). `pairing_relation = shared_sampling_uniforms_distribution_preserving_partition`.
@@ -121,7 +124,9 @@ Layout check: `4*64*64 / (1*8*8) = 256 bits = 32 bytes`. ✔
 - `raven_repro/tests/test_gaussian_shading_official.py` — **new** test suite.
 
 ## Success commands
-10-image integration gate (**do NOT raise `--num_pairs`; N=1000 is the formal run**):
+The 25-step command below is a **fast smoke gate only**. Before the formal N=1000 run,
+a **10-pair, 50-step generation** gate and a **50-step verification inversion** gate must
+pass. 10-image integration gate (**do NOT raise `--num_pairs`; N=1000 is the formal run**):
 ```bash
 cd /workspace/RAVEN
 export TQDM_DISABLE=1
@@ -145,8 +150,8 @@ cd /workspace/RAVEN/raven_repro && python -m pytest tests/ -q   # 179 passed (TR
 ```
 
 ## Tests (all passing)
-`test_gaussian_shading_official.py` (7): reference payload/cipher/sampling/decode parity
-(fixed SHAs); determinism + unique-per-run (10 seeds→10 unique latents/secrets/uniforms);
+`test_gaussian_shading_official.py` (7): official layout/cipher/decode + inverse-CDF
+reference (fixed SHAs against the in-repo reference; not upstream scipy RNG bit-exact); determinism + unique-per-run (10 seeds→10 unique latents/secrets/uniforms);
 direct-decode bit-accuracy=1 + random-clean baseline in [0.35,0.65]; majority-vote ties→0;
 metadata index+hash only (no key_hex/nonce_hex/ground_truth_bits); GS pairing-audit
 uniqueness (rejects duplicate sampling uniforms); resume accepts identical / rejects
@@ -192,6 +197,17 @@ pools/uniqueness scale to 1000 — the **generation** stage is safe to launch at
 (`--num_pairs 1000`, official_compatible). Before treating N=1000 detection/traceability
 numbers as final, first do a small end-to-end RAVEN attack dry-run (open item) and derive
 the 1%-FPR threshold from the run's own clean negatives.
+
+## GS end-to-end gate stages
+Correct GS stage order: `snapshot → attack-watermarked → verify → quality → fid → clip →
+aggregate → validate`. `attack-clean` belongs **only** to the TR flow; GS must **not** run
+`attack-clean`.
+
+## N=1000 readiness (explicit)
+- **N=1000 generation**: must first pass the 50-step generation and resume gate.
+- **N=1000 attack/evaluation**: must then pass the 10-pair full GS RAVEN end-to-end gate.
+- N=10 is **not** enough for a statistically valid 1% FPR result; it only verifies pipeline
+  wiring and provenance.
 
 ## Next steps
 1. Small end-to-end RAVEN attack dry-run on ~10 GS pairs (extract + evaluate).
