@@ -185,18 +185,23 @@ sampling-seed drift. Full `raven_repro/tests`: **179 passed** (TR unchanged).
       per-run unique-target audit holds at N=1000).
 - [x] Metadata = hashes/indices only.
 - [x] Legacy vs official-tau vs 1%-FPR thresholds recorded separately.
-- [x] 10-image gate + resume + audit green.
+- [x] 10-image 25-step fast smoke gate + resume + audit green.
+- [ ] 10-pair 50-step generation + identical-command resume gate.
 - [x] TR non-regression.
 - [ ] Full end-to-end RAVEN attack pipeline dry-run on a small GS cohort (recommended
       before N=1000).
 - [ ] Optional: vendor upstream GS for a byte-level parity diff.
 - [ ] Compute the 1%-FPR threshold from N=1000 clean negatives (downstream, not generator).
 
-**N=1000 safe to run?** Generation + provenance + resume + audit are green and the secret
-pools/uniqueness scale to 1000 — the **generation** stage is safe to launch at N=1000
-(`--num_pairs 1000`, official_compatible). Before treating N=1000 detection/traceability
-numbers as final, first do a small end-to-end RAVEN attack dry-run (open item) and derive
-the 1%-FPR threshold from the run's own clean negatives.
+**N=1000 safe to run?** Not yet. The existing 10-image 25-step fast smoke gate,
+resume check, and provenance audit are green, but the required 10-pair 50-step
+generation and identical-command resume gate have not yet been executed.
+
+- N=1000 generation is not approved until the 50-step generation and resume gate passes.
+- N=1000 attack/evaluation is not approved until the 10-pair full GS RAVEN
+  end-to-end gate passes.
+- The final 1%-FPR threshold must be calibrated from the N=1000 clean-negative
+  cohort; N=10 is only a wiring and provenance gate.
 
 ## GS end-to-end gate stages
 Correct GS stage order: `snapshot → attack-watermarked → verify → quality → fid → clip →
@@ -210,7 +215,8 @@ aggregate → validate`. `attack-clean` belongs **only** to the TR flow; GS must
   wiring and provenance.
 
 ## Next steps
-1. Small end-to-end RAVEN attack dry-run on ~10 GS pairs (extract + evaluate).
-2. Launch N=1000 generation (official_compatible) when the dry-run is green.
-3. Calibrate 1%-FPR from N=1000 clean negatives; report TPR@1%FPR separately from legacy.
-4. (Optional) Vendor `bsmhmmlf/Gaussian-Shading@09c678f` for a byte-level parity diff.
+1. Run the 10-pair 50-step generation and identical-command resume gate.
+2. Run the 10-pair full GS RAVEN end-to-end gate.
+3. Only after both gates pass, launch N=1000 generation and attack/evaluation.
+4. Calibrate 1%-FPR from N=1000 clean negatives; report TPR@1%FPR separately from legacy.
+5. (Optional) Vendor `bsmhmmlf/Gaussian-Shading@09c678f` for a byte-level parity diff.
