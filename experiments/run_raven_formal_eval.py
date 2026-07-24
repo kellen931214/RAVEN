@@ -85,6 +85,20 @@ def parse_bool_flag(value: str) -> bool:
     raise argparse.ArgumentTypeError(f"expected a boolean value, got {value!r}")
 
 
+def require_valid_storage_mode(storage_light: bool, attack_clean_enabled: bool) -> None:
+    """Fail closed: only full formal and storage-light modes are legal.
+
+    Full formal:   storage_light=false, attack_clean_enabled=true
+    Storage-light: storage_light=true,  attack_clean_enabled=false
+    """
+    if bool(storage_light) != (not bool(attack_clean_enabled)):
+        raise RuntimeError(
+            "storage-light mode requires both --storage-light "
+            "and --attack-clean-enabled false; full formal mode requires "
+            "neither --storage-light nor --attack-clean-enabled false"
+        )
+
+
 def storage_mode_metadata(
     *, method: str, expected_count: int, storage_light: bool, attack_clean_enabled: bool
 ) -> dict[str, Any]:
@@ -1287,6 +1301,7 @@ def main(argv: Iterable[str] | None = None) -> int:
     if args.expected_count <= 0 or args.batch_size <= 0:
         raise ValueError("expected-count and batch-size must be positive")
     args.method = args.method.upper()
+    require_valid_storage_mode(args.storage_light, args.attack_clean_enabled)
     if not args.attack_clean_enabled and args.method != "TR":
         raise RuntimeError("--attack-clean-enabled false only applies to the TR protocol")
     if args.stage == "attack-clean" and not args.attack_clean_enabled:

@@ -148,6 +148,30 @@ def test_build_parser_defaults_and_flags():
     assert light_args.attack_clean_enabled is False
 
 
+@pytest.mark.parametrize(
+    "storage_light, attack_clean_enabled",
+    [
+        (False, True),   # full formal
+        (True, False),   # storage-light
+    ],
+)
+def test_require_valid_storage_mode_accepts_legal_pairs(storage_light, attack_clean_enabled):
+    # Should not raise.
+    formal_eval.require_valid_storage_mode(storage_light, attack_clean_enabled)
+
+
+@pytest.mark.parametrize(
+    "storage_light, attack_clean_enabled",
+    [
+        (True, True),    # storage-light without disabling attack-clean
+        (False, False),  # attack-clean disabled without storage-light
+    ],
+)
+def test_require_valid_storage_mode_rejects_illegal_pairs(storage_light, attack_clean_enabled):
+    with pytest.raises(RuntimeError, match="storage-light mode requires"):
+        formal_eval.require_valid_storage_mode(storage_light, attack_clean_enabled)
+
+
 def test_parse_bool_flag_rejects_garbage():
     with pytest.raises(Exception):
         formal_eval.parse_bool_flag("maybe")
