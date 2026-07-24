@@ -304,8 +304,20 @@ def normalize_formal_attack_config(payload: Mapping[str, Any]) -> dict[str, Any]
         raise ValueError(f"unsupported inversion_mode={config['inversion_mode']!r}")
     if config["scheduler_mode"] not in {"ddim", "ddpm"}:
         raise ValueError(f"unsupported scheduler_mode={config['scheduler_mode']!r}")
-    if config["inversion_mode"] != config["scheduler_mode"]:
-        raise ValueError("inversion_mode and scheduler_mode must match")
+    allowed_scheduler_pairs = {
+        ("ddim", "ddim"),
+        ("ddpm", "ddpm"),
+        ("ddim", "ddpm"),
+    }
+    pair = (
+        config["inversion_mode"],
+        config["scheduler_mode"],
+    )
+    if pair not in allowed_scheduler_pairs:
+        raise ValueError(
+            "unsupported inversion/scheduler combination: "
+            f"inversion_mode={pair[0]!r}, scheduler_mode={pair[1]!r}"
+        )
     if config["latent_sampling_mode"] not in {"nearest", "bilinear"}:
         raise ValueError("latent_sampling_mode must be nearest or bilinear")
     if config["color_transfer_mode"] not in {"paper_exact_two_stage_aligned", "paper_exact_two_stage"}:
