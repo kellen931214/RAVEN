@@ -119,6 +119,19 @@ def test_official_mode_is_deterministic_and_unique_per_run():
     assert len(set(uniform_hashes)) == 10
 
 
+def test_gs_sampling_seed_matches_tree_ring_schedule():
+    seed = generator_module.deterministic_gs_sampling_seed
+    # per-row GS seed == base_seed + run_id, identical to the TR schedule
+    assert seed(42, 0) == 42
+    assert seed(42, 1) == 43
+    assert seed(42, 1000) == 1042
+    seeds = [seed(42, run_id) for run_id in range(1001)]
+    assert seeds == list(range(42, 1043))
+    assert len(set(seeds)) == 1001  # all unique
+    # reproducible for the same base seed and run_id
+    assert [seed(42, run_id) for run_id in range(1001)] == seeds
+
+
 def test_official_direct_decode_and_random_clean_baseline():
     provider = official_provider(secret_index=7, sampling_seed=77)
     watermarked = provider.get_wm_latents()["zT_torch"]

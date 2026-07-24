@@ -113,10 +113,12 @@ def parse_args() -> argparse.Namespace:
 
 
 def deterministic_gs_sampling_seed(base_seed: int, run_id: int) -> int:
-    digest = hashlib.sha256(
-        f"gaussian-shading-official-sampling-v1:{int(base_seed)}:{int(run_id)}".encode("utf-8")
-    ).digest()
-    return int.from_bytes(digest[:8], "big") & ((1 << 63) - 1)
+    # Per-row GS sampling seed = base_seed + run_id, matching the Tree-Ring
+    # per-row seed schedule (base_latent_seed = base_seed + run_id) so GS and TR
+    # consume the same numeric seed per run_id for apples-to-apples comparison.
+    # This only seeds the GS uniform draw; payload/cipher/latent construction
+    # in gs_provider.py are unchanged.
+    return int(base_seed) + int(run_id)
 
 
 def validate_gs_resume_provenance(
@@ -446,7 +448,7 @@ def run_method(args: argparse.Namespace, dataset_dir: Path, wm_type: str, prompt
             "sampling": "norm.ppf((u+encrypted_bit)/2)",
             "majority_vote": "strict_gt_half_ties_zero",
             "secret_mapping": "secret_index=run_id",
-            "sampling_seed_policy": "sha256(base_seed,run_id,protocol)",
+            "sampling_seed_policy": "base_seed+run_id",
             "watermark_mask_sha256": watermark_mask_sha256,
         }
     watermark_config_sha256 = canonical_json_sha256(watermark_config)
