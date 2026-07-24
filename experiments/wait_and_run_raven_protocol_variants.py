@@ -272,6 +272,8 @@ def run_one_cohort(
         command = [
             sys.executable,
             str(NO_COLOR_RUNNER),
+            "--dataset", "diffusiondb",
+            "--method", "TR",
             "--formal-root", str(root),
             "--output-root", str(no_color_root),
             "--expected-count", str(count),
