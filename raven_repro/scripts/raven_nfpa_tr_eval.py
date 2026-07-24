@@ -787,6 +787,49 @@ def aggregate_nfpa_protocol(rows: list[dict], suffix: str) -> dict:
     }
 
 
+def aggregate_nfpa_protocol_no_clean(rows: list[dict], suffix: str) -> dict:
+    """Storage-light aggregate: original-clean calibration only, no recalibration.
+
+    Uses the original-clean and watermarked scores that are always available, and
+    reports attacked-watermarked TPR at the original-clean threshold. All
+    attacked-clean recalibration fields are null because attack-clean was skipped.
+    """
+    columns = {
+        stage: [float(row[f"{stage}_l1_{suffix}"]) for row in rows]
+        for stage in ("original_clean", "watermarked", "attacked_watermarked")
+    }
+    before_threshold = nfpa_threshold(columns["original_clean"])
+    before_fp = int(np.sum(np.asarray(columns["original_clean"]) < before_threshold))
+    before_tpr = nfpa_detection_rate(columns["watermarked"], before_threshold)
+    original_threshold_tpr = nfpa_detection_rate(
+        columns["attacked_watermarked"], before_threshold
+    )
+    return {
+        "target_fpr": TARGET_FPR,
+        "attack_clean_enabled": False,
+        "recalibrated_metrics_available": False,
+        "original_clean_target_fpr": TARGET_FPR,
+        "original_clean_threshold": before_threshold,
+        "original_clean_actual_fpr": before_fp / len(rows),
+        "original_clean_fp_count": before_fp,
+        "before_threshold": before_threshold,
+        "before_actual_fpr": before_fp / len(rows),
+        "before_false_positives": before_fp,
+        "before_tpr": before_tpr,
+        "before_roc_auc": roc_auc(
+            [-value for value in columns["watermarked"]],
+            [-value for value in columns["original_clean"]],
+        ),
+        "attacked_tpr_at_original_clean_threshold": original_threshold_tpr,
+        "attacked_clean_recalibrated_threshold": None,
+        "attacked_clean_actual_fpr": None,
+        "attacked_clean_fp_count": None,
+        "attacked_tpr_at_attacked_clean_recalibrated_threshold": None,
+        "attacked_roc_auc": None,
+        "attack_success_rate_at_recalibrated_threshold": None,
+    }
+
+
 def assert_detector_source_tensor_hashes(
     rows: list[dict[str, Any]], *, detector_target_sha256: str, detector_mask_sha256: str
 ) -> None:
@@ -810,17 +853,29 @@ def command_score_formal(args) -> int:
 
     if args.output_dir.exists():
         raise FileExistsError(f"refusing to reuse formal TR output: {args.output_dir}")
+    attack_clean_enabled = not args.no_attacked_clean
+    if attack_clean_enabled and args.attacked_clean_records is None:
+        raise ValueError("attacked-clean scoring requires --attacked-clean-records")
+    if not attack_clean_enabled and args.attacked_clean_records is not None:
+        raise ValueError("--no-attacked-clean forbids --attacked-clean-records")
     with args.manifest.open(newline="", encoding="utf-8-sig") as handle:
         manifest_rows = list(csv.DictReader(handle))
-    clean_rows = load_jsonl(args.attacked_clean_records)
-    if not manifest_rows or len(manifest_rows) != len(clean_rows):
-        raise ValueError("formal TR manifest and attacked-clean record counts differ")
+    if not manifest_rows:
+        raise ValueError("formal TR manifest is empty")
     manifest = {str(row["run_id"]): row for row in manifest_rows}
-    clean = {str(row["run_id"]): row for row in clean_rows}
-    if len(manifest) != len(manifest_rows) or len(clean) != len(clean_rows):
+    if len(manifest) != len(manifest_rows):
         raise ValueError("duplicate run ID in formal TR inputs")
-    if set(manifest) != set(clean):
-        raise ValueError("formal TR manifest and attacked-clean run-ID sets differ")
+    if attack_clean_enabled:
+        clean_rows = load_jsonl(args.attacked_clean_records)
+        if len(manifest_rows) != len(clean_rows):
+            raise ValueError("formal TR manifest and attacked-clean record counts differ")
+        clean = {str(row["run_id"]): row for row in clean_rows}
+        if len(clean) != len(clean_rows):
+            raise ValueError("duplicate run ID in formal TR inputs")
+        if set(manifest) != set(clean):
+            raise ValueError("formal TR manifest and attacked-clean run-ID sets differ")
+    else:
+        clean = {}
     config, config_hash = require_uniform_provider_config("TR", manifest_rows)
     recorded_hashes = {row.get("provider_config_hash", "") for row in manifest_rows}
     if recorded_hashes != {config_hash}:
@@ -862,29 +917,30 @@ def command_score_formal(args) -> int:
     with output_path.open("x", encoding="utf-8") as output:
         for index, run_id in enumerate(sorted(manifest, key=int), start=1):
             row = manifest[run_id]
-            clean_attack = clean[run_id]
-            if clean_attack.get("input_role") != "clean":
-                raise ValueError(f"run_id={run_id}: attacked-clean record has wrong role")
-            if clean_attack.get("attack_config_hash") != row.get("attack_config_hash"):
-                raise ValueError(f"run_id={run_id}: attacked clean/watermarked config mismatch")
-            for field in (
-                "attack_seed", "planned_flow_dx_image_px", "planned_flow_dy_image_px",
-                "transform_config_hash", "pairing_sha256",
-            ):
-                if str(clean_attack.get(field)) != str(row.get(field)):
-                    raise ValueError(f"run_id={run_id}: attacked pair {field} mismatch")
             paths = {
                 "original_clean": Path(row["clean_path"]),
                 "watermarked": Path(row["watermarked_path"]),
-                "attacked_clean": Path(clean_attack["attacked_path"]),
                 "attacked_watermarked": Path(row["attacked_path"]),
             }
             expected = {
                 "original_clean": row["clean_sha256"],
                 "watermarked": row["watermarked_sha256"],
-                "attacked_clean": clean_attack["attacked_sha256"],
                 "attacked_watermarked": row["attacked_sha256"],
             }
+            if attack_clean_enabled:
+                clean_attack = clean[run_id]
+                if clean_attack.get("input_role") != "clean":
+                    raise ValueError(f"run_id={run_id}: attacked-clean record has wrong role")
+                if clean_attack.get("attack_config_hash") != row.get("attack_config_hash"):
+                    raise ValueError(f"run_id={run_id}: attacked clean/watermarked config mismatch")
+                for field in (
+                    "attack_seed", "planned_flow_dx_image_px", "planned_flow_dy_image_px",
+                    "transform_config_hash", "pairing_sha256",
+                ):
+                    if str(clean_attack.get(field)) != str(row.get(field)):
+                        raise ValueError(f"run_id={run_id}: attacked pair {field} mismatch")
+                paths["attacked_clean"] = Path(clean_attack["attacked_path"])
+                expected["attacked_clean"] = clean_attack["attacked_sha256"]
             for stage, path in paths.items():
                 if formal_sha256_path(path) != expected[stage]:
                     raise RuntimeError(f"run_id={run_id}: {stage} SHA mismatch")
@@ -917,12 +973,20 @@ def command_score_formal(args) -> int:
             append_jsonl(output, record)
             rows.append(record)
             print(f"[formal-tr {index}/{len(manifest)}] run_id={run_id}", flush=True)
+    protocol_aggregate = (
+        aggregate_nfpa_protocol if attack_clean_enabled else aggregate_nfpa_protocol_no_clean
+    )
     aggregate = {
         "protocol": "formal_tree_ring_complex_l1_v3",
         "N": len(rows),
         "sample_count": len(rows),
         "gate_only": len(rows) < 1000,
         "paper_comparable": False,
+        "attack_clean_enabled": attack_clean_enabled,
+        "recalibrated_metrics_available": attack_clean_enabled,
+        "result_classification": (
+            "formal_complete" if attack_clean_enabled else "TR STORAGE-LIGHT / NO ATTACK-CLEAN"
+        ),
         "statistical_validity": (
             "gate_only_insufficient_for_1pct_fpr"
             if len(rows) < 100
@@ -937,8 +1001,8 @@ def command_score_formal(args) -> int:
         "source_watermark_target_sha256": target_hash,
         "detector_watermark_mask_sha256": mask_hash,
         "source_watermark_mask_sha256": mask_hash,
-        "full_precision_protocol": aggregate_nfpa_protocol(rows, "full_precision"),
-        "nfpa_rounded2_protocol": aggregate_nfpa_protocol(rows, "nfpa_rounded2"),
+        "full_precision_protocol": protocol_aggregate(rows, "full_precision"),
+        "nfpa_rounded2_protocol": protocol_aggregate(rows, "nfpa_rounded2"),
         "primary_protocol": "nfpa_rounded2_protocol",
     }
     write_json(args.output_dir / "aggregate_results.json", aggregate)
@@ -1239,7 +1303,15 @@ def build_parser() -> argparse.ArgumentParser:
     aggregate.add_argument("--output-dir", type=Path, required=True)
     formal = sub.add_parser("score-formal")
     formal.add_argument("--manifest", type=Path, required=True)
-    formal.add_argument("--attacked-clean-records", type=Path, required=True)
+    formal.add_argument("--attacked-clean-records", type=Path, default=None)
+    formal.add_argument(
+        "--no-attacked-clean",
+        action="store_true",
+        help=(
+            "Storage-light TR: score watermarked detection only, without "
+            "attacked-clean FPR recalibration or recalibrated TPR."
+        ),
+    )
     formal.add_argument("--output-dir", type=Path, required=True)
     formal.add_argument("--eval-repo", type=Path, default=Path(__file__).resolve().parents[2] / "eval_bench_wm")
     formal.add_argument("--device", choices=["cuda", "cpu"], default="cuda")

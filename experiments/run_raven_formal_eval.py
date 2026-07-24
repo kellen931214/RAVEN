@@ -76,6 +76,37 @@ def utc_now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
+def parse_bool_flag(value: str) -> bool:
+    normalized = str(value).strip().lower()
+    if normalized in {"true", "1", "yes", "on"}:
+        return True
+    if normalized in {"false", "0", "no", "off"}:
+        return False
+    raise argparse.ArgumentTypeError(f"expected a boolean value, got {value!r}")
+
+
+def storage_mode_metadata(
+    *, method: str, expected_count: int, storage_light: bool, attack_clean_enabled: bool
+) -> dict[str, Any]:
+    """Derive the storage-light / attack-clean provenance flags.
+
+    Kept pure so callers (run_config, aggregate, validate) and tests all agree on
+    the exact classification. Defaults reproduce the legacy formal protocol.
+    """
+    method = method.upper()
+    tr_recalibrated = bool(attack_clean_enabled) and method == "TR"
+    return {
+        "storage_light": bool(storage_light),
+        "attack_clean_enabled": bool(attack_clean_enabled),
+        "attacked_clean_count": int(expected_count) if tr_recalibrated else 0,
+        "recalibrated_metrics_available": tr_recalibrated,
+        "formal_protocol_complete": bool(attack_clean_enabled) and not bool(storage_light),
+        "result_classification": (
+            "TR STORAGE-LIGHT / NO ATTACK-CLEAN" if storage_light else "formal_complete"
+        ),
+    }
+
+
 def git_head() -> str:
     return subprocess.run(
         ["git", "rev-parse", "HEAD"], cwd=REPO, check=True, capture_output=True, text=True
@@ -295,6 +326,12 @@ def run_config(
         "source_code_manifest_path": str(runtime_source_manifest),
         "source_code_manifest_sha256": source_manifest_sha,
         "formal_source_config_hash": source_manifest_sha,
+        **storage_mode_metadata(
+            method=args.method,
+            expected_count=args.expected_count,
+            storage_light=args.storage_light,
+            attack_clean_enabled=args.attack_clean_enabled,
+        ),
     }
 
 
@@ -561,6 +598,11 @@ def expected_resume_fields(
 def attack_stage(args: argparse.Namespace, config: dict[str, Any], role: str) -> int:
     if role == "clean" and args.method != "TR":
         raise ValueError("attack-clean is required only for the formal TR/NFPA protocol")
+    if role == "clean" and not config["attack_clean_enabled"]:
+        raise ValueError(
+            "attack-clean is disabled in storage-light mode "
+            "(--attack-clean-enabled false); the TR result is NO ATTACK-CLEAN"
+        )
     rows = load_snapshot_rows(args.output_root)
     if not rows:
         raise RuntimeError("no immutable snapshots are available")
@@ -638,6 +680,7 @@ def attack_stage(args: argparse.Namespace, config: dict[str, Any], role: str) ->
             negative_prompt=config["attack_config"]["negative_prompt"],
             debug=False,
             inversion_mode=config["attack_config"]["inversion_mode"],
+            save_input_copy=not config["storage_light"],
         )
         del attacked, image
         attacked_path = output_dir / "final_color_corrected.png"
@@ -879,26 +922,28 @@ def verify_stage(args: argparse.Namespace, config: dict[str, Any]) -> int:
     run_subprocess(manifest_command)
     verification = args.output_root / "verification"
     if args.method == "TR":
-        clean_records = require_complete_records(args, config, "clean")
-        clean_path = verification / "attacked_clean_records.jsonl"
-        with clean_path.open("x", encoding="utf-8") as handle:
-            for row in clean_records:
-                handle.write(json.dumps(row, sort_keys=True, allow_nan=False) + "\n")
-        run_subprocess(
-            [
-                sys.executable,
-                str(RAVEN_REPRO / "scripts" / "raven_nfpa_tr_eval.py"),
-                "score-formal",
-                "--manifest",
-                str(manifest),
-                "--attacked-clean-records",
-                str(clean_path),
-                "--output-dir",
-                str(verification / "tr_nfpa"),
-                "--device",
-                args.device,
-            ]
-        )
+        tr_command = [
+            sys.executable,
+            str(RAVEN_REPRO / "scripts" / "raven_nfpa_tr_eval.py"),
+            "score-formal",
+            "--manifest",
+            str(manifest),
+            "--output-dir",
+            str(verification / "tr_nfpa"),
+            "--device",
+            args.device,
+        ]
+        if config["attack_clean_enabled"]:
+            clean_records = require_complete_records(args, config, "clean")
+            clean_path = verification / "attacked_clean_records.jsonl"
+            with clean_path.open("x", encoding="utf-8") as handle:
+                for row in clean_records:
+                    handle.write(json.dumps(row, sort_keys=True, allow_nan=False) + "\n")
+            tr_command.extend(["--attacked-clean-records", str(clean_path)])
+        else:
+            # storage-light: no attacked-clean recalibration is performed.
+            tr_command.append("--no-attacked-clean")
+        run_subprocess(tr_command)
     else:
         scores = verification / "scores.csv"
         run_subprocess(
@@ -947,7 +992,12 @@ def aggregate_stage(args: argparse.Namespace, config: dict[str, Any]) -> int:
             raise FileNotFoundError(path)
     aggregate = {
         **config,
-        "status": "formal_complete_pending_validation",
+        "status": (
+            "storage_light_no_attack_clean_pending_validation"
+            if config["storage_light"]
+            else "formal_complete_pending_validation"
+        ),
+        "result_classification": config["result_classification"],
         "N": args.expected_count,
         "sample_count": args.expected_count,
         "gate_only": args.expected_count < 1000,
@@ -1029,7 +1079,7 @@ def validate_stage(args: argparse.Namespace, config: dict[str, Any]) -> int:
             path = Path(record[path_field])
             if not path.is_file() or sha256_path(path) != record[hash_field]:
                 raise RuntimeError(f"run_id={record['run_id']}: {path_field} SHA mismatch")
-    if args.method == "TR":
+    if args.method == "TR" and config["attack_clean_enabled"]:
         clean_records = require_complete_records(args, config, "clean")
         clean_by_id = {str(row["run_id"]): row for row in clean_records}
         if set(clean_by_id) != run_ids:
@@ -1125,14 +1175,19 @@ def validate_stage(args: argparse.Namespace, config: dict[str, Any]) -> int:
                 raise RuntimeError("TR detector/source mask hash mismatch")
             if score.get("source_watermark_mask_sha256") != source_mask_hash:
                 raise RuntimeError("TR score/source mask hash mismatch")
+        finite_keys = [
+            "original_clean_threshold", "original_clean_actual_fpr",
+            "before_tpr", "attacked_tpr_at_original_clean_threshold",
+        ]
+        if config["attack_clean_enabled"]:
+            # attacked-clean recalibration is only present in the full protocol.
+            finite_keys.extend([
+                "attacked_clean_recalibrated_threshold", "attacked_clean_actual_fpr",
+                "attacked_tpr_at_attacked_clean_recalibrated_threshold", "attacked_roc_auc",
+            ])
         for protocol_name in ("full_precision_protocol", "nfpa_rounded2_protocol"):
             protocol = detector_payload[protocol_name]
-            for key in (
-                "original_clean_threshold", "original_clean_actual_fpr",
-                "attacked_clean_recalibrated_threshold", "attacked_clean_actual_fpr",
-                "before_tpr", "attacked_tpr_at_original_clean_threshold",
-                "attacked_tpr_at_attacked_clean_recalibrated_threshold", "attacked_roc_auc",
-            ):
+            for key in finite_keys:
                 if not math.isfinite(float(protocol[key])):
                     raise RuntimeError(f"non-finite TR aggregate {protocol_name}.{key}")
     aggregate = args.output_root / "formal_aggregate.json"
@@ -1162,7 +1217,12 @@ def validate_stage(args: argparse.Namespace, config: dict[str, Any]) -> int:
         "mixed_clip_provenance": 0,
         "mixed_source_manifests": 0,
         "mixed_model_revisions": 0,
-        "attacked_clean_count": args.expected_count if args.method == "TR" else 0,
+        "storage_light": config["storage_light"],
+        "attack_clean_enabled": config["attack_clean_enabled"],
+        "recalibrated_metrics_available": config["recalibrated_metrics_available"],
+        "formal_protocol_complete": config["formal_protocol_complete"],
+        "result_classification": config["result_classification"],
+        "attacked_clean_count": config["attacked_clean_count"],
         "attacked_watermarked_count": args.expected_count,
         "verification_count": args.expected_count,
         "quality_count": args.expected_count,
@@ -1196,6 +1256,25 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--expected-count", type=int, required=True)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument(
+        "--storage-light",
+        action="store_true",
+        help=(
+            "Skip the redundant per-sample input.png copy. Combined with "
+            "--attack-clean-enabled false this produces a TR STORAGE-LIGHT / "
+            "NO ATTACK-CLEAN result (no attacked-clean FPR recalibration)."
+        ),
+    )
+    parser.add_argument(
+        "--attack-clean-enabled",
+        type=parse_bool_flag,
+        default=True,
+        help=(
+            "Default true reproduces the full formal TR protocol. Set false to "
+            "skip attack-clean, attacked-clean FPR, recalibrated threshold and "
+            "recalibrated TPR (storage-light TR)."
+        ),
+    )
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--dtype", default="float16", choices=["float16"])
     parser.add_argument("--gpu", default=None)
@@ -1208,6 +1287,10 @@ def main(argv: Iterable[str] | None = None) -> int:
     if args.expected_count <= 0 or args.batch_size <= 0:
         raise ValueError("expected-count and batch-size must be positive")
     args.method = args.method.upper()
+    if not args.attack_clean_enabled and args.method != "TR":
+        raise RuntimeError("--attack-clean-enabled false only applies to the TR protocol")
+    if args.stage == "attack-clean" and not args.attack_clean_enabled:
+        raise RuntimeError("attack-clean stage requested but attack-clean is disabled")
     if not args.device.startswith("cuda"):
         raise RuntimeError("formal RAVEN evaluation forbids CPU fallback")
     if args.dtype != "float16":

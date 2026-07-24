@@ -215,6 +215,7 @@ class RavenPipeline:
         negative_prompt: str = "",
         debug: bool = False,
         inversion_mode: str = "ddim",
+        save_input_copy: bool = True,
     ) -> Image.Image:
         torch = self.torch
         restore_default_attention(self.pipe.unet, self._default_attn_processors)
@@ -222,7 +223,10 @@ class RavenPipeline:
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         image_size_divisible_by_8(input_image)
-        save_image(input_image, output_dir / "input.png")
+        # storage-light mode omits the redundant input.png copy; the original
+        # source path/SHA is already recorded upstream in the formal record.
+        if save_input_copy:
+            save_image(input_image, output_dir / "input.png")
 
         generator = self._make_generator(seed)
         inversion_prompt_embeds = self._encode_prompt(
