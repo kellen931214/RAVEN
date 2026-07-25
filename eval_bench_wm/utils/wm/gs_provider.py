@@ -751,20 +751,33 @@ OFFICIAL_REPRODUCTION_REVISION = "fp16"
 
 
 def apply_official_reproduction_defaults(args, argv=None) -> typing.Dict[str, typing.Any]:
-    """Inject official upstream Gaussian Shading *generation* defaults for the
-    standalone reproduction runners (``run_watermark.py`` / ``run_removal.py``) ONLY.
+    """Inject an official-inspired Gaussian Shading *generation* configuration for
+    the standalone reproduction runners (``run_watermark.py`` / ``run_removal.py``)
+    ONLY. Intentionally NOT wired into the formal generator
+    (``experiments/generate_watermarked_images.py``), which keeps the shared
+    matched-cohort model/scheduler (RedbeardNZ + DDIM) so GS stays comparable to
+    the other watermark methods. Other watermark methods are never touched
+    (guarded by ``wm_type == "GS"``).
 
-    Sets the official model / scheduler / fp16 weight revision unless the user
-    passed them explicitly on the command line. This is intentionally NOT wired
-    into the formal generator (``experiments/generate_watermarked_images.py``),
-    which keeps the shared matched-cohort model/scheduler (RedbeardNZ + DDIM) so
-    GS stays comparable to the other watermark methods. Other watermark methods
-    are never touched (guarded by ``wm_type == "GS"``).
+    Injection semantics (each layer respects explicit user flags):
+
+    - No explicit ``--modelid_target`` -> use the official reproduction model
+      (stabilityai/stable-diffusion-2-1-base).
+    - The scheduler/revision defaults are ONLY injected when we are actually on the
+      official reproduction model (whether the user supplied it explicitly or it was
+      just injected). This prevents attaching ``revision=fp16`` (which is a
+      model-specific weight branch) or forcing DPM onto an unrelated/non-official
+      model the user chose.
+    - Explicit ``--scheduler_target`` / ``--model_revision`` are never overridden.
+    - Non-GS methods: nothing is changed.
 
     Note: the fork's global compute dtype is ``torch.float32`` (see
-    ``pipe_provider.DTYPE``); ``revision="fp16"`` selects the fp16 *weight*
-    variant only. Full fp16 compute parity with upstream is a documented residual
-    difference, not silently changed here.
+    ``pipe_provider.DTYPE``); ``revision="fp16"`` selects the fp16 *weight* variant
+    only, so this is NOT true fp16 compute parity with upstream — a documented
+    residual difference. The inversion is an official-*inspired* configuration
+    (empty prompt, guidance_scale=1, DPM-family inverse scheduler), NOT a
+    byte-level or numerical reproduction of upstream's manual DDIM-style
+    forward-diffusion inversion.
     """
     import sys as _sys
 
@@ -776,22 +789,37 @@ def apply_official_reproduction_defaults(args, argv=None) -> typing.Dict[str, ty
     applied: typing.Dict[str, typing.Any] = {}
     if getattr(args, "wm_type", None) != "GS":
         return applied
-    if hasattr(args, "modelid_target") and not _explicit("--modelid_target"):
+
+    explicit_model = _explicit("--modelid_target")
+    explicit_scheduler = _explicit("--scheduler_target")
+    explicit_revision = _explicit("--model_revision")
+
+    if hasattr(args, "modelid_target") and not explicit_model:
         args.modelid_target = OFFICIAL_REPRODUCTION_MODEL_ID
         applied["modelid_target"] = args.modelid_target
-    if hasattr(args, "scheduler_target") and not _explicit("--scheduler_target"):
+
+    using_official_model = getattr(args, "modelid_target", None) == OFFICIAL_REPRODUCTION_MODEL_ID
+
+    # Scheduler / revision are model-specific: only inject them when actually on the
+    # official reproduction model, and never over an explicit user value.
+    if using_official_model and hasattr(args, "scheduler_target") and not explicit_scheduler:
         args.scheduler_target = OFFICIAL_REPRODUCTION_SCHEDULER
         applied["scheduler_target"] = args.scheduler_target
-    if not _explicit("--model_revision") and getattr(args, "model_revision", None) in (None, ""):
+    if using_official_model and not explicit_revision and getattr(args, "model_revision", None) in (None, ""):
         args.model_revision = OFFICIAL_REPRODUCTION_REVISION
         applied["model_revision"] = args.model_revision
+
+    applied["using_official_model"] = using_official_model
     applied["dtype_note"] = (
         "compute dtype follows the fork global (torch.float32); official upstream "
-        "uses fp16 — revision='fp16' selects the fp16 weight variant only"
+        "uses fp16 — revision='fp16' selects the fp16 weight variant only, NOT true "
+        "fp16 compute parity"
     )
     applied["inversion_note"] = (
-        "official-compatible inversion via invert_z0 (empty prompt, guidance_scale=1, "
-        "DPM inverse-scheduler timesteps); not byte-identical to upstream "
-        "inverse_stable_diffusion.py"
+        "official-inspired standalone inversion configuration: empty prompt, "
+        "guidance_scale=1, DPM-family inverse scheduler (Diffusers "
+        "DPMSolverMultistepInverseScheduler via invert_z0). NOT byte-identical or "
+        "numerically equivalent to upstream inverse_stable_diffusion.py, which uses "
+        "a manual DDIM-style backward diffusion update"
     )
     return applied

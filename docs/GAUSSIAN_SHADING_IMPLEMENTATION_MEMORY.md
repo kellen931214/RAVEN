@@ -6,7 +6,11 @@ additional GS memory files; update this one.
 
 ## Branch / HEAD / provenance
 - Branch: `agent/cleanup-quality-decomposition`
-- GS implementation commit reviewed: `a69e517fc99b7b4bfbcbfc1f687599de84cc9ca4`
+- Original GS implementation commit reviewed: `a69e517fc99b7b4bfbcbfc1f687599de84cc9ca4`
+- GS default flip to official implementation path: `02b669c` (2026-07-25).
+- Detection-threshold / parser / injection cleanup + metadata migration script:
+  this branch HEAD (2026-07-25). The authoritative source SHAs are recorded in
+  `audit/formal_source_manifest.json` (rebuilt at that HEAD).
 - Official reference asserted in code/metadata: `bsmhmmlf/Gaussian-Shading`,
   commit `09c678fadc7545acf7be12647ddf2a5e66f6a9dc` (`watermark.py`,
   `run_gaussian_shading.py`, `inverse_stable_diffusion.py`).
@@ -49,8 +53,13 @@ it is never selected implicitly, so old *legacy* results are only reproduced on 
 - **Standalone reproduction runners** (`run_watermark.py`, `run_removal.py`) additionally
   adopt official upstream **generation** defaults for GS unless overridden:
   `modelid_target=stabilityai/stable-diffusion-2-1-base`, `scheduler_target=DPM`
-  (DPMSolverMultistepScheduler), `revision=fp16`, and the official-compatible inversion
-  (empty prompt, `guidance_scale=1`, DPM inverse-scheduler timesteps via `invert_z0`).
+  (DPMSolverMultistepScheduler), `revision=fp16` (weight variant only), and an
+  **official-inspired standalone inversion configuration** (empty prompt,
+  `guidance_scale=1`, DPM-family inverse scheduler via `invert_z0`) — NOT a
+  byte-level or numerical reproduction of upstream's manual DDIM-style inversion.
+  The model/scheduler/revision injection only applies on the official reproduction
+  model (see `apply_official_reproduction_defaults`): an explicit non-official
+  model never gets `revision=fp16` or a forced DPM scheduler.
 - **Formal generator** (`experiments/generate_watermarked_images.py`) deliberately keeps
   the shared matched-cohort generation pipeline (`RedbeardNZ/stable-diffusion-2-1-base` +
   DDIM + the fork dtype) so GS stays comparable to TR/RID/… — it does **not** switch GS
@@ -62,9 +71,11 @@ it is never selected implicitly, so old *legacy* results are only reproduced on 
    decode/majority-vote/thresholds).
 2. **generation benchmark protocol** = `shared_formal_cohort_redbeardnz_ddim` (the formal
    generator's shared cohort pipeline).
-3. **upstream official reproduction runner** =
+3. **standalone upstream-inspired reproduction configuration** =
    `stabilityai/stable-diffusion-2-1-base+DPMSolverMultistepScheduler+fp16` (the standalone
-   runners' generation settings).
+   runners' generation settings) — with an **official-inspired inversion approximation**
+   (see below) and `revision=fp16` selecting the **fp16 weight variant only** (global
+   compute dtype stays `torch.float32`, so this is not true fp16-compute parity).
 Formal GS rows carry all three (`watermark_implementation_protocol`,
 `generation_benchmark_protocol`, `upstream_official_reproduction_runner`) plus
 `gs_detection_mode` and `detection_threshold_comparison_operator`.
@@ -198,16 +209,24 @@ provenance, `rows_written_this_run=0`).
 Tests:
 ```bash
 cd /workspace/RAVEN && python -m pytest raven_repro/tests/test_gaussian_shading_official.py -q
-cd /workspace/RAVEN/raven_repro && python -m pytest tests/ -q   # 179 passed (TR unaffected)
+cd /workspace/RAVEN/raven_repro && python -m pytest tests/ -q   # 235 passed (TR unaffected)
 ```
 
 ## Tests (all passing)
-`test_gaussian_shading_official.py` (7): official layout/cipher/decode + inverse-CDF
-reference (fixed SHAs against the in-repo reference; not upstream scipy RNG bit-exact); determinism + unique-per-run (10 seeds→10 unique latents/secrets/uniforms);
-direct-decode bit-accuracy=1 + random-clean baseline in [0.35,0.65]; majority-vote ties→0;
-metadata index+hash only (no key_hex/nonce_hex/ground_truth_bits); GS pairing-audit
-uniqueness (rejects duplicate sampling uniforms); resume accepts identical / rejects
-sampling-seed drift. Full `raven_repro/tests`: **179 passed** (TR unchanged).
+`test_gaussian_shading_official.py` (**31**): official layout/cipher/decode + inverse-CDF
+reference (fixed SHAs against the in-repo reference; not upstream scipy RNG bit-exact);
+determinism + unique-per-run (10 seeds→10 unique latents/secrets/uniforms); GS sampling
+seed == TR schedule; direct-decode bit-accuracy=1 + random-clean baseline in [0.35,0.65];
+majority-vote ties→0; metadata index+hash only; GS pairing-audit uniqueness; resume accepts
+identical / rejects sampling-seed drift; **default protocol=official_compatible + detection
+mode=official_onebit; official tau_onebit actually drives detection; traceability/legacy
+modes explicit & distinct; legacy protocol still works explicitly; reproduction-default
+injection semantics (official model→DPM+fp16, explicit non-official model→no fp16/no DPM,
+explicit scheduler/revision preserved, non-GS untouched); run_watermark/run_removal parsers
+accept `--model_revision`; formal generator keeps RedbeardNZ+DDIM; detection fields excluded
+from provenance hashes; migration script (upgrade, idempotent, hash/secret/latent/bit-acc
+fail-closed cases, partial-schema unify, PNG untouched, dry-run)**. Full `raven_repro/tests`:
+**235 passed** (TR unchanged).
 
 ## Verified acceptance (this session)
 - Per-run secret & GS latent unique + reproducible: gate audit shows 10 unique
@@ -234,12 +253,18 @@ sampling-seed drift. Full `raven_repro/tests`: **179 passed** (TR unchanged).
   `torch.float32` (`pipe_provider.DTYPE`). True fp16-compute parity with upstream is NOT
   forced here (it would change every method + the formal cohort). This is a known,
   documented residual difference, not a silent divergence.
-- **Inversion (official-compatible, not byte-identical):** the standalone GS official path
-  achieves upstream-equivalent inversion *behavior* — empty prompt, `guidance_scale=1`, and
-  DPM inverse-scheduler timesteps (selected via `scheduler_target=DPM`, executed by the
-  existing `invert_z0`). It is **not** a byte-level port of upstream
-  `inverse_stable_diffusion.py`; no shared-pipeline rewrite was done, so TR/RID/HSTR/HSQR
-  inversion is untouched.
+- **Inversion (official-inspired approximation, NOT equivalent):** the standalone GS
+  official path uses an *official-inspired standalone inversion configuration* — empty
+  prompt, `guidance_scale=1`, and a DPM-family inverse scheduler (Diffusers
+  `DPMSolverMultistepInverseScheduler`, selected via `scheduler_target=DPM`, executed by
+  the existing `invert_z0`). It is deliberately **not** claimed to be byte-identical,
+  numerically equivalent, or upstream-behavior-equivalent: upstream
+  `inverse_stable_diffusion.py` uses a **manual DDIM-style backward/forward-diffusion
+  update** (reversed DPM timesteps, per-step UNet noise prediction, manual `alpha_prod_t`
+  / `alpha_prod_t_prev` `backward_ddim`), which is a different implementation. A true
+  GS-only port of that manual inversion was **not** done (it would need isolation +
+  numerical tests and must not touch the shared `invert_z0` used by TR/RID/HSTR/HSQR).
+  So the current standalone inversion remains an official-*inspired* approximation.
 - Detection default flipped to the official beta-tail `tau_onebit`; the formal generator's
   `before_detection_successful` for GS is now computed against `tau_onebit` (`>=`) rather
   than the legacy fixed threshold. Provenance hashes are unaffected (detection fields are
@@ -274,7 +299,35 @@ generation and identical-command resume gate have not yet been executed.
 ## GS end-to-end gate stages
 Correct GS stage order: `snapshot → attack-watermarked → verify → quality → fid → clip →
 aggregate → validate`. `attack-clean` belongs **only** to the TR flow; GS must **not** run
-`attack-clean`.
+`attack-clean`. This is enforced method-specifically in `run_raven_formal_eval.py` and
+does not need a code change:
+- `attack_stage(role="clean")` raises `attack-clean is required only for the formal TR/NFPA
+  protocol` for any non-TR method.
+- `verify_stage`, `aggregate_stage`, and `validate_stage` gate every attacked-clean
+  requirement behind `method == "TR"`, so the GS pipeline reaches `validate` without any
+  attacked-clean records. TR keeps the full attack-clean recalibration protocol unchanged.
+An orchestrator must therefore simply omit the `attack-clean` stage for GS (running it is a
+fail-closed error, not a silent no-op).
+
+## Metadata migration (existing GS cohorts — no image regeneration)
+`experiments/migrate_gs_detection_metadata.py` upgrades pre-`02b669c` GS metadata (legacy
+`detection_threshold=0.70703125`, legacy `before_detection_successful`, missing official
+detection columns) to the official schema **without regenerating images**. It:
+- verifies each row's provenance (secret mapping via `secret_provenance`, watermark target
+  via re-derived `watermark_target_tensor`, on-disk PNG SHA-256, and `pairing_sha256`);
+- recomputes `before_detection_successful = before_bit_accuracy >= 0.6484375` from an
+  existing bit-accuracy column (`before_bit_accuracy` / `before_detection_metric_value`;
+  fail closed if absent or inconsistent — re-run inversion/score extraction, never
+  regenerate the PNG);
+- writes `gs_detection_mode`, `detection_threshold`, `detection_threshold_type`,
+  `detection_threshold_comparison_operator`, `gs_official_tau_onebit/tau_bits`, and the
+  three protocol-layer fields;
+- never touches `watermarked_latent_sha256`, `generation_config_sha256`,
+  `watermark_config_sha256`, PNG bytes, or `pairing_sha256` (detection fields are not in
+  `PAIRING_HASH_FIELDS`/`GS_REQUIRED_FIELDS`);
+- backs up (`*.premigration.<ts>.bak`), writes atomically, is idempotent, and re-runs the
+  full pairing audit; any inconsistency fails closed.
+Usage: `python experiments/migrate_gs_detection_metadata.py [--dry-run] <metadata.csv> ...`
 
 ## N=1000 readiness (explicit)
 - **N=1000 generation**: must first pass the 50-step generation and resume gate.

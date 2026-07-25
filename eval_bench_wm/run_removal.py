@@ -71,7 +71,8 @@ METRIC_MAP = {
     "GM": "value",
 }
 
-def parse_args():
+def build_parser():
+    """Construct the run_removal argument parser (side-effect free, testable)."""
     parent_parsers = [
         gs_parser,
         tr_parser,
@@ -89,6 +90,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="watermark-removal", parents=parent_parsers)
     parser.add_argument("--out_dir", type=str, default="out/removal/")
     parser.add_argument("--modelid_target", type=str, default="stabilityai/stable-diffusion-2-1-base", choices=MODEL_IDS)
+    parser.add_argument("--model_revision", type=str, default=None)
     parser.add_argument("--scheduler_target", type=str, default="DDIM", choices=sorted(pipe_utils.SCHEDULER_CLASSES.keys()))
     parser.add_argument("--num_inference_steps_target", type=int, default=50)
     parser.add_argument("--guidance_scale_target", type=float, default=7.5)
@@ -107,7 +109,11 @@ def parse_args():
     parser.add_argument("--rm_xy", type=int, default=40)
     parser.add_argument("--rm_z", type=int, default=0)
     parser.add_argument("--rm_guidance_scale", type=float, default=7.5)
-    return parser.parse_args()
+    return parser
+
+
+def parse_args(argv=None):
+    return build_parser().parse_args(argv)
 
 
 def detection_value(results, wm_type):

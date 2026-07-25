@@ -38,6 +38,7 @@ CORE_FILES = (
     "raven_repro/scripts/extract_verification_scores.py",
     "raven_repro/scripts/raven_nfpa_tr_eval.py",
     "experiments/generate_watermarked_images.py",
+    "experiments/migrate_gs_detection_metadata.py",
     "eval_bench_wm/utils/wm/gs_provider.py",
 )
 

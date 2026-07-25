@@ -380,6 +380,76 @@ def test_official_reproduction_defaults_apply_only_to_gs_standalone_runners():
     assert ns3.model_revision == "c6a5e9"
 
 
+def test_reproduction_defaults_explicit_official_model_gets_dpm_and_fp16():
+    # GS + explicit official model, no scheduler/revision -> inject DPM + fp16.
+    ns = argparse.Namespace(
+        wm_type="GS", modelid_target=OFFICIAL_REPRODUCTION_MODEL_ID,
+        scheduler_target="DDIM", model_revision=None,
+    )
+    apply_official_reproduction_defaults(
+        ns, argv=["run_watermark.py", "--modelid_target", OFFICIAL_REPRODUCTION_MODEL_ID]
+    )
+    assert ns.scheduler_target == OFFICIAL_REPRODUCTION_SCHEDULER == "DPM"
+    assert ns.model_revision == OFFICIAL_REPRODUCTION_REVISION == "fp16"
+
+
+def test_reproduction_defaults_explicit_nonofficial_model_gets_no_fp16_no_dpm():
+    # GS + explicit NON-official model, no scheduler/revision -> must NOT attach
+    # fp16 (a model-specific weight branch) nor force DPM.
+    ns = argparse.Namespace(
+        wm_type="GS", modelid_target="RedbeardNZ/stable-diffusion-2-1-base",
+        scheduler_target="DDIM", model_revision=None,
+    )
+    applied = apply_official_reproduction_defaults(
+        ns, argv=["run_watermark.py", "--modelid_target", "RedbeardNZ/stable-diffusion-2-1-base"]
+    )
+    assert ns.modelid_target == "RedbeardNZ/stable-diffusion-2-1-base"
+    assert ns.scheduler_target == "DDIM"  # not forced to DPM
+    assert ns.model_revision is None  # no fp16 injected
+    assert applied.get("using_official_model") is False
+    assert "model_revision" not in applied
+    assert "scheduler_target" not in applied
+
+
+def test_reproduction_defaults_do_not_override_explicit_scheduler_or_revision():
+    ns = argparse.Namespace(
+        wm_type="GS", modelid_target=OFFICIAL_REPRODUCTION_MODEL_ID,
+        scheduler_target="Euler", model_revision="rev123",
+    )
+    apply_official_reproduction_defaults(
+        ns,
+        argv=[
+            "run_watermark.py", "--modelid_target", OFFICIAL_REPRODUCTION_MODEL_ID,
+            "--scheduler_target", "Euler", "--model_revision", "rev123",
+        ],
+    )
+    assert ns.scheduler_target == "Euler"
+    assert ns.model_revision == "rev123"
+
+
+def test_run_watermark_parser_accepts_model_revision():
+    import run_watermark
+    args = run_watermark.build_parser().parse_known_args(
+        ["--wm_type", "GS", "--num", "1", "--model_revision", "fp16"]
+    )[0]
+    assert args.model_revision == "fp16"
+    assert args.wm_type == "GS"
+    # default is None when omitted
+    args2 = run_watermark.build_parser().parse_known_args(["--wm_type", "GS", "--num", "1"])[0]
+    assert args2.model_revision is None
+
+
+def test_run_removal_parser_accepts_model_revision():
+    import run_removal
+    args = run_removal.build_parser().parse_args(
+        ["--wm_type", "GS", "--num", "1", "--model_revision", "fp16"]
+    )
+    assert args.model_revision == "fp16"
+    assert args.wm_type == "GS"
+    args2 = run_removal.parse_args(["--wm_type", "GS", "--num", "1"])
+    assert args2.model_revision is None
+
+
 def test_formal_generator_keeps_shared_cohort_model_scheduler_defaults():
     # The formal generator must NOT adopt the official upstream model/scheduler;
     # it keeps the shared matched cohort (RedbeardNZ + DDIM) so GS stays comparable.
@@ -397,3 +467,286 @@ def test_formal_generator_keeps_shared_cohort_model_scheduler_defaults():
     # But GS defaults there are still official.
     assert args.gs_protocol_mode == "official_compatible"
     assert args.gs_detection_mode == "official_onebit"
+
+
+def test_detection_fields_excluded_from_provenance_hashes():
+    # Detection is a scoring-time policy; changing it must never perturb the
+    # embedding-config hash or the pairing hash (so generation_config_sha256 /
+    # watermark_config_sha256 / pairing_sha256 stay stable across detection changes).
+    from raven.eval_protocol import PROVIDER_FIELDS_BY_METHOD
+    from raven.pairing_provenance import PAIRING_HASH_FIELDS, GS_REQUIRED_FIELDS
+
+    detection_fields = {
+        "gs_detection_mode",
+        "detection_threshold",
+        "detection_threshold_type",
+        "detection_threshold_comparison_operator",
+        "threshold_calibrated_from_current_clean_negatives",
+        "watermark_implementation_protocol",
+        "generation_benchmark_protocol",
+        "upstream_official_reproduction_runner",
+        "before_detection_successful",
+        "gs_official_tau_onebit",
+        "gs_official_tau_bits",
+    }
+    assert not (detection_fields & set(PROVIDER_FIELDS_BY_METHOD["GS"]))
+    assert not (detection_fields & set(PAIRING_HASH_FIELDS))
+    assert not (detection_fields & set(GS_REQUIRED_FIELDS))
+
+
+# ---------------------------------------------------------------------------
+# Migration tests (experiments/migrate_gs_detection_metadata.py)
+# ---------------------------------------------------------------------------
+
+import csv as _csv
+import json as _json
+
+
+def _load_migration_module():
+    path = REPO / "experiments" / "migrate_gs_detection_metadata.py"
+    spec = importlib.util.spec_from_file_location("migrate_gs_detection_metadata", path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+migration_module = _load_migration_module()
+
+
+def _make_gs_cohort(tmp_path, n=2, *, legacy_style=True):
+    """Build a small, self-contained, audit-valid official-compatible GS cohort.
+
+    Returns (metadata_csv_path, rows). PNGs are real (tiny) files whose SHA-256 is
+    recorded, so file verification and the pairing audit both pass.
+    """
+    method_dir = tmp_path / "GS"
+    method_dir.mkdir(parents=True, exist_ok=True)
+    (method_dir / "watermark_config.json").write_text(
+        _json.dumps({"message_width_in_bytes": 32, "channel_copy": 1, "hw_copy": 8})
+    )
+    gen_cfg_sha = canonical_json_sha256({"model_id": "RedbeardNZ/stable-diffusion-2-1-base", "steps": 50})
+    wm_cfg_sha = canonical_json_sha256({"wm_type": "GS", "mode": "official_compatible"})
+    mask_sha = canonical_json_sha256({"method": "GS", "mask": "not_applicable", "version": 1})
+
+    rows = []
+    for run_id in range(n):
+        seed = 42 + run_id
+        provider = official_provider(secret_index=run_id, sampling_seed=seed)
+        res = provider.get_wm_latents()
+        clean_zt = res["zT_clean_torch"]
+        wm_zt = res["zT_torch"]
+        base_sha = tensor_sha256(clean_zt)
+        secret = res["secret_provenance_list"][0]
+
+        clean_path = method_dir / f"{run_id:06d}_clean.png"
+        wm_path = method_dir / f"{run_id:06d}_wm.png"
+        Image.new("RGB", (8, 8), (run_id % 256, 0, 0)).save(clean_path)
+        Image.new("RGB", (8, 8), (0, run_id % 256, 7)).save(wm_path)
+
+        prompt = f"prompt number {run_id}"
+        row = {
+            "protocol": GS_PAIRING_PROTOCOL,
+            "dataset_name": "unit", "dataset": "unit",
+            "run_id": run_id, "prompt_id": run_id, "prompt": prompt,
+            "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+            "source": "unit", "wm_type": "GS", "wm_name": "Gaussian Shading",
+            "model_id": "RedbeardNZ/stable-diffusion-2-1-base",
+            "model_revision": "c6a5e9bab8d874d081de76fa270ae0aefa5410ff",
+            "scheduler_target": "DDIM", "resolution": 512,
+            "threshold_calibrated_from_current_clean_negatives": "False",
+            "before_detection_metric_value": "1.0",
+            "base_latent_seed": seed, "generation_seed": seed,
+            "base_latent_sha256": base_sha,
+            "clean_base_latent_sha256": base_sha,
+            "watermarked_base_latent_sha256": base_sha,
+            "watermarked_latent_sha256": tensor_sha256(wm_zt),
+            "watermark_target_sha256": tensor_sha256(res["barcodes_torch"]),
+            "watermark_mask_sha256": mask_sha,
+            "generation_config_sha256": gen_cfg_sha,
+            "watermark_config_sha256": wm_cfg_sha,
+            "clean_path": str(clean_path.resolve()),
+            "clean_sha256": sha256_path(clean_path),
+            "watermarked_path": str(wm_path.resolve()),
+            "watermarked_image_path": str(wm_path.resolve()),
+            "watermarked_sha256": sha256_path(wm_path),
+            "gs_protocol_mode": "official_compatible",
+            "gs_secret_index": run_id,
+            "gs_message_sha256": secret["message_sha256"],
+            "gs_key_sha256": secret["key_sha256"],
+            "gs_nonce_sha256": secret["nonce_sha256"],
+            "gs_secret_bundle_sha256": secret["secret_bundle_sha256"],
+            "gs_sampling_seed": seed,
+            "gs_sampling_uniform_sha256": res["sampling_uniform_sha256_list"][0],
+            "gs_payload_layout": "channel_spatial_repeat",
+            "gs_cipher": "PyCryptodome_ChaCha20_32byte_key_12byte_nonce",
+            "gs_official_tau_onebit": "0.6484375",
+            "gs_official_tau_bits": "0.71484375",
+            "before_bit_accuracy": "1.0",
+        }
+        if legacy_style:
+            row["detection_threshold"] = "0.70703125"
+            row["detection_threshold_type"] = "legacy_default_threshold"
+            row["before_detection_successful"] = "True"
+        row["pairing_sha256"] = build_pairing_sha256(row)
+        rows.append(row)
+
+    csv_path = method_dir / "metadata.csv"
+    with csv_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = _csv.DictWriter(handle, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+    return csv_path, rows
+
+
+def _read_rows(csv_path):
+    with open(csv_path, newline="", encoding="utf-8") as handle:
+        return list(_csv.DictReader(handle))
+
+
+def test_migration_upgrades_normal_legacy_rows(tmp_path):
+    csv_path, _ = _make_gs_cohort(tmp_path, n=2)
+    png_before = {
+        p.name: sha256_path(p) for p in csv_path.parent.glob("*.png")
+    }
+    summary = migration_module.migrate_metadata_file(csv_path)
+    assert summary["changed"] is True
+    assert summary["pairing_audit_passed"] is True
+    rows = _read_rows(csv_path)
+    for row in rows:
+        assert row["gs_detection_mode"] == "official_onebit"
+        assert row["detection_threshold"] == "0.6484375"
+        assert row["detection_threshold_type"] == "official_beta_tail_tau_onebit"
+        assert row["detection_threshold_comparison_operator"] == ">="
+        assert row["watermark_implementation_protocol"] == "official_compatible"
+        assert row["generation_benchmark_protocol"] == "shared_formal_cohort_redbeardnz_ddim"
+        assert row["upstream_official_reproduction_runner"].startswith("stabilityai/")
+        assert row["before_detection_successful"] == "True"  # 1.0 >= 0.6484375
+    # PNGs untouched.
+    png_after = {p.name: sha256_path(p) for p in csv_path.parent.glob("*.png")}
+    assert png_before == png_after
+
+
+def test_migration_is_idempotent(tmp_path):
+    csv_path, _ = _make_gs_cohort(tmp_path, n=2)
+    migration_module.migrate_metadata_file(csv_path)
+    first = csv_path.read_bytes()
+    summary2 = migration_module.migrate_metadata_file(csv_path)
+    assert summary2["already_current"] is True
+    assert summary2["changed"] is False
+    assert csv_path.read_bytes() == first
+    # No second backup created on the idempotent re-run.
+    backups = list(csv_path.parent.glob("*.premigration.*.bak"))
+    assert len(backups) == 1
+
+
+def test_migration_preserves_immutable_and_pairing_hashes(tmp_path):
+    csv_path, before_rows = _make_gs_cohort(tmp_path, n=2)
+    before = {r["run_id"]: r for r in before_rows}
+    migration_module.migrate_metadata_file(csv_path)
+    for row in _read_rows(csv_path):
+        b = before[int(row["run_id"])] if int(row["run_id"]) in before else before[row["run_id"]]
+        for field in (
+            "watermarked_latent_sha256", "generation_config_sha256",
+            "watermark_config_sha256", "clean_sha256", "watermarked_sha256",
+            "pairing_sha256",
+        ):
+            assert row[field] == str(b[field]), field
+
+
+def test_migration_rejects_image_hash_mismatch(tmp_path):
+    csv_path, rows = _make_gs_cohort(tmp_path, n=1)
+    data = _read_rows(csv_path)
+    data[0]["watermarked_sha256"] = "0" * 64
+    _rewrite(csv_path, data)
+    with pytest.raises(migration_module.MigrationError, match="SHA mismatch"):
+        migration_module.migrate_metadata_file(csv_path)
+
+
+def test_migration_rejects_secret_provenance_mismatch(tmp_path):
+    csv_path, rows = _make_gs_cohort(tmp_path, n=1)
+    data = _read_rows(csv_path)
+    data[0]["gs_message_sha256"] = "a" * 64
+    _rewrite(csv_path, data)
+    with pytest.raises(migration_module.MigrationError, match="gs_message_sha256"):
+        migration_module.migrate_metadata_file(csv_path)
+
+
+def test_migration_rejects_latent_target_mismatch(tmp_path):
+    csv_path, rows = _make_gs_cohort(tmp_path, n=1)
+    data = _read_rows(csv_path)
+    data[0]["watermark_target_sha256"] = "b" * 64
+    # keep pairing hash consistent with the tampered value so we exercise the
+    # target-provenance check rather than the pairing check.
+    data[0]["pairing_sha256"] = build_pairing_sha256(data[0])
+    _rewrite(csv_path, data)
+    with pytest.raises(migration_module.MigrationError, match="watermark_target_sha256"):
+        migration_module.migrate_metadata_file(csv_path)
+
+
+def test_migration_rejects_missing_bit_accuracy(tmp_path):
+    csv_path, rows = _make_gs_cohort(tmp_path, n=1)
+    data = _read_rows(csv_path)
+    data[0]["before_bit_accuracy"] = ""
+    data[0]["before_detection_metric_value"] = ""
+    _rewrite(csv_path, data)
+    with pytest.raises(migration_module.MigrationError, match="no usable bit-accuracy"):
+        migration_module.migrate_metadata_file(csv_path)
+
+
+def test_migration_rejects_inconsistent_bit_accuracy(tmp_path):
+    csv_path, rows = _make_gs_cohort(tmp_path, n=1)
+    data = _read_rows(csv_path)
+    data[0]["before_bit_accuracy"] = "1.0"
+    data[0]["before_detection_metric_value"] = "0.5"
+    _rewrite(csv_path, data)
+    with pytest.raises(migration_module.MigrationError, match="inconsistent bit-accuracy"):
+        migration_module.migrate_metadata_file(csv_path)
+
+
+def test_migration_unifies_partial_cohort_schema(tmp_path):
+    # Row 0 already migrated (has new columns), row 1 old-style (missing them),
+    # written with a superset header -> migration must unify without error.
+    csv_path, rows = _make_gs_cohort(tmp_path, n=2)
+    data = _read_rows(csv_path)
+    # Simulate row 0 already carrying the new detection columns.
+    data[0]["gs_detection_mode"] = "official_onebit"
+    data[0]["detection_threshold"] = "0.6484375"
+    data[0]["detection_threshold_type"] = "official_beta_tail_tau_onebit"
+    data[0]["detection_threshold_comparison_operator"] = ">="
+    data[0]["watermark_implementation_protocol"] = "official_compatible"
+    data[0]["generation_benchmark_protocol"] = "shared_formal_cohort_redbeardnz_ddim"
+    data[0]["upstream_official_reproduction_runner"] = (
+        "stabilityai/stable-diffusion-2-1-base+DPMSolverMultistepScheduler+fp16"
+    )
+    data[0]["before_detection_successful"] = "True"
+    fieldnames = list(dict.fromkeys([*data[0].keys(), *data[1].keys()]))
+    _rewrite(csv_path, data, fieldnames=fieldnames)
+    summary = migration_module.migrate_metadata_file(csv_path)
+    assert summary["pairing_audit_passed"] is True
+    out = _read_rows(csv_path)
+    header = set(out[0].keys())
+    for field in migration_module.DETECTION_FIELDS:
+        assert field in header
+    for row in out:
+        assert row["gs_detection_mode"] == "official_onebit"
+
+
+def test_migration_dry_run_does_not_write(tmp_path):
+    csv_path, _ = _make_gs_cohort(tmp_path, n=2)
+    before = csv_path.read_bytes()
+    summary = migration_module.migrate_metadata_file(csv_path, dry_run=True)
+    assert summary["dry_run"] is True
+    assert summary["changed"] is False
+    assert csv_path.read_bytes() == before
+    assert not list(csv_path.parent.glob("*.premigration.*.bak"))
+
+
+def _rewrite(csv_path, rows, fieldnames=None):
+    fieldnames = fieldnames or list(rows[0].keys())
+    with open(csv_path, "w", newline="", encoding="utf-8") as handle:
+        writer = _csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({k: row.get(k, "") for k in fieldnames})
