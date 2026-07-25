@@ -427,6 +427,71 @@ def test_reproduction_defaults_do_not_override_explicit_scheduler_or_revision():
     assert ns.model_revision == "rev123"
 
 
+# --- Inversion note must reflect the actually-resolved model/scheduler ----------
+# "DPMSolverMultistepInverseScheduler" is the marker of an official-inspired DPM
+# reproduction claim; bare "DPM" also appears in the *disclaimer* of the non-official
+# note ("requires the official model + DPM inverse scheduler"), so tests key off the
+# specific inverse-scheduler token, not the substring "DPM".
+_OFFICIAL_DPM_INVERSION_MARKER = "DPMSolverMultistepInverseScheduler"
+_OFFICIAL_INSPIRED_MARKER = "official-inspired standalone inversion approximation"
+
+
+def test_inversion_note_official_model_dpm_emits_official_inspired_note():
+    ns = argparse.Namespace(
+        wm_type="GS", modelid_target=OFFICIAL_REPRODUCTION_MODEL_ID,
+        scheduler_target="DDIM", model_revision=None,
+    )
+    applied = apply_official_reproduction_defaults(
+        ns, argv=["run_watermark.py", "--modelid_target", OFFICIAL_REPRODUCTION_MODEL_ID]
+    )
+    assert ns.scheduler_target == "DPM"  # injected
+    note = applied["inversion_note"]
+    assert _OFFICIAL_INSPIRED_MARKER in note
+    assert _OFFICIAL_DPM_INVERSION_MARKER in note
+    # Honesty caveat retained (not claimed byte-identical/equivalent).
+    assert "NOT byte-identical" in note
+    assert "fp16 weight variant only" in applied["dtype_note"]
+
+
+def test_inversion_note_nonofficial_model_ddim_makes_no_dpm_reproduction_claim():
+    ns = argparse.Namespace(
+        wm_type="GS", modelid_target="RedbeardNZ/stable-diffusion-2-1-base",
+        scheduler_target="DDIM", model_revision=None,
+    )
+    applied = apply_official_reproduction_defaults(
+        ns, argv=["run_watermark.py", "--modelid_target", "RedbeardNZ/stable-diffusion-2-1-base"]
+    )
+    note = applied["inversion_note"]
+    # No official DPM reproduction claim, no official-inspired label.
+    assert _OFFICIAL_DPM_INVERSION_MARKER not in note
+    assert _OFFICIAL_INSPIRED_MARKER not in note
+    # Records the actual scheduler and disclaims the official path.
+    assert "DDIM" in note
+    assert "NOT the official Gaussian Shading reproduction path" in note
+    assert applied["using_official_model"] is False
+    # No fp16 weight variant injected for a non-official model.
+    assert "no fp16 weight variant injected" in applied["dtype_note"]
+
+
+def test_inversion_note_explicit_scheduler_matches_actual_scheduler():
+    # Official model but explicit Euler -> note names Euler, not the DPM inverse path.
+    ns = argparse.Namespace(
+        wm_type="GS", modelid_target=OFFICIAL_REPRODUCTION_MODEL_ID,
+        scheduler_target="Euler", model_revision="rev123",
+    )
+    applied = apply_official_reproduction_defaults(
+        ns,
+        argv=[
+            "run_watermark.py", "--modelid_target", OFFICIAL_REPRODUCTION_MODEL_ID,
+            "--scheduler_target", "Euler", "--model_revision", "rev123",
+        ],
+    )
+    note = applied["inversion_note"]
+    assert "Euler" in note
+    assert _OFFICIAL_DPM_INVERSION_MARKER not in note
+    assert _OFFICIAL_INSPIRED_MARKER not in note
+
+
 def test_run_watermark_parser_accepts_model_revision():
     import run_watermark
     args = run_watermark.build_parser().parse_known_args(
@@ -514,23 +579,72 @@ def _load_migration_module():
 migration_module = _load_migration_module()
 
 
-def _make_gs_cohort(tmp_path, n=2, *, legacy_style=True):
+def _cohort_generation_config():
+    # Mirrors experiments/generate_watermarked_images.py generation_config exactly
+    # (shared formal cohort: RedbeardNZ + DDIM + float32). dtype drives latent
+    # re-derivation, so it must match the provider dtype (float32).
+    return {
+        "dtype": "torch.float32",
+        "guidance_scale": 7.5,
+        "model_id": "RedbeardNZ/stable-diffusion-2-1-base",
+        "model_revision": "c6a5e9bab8d874d081de76fa270ae0aefa5410ff",
+        "num_inference_steps": 50,
+        "resolution": 512,
+        "scheduler": "DDIM",
+    }
+
+
+def _cohort_watermark_config(mask_sha):
+    return {
+        "channel_copy": 1,
+        "cipher": "PyCryptodome.ChaCha20",
+        "gs_protocol_mode": "official_compatible",
+        "hw_copy": 8,
+        "key_bytes": 32,
+        "majority_vote": "strict_gt_half_ties_zero",
+        "message_width_in_bytes": 32,
+        "nonce_bytes": 12,
+        "official_source_commit": "09c678fadc7545acf7be12647ddf2a5e66f6a9dc",
+        "official_source_repository": "bsmhmmlf/Gaussian-Shading",
+        "payload_layout": "torch.repeat(1,channel_copy,hw_copy,hw_copy)",
+        "sampling": "norm.ppf((u+encrypted_bit)/2)",
+        "sampling_seed_policy": "base_seed+run_id",
+        "secret_mapping": "secret_index=run_id",
+        "watermark_mask_sha256": mask_sha,
+        "wm_type": "GS",
+    }
+
+
+def _write_config(path, payload):
+    path.write_text(_json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def _make_gs_cohort(
+    tmp_path, n=2, *, legacy_style=True, suffix="", num_shards=1, shard_index=0, run_ids=None
+):
     """Build a small, self-contained, audit-valid official-compatible GS cohort.
 
     Returns (metadata_csv_path, rows). PNGs are real (tiny) files whose SHA-256 is
-    recorded, so file verification and the pairing audit both pass.
+    recorded, so file verification and the pairing audit both pass. Real
+    ``generation_config{suffix}.json`` and ``watermark_config{suffix}.json`` sidecars
+    are written with canonical SHAs matching the rows, so the migration's full
+    re-derivation + config-consistency checks succeed.
     """
     method_dir = tmp_path / "GS"
     method_dir.mkdir(parents=True, exist_ok=True)
-    (method_dir / "watermark_config.json").write_text(
-        _json.dumps({"message_width_in_bytes": 32, "channel_copy": 1, "hw_copy": 8})
-    )
-    gen_cfg_sha = canonical_json_sha256({"model_id": "RedbeardNZ/stable-diffusion-2-1-base", "steps": 50})
-    wm_cfg_sha = canonical_json_sha256({"wm_type": "GS", "mode": "official_compatible"})
     mask_sha = canonical_json_sha256({"method": "GS", "mask": "not_applicable", "version": 1})
+    generation_config = _cohort_generation_config()
+    watermark_config = _cohort_watermark_config(mask_sha)
+    _write_config(method_dir / f"generation_config{suffix}.json", generation_config)
+    _write_config(method_dir / f"watermark_config{suffix}.json", watermark_config)
+    gen_cfg_sha = canonical_json_sha256(generation_config)
+    wm_cfg_sha = canonical_json_sha256(watermark_config)
+
+    if run_ids is None:
+        run_ids = list(range(n))
 
     rows = []
-    for run_id in range(n):
+    for run_id in run_ids:
         seed = 42 + run_id
         provider = official_provider(secret_index=run_id, sampling_seed=seed)
         res = provider.get_wm_latents()
@@ -551,6 +665,7 @@ def _make_gs_cohort(tmp_path, n=2, *, legacy_style=True):
             "run_id": run_id, "prompt_id": run_id, "prompt": prompt,
             "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
             "source": "unit", "wm_type": "GS", "wm_name": "Gaussian Shading",
+            "num_shards": num_shards, "shard_index": shard_index,
             "model_id": "RedbeardNZ/stable-diffusion-2-1-base",
             "model_revision": "c6a5e9bab8d874d081de76fa270ae0aefa5410ff",
             "scheduler_target": "DDIM", "resolution": 512,
@@ -591,7 +706,7 @@ def _make_gs_cohort(tmp_path, n=2, *, legacy_style=True):
         row["pairing_sha256"] = build_pairing_sha256(row)
         rows.append(row)
 
-    csv_path = method_dir / "metadata.csv"
+    csv_path = method_dir / f"metadata{suffix}.csv"
     with csv_path.open("w", newline="", encoding="utf-8") as handle:
         writer = _csv.DictWriter(handle, fieldnames=list(rows[0].keys()))
         writer.writeheader()
@@ -750,3 +865,128 @@ def _rewrite(csv_path, rows, fieldnames=None):
         writer.writeheader()
         for row in rows:
             writer.writerow({k: row.get(k, "") for k in fieldnames})
+
+
+# ---------------------------------------------------------------------------
+# Full latent / sampling / mapping re-derivation fail-closed cases
+# ---------------------------------------------------------------------------
+
+
+def test_migration_rejects_watermarked_latent_mismatch(tmp_path):
+    csv_path, _ = _make_gs_cohort(tmp_path, n=1)
+    data = _read_rows(csv_path)
+    data[0]["watermarked_latent_sha256"] = "c" * 64
+    data[0]["pairing_sha256"] = build_pairing_sha256(data[0])  # isolate re-derivation
+    _rewrite(csv_path, data)
+    with pytest.raises(migration_module.MigrationError, match="watermarked_latent_sha256"):
+        migration_module.migrate_metadata_file(csv_path)
+
+
+def test_migration_rejects_sampling_uniform_mismatch(tmp_path):
+    csv_path, _ = _make_gs_cohort(tmp_path, n=1)
+    data = _read_rows(csv_path)
+    data[0]["gs_sampling_uniform_sha256"] = "e" * 64
+    data[0]["pairing_sha256"] = build_pairing_sha256(data[0])
+    _rewrite(csv_path, data)
+    with pytest.raises(migration_module.MigrationError, match="gs_sampling_uniform_sha256"):
+        migration_module.migrate_metadata_file(csv_path)
+
+
+def test_migration_rejects_sampling_seed_drift(tmp_path):
+    # gs_sampling_seed (and base_latent_seed, kept consistent for formal mapping) are
+    # bumped, but the recorded uniforms/latents were sampled with the ORIGINAL seed,
+    # so re-derivation diverges and the row is rejected.
+    csv_path, rows = _make_gs_cohort(tmp_path, n=1)
+    original_seed = int(rows[0]["gs_sampling_seed"])
+    data = _read_rows(csv_path)
+    data[0]["gs_sampling_seed"] = str(original_seed + 1)
+    data[0]["base_latent_seed"] = str(original_seed + 1)  # keep formal mapping intact
+    data[0]["pairing_sha256"] = build_pairing_sha256(data[0])
+    _rewrite(csv_path, data)
+    with pytest.raises(migration_module.MigrationError, match="re-derivation"):
+        migration_module.migrate_metadata_file(csv_path)
+
+
+def test_migration_rejects_secret_index_not_run_id(tmp_path):
+    csv_path, rows = _make_gs_cohort(tmp_path, n=1)
+    data = _read_rows(csv_path)
+    data[0]["gs_secret_index"] = str(int(rows[0]["run_id"]) + 100)
+    data[0]["pairing_sha256"] = build_pairing_sha256(data[0])
+    _rewrite(csv_path, data)
+    with pytest.raises(migration_module.MigrationError, match="gs_secret_index"):
+        migration_module.migrate_metadata_file(csv_path)
+
+
+def test_migration_rejects_sampling_seed_not_base_latent_seed(tmp_path):
+    csv_path, rows = _make_gs_cohort(tmp_path, n=1)
+    data = _read_rows(csv_path)
+    data[0]["gs_sampling_seed"] = str(int(rows[0]["gs_sampling_seed"]) + 5)
+    data[0]["pairing_sha256"] = build_pairing_sha256(data[0])
+    _rewrite(csv_path, data)
+    with pytest.raises(migration_module.MigrationError, match="base_latent_seed"):
+        migration_module.migrate_metadata_file(csv_path)
+
+
+# ---------------------------------------------------------------------------
+# Sharded metadata: config resolution + SHA/content consistency
+# ---------------------------------------------------------------------------
+
+_SHARD_SUFFIX = ".shard-001-of-004"
+
+
+def test_migration_shard_config_success(tmp_path):
+    csv_path, _ = _make_gs_cohort(
+        tmp_path, suffix=_SHARD_SUFFIX, num_shards=4, shard_index=1, run_ids=[1, 5]
+    )
+    assert csv_path.name == "metadata.shard-001-of-004.csv"
+    # Sidecar configs use the same suffix.
+    assert (csv_path.parent / "generation_config.shard-001-of-004.json").is_file()
+    assert (csv_path.parent / "watermark_config.shard-001-of-004.json").is_file()
+    summary = migration_module.migrate_metadata_file(csv_path)
+    assert summary["shard_suffix"] == _SHARD_SUFFIX
+    assert summary["changed"] is True
+    assert summary["pairing_audit_passed"] is True
+    for row in _read_rows(csv_path):
+        assert row["gs_detection_mode"] == "official_onebit"
+        assert row["detection_threshold"] == "0.6484375"
+
+
+def test_migration_shard_missing_config_rejected(tmp_path):
+    csv_path, _ = _make_gs_cohort(
+        tmp_path, n=1, suffix=".shard-002-of-003", num_shards=3, shard_index=2, run_ids=[2]
+    )
+    (csv_path.parent / "generation_config.shard-002-of-003.json").unlink()
+    with pytest.raises(migration_module.MigrationError, match="not found"):
+        migration_module.migrate_metadata_file(csv_path)
+
+
+def test_migration_shard_config_sha_mismatch_rejected(tmp_path):
+    csv_path, _ = _make_gs_cohort(
+        tmp_path, n=1, suffix=".shard-000-of-002", num_shards=2, shard_index=0, run_ids=[0]
+    )
+    wm_cfg_path = csv_path.parent / "watermark_config.shard-000-of-002.json"
+    cfg = _json.loads(wm_cfg_path.read_text())
+    cfg["official_source_commit"] = "deadbeef"  # changes canonical SHA (not GS layout)
+    wm_cfg_path.write_text(_json.dumps(cfg, indent=2, sort_keys=True))
+    with pytest.raises(migration_module.MigrationError, match="watermark_config_sha256"):
+        migration_module.migrate_metadata_file(csv_path)
+
+
+def test_migration_shard_config_content_drift_rejected(tmp_path):
+    csv_path, _ = _make_gs_cohort(
+        tmp_path, n=1, suffix=".shard-001-of-002", num_shards=2, shard_index=1, run_ids=[1]
+    )
+    gen_cfg_path = csv_path.parent / "generation_config.shard-001-of-002.json"
+    cfg = _json.loads(gen_cfg_path.read_text())
+    cfg["scheduler"] = "DPM"  # drift vs metadata scheduler_target=DDIM
+    gen_cfg_path.write_text(_json.dumps(cfg, indent=2, sort_keys=True))
+    new_sha = canonical_json_sha256(cfg)
+    # Sync the row's generation_config_sha256 + pairing so the SHA check passes and it
+    # is the CONTENT check (scheduler) that fails closed.
+    data = _read_rows(csv_path)
+    for row in data:
+        row["generation_config_sha256"] = new_sha
+        row["pairing_sha256"] = build_pairing_sha256(row)
+    _rewrite(csv_path, data)
+    with pytest.raises(migration_module.MigrationError, match="scheduler"):
+        migration_module.migrate_metadata_file(csv_path)

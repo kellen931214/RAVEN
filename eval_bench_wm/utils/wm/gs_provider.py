@@ -774,10 +774,15 @@ def apply_official_reproduction_defaults(args, argv=None) -> typing.Dict[str, ty
     Note: the fork's global compute dtype is ``torch.float32`` (see
     ``pipe_provider.DTYPE``); ``revision="fp16"`` selects the fp16 *weight* variant
     only, so this is NOT true fp16 compute parity with upstream — a documented
-    residual difference. The inversion is an official-*inspired* configuration
-    (empty prompt, guidance_scale=1, DPM-family inverse scheduler), NOT a
-    byte-level or numerical reproduction of upstream's manual DDIM-style
-    forward-diffusion inversion.
+    residual difference. The returned ``inversion_note``/``dtype_note`` are produced
+    from the *actually resolved* model/scheduler/revision: the official-inspired
+    DPM inversion approximation note is emitted ONLY when ``using_official_model`` is
+    true and the resolved scheduler is DPM. For any other configuration (an explicit
+    non-official model, or an explicit non-DPM scheduler such as DDIM/Euler) the note
+    records only the actual scheduler and makes no official-reproduction claim. Even
+    the official-inspired note is an official-*inspired* approximation (empty prompt,
+    guidance_scale=1, DPM-family inverse scheduler), NOT a byte-level or numerical
+    reproduction of upstream's manual DDIM-style forward-diffusion inversion.
     """
     import sys as _sys
 
@@ -809,17 +814,47 @@ def apply_official_reproduction_defaults(args, argv=None) -> typing.Dict[str, ty
         args.model_revision = OFFICIAL_REPRODUCTION_REVISION
         applied["model_revision"] = args.model_revision
 
+    resolved_model = getattr(args, "modelid_target", None)
+    resolved_scheduler = getattr(args, "scheduler_target", None)
+    resolved_revision = getattr(args, "model_revision", None)
     applied["using_official_model"] = using_official_model
-    applied["dtype_note"] = (
-        "compute dtype follows the fork global (torch.float32); official upstream "
-        "uses fp16 — revision='fp16' selects the fp16 weight variant only, NOT true "
-        "fp16 compute parity"
+    applied["resolved_modelid_target"] = resolved_model
+    applied["resolved_scheduler_target"] = resolved_scheduler
+    applied["resolved_model_revision"] = resolved_revision
+
+    # The official-inspired DPM inversion note is only truthful when we are actually
+    # on the official reproduction model AND the resolved scheduler is DPM (the
+    # DPM-family inverse scheduler is what makes it "official-inspired"). In every
+    # other case (non-official model, or an explicit non-DPM scheduler such as DDIM /
+    # Euler) we record ONLY the actual scheduler/model and make no official
+    # reproduction claim.
+    official_dpm_inversion = (
+        using_official_model and resolved_scheduler == OFFICIAL_REPRODUCTION_SCHEDULER
     )
-    applied["inversion_note"] = (
-        "official-inspired standalone inversion configuration: empty prompt, "
-        "guidance_scale=1, DPM-family inverse scheduler (Diffusers "
-        "DPMSolverMultistepInverseScheduler via invert_z0). NOT byte-identical or "
-        "numerically equivalent to upstream inverse_stable_diffusion.py, which uses "
-        "a manual DDIM-style backward diffusion update"
-    )
+    if official_dpm_inversion:
+        applied["dtype_note"] = (
+            "compute dtype follows the fork global (torch.float32); official upstream "
+            "uses fp16 — revision='fp16' selects the fp16 weight variant only, NOT true "
+            "fp16 compute parity"
+        )
+        applied["inversion_note"] = (
+            "official-inspired standalone inversion approximation: empty prompt, "
+            "guidance_scale=1, DPM-family inverse scheduler (Diffusers "
+            "DPMSolverMultistepInverseScheduler via invert_z0). NOT byte-identical or "
+            "numerically equivalent to upstream inverse_stable_diffusion.py, which uses "
+            "a manual DDIM-style backward diffusion update"
+        )
+    else:
+        applied["dtype_note"] = (
+            "compute dtype follows the fork global (torch.float32); model_revision="
+            f"{resolved_revision!r} (no fp16 weight variant injected for a non-official "
+            "reproduction configuration)"
+        )
+        applied["inversion_note"] = (
+            "standalone inversion uses the configured scheduler "
+            f"({resolved_scheduler!r}) on model {resolved_model!r} via invert_z0; this "
+            "is NOT the official Gaussian Shading reproduction path (which requires the "
+            "official model + DPM inverse scheduler) and makes no official-reproduction "
+            "claim"
+        )
     return applied

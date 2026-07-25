@@ -153,9 +153,11 @@ def main():
         wm_provider_cls.apply_arg_defaults(args, sys.argv)
 
     # Standalone GS reproduction runner: adopt official upstream generation
-    # defaults (stabilityai SD2.1-base + DPM + fp16 revision + official-compatible
-    # inversion) unless the user specified them explicitly. Other methods and the
-    # formal generator are unaffected.
+    # defaults (stabilityai SD2.1-base + DPM + fp16 weight revision + an
+    # official-inspired inversion approximation) unless the user specified them
+    # explicitly. The official-inspired inversion note is only emitted when actually
+    # on the official model + DPM (see apply_official_reproduction_defaults). Other
+    # methods and the formal generator are unaffected.
     if args.wm_type == "GS":
         from utils.wm.gs_provider import apply_official_reproduction_defaults
         gs_official_defaults = apply_official_reproduction_defaults(args, sys.argv)

@@ -154,8 +154,10 @@ def main(argv=None):
         wm_provider_cls.apply_arg_defaults(args, sys.argv)
 
     # Standalone GS reproduction runner: adopt official-inspired upstream generation
-    # defaults (stabilityai SD2.1-base + DPM + fp16 weight revision + official-inspired
-    # inversion configuration) unless the user specified them explicitly. This does NOT
+    # defaults (stabilityai SD2.1-base + DPM + fp16 weight revision + an
+    # official-inspired inversion approximation) unless the user specified them
+    # explicitly. The official-inspired inversion note is only emitted when actually on
+    # the official model + DPM (see apply_official_reproduction_defaults). This does NOT
     # affect other methods or the formal generator (which keeps the shared
     # RedbeardNZ + DDIM cohort).
     if args.wm_type == "GS":

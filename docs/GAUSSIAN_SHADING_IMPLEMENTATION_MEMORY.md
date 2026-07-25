@@ -54,12 +54,18 @@ it is never selected implicitly, so old *legacy* results are only reproduced on 
   adopt official upstream **generation** defaults for GS unless overridden:
   `modelid_target=stabilityai/stable-diffusion-2-1-base`, `scheduler_target=DPM`
   (DPMSolverMultistepScheduler), `revision=fp16` (weight variant only), and an
-  **official-inspired standalone inversion configuration** (empty prompt,
-  `guidance_scale=1`, DPM-family inverse scheduler via `invert_z0`) — NOT a
-  byte-level or numerical reproduction of upstream's manual DDIM-style inversion.
+  **official-inspired inversion approximation** (empty prompt, `guidance_scale=1`,
+  DPM-family inverse scheduler via `invert_z0`) — NOT a byte-level or numerical
+  reproduction of upstream's manual DDIM-style inversion.
   The model/scheduler/revision injection only applies on the official reproduction
   model (see `apply_official_reproduction_defaults`): an explicit non-official
   model never gets `revision=fp16` or a forced DPM scheduler.
+- The `inversion_note` / `dtype_note` returned by `apply_official_reproduction_defaults`
+  are **parameter-aware**: the official-inspired DPM inversion note is emitted **only**
+  when `using_official_model` is true **and** the resolved scheduler is DPM. For any
+  other configuration (explicit non-official model, or an explicit non-DPM scheduler
+  such as DDIM/Euler) the note records **only the actual scheduler** and makes **no
+  official-reproduction claim** (and no fp16 weight-variant claim).
 - **Formal generator** (`experiments/generate_watermarked_images.py`) deliberately keeps
   the shared matched-cohort generation pipeline (`RedbeardNZ/stable-diffusion-2-1-base` +
   DDIM + the fork dtype) so GS stays comparable to TR/RID/… — it does **not** switch GS
@@ -209,11 +215,11 @@ provenance, `rows_written_this_run=0`).
 Tests:
 ```bash
 cd /workspace/RAVEN && python -m pytest raven_repro/tests/test_gaussian_shading_official.py -q
-cd /workspace/RAVEN/raven_repro && python -m pytest tests/ -q   # 235 passed (TR unaffected)
+cd /workspace/RAVEN/raven_repro && python -m pytest tests/ -q   # 247 passed (TR unaffected)
 ```
 
 ## Tests (all passing)
-`test_gaussian_shading_official.py` (**31**): official layout/cipher/decode + inverse-CDF
+`test_gaussian_shading_official.py` (**43**): official layout/cipher/decode + inverse-CDF
 reference (fixed SHAs against the in-repo reference; not upstream scipy RNG bit-exact);
 determinism + unique-per-run (10 seeds→10 unique latents/secrets/uniforms); GS sampling
 seed == TR schedule; direct-decode bit-accuracy=1 + random-clean baseline in [0.35,0.65];
@@ -222,11 +228,17 @@ identical / rejects sampling-seed drift; **default protocol=official_compatible 
 mode=official_onebit; official tau_onebit actually drives detection; traceability/legacy
 modes explicit & distinct; legacy protocol still works explicitly; reproduction-default
 injection semantics (official model→DPM+fp16, explicit non-official model→no fp16/no DPM,
-explicit scheduler/revision preserved, non-GS untouched); run_watermark/run_removal parsers
-accept `--model_revision`; formal generator keeps RedbeardNZ+DDIM; detection fields excluded
-from provenance hashes; migration script (upgrade, idempotent, hash/secret/latent/bit-acc
-fail-closed cases, partial-schema unify, PNG untouched, dry-run)**. Full `raven_repro/tests`:
-**235 passed** (TR unchanged).
+explicit scheduler/revision preserved, non-GS untouched); parameter-aware inversion note
+(official model+DPM→official-inspired DPM note; non-official+DDIM→no DPM/official claim;
+explicit Euler→note matches actual scheduler); run_watermark/run_removal parsers accept
+`--model_revision`; formal generator keeps RedbeardNZ+DDIM; detection fields excluded from
+provenance hashes; migration script — full latent/sampling/secret/target/base + config
+SHA/content re-derivation and formal-mapping (secret_index==run_id,
+sampling_seed==base_latent_seed) checks: upgrade, idempotent, immutable/pairing preservation,
+image/secret/target/watermarked-latent/sampling-uniform/seed-drift/secret-index/seed-vs-base
+mismatch fail-closed, missing/SHA-mismatch/content-drift shard-config rejection, sharded
+config resolution, partial-schema unify, PNG untouched, dry-run**. Full `raven_repro/tests`:
+**247 passed** (TR unchanged).
 
 ## Verified acceptance (this session)
 - Per-run secret & GS latent unique + reproducible: gate audit shows 10 unique
@@ -234,7 +246,7 @@ fail-closed cases, partial-schema unify, PNG untouched, dry-run)**. Full `raven_
 - Official mode == independent reference at fixed payload/key/nonce (SHA-pinned test). ✔
 - No-attack direct decode bit-accuracy = 1.0 (gate `before_detection_rate=1.0`). ✔
 - Clean random latent ≈ random baseline (test [0.35,0.65]). ✔
-- TR tests do not regress (179 passed). ✔
+- TR/other methods do not regress (full `raven_repro/tests` = **247 passed**). ✔
 - 10-image gate + resume + audit pass. ✔
 
 ## Limitations / remaining deviations from official
@@ -313,8 +325,26 @@ fail-closed error, not a silent no-op).
 `experiments/migrate_gs_detection_metadata.py` upgrades pre-`02b669c` GS metadata (legacy
 `detection_threshold=0.70703125`, legacy `before_detection_successful`, missing official
 detection columns) to the official schema **without regenerating images**. It:
-- verifies each row's provenance (secret mapping via `secret_provenance`, watermark target
-  via re-derived `watermark_target_tensor`, on-disk PNG SHA-256, and `pairing_sha256`);
+- **Fully re-derives** GS latent/sampling/secret provenance per row: it rebuilds a fresh
+  `GsProvider` from the row's `gs_secret_index` / `gs_sampling_seed`, the sidecar
+  `watermark_config` layout (`message_width_in_bytes` / `channel_copy` / `hw_copy`), the
+  `generation_config` `resolution`+`dtype`, and re-runs `get_wm_latents()`, then verifies
+  that `gs_message/key/nonce/secret_bundle_sha256`, `gs_sampling_uniform_sha256`,
+  `watermarked_latent_sha256`, `watermark_target_sha256`, and the base-latent SHAs
+  (`base_latent_sha256` / `clean_base_latent_sha256` / `watermarked_base_latent_sha256`) all
+  recompute **exactly**. The `dtype` used for re-derivation comes from `generation_config`
+  (whose canonical SHA is verified against the row), so it is exactly the generation dtype.
+- Verifies the **formal mapping** `gs_secret_index == run_id` and
+  `gs_sampling_seed == base_latent_seed`.
+- **Resolves the sidecar configs by the metadata filename's shard suffix**:
+  `metadata.csv` → `generation_config.json` / `watermark_config.json`;
+  `metadata.shard-003-of-008.csv` → `generation_config.shard-003-of-008.json` /
+  `watermark_config.shard-003-of-008.json`. A **missing** sidecar **fails closed** (never
+  falls back to default parameters). Both configs' canonical SHA-256 is recomputed and
+  compared with each row's `generation_config_sha256` / `watermark_config_sha256`, and their
+  content (`model_id` / `model_revision` / `scheduler` / `resolution` / GS `gs_protocol_mode`
+  + layout) must agree with the row.
+- Still verifies on-disk PNG SHA-256 and `pairing_sha256`.
 - recomputes `before_detection_successful = before_bit_accuracy >= 0.6484375` from an
   existing bit-accuracy column (`before_bit_accuracy` / `before_detection_metric_value`;
   fail closed if absent or inconsistent — re-run inversion/score extraction, never
@@ -322,12 +352,15 @@ detection columns) to the official schema **without regenerating images**. It:
 - writes `gs_detection_mode`, `detection_threshold`, `detection_threshold_type`,
   `detection_threshold_comparison_operator`, `gs_official_tau_onebit/tau_bits`, and the
   three protocol-layer fields;
-- never touches `watermarked_latent_sha256`, `generation_config_sha256`,
-  `watermark_config_sha256`, PNG bytes, or `pairing_sha256` (detection fields are not in
-  `PAIRING_HASH_FIELDS`/`GS_REQUIRED_FIELDS`);
+- never touches PNG bytes, `clean_sha256`, `watermarked_sha256`, `watermarked_latent_sha256`,
+  `gs_sampling_uniform_sha256`, `gs_sampling_seed`, the secret SHAs, `base_latent_seed`,
+  the base-latent SHAs, `generation_config_sha256`, `watermark_config_sha256`, or
+  `pairing_sha256` (detection fields are not in `PAIRING_HASH_FIELDS`/`GS_REQUIRED_FIELDS`;
+  the immutable set is verified byte-for-byte after building each migrated row);
 - backs up (`*.premigration.<ts>.bak`), writes atomically, is idempotent, and re-runs the
   full pairing audit; any inconsistency fails closed.
 Usage: `python experiments/migrate_gs_detection_metadata.py [--dry-run] <metadata.csv> ...`
+(also accepts sharded `metadata.shard-003-of-008.csv` inputs).
 
 ## N=1000 readiness (explicit)
 - **N=1000 generation**: must first pass the 50-step generation and resume gate.
