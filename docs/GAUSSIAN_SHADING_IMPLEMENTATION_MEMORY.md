@@ -247,7 +247,19 @@ config resolution, partial-schema unify, PNG untouched, dry-run**. Full `raven_r
 - No-attack direct decode bit-accuracy = 1.0 (gate `before_detection_rate=1.0`). ✔
 - Clean random latent ≈ random baseline (test [0.35,0.65]). ✔
 - TR/other methods do not regress (full `raven_repro/tests` = **247 passed**). ✔
-- 10-image gate + resume + audit pass. ✔
+- 10-image 25-step gate + resume + audit pass. ✔
+- **10-pair 50-step generation gate + identical-command resume gate** (2026-07-25, HEAD
+  `c648efa`): 10/10 generated, `before_detection_rate=1.0`, pairing audit all-unique;
+  resume `rows_written_this_run=0` (all rows skipped + GS provenance revalidated). ✔
+- **Full GS RAVEN end-to-end dry-run** (2026-07-25, N=10, fp16 attack pipeline):
+  `snapshot → attack-watermarked → verify → quality → fid → clip → aggregate → validate`
+  reached `result_classification=formal_complete`; `attacked_clean_count=0` and no
+  attacked-clean artifacts on disk (attack-clean stayed TR-only, method-gated —
+  no code change needed); `source_code_manifest_sha256=8a204ca1…` matches the rebuilt
+  manifest. ✔
+- **Migration full re-derivation** verified on the real 1001-image cohort and the fresh
+  10-pair gate cohort: latent/uniform/target/secret/base SHAs + both config canonical
+  SHAs recompute exactly; idempotent (`already_current`, no write). ✔
 
 ## Limitations / remaining deviations from official
 - Upstream `bsmhmmlf/Gaussian-Shading` is **not vendored**; parity is vs. an independent
@@ -291,22 +303,21 @@ config resolution, partial-schema unify, PNG untouched, dry-run**. Full `raven_r
 - [x] Metadata = hashes/indices only.
 - [x] Legacy vs official-tau vs 1%-FPR thresholds recorded separately.
 - [x] 10-image 25-step fast smoke gate + resume + audit green.
-- [ ] 10-pair 50-step generation + identical-command resume gate.
+- [x] 10-pair 50-step generation + identical-command resume gate (2026-07-25, HEAD
+      `c648efa`: 10/10, `before_detection_rate=1.0`, resume `rows_written_this_run=0`).
 - [x] TR non-regression.
-- [ ] Full end-to-end RAVEN attack pipeline dry-run on a small GS cohort (recommended
-      before N=1000).
+- [x] Full end-to-end RAVEN attack pipeline dry-run on a small GS cohort (2026-07-25,
+      N=10: `formal_complete`, no attacked-clean artifacts).
 - [ ] Optional: vendor upstream GS for a byte-level parity diff.
 - [ ] Compute the 1%-FPR threshold from N=1000 clean negatives (downstream, not generator).
 
-**N=1000 safe to run?** Not yet. The existing 10-image 25-step fast smoke gate,
-resume check, and provenance audit are green, but the required 10-pair 50-step
-generation and identical-command resume gate have not yet been executed.
+**Gate status (2026-07-25).** The 10-pair 50-step generation + identical-command resume
+gate and the full GS RAVEN end-to-end dry-run (N=10) both **passed** at HEAD `c648efa`
+(see Verified acceptance). These are wiring + provenance gates on a small cohort.
 
-- N=1000 generation is not approved until the 50-step generation and resume gate passes.
-- N=1000 attack/evaluation is not approved until the 10-pair full GS RAVEN
-  end-to-end gate passes.
-- The final 1%-FPR threshold must be calibrated from the N=1000 clean-negative
-  cohort; N=10 is only a wiring and provenance gate.
+- The final 1%-FPR threshold must still be calibrated from the N=1000 clean-negative
+  cohort (downstream, not the generator); N=10 is only a wiring and provenance gate and
+  is NOT a statistically valid 1%-FPR result.
 
 ## GS end-to-end gate stages
 Correct GS stage order: `snapshot → attack-watermarked → verify → quality → fid → clip →
@@ -363,14 +374,17 @@ Usage: `python experiments/migrate_gs_detection_metadata.py [--dry-run] <metadat
 (also accepts sharded `metadata.shard-003-of-008.csv` inputs).
 
 ## N=1000 readiness (explicit)
-- **N=1000 generation**: must first pass the 50-step generation and resume gate.
-- **N=1000 attack/evaluation**: must then pass the 10-pair full GS RAVEN end-to-end gate.
+- **N=1000 generation**: the 50-step generation and resume gate **passed** (2026-07-25,
+  HEAD `c648efa`).
+- **N=1000 attack/evaluation**: the 10-pair full GS RAVEN end-to-end dry-run **passed**
+  (2026-07-25, `formal_complete`).
 - N=10 is **not** enough for a statistically valid 1% FPR result; it only verifies pipeline
   wiring and provenance.
 
 ## Next steps
-1. Run the 10-pair 50-step generation and identical-command resume gate.
-2. Run the 10-pair full GS RAVEN end-to-end gate.
-3. Only after both gates pass, launch N=1000 generation and attack/evaluation.
+1. ~~Run the 10-pair 50-step generation and identical-command resume gate.~~ Done
+   (2026-07-25, HEAD `c648efa`).
+2. ~~Run the 10-pair full GS RAVEN end-to-end gate.~~ Done (2026-07-25, `formal_complete`).
+3. Launch/complete N=1000 generation and attack/evaluation (small-cohort gates pass).
 4. Calibrate 1%-FPR from N=1000 clean negatives; report TPR@1%FPR separately from legacy.
 5. (Optional) Vendor `bsmhmmlf/Gaussian-Shading@09c678f` for a byte-level parity diff.
