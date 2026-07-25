@@ -145,7 +145,16 @@ def main():
         )
     if hasattr(wm_provider_cls, "apply_arg_defaults"):
         wm_provider_cls.apply_arg_defaults(args, sys.argv)
-        
+
+    # Standalone GS reproduction runner: adopt official upstream generation
+    # defaults (stabilityai SD2.1-base + DPM + fp16 revision + official-compatible
+    # inversion) unless the user specified them explicitly. Other methods and the
+    # formal generator are unaffected.
+    if args.wm_type == "GS":
+        from utils.wm.gs_provider import apply_official_reproduction_defaults
+        gs_official_defaults = apply_official_reproduction_defaults(args, sys.argv)
+        print(f"[GS] official reproduction defaults applied: {gs_official_defaults}", flush=True)
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     set_random_seed(args.seed)
 
@@ -172,6 +181,7 @@ def main():
         eager_loading=True if args.modelid_target in EAGER_LOAD_MODELS else False,
         schedulers_name=args.scheduler_target,
         disable_tqdm=True,
+        revision=getattr(args, "model_revision", None),
     )
 
     wm_provider = wm_provider_cls(
@@ -179,6 +189,12 @@ def main():
         dtype=pipe_provider_target.get_dtype(),
         device=device,
         **vars(args),
+    )
+
+    # GS detection uses the official beta-tail threshold family (default
+    # official_onebit, ">="); legacy_default must be requested explicitly.
+    gs_detection_info = (
+        wm_provider.active_detection_threshold() if args.wm_type == "GS" else None
     )
 
     wm_initial_results = wm_provider.get_wm_latents()
@@ -230,6 +246,10 @@ def main():
             before_successful = None
         elif args.wm_type in ["PRC", "MAXSIVE", "SHALLOW", "GM"]:
             before_successful = before["detection_success"]
+        elif args.wm_type == "GS":
+            before_successful = wm_provider.is_detection_successful(
+                detection_value(before, args.wm_type)
+            )
         else:
             before_successful = check_if_detection_successful(
                 wm_type=args.wm_type,
@@ -272,6 +292,10 @@ def main():
             after_successful = None
         elif args.wm_type in ["PRC", "MAXSIVE", "SHALLOW", "GM"]:
             after_successful = after["detection_success"]
+        elif args.wm_type == "GS":
+            after_successful = wm_provider.is_detection_successful(
+                detection_value(after, args.wm_type)
+            )
         else:
             after_successful = check_if_detection_successful(
                 wm_type=args.wm_type,
@@ -299,11 +323,30 @@ def main():
             "rm_z": args.rm_z,
             "before_detection_successful": before_successful,
             "after_detection_successful": after_successful,
-            "detection_threshold": legacy_threshold_metadata["threshold"],
-            "detection_threshold_type": legacy_threshold_metadata["threshold_type"],
-            "detection_threshold_nominal_fpr": legacy_threshold_metadata["nominal_fpr"],
+            "detection_threshold": (
+                gs_detection_info["threshold"]
+                if gs_detection_info is not None
+                else legacy_threshold_metadata["threshold"]
+            ),
+            "detection_threshold_type": (
+                gs_detection_info["threshold_type"]
+                if gs_detection_info is not None
+                else legacy_threshold_metadata["threshold_type"]
+            ),
+            "detection_threshold_nominal_fpr": (
+                gs_detection_info["nominal_fpr"]
+                if gs_detection_info is not None
+                else legacy_threshold_metadata["nominal_fpr"]
+            ),
             "threshold_calibrated_from_current_clean_negatives": False,
         }
+        if gs_detection_info is not None:
+            row.update({
+                "gs_detection_mode": gs_detection_info["detection_mode"],
+                "gs_official_tau_onebit": gs_detection_info["official_tau_onebit"],
+                "gs_official_tau_bits": gs_detection_info["official_tau_bits"],
+                "detection_threshold_comparison_operator": gs_detection_info["comparison_operator"],
+            })
         row.update({f"before_{key}": value for key, value in before_compact.items()})
         row.update({f"after_{key}": value for key, value in after_compact.items()})
         all_rows.append(row)

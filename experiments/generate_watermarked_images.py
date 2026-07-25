@@ -569,18 +569,33 @@ def run_method(args: argparse.Namespace, dataset_dir: Path, wm_type: str, prompt
                     do_lpips=False,
                     device=str(device),
                 )
-                before_successful = check_if_detection_successful(
-                    wm_type=wm_type,
-                    threshold=detection_threshold,
-                    value=detection_value(before, wm_type),
-                )
                 before_metric_value = detection_value(before, wm_type)
+                if wm_type == "GS":
+                    # Official Gaussian Shading detection (default gs_detection_mode
+                    # official_onebit, beta-tail tau_onebit, ">="). The generation
+                    # model/scheduler stay the shared formal cohort (RedbeardNZ + DDIM);
+                    # only the detection-success threshold family is official here.
+                    before_successful = run_provider.is_detection_successful(before_metric_value)
+                else:
+                    before_successful = check_if_detection_successful(
+                        wm_type=wm_type,
+                        threshold=detection_threshold,
+                        value=before_metric_value,
+                    )
                 before_compact = compact_results(before)
             else:
                 before_successful = None
                 before_metric_value = None
                 before_compact = {}
 
+            if wm_type == "GS":
+                gs_detection_info = run_provider.active_detection_threshold()
+                row_detection_threshold = gs_detection_info["threshold"]
+                row_detection_threshold_type = gs_detection_info["threshold_type"]
+            else:
+                gs_detection_info = None
+                row_detection_threshold = detection_threshold
+                row_detection_threshold_type = legacy_threshold["threshold_type"]
             row = {
                 "protocol": GS_PAIRING_PROTOCOL if wm_type == "GS" else PAIRING_PROTOCOL,
                 "dataset_name": args.dataset_name,
@@ -601,8 +616,8 @@ def run_method(args: argparse.Namespace, dataset_dir: Path, wm_type: str, prompt
                 "num_inference_steps_target": args.num_inference_steps_target,
                 "guidance_scale_target": args.guidance_scale_target,
                 "resolution": args.resolution,
-                "detection_threshold": detection_threshold,
-                "detection_threshold_type": legacy_threshold["threshold_type"],
+                "detection_threshold": row_detection_threshold,
+                "detection_threshold_type": row_detection_threshold_type,
                 "threshold_calibrated_from_current_clean_negatives": False,
                 "detection_metric": METRIC_MAP[wm_type],
                 "before_detection_successful": bool_for_json(before_successful),
@@ -651,8 +666,18 @@ def run_method(args: argparse.Namespace, dataset_dir: Path, wm_type: str, prompt
                     "gs_sampling_uniform_sha256": wm_results["sampling_uniform_sha256_list"][0],
                     "gs_payload_layout": "channel_spatial_repeat",
                     "gs_cipher": "PyCryptodome_ChaCha20_32byte_key_12byte_nonce",
-                    "gs_official_tau_onebit": run_provider.official_thresholds()["tau_onebit"],
-                    "gs_official_tau_bits": run_provider.official_thresholds()["tau_bits"],
+                    "gs_official_tau_onebit": gs_detection_info["official_tau_onebit"],
+                    "gs_official_tau_bits": gs_detection_info["official_tau_bits"],
+                    "gs_detection_mode": gs_detection_info["detection_mode"],
+                    "detection_threshold_comparison_operator": gs_detection_info["comparison_operator"],
+                    # Three explicitly-distinct protocol layers (see docs):
+                    # 1) watermark implementation protocol, 2) generation benchmark
+                    # protocol (this run), 3) the separate upstream reproduction runner.
+                    "watermark_implementation_protocol": "official_compatible",
+                    "generation_benchmark_protocol": "shared_formal_cohort_redbeardnz_ddim",
+                    "upstream_official_reproduction_runner": (
+                        "stabilityai/stable-diffusion-2-1-base+DPMSolverMultistepScheduler+fp16"
+                    ),
                 })
             row["pairing_sha256"] = build_pairing_sha256(row)
             row.update({f"before_{key}": bool_for_json(value) for key, value in before_compact.items()})

@@ -252,3 +252,148 @@ def test_gs_resume_accepts_identical_and_rejects_sampling_drift():
         generator_module.validate_gs_resume_provenance(
             stored, run_id=run_id, sampling_seed=sampling_seed, wm_results=result
         )
+
+
+# ---------------------------------------------------------------------------
+# Default-path (official) coverage — added 2026-07-25 when GS default flipped
+# from legacy to official_compatible and detection defaulted to official tau.
+# ---------------------------------------------------------------------------
+
+import argparse
+
+from utils.wm.gs_provider import (
+    OFFICIAL_REPRODUCTION_MODEL_ID,
+    OFFICIAL_REPRODUCTION_SCHEDULER,
+    OFFICIAL_REPRODUCTION_REVISION,
+    apply_official_reproduction_defaults,
+    parser as gs_parser,
+)
+
+
+def _default_provider(**overrides):
+    kwargs = dict(
+        latent_shape=(1, 4, 64, 64),
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+        batch_size=1,
+    )
+    kwargs.update(overrides)
+    return GsProvider(**kwargs)
+
+
+def test_gs_default_protocol_mode_is_official_compatible():
+    # Parser default.
+    assert gs_parser.parse_known_args([])[0].gs_protocol_mode == "official_compatible"
+    # Provider constructor default (no gs_protocol_mode passed).
+    assert _default_provider().gs_protocol_mode == "official_compatible"
+
+
+def test_gs_default_detection_mode_is_official_not_legacy():
+    assert gs_parser.parse_known_args([])[0].gs_detection_mode == "official_onebit"
+    provider = _default_provider()
+    assert provider.gs_detection_mode == "official_onebit"
+    info = provider.active_detection_threshold()
+    assert info["detection_mode"] == "official_onebit"
+    assert info["threshold_type"] == "official_beta_tail_tau_onebit"
+    assert info["threshold_type"] != "legacy_default_threshold"
+    assert info["comparison_operator"] == ">="
+
+
+def test_gs_official_tau_onebit_actually_drives_detection_success():
+    provider = _default_provider()
+    official = provider.official_thresholds()
+    tau = official["tau_onebit"]
+    # The threshold used for success is the official tau, not legacy GS_THRESHOLDS.
+    from utils.utils import GS_THRESHOLDS
+
+    assert provider.active_detection_threshold()["threshold"] == tau
+    assert tau != GS_THRESHOLDS
+    # Success is decided by value >= tau (official), so a value between tau and the
+    # (higher) legacy threshold succeeds under official but would fail under legacy.
+    between = (tau + GS_THRESHOLDS) / 2.0
+    assert tau < between < GS_THRESHOLDS
+    assert provider.is_detection_successful(between) is True
+    assert provider.is_detection_successful(tau) is True  # >= boundary
+    assert provider.is_detection_successful(tau - 1e-6) is False
+
+
+def test_gs_traceability_and_legacy_detection_modes_are_explicit_and_distinct():
+    trace = _default_provider(gs_detection_mode="official_traceability")
+    t_info = trace.active_detection_threshold()
+    assert t_info["threshold"] == trace.official_thresholds()["tau_bits"]
+    assert t_info["threshold_type"] == "official_beta_tail_tau_bits"
+    assert t_info["comparison_operator"] == ">="
+
+    legacy = _default_provider(gs_detection_mode="legacy_default")
+    l_info = legacy.active_detection_threshold()
+    from utils.utils import GS_THRESHOLDS
+
+    assert l_info["threshold"] == GS_THRESHOLDS
+    assert l_info["threshold_type"] == "legacy_default_threshold"
+    assert l_info["comparison_operator"] == ">"
+    # Legacy uses strict '>': exactly at the threshold is NOT a success.
+    assert legacy.is_detection_successful(GS_THRESHOLDS) is False
+    assert legacy.is_detection_successful(GS_THRESHOLDS + 1e-6) is True
+
+    with pytest.raises(ValueError, match="gs_detection_mode"):
+        _default_provider(gs_detection_mode="not_a_mode")
+
+
+def test_legacy_protocol_still_works_when_explicitly_requested():
+    provider = _default_provider(gs_protocol_mode="legacy", gs_hw_copy=8)
+    assert provider.gs_protocol_mode == "legacy"
+    # Legacy encode/decode round-trips (byte-replication path still functional).
+    result = provider.get_wm_latents()
+    accuracies = provider.get_accuracies(result["zT_torch"])
+    assert accuracies["bit_accuracies"][0] == 1.0
+
+
+def test_official_reproduction_defaults_apply_only_to_gs_standalone_runners():
+    # GS with no explicit model/scheduler -> official upstream generation defaults.
+    ns = argparse.Namespace(
+        wm_type="GS", modelid_target="placeholder", scheduler_target="DDIM", model_revision=None
+    )
+    applied = apply_official_reproduction_defaults(ns, argv=["run_watermark.py"])
+    assert ns.modelid_target == OFFICIAL_REPRODUCTION_MODEL_ID == "stabilityai/stable-diffusion-2-1-base"
+    assert ns.scheduler_target == OFFICIAL_REPRODUCTION_SCHEDULER == "DPM"
+    assert ns.model_revision == OFFICIAL_REPRODUCTION_REVISION == "fp16"
+    assert applied["modelid_target"] == OFFICIAL_REPRODUCTION_MODEL_ID
+
+    # Explicit user flags are respected (not overridden).
+    ns2 = argparse.Namespace(
+        wm_type="GS", modelid_target="mine", scheduler_target="Euler", model_revision="rev"
+    )
+    apply_official_reproduction_defaults(
+        ns2, argv=["run_watermark.py", "--modelid_target", "mine", "--scheduler_target", "Euler", "--model_revision", "rev"]
+    )
+    assert (ns2.modelid_target, ns2.scheduler_target, ns2.model_revision) == ("mine", "Euler", "rev")
+
+    # Non-GS methods are never touched.
+    ns3 = argparse.Namespace(
+        wm_type="TR", modelid_target="RedbeardNZ/stable-diffusion-2-1-base",
+        scheduler_target="DDIM", model_revision="c6a5e9",
+    )
+    applied3 = apply_official_reproduction_defaults(ns3, argv=["run_watermark.py"])
+    assert applied3 == {}
+    assert ns3.modelid_target == "RedbeardNZ/stable-diffusion-2-1-base"
+    assert ns3.scheduler_target == "DDIM"
+    assert ns3.model_revision == "c6a5e9"
+
+
+def test_formal_generator_keeps_shared_cohort_model_scheduler_defaults():
+    # The formal generator must NOT adopt the official upstream model/scheduler;
+    # it keeps the shared matched cohort (RedbeardNZ + DDIM) so GS stays comparable.
+    # Inspect the argparse defaults via a fresh parser build with empty argv.
+    import sys as _sys
+
+    argv_backup = _sys.argv
+    try:
+        _sys.argv = ["generate_watermarked_images.py"]
+        args = generator_module.parse_args()
+    finally:
+        _sys.argv = argv_backup
+    assert args.modelid_target == "RedbeardNZ/stable-diffusion-2-1-base"
+    assert args.scheduler_target == "DDIM"
+    # But GS defaults there are still official.
+    assert args.gs_protocol_mode == "official_compatible"
+    assert args.gs_detection_mode == "official_onebit"

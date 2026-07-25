@@ -33,8 +33,41 @@ additional GS memory files; update this one.
 
 ## Final architecture
 Two explicit modes on `GsProvider` (`eval_bench_wm/utils/wm/gs_provider.py`), selected by
-`--gs_protocol_mode {legacy, official_compatible}`; **default `legacy`** so old results
-never change silently.
+`--gs_protocol_mode {legacy, official_compatible}`; **default `official_compatible`**
+(changed 2026-07-25 — GS now follows the official implementation path by default).
+**Legacy is retained but must be requested explicitly** with `--gs_protocol_mode legacy`;
+it is never selected implicitly, so old *legacy* results are only reproduced on demand.
+
+### Default behavior summary (post-2026-07-25)
+- `gs_protocol_mode` default = `official_compatible` (parser + `GsProvider.__init__` +
+  `eval_protocol.PROVIDER_DEFAULTS["GS"]`).
+- `gs_detection_mode` default = `official_onebit` (new arg) → detection success uses the
+  official beta-tail `tau_onebit` with `>=`, **not** the legacy fixed `GS_THRESHOLDS`.
+  `legacy_default` (legacy `GS_THRESHOLDS`, strict `>`) must be requested explicitly.
+- Official GS **params** are already the defaults: `message_width_in_bytes=32`,
+  `gs_channel_copy=1`, `gs_hw_copy=8`, `l=1`, `gs_fpr=1e-6`, `gs_user_number=1_000_000`.
+- **Standalone reproduction runners** (`run_watermark.py`, `run_removal.py`) additionally
+  adopt official upstream **generation** defaults for GS unless overridden:
+  `modelid_target=stabilityai/stable-diffusion-2-1-base`, `scheduler_target=DPM`
+  (DPMSolverMultistepScheduler), `revision=fp16`, and the official-compatible inversion
+  (empty prompt, `guidance_scale=1`, DPM inverse-scheduler timesteps via `invert_z0`).
+- **Formal generator** (`experiments/generate_watermarked_images.py`) deliberately keeps
+  the shared matched-cohort generation pipeline (`RedbeardNZ/stable-diffusion-2-1-base` +
+  DDIM + the fork dtype) so GS stays comparable to TR/RID/… — it does **not** switch GS
+  model/scheduler. GS there still uses official-compatible encode/decode + official
+  detection thresholds; only the generation pipeline is held common.
+
+### Three protocol layers (recorded distinctly in metadata — never conflated)
+1. **watermark implementation protocol** = `official_compatible` (payload/cipher/sampling/
+   decode/majority-vote/thresholds).
+2. **generation benchmark protocol** = `shared_formal_cohort_redbeardnz_ddim` (the formal
+   generator's shared cohort pipeline).
+3. **upstream official reproduction runner** =
+   `stabilityai/stable-diffusion-2-1-base+DPMSolverMultistepScheduler+fp16` (the standalone
+   runners' generation settings).
+Formal GS rows carry all three (`watermark_implementation_protocol`,
+`generation_benchmark_protocol`, `upstream_official_reproduction_runner`) plus
+`gs_detection_mode` and `detection_threshold_comparison_operator`.
 
 ### Legacy mode (unchanged, byte-for-byte behavior retained)
 - Byte replication → `(num_replications, message_width_in_bits)` barcode.
@@ -78,9 +111,11 @@ Layout check: `4*64*64 / (1*8*8) = 256 bits = 32 bytes`. ✔
 - `secret_index = run_id` → indexes into fixed pools
   `utils/wm/{messages,keys,nonces}.py` (10,000 entries each, all unique;
   keys 32B, nonces 16B→first 12B used, `message[:32]` unique across all 10,000).
-- `gs_sampling_seed = deterministic_gs_sampling_seed(base_seed, run_id)`
-  `= int(sha256(f"gaussian-shading-official-sampling-v1:{base_seed}:{run_id}")[:8]) & (2^63-1)`
-  (`experiments/generate_watermarked_images.py`).
+- `gs_sampling_seed = deterministic_gs_sampling_seed(base_seed, run_id) = base_seed + run_id`
+  (`experiments/generate_watermarked_images.py`) — matches the Tree-Ring per-row seed
+  schedule (`base_latent_seed = base_seed + run_id`) so GS and TR consume the same numeric
+  seed per `run_id` for apples-to-apples comparison. Seeds only the GS uniform draw; the
+  payload/cipher/latent construction in `gs_provider.py` are unchanged.
 - A **fresh `GsProvider` per run_id** (`offset=run_id`, `gs_secret_index=run_id`,
   `gs_sampling_seed=...`) → independent message/key/nonce/sampling/latent per image.
 - Metadata stores **only** `gs_secret_index` + SHA-256 of message/key/nonce/bundle +
@@ -89,15 +124,22 @@ Layout check: `4*64*64 / (1*8*8) = 256 bits = 32 bytes`. ✔
   decoded bits stored as `*_decoded_bits_sha256`).
 
 ## Threshold protocols (kept separate — never conflated)
-1. **Legacy default** — `get_detection_threshold("GS", ...)` → fixed `GS_THRESHOLDS`.
-   Labeled via `describe_legacy_detection_threshold`:
-   `threshold_type="legacy_default_threshold"`,
-   `calibrated_from_current_clean_negatives=False`. Rows carry
-   `detection_threshold_type` + `threshold_calibrated_from_current_clean_negatives=False`.
-2. **Official beta-tail** — `GsProvider.official_thresholds()` via `scipy.special.betainc`:
-   `tau_onebit` (single-user detection) and `tau_bits` (traceability, ×user_number),
-   comparison `>=`. For the 256-bit/1e-6/1e6 config: `tau_onebit=0.6484375`,
-   `tau_bits=0.71484375`. Stored per-row as `gs_official_tau_onebit/gs_official_tau_bits`.
+Detection-success threshold is now selected by `--gs_detection_mode` (default
+`official_onebit`). The active choice is resolved by `GsProvider.active_detection_threshold()`
+and applied by `GsProvider.is_detection_successful(value)`; all three entry points (formal
+generator, `run_watermark.py`, `run_removal.py`) route GS detection through it.
+1. **Official beta-tail (DEFAULT)** — `GsProvider.official_thresholds()` via
+   `scipy.special.betainc`: `tau_onebit` (single-user detection, `gs_detection_mode=
+   official_onebit`) and `tau_bits` (traceability, ×user_number,
+   `gs_detection_mode=official_traceability`), comparison `>=`. For the 256-bit/1e-6/1e6
+   config: `tau_onebit=0.6484375`, `tau_bits=0.71484375`. Stored per-row as
+   `gs_official_tau_onebit/gs_official_tau_bits`; `detection_threshold_type` =
+   `official_beta_tail_tau_onebit` / `official_beta_tail_tau_bits`.
+2. **Legacy default (explicit only)** — `gs_detection_mode=legacy_default` → fixed
+   `GS_THRESHOLDS` (`0.70703125`), strict `>`, `threshold_type="legacy_default_threshold"`,
+   `calibrated_from_current_clean_negatives=False`. Never selected implicitly. The legacy
+   `get_detection_threshold("GS", ...)` / `describe_legacy_detection_threshold` helpers are
+   retained unchanged for other callers but are no longer the GS detection default.
 3. **1%-FPR calibrated** — MUST be computed downstream from THIS cohort's clean-negative
    scores (`raven_repro/scripts/eval_reproduction.py` protocol). NOT produced by the
    generator; not to be back-filled from (1) or (2).
@@ -110,12 +152,22 @@ Layout check: `4*64*64 / (1*8*8) = 256 bits = 32 bytes`. ✔
   `deterministic_gs_sampling_seed`, `validate_gs_resume_provenance`; per-run provider;
   GS pairing via shared uniforms; GS provenance rows; TR FFT check gated to `wm_type=="TR"`.
 - `eval_bench_wm/run_watermark.py`, `run_removal.py` — **fail closed**: GS with `num!=1`
-  raises (redirects to the auditable generator) so shared-`zT` cannot ship for GS.
+  raises (redirects to the auditable generator) so shared-`zT` cannot ship for GS. Now also
+  inject the official upstream GS **generation** defaults (`apply_official_reproduction_defaults`:
+  stabilityai SD2.1-base + DPM + `revision=fp16`) when not overridden, route GS detection
+  through `GsProvider.is_detection_successful` (official `tau_onebit` by default), and
+  `run_removal.py` records `gs_detection_mode` + official tau + comparison operator per row.
+- `eval_bench_wm/utils/wm/gs_provider.py` — `--gs_detection_mode` arg,
+  `active_detection_threshold()`, `is_detection_successful()`, and module-level
+  `apply_official_reproduction_defaults()` (standalone runners only; GS-guarded).
 - `raven_repro/raven/pairing_provenance.py` — `GS_PAIRING_PROTOCOL`,
   `gaussian_shading_shared_uniform_v1`, `GS_REQUIRED_FIELDS`, per-method audit with GS
   uniqueness (secret index/bundle/sampling seed/uniforms/target-per-run).
 - `raven_repro/raven/eval_protocol.py` — GS `PROVIDER_FIELDS_BY_METHOD`/`DEFAULTS`
-  (protocol mode, copies, fpr, user_number).
+  (protocol mode, copies, fpr, user_number). `PROVIDER_DEFAULTS["GS"]["gs_protocol_mode"]`
+  flipped `legacy → official_compatible` (fallback/type hint only; hash-safe since formal
+  GS rows always carry the field explicitly). `gs_detection_mode` intentionally excluded
+  from the embedding-config hash.
 - `experiments/run_raven_formal_eval.py` — GS pairing audit + drift/resume/attack fields.
 - `raven_repro/scripts/extract_verification_scores.py` — per-row GS provider rebuild +
   detector/source secret & target SHA parity; hashes-only; decoded-bits SHA.
@@ -175,8 +227,24 @@ sampling-seed drift. Full `raven_repro/tests`: **179 passed** (TR unchanged).
 - Downstream **RAVEN attack→extract→evaluate** GS path is covered by unit tests and the
   per-row provider-rebuild parity check, but a **full end-to-end RAVEN attack run** on GS
   images was NOT executed this session (only generation + resume + audit).
-- Legacy GS DDIM inversion / detection thresholds are unchanged and remain
-  legacy-labeled; no official-vs-legacy image-quality comparison was run.
+- Legacy GS DDIM inversion is retained unchanged and remains legacy-labeled; no
+  official-vs-legacy image-quality comparison was run.
+- **fp16 compute (residual difference):** the standalone reproduction runners set
+  `revision=fp16` (fp16 *weight* variant), but the fork's global compute dtype is
+  `torch.float32` (`pipe_provider.DTYPE`). True fp16-compute parity with upstream is NOT
+  forced here (it would change every method + the formal cohort). This is a known,
+  documented residual difference, not a silent divergence.
+- **Inversion (official-compatible, not byte-identical):** the standalone GS official path
+  achieves upstream-equivalent inversion *behavior* — empty prompt, `guidance_scale=1`, and
+  DPM inverse-scheduler timesteps (selected via `scheduler_target=DPM`, executed by the
+  existing `invert_z0`). It is **not** a byte-level port of upstream
+  `inverse_stable_diffusion.py`; no shared-pipeline rewrite was done, so TR/RID/HSTR/HSQR
+  inversion is untouched.
+- Detection default flipped to the official beta-tail `tau_onebit`; the formal generator's
+  `before_detection_successful` for GS is now computed against `tau_onebit` (`>=`) rather
+  than the legacy fixed threshold. Provenance hashes are unaffected (detection fields are
+  not part of `PAIRING_HASH_FIELDS`/`GS_REQUIRED_FIELDS`, and `generation_config`/
+  `watermark_config` were not modified).
 
 ## N=1000 readiness checklist
 - [x] Official mode matches independent reference (SHA-pinned).

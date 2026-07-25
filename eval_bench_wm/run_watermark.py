@@ -127,7 +127,16 @@ if args.wm_type == "GS" and int(args.num) != 1:
     )
 if hasattr(wm_provider_cls, "apply_arg_defaults"):
     wm_provider_cls.apply_arg_defaults(args, sys.argv)
-    
+
+# Standalone GS reproduction runner: adopt official upstream generation defaults
+# (stabilityai SD2.1-base + DPM + fp16 revision + official-compatible inversion)
+# unless the user specified them explicitly. This does NOT affect other methods
+# or the formal generator (which keeps the shared RedbeardNZ + DDIM cohort).
+if args.wm_type == "GS":
+    from utils.wm.gs_provider import apply_official_reproduction_defaults
+    _gs_official_defaults = apply_official_reproduction_defaults(args, sys.argv)
+    print(f"[GS] official reproduction defaults applied: {_gs_official_defaults}", flush=True)
+
 # set seeds
 set_random_seed(args.seed)
 
@@ -147,7 +156,8 @@ pipe_provider_target = pipe_utils.get_pipe_provider(pretrained_model_name_or_pat
                                                     device=DEVICE,
                                                     eager_loading=True if args.modelid_target in model_flux else False,
                                                     schedulers_name=args.scheduler_target,
-                                                    disable_tqdm=True,)
+                                                    disable_tqdm=True,
+                                                    revision=getattr(args, "model_revision", None),)
 
 # generate a watermarked latent zT
 # This way like it is done here is a simple way to obtain a watermark provider for a simple test run.
@@ -258,6 +268,11 @@ for id, (target_prompt) in tqdm(enumerate(target_prompts), total=len(target_prom
         detection_successful = None
     elif args.wm_type in ["PRC", "MAXSIVE", "SHALLOW", "GM"]:
         detection_successful = results["detection_success"]
+    elif args.wm_type == "GS":
+        # Official Gaussian Shading detection: default gs_detection_mode is
+        # official_onebit (beta-tail tau_onebit, ">="); legacy_default must be
+        # requested explicitly. Never uses the legacy fixed GS_THRESHOLDS by default.
+        detection_successful = wm_provider.is_detection_successful(results[metric_map[args.wm_type]])
     else:
         detection_successful = check_if_detection_successful(wm_type=args.wm_type,
                                                             threshold=detection_threshold,

@@ -33,9 +33,22 @@ parser.add_argument('--num_replications', default=64, type=int, help="The number
 parser.add_argument('--message_width_in_bytes', default=32, type=int, help="Message width in bytes")
 parser.add_argument(
     '--gs_protocol_mode',
-    default='legacy',
+    default='official_compatible',
     choices=('legacy', 'official_compatible'),
-    help='Explicit Gaussian Shading implementation; legacy remains the default.',
+    help='Gaussian Shading implementation path. Default is official_compatible '
+         '(bsmhmmlf/Gaussian-Shading); the legacy path is retained but must be '
+         'requested explicitly with --gs_protocol_mode legacy.',
+)
+parser.add_argument(
+    '--gs_detection_mode',
+    default='official_onebit',
+    choices=('official_onebit', 'official_traceability', 'legacy_default'),
+    help='Detection-success threshold policy for Gaussian Shading. official_onebit '
+         '(default) and official_traceability use the official beta-tail thresholds '
+         '(tau_onebit / tau_bits) from official_thresholds() compared with ">="; '
+         'legacy_default uses the legacy fixed GS threshold compared with ">" and '
+         'must be requested explicitly. These are distinct threshold families and '
+         'are never mixed with a clean-negative-calibrated 1%-FPR threshold.',
 )
 parser.add_argument('--gs_channel_copy', default=1, type=int)
 parser.add_argument('--gs_hw_copy', default=8, type=int)
@@ -59,7 +72,8 @@ class GsProvider(WmProvider):
                  message: typing.Optional[str] = None,
                  key: str = None,
                  nonce: str = None,
-                 gs_protocol_mode: str = "legacy",
+                 gs_protocol_mode: str = "official_compatible",
+                 gs_detection_mode: str = "official_onebit",
                  gs_channel_copy: int = 1,
                  gs_hw_copy: int = 8,
                  gs_fpr: float = 1e-6,
@@ -112,6 +126,13 @@ class GsProvider(WmProvider):
         self.gs_protocol_mode = str(gs_protocol_mode)
         if self.gs_protocol_mode not in {"legacy", "official_compatible"}:
             raise ValueError(f"unsupported gs_protocol_mode: {self.gs_protocol_mode!r}")
+        self.gs_detection_mode = str(gs_detection_mode)
+        if self.gs_detection_mode not in {
+            "official_onebit",
+            "official_traceability",
+            "legacy_default",
+        }:
+            raise ValueError(f"unsupported gs_detection_mode: {self.gs_detection_mode!r}")
         self.gs_channel_copy = int(gs_channel_copy)
         self.gs_hw_copy = int(gs_hw_copy)
         self.gs_fpr = float(gs_fpr)
@@ -320,6 +341,68 @@ class GsProvider(WmProvider):
             "comparison_operator": ">=",
             "source": "bsmhmmlf/Gaussian-Shading watermark.py@09c678f",
         }
+
+
+    def active_detection_threshold(self) -> typing.Dict[str, typing.Any]:
+        """Resolve the detection-success threshold actually used, honoring
+        ``gs_detection_mode``.
+
+        Three distinct threshold families are kept explicitly separate:
+
+        - ``official_onebit`` / ``official_traceability`` -> official beta-tail
+          thresholds ``tau_onebit`` / ``tau_bits`` from :meth:`official_thresholds`,
+          compared with ``>=`` (matches bsmhmmlf/Gaussian-Shading).
+        - ``legacy_default`` -> the legacy fixed GS threshold, compared with ``>``
+          (retained only for explicit legacy/debug parity).
+
+        Neither is a clean-negative-calibrated 1%-FPR threshold; callers must not
+        relabel the resulting detection rate as TPR@1%FPR.
+        """
+        official = self.official_thresholds()
+        if self.gs_detection_mode == "legacy_default":
+            from utils.utils import GS_THRESHOLDS, LEGACY_THRESHOLD_NOMINAL_FPR
+
+            return {
+                "detection_mode": "legacy_default",
+                "threshold": float(GS_THRESHOLDS),
+                "threshold_type": "legacy_default_threshold",
+                "comparison_operator": ">",
+                "nominal_fpr": LEGACY_THRESHOLD_NOMINAL_FPR.get("GS"),
+                "calibrated_from_current_clean_negatives": False,
+                "official_tau_onebit": official["tau_onebit"],
+                "official_tau_bits": official["tau_bits"],
+            }
+        if self.gs_detection_mode == "official_traceability":
+            threshold = official["tau_bits"]
+            threshold_type = "official_beta_tail_tau_bits"
+        else:
+            threshold = official["tau_onebit"]
+            threshold_type = "official_beta_tail_tau_onebit"
+        return {
+            "detection_mode": self.gs_detection_mode,
+            "threshold": None if threshold is None else float(threshold),
+            "threshold_type": threshold_type,
+            "comparison_operator": ">=",
+            "nominal_fpr": official["fpr"],
+            "calibrated_from_current_clean_negatives": False,
+            "official_tau_onebit": official["tau_onebit"],
+            "official_tau_bits": official["tau_bits"],
+        }
+
+
+    def is_detection_successful(self, value: float) -> bool:
+        """Detection-success decision for GS honoring ``gs_detection_mode``.
+
+        Official modes compare bit-accuracy with ``>=`` against the beta-tail
+        threshold; legacy_default reproduces the legacy strict ``>`` comparison.
+        """
+        info = self.active_detection_threshold()
+        threshold = info["threshold"]
+        if threshold is None:
+            return False
+        if info["comparison_operator"] == ">=":
+            return float(value) >= float(threshold)
+        return float(value) > float(threshold)
 
 
     def __character_str_to_bytes(self,
@@ -656,5 +739,59 @@ class GsProvider(WmProvider):
         u = np.random.uniform(low=0, high=1, size=y.shape).astype(np.float32)
         # sampling a gaussian
         new_latent = norm.ppf((u + y) / 2**self.l)
-        
+
         return torch.tensor(new_latent, dtype=self.dtype, device=self.device)
+
+
+# Official upstream generation settings from bsmhmmlf/Gaussian-Shading
+# run_gaussian_shading.py (stabilityai SD2.1-base, DPMSolverMultistepScheduler, fp16).
+OFFICIAL_REPRODUCTION_MODEL_ID = "stabilityai/stable-diffusion-2-1-base"
+OFFICIAL_REPRODUCTION_SCHEDULER = "DPM"  # DPMSolverMultistepScheduler in pipe_utils.SCHEDULER_CLASSES
+OFFICIAL_REPRODUCTION_REVISION = "fp16"
+
+
+def apply_official_reproduction_defaults(args, argv=None) -> typing.Dict[str, typing.Any]:
+    """Inject official upstream Gaussian Shading *generation* defaults for the
+    standalone reproduction runners (``run_watermark.py`` / ``run_removal.py``) ONLY.
+
+    Sets the official model / scheduler / fp16 weight revision unless the user
+    passed them explicitly on the command line. This is intentionally NOT wired
+    into the formal generator (``experiments/generate_watermarked_images.py``),
+    which keeps the shared matched-cohort model/scheduler (RedbeardNZ + DDIM) so
+    GS stays comparable to the other watermark methods. Other watermark methods
+    are never touched (guarded by ``wm_type == "GS"``).
+
+    Note: the fork's global compute dtype is ``torch.float32`` (see
+    ``pipe_provider.DTYPE``); ``revision="fp16"`` selects the fp16 *weight*
+    variant only. Full fp16 compute parity with upstream is a documented residual
+    difference, not silently changed here.
+    """
+    import sys as _sys
+
+    argv = _sys.argv if argv is None else argv
+
+    def _explicit(flag: str) -> bool:
+        return any(a == flag or a.startswith(flag + "=") for a in argv)
+
+    applied: typing.Dict[str, typing.Any] = {}
+    if getattr(args, "wm_type", None) != "GS":
+        return applied
+    if hasattr(args, "modelid_target") and not _explicit("--modelid_target"):
+        args.modelid_target = OFFICIAL_REPRODUCTION_MODEL_ID
+        applied["modelid_target"] = args.modelid_target
+    if hasattr(args, "scheduler_target") and not _explicit("--scheduler_target"):
+        args.scheduler_target = OFFICIAL_REPRODUCTION_SCHEDULER
+        applied["scheduler_target"] = args.scheduler_target
+    if not _explicit("--model_revision") and getattr(args, "model_revision", None) in (None, ""):
+        args.model_revision = OFFICIAL_REPRODUCTION_REVISION
+        applied["model_revision"] = args.model_revision
+    applied["dtype_note"] = (
+        "compute dtype follows the fork global (torch.float32); official upstream "
+        "uses fp16 — revision='fp16' selects the fp16 weight variant only"
+    )
+    applied["inversion_note"] = (
+        "official-compatible inversion via invert_z0 (empty prompt, guidance_scale=1, "
+        "DPM inverse-scheduler timesteps); not byte-identical to upstream "
+        "inverse_stable_diffusion.py"
+    )
+    return applied

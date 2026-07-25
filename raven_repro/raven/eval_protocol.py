@@ -95,7 +95,13 @@ PROVIDER_DEFAULTS = {
     "HSTR": {"hstr_seed": 999999, "fix_gt": 1},
     "HSQR": {"hsqr_seed": 999999, "fix_gt": 1, "delta": 0},
     "GS": {
-        "gs_protocol_mode": "legacy",
+        # Default is official_compatible; legacy must be requested explicitly.
+        # Only a fallback/type hint here — formal GS rows always carry
+        # gs_protocol_mode explicitly, so flipping this does not change existing
+        # provider_config hashes. gs_detection_mode is deliberately NOT part of
+        # the embedding-config hash (it is a detection-time policy, not a
+        # watermark-construction parameter).
+        "gs_protocol_mode": "official_compatible",
         "message_width_in_bytes": 32,
         "l": 1,
         "num_replications": 64,
