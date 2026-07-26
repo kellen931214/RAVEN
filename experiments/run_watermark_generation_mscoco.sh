@@ -21,7 +21,11 @@ export NUMEXPR_NUM_THREADS=1
 export TOKENIZERS_PARALLELISM=false
 
 MODEL_ID="${MODEL_ID:-RedbeardNZ/stable-diffusion-2-1-base}"
-OUTPUT_DIR="${OUTPUT_DIR:-/workspace/data/watermarked}"
+# Canonical layout (migration 2026-07-26): leaving OUTPUT_DIR empty lets the
+# generator route each method to its own root (data/tr/, data/gs/); clean images
+# always go to data/clean/<dataset>/.
+OUTPUT_DIR="${OUTPUT_DIR:-}"
+CLEAN_OUTPUT_DIR="${CLEAN_OUTPUT_DIR:-${ROOT_DIR}/data/clean}"
 NUM_PAIRS="${NUM_PAIRS:-1000}"
 
 printf '[%s] Starting MS-COCO watermarked image generation\n' "$(date -Iseconds)"
@@ -33,8 +37,9 @@ nvidia-smi
 
 python "${ROOT_DIR}/experiments/generate_watermarked_images.py" \
   --dataset_name mscoco \
-  --prompts_csv "${ROOT_DIR}/data/prompts/mscoco_5000.csv" \
-  --output_dir "${OUTPUT_DIR}" \
+  --prompts_csv "${ROOT_DIR}/data/clean/mscoco/inputs/mscoco_5000.csv" \
+  ${OUTPUT_DIR:+--output_dir "${OUTPUT_DIR}"} \
+  --clean_output_dir "${CLEAN_OUTPUT_DIR}" \
   --wm_types GS TR RID HSTR HSQR \
   --num_pairs "${NUM_PAIRS}" \
   --modelid_target "${MODEL_ID}" \

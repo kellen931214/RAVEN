@@ -642,3 +642,14 @@ legacy reference behavior preservation.
 - Push status: pending
 - Entry point: `experiments/run_raven_formal_eval.py`
 - Formal output eligibility: code change validated; centered full evaluation not run.
+
+## 2026-07-26 — Canonical data/output layout migration
+
+All data and run outputs were reorganised into five canonical roots: `data/clean/`,
+`data/tr/`, `data/gs/`, `outputs/tr/`, `outputs/gs/`. No image pixels were re-encoded
+and nothing was regenerated; every moved file's SHA-256 was verified unchanged and the
+TR and GS pairing audits pass at the new locations.
+
+Earlier entries in this changelog reference pre-migration paths. They are kept as
+written (they are a historical log); resolve them with the old→new prefix table in
+`audit/path_migration_20260726.md`.

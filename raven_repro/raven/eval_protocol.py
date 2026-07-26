@@ -15,6 +15,125 @@ from typing import Any, Iterable, Mapping, Sequence
 
 METRIC_PROTOCOL_VERSION = "raven_formal_eval_v2_aligned_color"
 
+# --------------------------------------------------------------------------- #
+# Canonical repository data / output layout (migration 2026-07-26)
+# --------------------------------------------------------------------------- #
+# The repository has exactly five data/output roots. Nothing else may be created
+# at the top of ``data/`` or ``outputs/``:
+#
+#   data/clean/   original clean images + the metadata that defines them
+#   data/tr/      Tree-Ring watermarked images + metadata
+#   data/gs/      Gaussian Shading watermarked images + metadata
+#   outputs/tr/   every Tree-Ring run artifact (attack/eval/metrics/provenance/log)
+#   outputs/gs/   every Gaussian Shading run artifact
+#
+# Small gates / smoke tests / dry-runs must NOT be written into outputs/; use
+# ``scratch_run_root()`` (a /tmp directory) instead.
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+DATA_ROOT = REPO_ROOT / "data"
+OUTPUTS_ROOT = REPO_ROOT / "outputs"
+CLEAN_DATA_ROOT = DATA_ROOT / "clean"
+
+# method -> (watermarked data root, run output root)
+METHOD_DATA_ROOTS: dict[str, Path] = {
+    "TR": DATA_ROOT / "tr",
+    "GS": DATA_ROOT / "gs",
+}
+METHOD_OUTPUT_ROOTS: dict[str, Path] = {
+    "TR": OUTPUTS_ROOT / "tr",
+    "GS": OUTPUTS_ROOT / "gs",
+}
+
+# Methods whose formal protocol includes the attacked-clean recalibration branch.
+# Everything else must never produce attacked-clean artifacts.
+ATTACK_CLEAN_METHODS = frozenset({"TR"})
+
+
+def method_data_root(method: str) -> Path:
+    """Canonical watermarked-data root for ``method`` (fail closed on unknown)."""
+    key = str(method).upper()
+    try:
+        return METHOD_DATA_ROOTS[key]
+    except KeyError:
+        raise ValueError(
+            f"no canonical data root for method {method!r}; "
+            f"known methods: {sorted(METHOD_DATA_ROOTS)}"
+        ) from None
+
+
+def method_output_root(method: str) -> Path:
+    """Canonical run-output root for ``method`` (fail closed on unknown)."""
+    key = str(method).upper()
+    try:
+        return METHOD_OUTPUT_ROOTS[key]
+    except KeyError:
+        raise ValueError(
+            f"no canonical output root for method {method!r}; "
+            f"known methods: {sorted(METHOD_OUTPUT_ROOTS)}"
+        ) from None
+
+
+def source_metadata_path(method: str, dataset: str) -> Path:
+    """Canonical source metadata CSV for a generated cohort."""
+    return method_data_root(method) / dataset / str(method).upper() / "metadata.csv"
+
+
+def clean_data_dir(dataset: str, method: str | None = None) -> Path:
+    """Canonical clean-image directory for a dataset (GS cohorts nest under GS/)."""
+    root = CLEAN_DATA_ROOT / dataset
+    if method is not None and str(method).upper() == "GS":
+        return root / "GS"
+    return root
+
+
+def formal_run_key(source_manifest_sha256: str, attack_config_hash: str) -> str:
+    """Stable run key from content hashes — deliberately NOT a timestamp.
+
+    Re-running the same method/dataset/variant with the same source manifest and
+    attack config resolves to the same output root, so work is continued with
+    ``--resume`` instead of piling up a new timestamped directory each time.
+    """
+    if not source_manifest_sha256 or not attack_config_hash:
+        raise ValueError("run key requires both source manifest and attack config hashes")
+    return f"{str(source_manifest_sha256)[:12]}_{str(attack_config_hash)[:12]}"
+
+
+def formal_output_root(
+    method: str, dataset: str, variant: str, run_key: str
+) -> Path:
+    """Canonical formal-run output root: outputs/<method>/<dataset>/<variant>/<run-key>."""
+    for name, value in (("dataset", dataset), ("variant", variant), ("run_key", run_key)):
+        text = str(value)
+        if not text or "/" in text or text in {".", ".."}:
+            raise ValueError(f"invalid {name} path component: {value!r}")
+    return method_output_root(method) / dataset / variant / run_key
+
+
+def scratch_run_root(method: str, purpose: str) -> Path:
+    """Throwaway root for gates / smoke tests / dry-runs.
+
+    Small non-formal runs must never be written under ``outputs/``. The caller
+    deletes the directory on success and keeps (and reports) it on failure.
+    """
+    import tempfile
+
+    safe_method = str(method).upper()
+    safe_purpose = "".join(c if c.isalnum() or c in "-_" else "-" for c in str(purpose))
+    return Path(tempfile.mkdtemp(prefix=f"raven-{safe_method.lower()}-{safe_purpose}-"))
+
+
+def assert_canonical_output_root(path: str | Path, method: str) -> Path:
+    """Fail closed when a run would write outside its canonical method root."""
+    resolved = Path(path).resolve()
+    expected = method_output_root(method).resolve()
+    if resolved != expected and expected not in resolved.parents:
+        raise ValueError(
+            f"output root {resolved} is outside the canonical root for method "
+            f"{str(method).upper()}: {expected}"
+        )
+    return resolved
+
 FORMAL_ATTACK_CONFIG: dict[str, Any] = {
     "model_id": "RedbeardNZ/stable-diffusion-2-1-base",
     "model_revision": "c6a5e9bab8d874d081de76fa270ae0aefa5410ff",

@@ -61,8 +61,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--methods", nargs="+", default=METHODS, choices=METHODS)
     parser.add_argument("--num_pairs", type=int, default=1000)
     parser.add_argument("--model_id", type=str, default="RedbeardNZ/stable-diffusion-2-1-base")
-    parser.add_argument("--output_dir", type=str, default=str(WORKSPACE / "data" / "watermarked"))
-    parser.add_argument("--prompts_csv", type=str, default=str(WORKSPACE / "data" / "prompts" / "mscoco_5000.csv"))
+    # Canonical layout: empty output_dir lets the generator route each method to
+    # its own data root (data/tr/, data/gs/).
+    parser.add_argument("--output_dir", type=str, default="")
+    parser.add_argument("--prompts_csv", type=str,
+                        default=str(WORKSPACE / "data" / "clean" / "mscoco" / "inputs" / "mscoco_5000.csv"))
     parser.add_argument("--max_parallel", type=int, default=0, help="0 means use all currently idle compatible GPUs")
     parser.add_argument("--min_cpu_mem_gb", type=float, default=64.0)
     parser.add_argument("--warn_cpu_mem_gb", type=float, default=96.0)
@@ -105,7 +108,7 @@ def launch_method(args: argparse.Namespace, method: str, gpu_id: str) -> Running
         str(WORKSPACE / "experiments" / "generate_watermarked_images.py"),
         "--dataset_name", "mscoco",
         "--prompts_csv", args.prompts_csv,
-        "--output_dir", args.output_dir,
+        *(["--output_dir", args.output_dir] if args.output_dir else []),
         "--wm_types", method,
         "--num_pairs", str(args.num_pairs),
         "--modelid_target", args.model_id,

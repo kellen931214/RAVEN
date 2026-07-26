@@ -27,6 +27,7 @@ for root in (str(RAVEN_ROOT), str(BENCH_ROOT)):
     if root not in sys.path:
         sys.path.insert(0, root)
 
+from raven.eval_protocol import method_data_root
 from raven.gpu_utils import configure_gpu, finalize_gpu_logging, setup_run_logging, utc_timestamp, write_experiment_records
 from raven.pairing_provenance import (
     GS_PAIRING_PROTOCOL,
@@ -69,9 +70,12 @@ def str_to_bool(value: Any) -> bool:
 def base_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--dataset_name", type=str, default="mscoco")
-    parser.add_argument("--prompts_csv", type=str, default=str(WORKSPACE / "data" / "prompts" / "mscoco_5000.csv"))
-    parser.add_argument("--output_dir", type=str, default=str(WORKSPACE / "data" / "watermarked"))
-    parser.add_argument("--clean_output_dir", type=str, default=None)
+    parser.add_argument("--prompts_csv", type=str, default=None)
+    # Canonical layout (migration 2026-07-26): watermarked images live under
+    # data/<method>/<dataset>/<METHOD>/ and clean images under data/clean/<dataset>/.
+    # --output_dir defaults to the method root resolved in main() from --wm_types.
+    parser.add_argument("--output_dir", type=str, default=None)
+    parser.add_argument("--clean_output_dir", type=str, default=str(WORKSPACE / "data" / "clean"))
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--gpu", type=str, default=None)
     parser.add_argument("--require_free_gpu", type=str_to_bool, default=True)
@@ -110,6 +114,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--resolution", type=int, default=512)
     parser.add_argument("--validate_before", type=str_to_bool, default=True)
     return parser.parse_args()
+
+
+def method_dataset_dir(output_dir: Any, dataset_name: str, wm_type: str) -> Path:
+    """Canonical dataset directory for one method's watermarked output.
+
+    Without an explicit ``--output_dir`` each method writes under its own canonical
+    data root (``data/tr/<dataset>`` / ``data/gs/<dataset>``), so a multi-method run
+    can never collide two methods into one directory.
+    """
+    if output_dir:
+        return Path(output_dir) / dataset_name
+    return method_data_root(wm_type) / dataset_name
 
 
 def deterministic_gs_sampling_seed(base_seed: int, run_id: int) -> int:
@@ -338,7 +354,7 @@ def summarize_metadata(csv_path: Path) -> Dict[str, Any]:
     }
 
 
-def run_method(args: argparse.Namespace, dataset_dir: Path, wm_type: str, prompt_rows: List[Dict[str, str]], guard: Any, device: Any) -> Dict[str, Any]:
+def run_method(args: argparse.Namespace, wm_type: str, prompt_rows: List[Dict[str, str]], guard: Any, device: Any) -> Dict[str, Any]:
     import torch
     from utils.imprint_utils import validate
     from utils.pipe import pipe_utils
@@ -355,14 +371,14 @@ def run_method(args: argparse.Namespace, dataset_dir: Path, wm_type: str, prompt
     if hasattr(wm_provider_cls, "apply_arg_defaults"):
         wm_provider_cls.apply_arg_defaults(args, sys.argv)
 
+    # Each method writes under its own canonical data root unless --output_dir is set.
+    dataset_dir = method_dataset_dir(args.output_dir, args.dataset_name, wm_type)
     method_dir = dataset_dir / wm_type
     method_dir.mkdir(parents=True, exist_ok=True)
-    clean_root = (
-        Path(args.clean_output_dir)
-        if args.clean_output_dir
-        else Path(args.output_dir).resolve().parent / "generated"
-    ) / args.dataset_name
+    clean_root = Path(args.clean_output_dir) / args.dataset_name
     if wm_type == "GS":
+        # GS clean latents are method-specific (shared sampling uniforms), so they are
+        # kept apart from the TR-paired clean images of the same dataset name.
         clean_root = clean_root / "GS"
     clean_root.mkdir(parents=True, exist_ok=True)
     suffix = shard_suffix(args.num_shards, args.shard_index)
@@ -732,7 +748,16 @@ def run_method(args: argparse.Namespace, dataset_dir: Path, wm_type: str, prompt
 
 def main() -> int:
     first = base_parser().parse_known_args()[0]
-    dataset_dir = Path(first.output_dir) / first.dataset_name
+    # Run-level logging lives with the first requested method's canonical dataset dir.
+    first_method = next(
+        (
+            value.upper()
+            for index, value in enumerate(sys.argv)
+            if index and sys.argv[index - 1] == "--wm_types"
+        ),
+        PAPER_WM_METHODS_IN_BENCH[0],
+    )
+    dataset_dir = method_dataset_dir(first.output_dir, first.dataset_name, first_method)
     dataset_dir.mkdir(parents=True, exist_ok=True)
     suffix = shard_suffix(first.num_shards, first.shard_index)
     setup_run_logging(dataset_dir, filename=f"run{suffix}.log")
@@ -767,6 +792,11 @@ def main() -> int:
         if args.device == "cuda" and not torch.cuda.is_available():
             raise RuntimeError("--device cuda requested but torch.cuda.is_available() is false")
         device = torch.device(args.device)
+        if not args.prompts_csv:
+            raise ValueError(
+                "--prompts_csv is required; dataset prompt lists live with the clean "
+                "data they define, e.g. data/clean/<dataset>/inputs/<prompts>.csv"
+            )
         prompt_rows = load_prompts(
             Path(args.prompts_csv),
             args.start_index,
@@ -802,7 +832,7 @@ def main() -> int:
         save_json(dataset_dir / f"paper_settings{suffix}.json", settings)
 
         for wm_type in args.wm_types:
-            summaries[wm_type] = run_method(args, dataset_dir, wm_type, prompt_rows, guard, device)
+            summaries[wm_type] = run_method(args, wm_type, prompt_rows, guard, device)
             guard.check(f"{args.dataset_name}/{wm_type}/method_complete")
         status = "completed"
         return 0

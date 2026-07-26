@@ -16,7 +16,7 @@ REPO = Path(__file__).resolve().parents[1]
 DEFAULT_RUNNER = REPO / "experiments" / "run_raven_formal_eval.py"
 sys.path.insert(0, str(REPO / "raven_repro"))
 
-from raven.eval_protocol import formal_attack_config_hash  # noqa: E402
+from raven.eval_protocol import formal_attack_config_hash, method_output_root  # noqa: E402
 
 
 def parser() -> argparse.ArgumentParser:
@@ -31,8 +31,10 @@ def parser() -> argparse.ArgumentParser:
         type=Path,
         default=REPO / "audit" / "formal_source_manifest.json",
     )
-    result.add_argument("--source-template", default="data/watermarked/{dataset}/{method}/metadata.csv")
-    result.add_argument("--output-root", type=Path, default=Path("outputs/raven_formal_eval"))
+    # Canonical layout (migration 2026-07-26): watermarked cohorts live under
+    # data/<method>/<dataset>/<METHOD>/ and runs under outputs/<method>/.
+    result.add_argument("--source-template", default="data/{method_lower}/{dataset}/{method}/metadata.csv")
+    result.add_argument("--output-root", type=Path, default=None)
     result.add_argument("--expected-count", action="append", default=[], metavar="DATASET=COUNT")
     result.add_argument("--device", default="cuda")
     result.add_argument("--gpu", default=None)
@@ -95,15 +97,22 @@ def run_stage(args, dataset: str, method: str, source: Path, output: Path, count
 
 
 def process_cohort(args, dataset: str, method: str, count: int) -> None:
-    source = (REPO / args.source_template.format(dataset=dataset, method=method)).resolve()
+    source = (
+        REPO
+        / args.source_template.format(
+            dataset=dataset, method=method, method_lower=method.lower()
+        )
+    ).resolve()
     if not source.is_file():
         print(f"waiting: missing source metadata {source}", flush=True)
         return
-    output = (args.output_root / dataset / method).resolve()
+    # Canonical method-aware root: outputs/<method>/<dataset>/<variant>.
+    method_root = args.output_root or method_output_root(method)
+    output = (method_root / dataset / "formal").resolve()
     lock_key = hashlib.sha256(
         f"{dataset}|{method}|{source}|{formal_attack_config_hash()}".encode()
     ).hexdigest()[:16]
-    with CohortLock(args.output_root / "locks" / f"{dataset}_{method}_{lock_key}.lock"):
+    with CohortLock(method_root / "locks" / f"{dataset}_{method}_{lock_key}.lock"):
         run_stage(args, dataset, method, source, output, count, "snapshot")
         run_stage(args, dataset, method, source, output, count, "attack-watermarked")
         if method == "TR":

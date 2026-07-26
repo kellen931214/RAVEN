@@ -532,7 +532,7 @@ def build_parser() -> argparse.ArgumentParser:
     validate.add_argument("--device", default="cuda")
     validate.add_argument("--dtype", default="float16")
     validate.add_argument("--eval-repo", type=Path, default=Path("eval_bench_wm"))
-    validate.add_argument("--l1-records", type=Path, default=Path("outputs/raven_nfpa_tr_eval/diffusiondb/20260714T161952Z/nfpa_l1_scores.jsonl"))
+    validate.add_argument("--l1-records", type=Path, default=Path("outputs/tr/diffusiondb/nfpa_tr_eval/20260714T161952Z/nfpa_l1_scores.jsonl"))
     validate.add_argument("--score", action="store_true")
     validate.add_argument("--debug", action="store_true")
     validate.set_defaults(func=command_validate)

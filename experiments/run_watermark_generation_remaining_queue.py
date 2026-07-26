@@ -34,11 +34,11 @@ from raven.gpu_utils import query_gpu_status
 METHODS = ["GS", "TR", "RID", "HSTR", "HSQR"]
 DATASETS = {
     "diffusiondb": {
-        "prompts_csv": WORKSPACE / "data" / "prompts" / "diffusiondb_1001.csv",
+        "prompts_csv": WORKSPACE / "data" / "clean" / "diffusiondb" / "inputs" / "diffusiondb_1001_prompts.csv",
         "num_pairs": 1001,
     },
     "sd_prompts": {
-        "prompts_csv": WORKSPACE / "data" / "prompts" / "sd_prompts_8192.csv",
+        "prompts_csv": WORKSPACE / "data" / "clean" / "sd_prompts" / "inputs" / "sd_prompts_8192.csv",
         "num_pairs": 8192,
     },
 }
@@ -76,7 +76,9 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Queue DiffusionDB and SD-Prompts watermarked image generation")
     parser.add_argument("--datasets", nargs="+", default=["diffusiondb", "sd_prompts"], choices=sorted(DATASETS.keys()))
     parser.add_argument("--methods", nargs="+", default=METHODS, choices=METHODS)
-    parser.add_argument("--output_dir", type=str, default=str(WORKSPACE / "data" / "watermarked"))
+    # Canonical layout: empty output_dir lets the generator route each method to
+    # its own data root (data/tr/, data/gs/).
+    parser.add_argument("--output_dir", type=str, default="")
     parser.add_argument("--model_id", type=str, default="RedbeardNZ/stable-diffusion-2-1-base")
     parser.add_argument("--max_parallel", type=int, default=4)
     parser.add_argument("--poll_seconds", type=int, default=60)
@@ -137,7 +139,7 @@ def launch_job(args: argparse.Namespace, job: PendingJob, gpu_id: str) -> Runnin
         str(WORKSPACE / "experiments" / "generate_watermarked_images.py"),
         "--dataset_name", job.dataset,
         "--prompts_csv", str(job.prompts_csv),
-        "--output_dir", args.output_dir,
+        *(["--output_dir", args.output_dir] if args.output_dir else []),
         "--wm_types", job.method,
         "--num_pairs", str(job.num_pairs),
         "--modelid_target", args.model_id,

@@ -1316,7 +1316,7 @@ def build_parser() -> argparse.ArgumentParser:
     formal.add_argument("--eval-repo", type=Path, default=Path(__file__).resolve().parents[2] / "eval_bench_wm")
     formal.add_argument("--device", choices=["cuda", "cpu"], default="cuda")
     run = sub.add_parser("run-sequential")
-    run.add_argument("--root", type=Path, default=Path("outputs/raven_nfpa_tr_eval"))
+    run.add_argument("--root", type=Path, default=Path("outputs/tr/diffusiondb/nfpa_tr_eval"))
     run.add_argument("--diffusiondb-p1-dir", type=Path, required=True)
     run.add_argument("--mscoco-p1-dir", type=Path, required=True)
     return parser

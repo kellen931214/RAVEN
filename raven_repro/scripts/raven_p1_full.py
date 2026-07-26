@@ -1001,7 +1001,7 @@ def build_parser() -> argparse.ArgumentParser:
     gate = sub.add_parser("validate-gate")
     gate.add_argument("--output-dir", type=Path, required=True)
     run = sub.add_parser("run-sequential")
-    run.add_argument("--root", type=Path, default=Path("outputs/raven_p1_full"))
+    run.add_argument("--root", type=Path, default=Path("outputs/tr/diffusiondb/p1_full"))
     run.add_argument("--diffusiondb-manifest", type=Path, required=True)
     run.add_argument("--diffusiondb-baseline-records", type=Path, required=True)
     run.add_argument("--mscoco-manifest", type=Path, required=True)

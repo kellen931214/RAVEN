@@ -28,11 +28,15 @@ RAVEN_REPRO = REPO / "raven_repro"
 sys.path.insert(0, str(RAVEN_REPRO))
 
 from raven.eval_protocol import (  # noqa: E402
+    ATTACK_CLEAN_METHODS,
     CLIP_CONFIG,
     FORMAL_ATTACK_CONFIG,
     METRIC_PROTOCOL_VERSION,
+    assert_canonical_output_root,
     assert_formal_debug_info,
     canonical_json_hash,
+    formal_output_root,
+    formal_run_key,
     current_clip_provenance,
     formal_attack_config_hash,
     formal_runtime_provenance,
@@ -109,6 +113,19 @@ def storage_mode_metadata(
     """
     method = method.upper()
     tr_recalibrated = bool(attack_clean_enabled) and method == "TR"
+    if method not in ATTACK_CLEAN_METHODS:
+        # attacked-clean recalibration is not part of this method's protocol at all,
+        # and the per-sample input.png copy is redundant (the source watermarked image
+        # is already SHA-pinned), so omitting both is the COMPLETE protocol here — not
+        # a reduced "storage-light" variant of it.
+        return {
+            "storage_light": bool(storage_light),
+            "attack_clean_enabled": False,
+            "attacked_clean_count": 0,
+            "recalibrated_metrics_available": False,
+            "formal_protocol_complete": True,
+            "result_classification": "formal_complete",
+        }
     return {
         "storage_light": bool(storage_light),
         "attack_clean_enabled": bool(attack_clean_enabled),
@@ -1266,7 +1283,25 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional verified prior formal snapshot index; prevents reading a mutable cohort.",
     )
     parser.add_argument("--attack-config", type=Path, default=None)
-    parser.add_argument("--output-root", type=Path, required=True)
+    parser.add_argument(
+        "--output-root", type=Path, default=None,
+        help=(
+            "Explicit run output root. Omit to use the canonical method-aware root "
+            "outputs/<tr|gs>/<dataset>/<variant>/<run-key>. Any explicit value must "
+            "still live under the canonical root for --method."
+        ),
+    )
+    parser.add_argument(
+        "--variant", default="formal",
+        help="Variant folder under the canonical method/dataset root (default: formal).",
+    )
+    parser.add_argument(
+        "--run-key", default=None,
+        help=(
+            "Stable run key (default: <source-manifest-short-sha>_<attack-config-short-hash>). "
+            "Deliberately not a timestamp so re-runs resume the same root."
+        ),
+    )
     parser.add_argument("--expected-count", type=int, required=True)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--resume", action="store_true")
@@ -1301,16 +1336,30 @@ def main(argv: Iterable[str] | None = None) -> int:
     if args.expected_count <= 0 or args.batch_size <= 0:
         raise ValueError("expected-count and batch-size must be positive")
     args.method = args.method.upper()
+    # Methods outside the TR/NFPA protocol never run the attacked-clean branch and
+    # never need the redundant per-sample input.png copy, so their storage-light /
+    # no-attack-clean posture is the default rather than something to remember.
+    if args.method not in ATTACK_CLEAN_METHODS:
+        args.attack_clean_enabled = False
+        args.storage_light = True
     require_valid_storage_mode(args.storage_light, args.attack_clean_enabled)
-    if not args.attack_clean_enabled and args.method != "TR":
-        raise RuntimeError("--attack-clean-enabled false only applies to the TR protocol")
     if args.stage == "attack-clean" and not args.attack_clean_enabled:
         raise RuntimeError("attack-clean stage requested but attack-clean is disabled")
     if not args.device.startswith("cuda"):
         raise RuntimeError("formal RAVEN evaluation forbids CPU fallback")
     if args.dtype != "float16":
         raise RuntimeError("formal RAVEN evaluation requires float16")
-    args.output_root = args.output_root.resolve()
+    if args.output_root is None:
+        # Canonical, method-aware, content-addressed root (never a timestamp dir).
+        run_key = args.run_key or formal_run_key(
+            sha256_path(args.source_manifest), formal_attack_config_hash(
+                load_formal_attack_config(args.attack_config) if args.attack_config else None
+            ),
+        )
+        args.output_root = formal_output_root(
+            args.method, args.dataset, args.variant, run_key
+        )
+    args.output_root = assert_canonical_output_root(args.output_root, args.method)
     if args.gpu is not None:
         # Keep --gpu tied to the physical nvidia-smi index used in provenance.
         os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"

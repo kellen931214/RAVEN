@@ -28,7 +28,7 @@ The reproduction model is `RedbeardNZ/stable-diffusion-2-1-base` at revision `c6
 ```bash
 python scripts/run_raven.py \
   --input path/to/watermarked.png \
-  --output_dir outputs/raven_test \
+  --output_dir /tmp/raven-tr-ablation \
   --model_id RedbeardNZ/stable-diffusion-2-1-base \
   --steps 50 \
   --strength 0.15 \
@@ -54,8 +54,8 @@ python scripts/run_raven.py \
 
 ```bash
 python scripts/attack_folder.py \
-  --input_dir data/watermarked \
-  --output_dir outputs/raven_folder \
+  --input_dir data/tr/diffusiondb/TR \
+  --output_dir /tmp/raven-tr-folder \
   --model_id RedbeardNZ/stable-diffusion-2-1-base \
   --steps 50 \
   --strength 0.15 \
@@ -77,18 +77,24 @@ Each image is saved into its own subdirectory. Failed files are listed in `faile
 ## Evaluation
 
 The only formal evaluation entrypoint is `experiments/run_raven_formal_eval.py`.
-Run stages separately against one immutable timestamped output root:
+Run stages separately against one output root. Omit `--output-root` and it resolves to
+the canonical, content-addressed root
+`outputs/<tr|gs>/<dataset>/<variant>/<source-manifest-sha>_<attack-config-hash>` — not a
+timestamp — so an identical re-run resumes the same root instead of creating another
+directory. An explicit `--output-root` must still live under the canonical root for
+`--method`.
 
 ```bash
 python experiments/run_raven_formal_eval.py \
   --dataset diffusiondb --method TR \
-  --source-metadata /absolute/path/to/metadata.csv \
-  --output-root outputs/raven_formal_eval/diffusiondb/TR/$(date -u +%Y%m%dT%H%M%SZ) \
+  --source-metadata data/tr/diffusiondb/TR/metadata.csv \
   --expected-count 30 --batch-size 10 --device cuda --gpu 0 --stage snapshot
 ```
 
 Then run `attack-watermarked`, `attack-clean` for TR, `verify`, `quality`, `fid`,
 `clip`, `aggregate`, and `validate` with the identical arguments plus `--resume`.
+`attack-clean` belongs to the TR protocol only; GS and the other methods never run it
+and never write a per-sample `input.png`.
 Formal color transfer is exclusively `paper_exact_two_stage_aligned` and consumes
 `effective_source_flow_dx_image_px` / `effective_source_flow_dy_image_px`.
 Do not run a full cohort until the 2/10/30 gates pass in fresh output roots.
@@ -146,9 +152,9 @@ Audit metadata and image pairing before loading a model:
 
 ```bash
 python scripts/audit_dataset.py \
-  --metadata /workspace/data/watermarked/mscoco/TR/metadata.csv \
+  --metadata /workspace/RAVEN/data/tr/diffusiondb/TR/metadata.csv \
   --workspace-root /workspace \
-  --output outputs/audit/mscoco_TR.json
+  --output outputs/tr/diffusiondb/_audit/diffusiondb_TR.json
 ```
 
 Use only `experiments/run_raven_formal_eval.py` for current formal evaluation.
