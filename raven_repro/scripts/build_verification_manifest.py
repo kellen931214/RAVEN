@@ -201,7 +201,13 @@ def main() -> int:
             "generation_config_sha256": attack.get("generation_config_sha256", ""),
             "watermark_config_sha256": attack.get("watermark_config_sha256", ""),
             **(
-                {field: attack.get(field, "") for field in gs_fields_for_rows([source])}
+                {
+                    # The cohort's own pairing protocol decides which GS provenance
+                    # fields exist (V1 has gs_sampling_seed, V2 does not), so the
+                    # detector needs the protocol identity, not a guess.
+                    "protocol": str(source.get("protocol", "")),
+                    **{field: attack.get(field, "") for field in gs_fields_for_rows([source])},
+                }
                 if args.method == "GS"
                 else {}
             ),

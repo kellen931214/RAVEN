@@ -19,6 +19,108 @@ This file records implementation bugs, validated non-bugs, ablations, and the ev
 
 
 
+## 2026-07-27 — GS detector rejected every V2 shared-clean cohort (`missing gs_sampling_seed`)
+
+### Problem
+The GS verify stage failed for the whole cohort with
+`run_id=<id>: missing gs_sampling_seed` (10/10 rows errored in the 10-sample
+gate), so no Gaussian Shading RAVEN evaluation could reach `verify`, let alone
+`aggregate`/`validate`.
+
+### Root cause
+Two stale V1-only assumptions in the reachable GS detector path:
+1. `extract_verification_scores.py` hard-required the fixed pair
+   (`gs_sampling_seed`, `gs_sampling_uniform_sha256`). `gs_sampling_seed` exists
+   only in the V1 GS pairing protocol; the V2 shared-TR-clean protocol derives
+   the uniforms deterministically from the shared Tree-Ring latent and therefore
+   defines no sampling seed (see `pairing_provenance.GS_CORE_FIELDS`, which
+   removes it deliberately). The authoritative per-protocol field tuple existed
+   and was simply not used here.
+2. `provider_kwargs()` passed `gs_sampling_seed=integer(row, …, 0)`, i.e. it
+   would have silently constructed the detector with a fabricated seed 0 for any
+   cohort without one. Detection never uses the sampling seed (the target payload
+   comes from the secret), so the value was pure fake provenance.
+
+The verification manifest also did not carry the cohort's `protocol` field, so
+the detector had no way to know which field set applies.
+
+### Affected files
+- `raven_repro/scripts/extract_verification_scores.py:gs_sampling_provenance`
+  (new), `:provider_kwargs`, GS branch of `main`.
+- `raven_repro/scripts/build_verification_manifest.py:main` (GS row block).
+- `raven_repro/tests/test_verification_pipeline.py`.
+
+### Affected outputs
+No formal output was produced by the failing path — the 10-sample gate root in
+`/tmp` was the only artifact and it was preserved for diagnosis, then removed.
+No existing result is invalidated: the GS detector never ran to completion
+before this fix, so there is no earlier GS evaluation carrying a fabricated
+sampling seed.
+
+### Fix
+`gs_sampling_provenance(row, identifier)` resolves the required sampling fields
+from `gs_fields_for_protocol(row["protocol"])`, requires
+`gs_sampling_uniform_sha256` for every supported protocol, requires
+`gs_sampling_seed` only for V1, and fails closed on an unknown protocol.
+`provider_kwargs("GS", …)` includes `gs_sampling_seed` only when the row
+actually has one. `build_verification_manifest.py` now writes the cohort's
+`protocol` into GS manifest rows so the protocol identity travels with the data.
+
+### Reused code
+`raven.pairing_provenance.gs_fields_for_protocol` / `gs_fields_for_rows` — the
+same authoritative V1/V2 field-set resolver already used by
+`run_raven_formal_eval.py:snapshot_stage` and `build_verification_manifest.py`.
+No second field list was introduced.
+
+### Historical bug coverage
+Reviewed the 2026-07-27 GS shared-clean V2 and TR flat-layout entries, which
+introduced the V2 field set. Searched the repository for `gs_sampling_seed`:
+remaining occurrences are the CLI flag and generation-time uniform draw in
+`eval_bench_wm/utils/wm/gs_provider.py` (correct — V1 generation), the column
+name in the score schema (kept, empty for V2), and the migration/audit history.
+No other reachable path still requires the V1-only field.
+
+### Regression prevention
+New tests assert that a V2 row resolves to `gs_sampling_uniform_sha256` alone,
+that a V1 row still requires both fields, that a V1 row missing its seed raises,
+that an unknown protocol fails closed, that GS detector kwargs never fabricate a
+sampling seed, and that the verification manifest records `protocol`.
+
+### Validation
+- `python -m pytest -q raven_repro/tests/test_verification_pipeline.py`: 5 passed.
+- Full detector probe on the preserved 10-sample gate attack records
+  (`build_verification_manifest.py` + `extract_verification_scores.py --method GS`,
+  `CUDA_VISIBLE_DEVICES=0`): 10 manifest rows, **0 errors**; before-attack
+  bit accuracy `1.0` on every row, attacked bit accuracy ≈0.47–0.55, clean-image
+  bit accuracy ≈0.45–0.55, `gs_official_tau_onebit=0.6484375`.
+
+### Watermark integrity
+- Source-data validity: `data/gs/diffusiondb_shared_tr/GS/metadata.csv`, 1001
+  rows, protocol `gaussian_shading_shared_tr_clean_v2`, unchanged.
+- Clean/watermarked pairing status: pairing audit passes in the snapshot stage.
+- Base-latent uniqueness status: unchanged (per-run unique).
+- Watermark target and mask status: detector target/mask SHAs are still verified
+  against the source row; the probe passed those checks for all 10 rows.
+- Attack-pairing status: GS attacks the watermarked role only;
+  `attacked_clean_count` stays 0.
+- Detector score definition: GS `bit_accuracy`, higher_is_watermarked.
+- Threshold calibration source: official beta-tail `tau_onebit` (0.6484375);
+  no empirical clean-negative 1%-FPR calibration was performed.
+- Actual empirical FPR: not measured (no clean-negative cohort evaluation).
+- Quality metric reference / CLIP / FID staging: unchanged by this fix.
+- Outputs requiring regeneration: none.
+
+### Git provenance
+- Repository: `kellen931214/RAVEN`
+- Branch: `agent/cleanup-quality-decomposition`
+- Commit: pending at time of entry
+- Remote branch: `origin/agent/cleanup-quality-decomposition`
+- Push status: pending
+- Entry point: `experiments/run_raven_formal_eval.py` (verify stage)
+- Formal output eligibility: bug fix only; the GS runs it unblocks are recorded
+  by `experiments/update_experiment_table.py` when they finish.
+
+
 ## 2026-07-27 — TensorFlow FID protocol becomes the default FID
 
 ### Problem

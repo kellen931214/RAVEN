@@ -73,14 +73,49 @@ def integer(row: dict[str, str], names: tuple[str, ...], default: int) -> int:
     return int(value) if value is not None else default
 
 
+def gs_sampling_provenance(row: dict[str, str], identifier: str) -> dict[str, str]:
+    """Sampling-provenance fields this row's own GS pairing protocol defines.
+
+    Which fields exist is a cohort property: V1 drew the watermark uniforms from
+    ``gs_sampling_seed``, while V2 derives them from the shared Tree-Ring latent
+    and therefore has no sampling seed at all. Requiring a fixed V1-only pair
+    rejects every valid V2 cohort, and defaulting the seed would record a number
+    that never existed.
+    """
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from raven.pairing_provenance import gs_fields_for_protocol
+
+    protocol = str(row.get("protocol", ""))
+    protocol_fields = gs_fields_for_protocol(protocol)
+    fields = [
+        field
+        for field in ("gs_sampling_seed", "gs_sampling_uniform_sha256")
+        if field in protocol_fields
+    ]
+    if "gs_sampling_uniform_sha256" not in fields:
+        raise RuntimeError(
+            f"run_id={identifier}: GS protocol {protocol!r} defines no sampling "
+            "uniform provenance"
+        )
+    resolved: dict[str, str] = {}
+    for field in fields:
+        if not str(row.get(field, "")):
+            raise RuntimeError(f"run_id={identifier}: missing {field}")
+        resolved[field] = row[field]
+    return resolved
+
+
 def provider_kwargs(method: str, row: dict[str, str]) -> dict:
     if method == "GS":
         secret_index = integer(row, ("gs_secret_index", "offset"), 0)
-        return {
-            "offset": secret_index,
-            "gs_secret_index": secret_index,
-            "gs_sampling_seed": integer(row, ("gs_sampling_seed",), 0),
-        }
+        kwargs = {"offset": secret_index, "gs_secret_index": secret_index}
+        # Only V1 cohorts carry a GS sampling seed. Detection never uses it (the
+        # target payload comes from the secret, not from the uniforms), so a
+        # missing seed must stay absent rather than be faked as 0.
+        sampling_seed = first(row, "gs_sampling_seed")
+        if sampling_seed is not None:
+            kwargs["gs_sampling_seed"] = int(sampling_seed)
+        return kwargs
     if method == "TR":
         return {
             "w_seed": integer(row, ("w_seed", "watermark_seed"), 999999),
@@ -335,10 +370,7 @@ def main() -> int:
                             )
                         record[field] = actual
                     record["gs_protocol_mode"] = provider.gs_protocol_mode
-                    for field in ("gs_sampling_seed", "gs_sampling_uniform_sha256"):
-                        if not str(row.get(field, "")):
-                            raise RuntimeError(f"run_id={identifier}: missing {field}")
-                        record[field] = row[field]
+                    record.update(gs_sampling_provenance(row, str(identifier)))
                     thresholds = provider.official_thresholds()
                     record["gs_official_tau_onebit"] = thresholds["tau_onebit"]
                     record["gs_official_tau_bits"] = thresholds["tau_bits"]

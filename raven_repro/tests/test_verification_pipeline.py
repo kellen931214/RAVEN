@@ -94,3 +94,45 @@ def test_gs_separates_legacy_official_and_clean_calibrated_thresholds():
     assert report["statistically_valid_for_target_fpr"] is False
     assert "key_hex" not in audited[0]
     assert audited[0]["attacked_decoded_bits_sha256"] == "attack-0"
+
+
+extractor = load_script("extract_verification_scores")
+
+
+def test_gs_sampling_provenance_follows_the_cohort_pairing_protocol():
+    """V2 shared-clean cohorts have no gs_sampling_seed; V1 cohorts require it."""
+    v2 = {
+        "protocol": "gaussian_shading_shared_tr_clean_v2",
+        "gs_sampling_uniform_sha256": "a" * 64,
+    }
+    assert extractor.gs_sampling_provenance(v2, "0") == {
+        "gs_sampling_uniform_sha256": "a" * 64
+    }
+
+    v1 = {
+        "protocol": "gaussian_shading_shared_uniform_v1",
+        "gs_sampling_seed": "1042",
+        "gs_sampling_uniform_sha256": "b" * 64,
+    }
+    assert extractor.gs_sampling_provenance(v1, "0") == {
+        "gs_sampling_seed": "1042",
+        "gs_sampling_uniform_sha256": "b" * 64,
+    }
+    with pytest.raises(RuntimeError, match="missing gs_sampling_seed"):
+        extractor.gs_sampling_provenance(
+            {k: v for k, v in v1.items() if k != "gs_sampling_seed"}, "0"
+        )
+    with pytest.raises(ValueError, match="unsupported GS pairing protocol"):
+        extractor.gs_sampling_provenance({"protocol": ""}, "0")
+
+
+def test_gs_detector_kwargs_never_fake_a_missing_sampling_seed():
+    v2 = extractor.provider_kwargs("GS", {"gs_secret_index": "7"})
+    assert v2 == {"offset": 7, "gs_secret_index": 7}
+    v1 = extractor.provider_kwargs("GS", {"gs_secret_index": "7", "gs_sampling_seed": "9"})
+    assert v1 == {"offset": 7, "gs_secret_index": 7, "gs_sampling_seed": 9}
+
+
+def test_gs_verification_manifest_carries_the_cohort_pairing_protocol():
+    source = (ROOT / "scripts" / "build_verification_manifest.py").read_text(encoding="utf-8")
+    assert '"protocol": str(source.get("protocol", ""))' in source
