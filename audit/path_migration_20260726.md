@@ -16,15 +16,15 @@ outputs/
 ```
 
 Canonical helpers live in `raven_repro/raven/eval_protocol.py`
-(`method_data_root`, `method_output_root`, `source_metadata_path`, `clean_data_dir`,
-`formal_output_root`, `formal_run_key`, `scratch_run_root`,
-`assert_canonical_output_root`).
+(`method_data_root`, `method_output_root`, `cohort_dir`, `source_metadata_path`,
+`watermarked_image_path`, `clean_data_dir`, `formal_output_root`, `formal_run_key`,
+`scratch_run_root`, `assert_canonical_output_root`).
 
 ## Current cohorts
 
 | Cohort | Clean | Watermarked | Runs |
 |---|---|---|---|
-| TR diffusiondb 1001 | `data/clean/diffusiondb/` | `data/tr/diffusiondb/TR/` | `outputs/tr/diffusiondb/` |
+| TR diffusiondb 1001 | `data/clean/diffusiondb/` | `data/tr/diffusiondb/` | `outputs/tr/diffusiondb/` |
 | GS diffusiondb 1001 (TR-matched) | `data/clean/gs_diffusiondb_1001_match_tr/GS/` | `data/gs/gs_diffusiondb_1001_match_tr/GS/` | `outputs/gs/gs_diffusiondb_1001_match_tr/` |
 | GS 10-pair gates | `data/clean/gs_*_10_50step/GS/` | `data/gs/gs_*_10_50step/GS/` | `outputs/gs/gs_*_10_50step/` |
 

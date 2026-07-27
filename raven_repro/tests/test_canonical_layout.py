@@ -16,6 +16,8 @@ sys.path.insert(0, str(REPO / "raven_repro"))
 from raven.eval_protocol import (
     ATTACK_CLEAN_METHODS,
     CLEAN_DATA_ROOT,
+    FLAT_COHORT_METHODS,
+    cohort_dir,
     METHOD_DATA_ROOTS,
     METHOD_OUTPUT_ROOTS,
     assert_canonical_output_root,
@@ -26,6 +28,7 @@ from raven.eval_protocol import (
     method_output_root,
     scratch_run_root,
     source_metadata_path,
+    watermarked_image_path,
 )
 
 
@@ -61,9 +64,39 @@ def test_unknown_method_fails_closed():
 def test_source_metadata_paths_are_method_and_dataset_specific():
     tr = source_metadata_path("TR", "diffusiondb")
     gs = source_metadata_path("GS", "diffusiondb_shared_tr")
-    assert tr == REPO / "data/tr/diffusiondb/TR/metadata.csv"
+    # TR uses the flat cohort layout (moved 2026-07-27); GS keeps the nested one.
+    assert tr == REPO / "data/tr/diffusiondb/metadata.csv"
     assert gs == REPO / "data/gs/diffusiondb_shared_tr/GS/metadata.csv"
     assert tr.is_file(), "the canonical Tree-Ring source cohort must exist"
+
+
+def test_flat_and_nested_cohort_layouts_are_per_method():
+    assert FLAT_COHORT_METHODS == frozenset({"TR"})
+    assert cohort_dir("TR", "diffusiondb") == REPO / "data/tr/diffusiondb"
+    assert cohort_dir("GS", "ds") == REPO / "data/gs/ds/GS"
+    assert watermarked_image_path("TR", "diffusiondb", 0) == (
+        REPO / "data/tr/diffusiondb/000000/watermarked.png"
+    )
+    assert watermarked_image_path("GS", "ds", 7) == (
+        REPO / "data/gs/ds/GS/000007/watermarked.png"
+    )
+
+
+def test_tr_cohort_is_flat_on_disk_and_matches_its_metadata():
+    """The real TR cohort resolves through the canonical helpers, not by string."""
+    import csv as _csv
+
+    metadata = source_metadata_path("TR", "diffusiondb")
+    with metadata.open(newline="", encoding="utf-8") as handle:
+        rows = list(_csv.DictReader(handle))
+    assert len(rows) == 1001
+    # No TR/ level remains, and every recorded path is the canonical flat one.
+    assert not (REPO / "data/tr/diffusiondb/TR").exists()
+    for row in rows[:5] + rows[-1:]:
+        expected = watermarked_image_path("TR", "diffusiondb", row["run_id"])
+        assert row["watermarked_path"] == str(expected)
+        assert row["watermarked_image_path"] == str(expected)
+        assert expected.is_file()
 
 
 def test_shared_clean_cohorts_reuse_the_tr_clean_directory():

@@ -6,6 +6,7 @@ This file records implementation bugs, validated non-bugs, ablations, and the ev
 
 | Date | Area | Status | Evidence |
 | --- | --- | --- | --- |
+| 2026-07-27 | TR flat cohort canonical path migration | Canonical TR source metadata is `data/tr/diffusiondb/metadata.csv`; all 1001 TR watermarked image paths point at `data/tr/diffusiondb/<run_id>/watermarked.png`; existing GS shared-clean V2 rows were repointed at the new TR metadata SHA and pairing hashes recomputed with the formal helper. | `experiments/migrate_tr_flat_layout.py`; `experiments/migrate_gs_shared_clean_source.py`; `data/gs/diffusiondb_shared_tr/GS/cross_method_shared_clean_audit.json` |
 | 2026-07-21 | Formal provenance and validation hardening | Source HEAD self-reference removed; runtime manifest copy, clean-tree/current-commit binding, pairing re-audit, detector tensor target/mask checks, explicit pre-color hashes, runtime scheduler/device/dtype/package provenance, threshold-specific table fields, and accurate no-color FID definitions added. CPU regression suite evidence is recorded below. | audit/formal_eval_protocol.md; formal runner and protocol regression tests |
 | 2026-07-18 | Formal evaluation protocol audit | Implemented immutable snapshots, explicit formal attack/debug assertions, effective-grid quality flow, strict resume/FID/provider/CLIP provenance, full/rounded TR reporting, formal waiter/table, and quarantined pre-audit derived outputs. Complete CPU suite: 148 passed; new 2/10/30 GPU gates remain blocked by unavailable NVML, so full eval is not safe. | `audit/formal_eval_protocol.md`; `audit/current_eval_processes.md`; `outputs/legacy_invalid/20260718T072817Z/DO_NOT_USE.md` |
 | 2026-07-17 | Tree-Ring paired generation and formal provenance | Shared-latent source and every derived `TPR=0.177822` result rejected. Per-sample paired latent generation, two-GPU pair sharding, orphan quarantine, fail-closed provenance gates, paired attack config hashes, and two aligned-color-only variants implemented; formal rerun in progress. | `raven_repro/raven/pairing_provenance.py`; `raven_repro/scripts/paired_generation_shards.py`; `raven_repro/scripts/run_diffusiondb_chain_after_clean.py`; `outputs/raven_paired_formal_smoke/diffusiondb/20260717T033000Z/data/watermarked/diffusiondb/TR/shard_merge_audit.json` |
@@ -14,6 +15,116 @@ This file records implementation bugs, validated non-bugs, ablations, and the ev
 | 2026-07-15 | RAVEN exact two-stage color transfer | Implemented and verified. Existing 10 validation pre-color outputs were reused; no DDIM inversion or denoising was rerun. | `raven_repro/raven/color_transfer.py`; `raven_repro/scripts/raven_color_transfer_validation.py`; `outputs/raven_color_transfer_validation/diffusiondb_20260715T042018Z/aggregate_results.md` |
 | 2026-07-14 | NFPA-style Tree-Ring complex L1 evaluation | Completed for DiffusionDB only. MS-COCO was not run after scope was corrected. | `outputs/raven_nfpa_tr_eval/diffusiondb/20260714T161952Z/aggregate_results.json` |
 
+
+
+
+## 2026-07-27 — TR flat cohort canonical path migration and GS shared-clean source refresh
+
+### Problem
+The Tree-Ring cohort was intentionally moved to the flat layout
+`data/tr/diffusiondb/metadata.csv` and
+`data/tr/diffusiondb/<run_id>/watermarked.png`, but reachable code, tests and
+shared-clean metadata still assumed the nested
+`data/tr/diffusiondb/TR/metadata.csv` source path. GS shared-clean V2 rows also
+recorded the old TR metadata path and SHA, which are part of the V2 pairing
+identity.
+
+### Root cause
+Canonical source layout was treated as a global nested method layout instead of
+a per-method cohort fact. TR was moved on disk, while GS was not; therefore only
+TR belongs to the flat cohort set.
+
+### Affected files
+- `raven_repro/raven/eval_protocol.py:cohort_dir`,
+  `:source_metadata_path`, `:watermarked_image_path`.
+- `experiments/generate_gs_from_tr_shared_clean.py:DEFAULT_TR_METADATA`.
+- `experiments/wait_and_run_raven_eval_all_datasets.py:process_cohort`.
+- `experiments/migrate_tr_flat_layout.py`.
+- `experiments/migrate_gs_shared_clean_source.py`.
+- `.agents/skills/raven-shared-clean/SKILL.md`.
+- `.agents/skills/raven-experiment-naming/SKILL.md`.
+- `raven_repro/tests/test_canonical_layout.py`.
+- `raven_repro/tests/test_gaussian_shading_shared_tr_clean.py`.
+- `audit/output_directory_guide.md`.
+- `audit/path_migration_20260726.md`.
+
+### Affected outputs
+TR image bytes were not regenerated, moved or re-encoded during this migration.
+`data/tr/diffusiondb/metadata.csv` was already in the flat path form when
+checked here, with SHA
+`b359a5104f93d54580914f152f074a72f7aae59e8ab6ef4a6a05ab91662aa66c`.
+The partial GS shared-clean V2 cohort contained 475 generated rows; only
+`shared_clean_source_metadata_path`, `shared_clean_source_metadata_sha256` and
+`pairing_sha256` were rewritten in
+`data/gs/diffusiondb_shared_tr/GS/metadata.csv`. Its post-migration SHA is
+`176edf49d2128533862a29965f92e5ff515e17a015afbd305e9a1ff4d033829a`.
+
+### Fix
+`source_metadata_path()` now resolves through `cohort_dir()` and
+`FLAT_COHORT_METHODS`, where only TR is flat. `watermarked_image_path()` exposes
+the same canonical per-method rule for image references. The formal waiter now
+uses `source_metadata_path(method, dataset)` by default instead of a nested
+string template. GS path rules remain nested because the GS cohort on disk was
+not moved.
+
+### Reused code
+The migration scripts reuse `sha256_path`, `audit_pairing_rows`,
+`audit_tr_gs_shared_clean` and the formal `build_pairing_sha256()` instead of
+duplicating pairing-hash logic.
+
+### Historical bug coverage
+Reviewed the 2026-07-26 canonical layout and 2026-07-27 GS shared-clean V2
+entries. Searched code, tests, skills and docs for nested TR path patterns. Old
+paths that appear only in historical changelog/path-migration tables remain as
+historical evidence, not live canonical definitions.
+
+### Regression prevention
+Canonical-path tests now assert TR is flat, GS remains nested, and real TR
+metadata rows point to `watermarked_image_path("TR", "diffusiondb", run_id)`.
+The GS shared-clean tests fail closed when the canonical TR metadata file is not
+present at `data/tr/diffusiondb/metadata.csv`.
+
+### Validation
+- GS generation was active and was stopped with SIGINT before metadata writes;
+  the final log ended with `KeyboardInterrupt` and no updater process remained.
+- `python experiments/migrate_tr_flat_layout.py --dry-run data/tr/diffusiondb/metadata.csv`
+  verified 1001/1001 TR watermarked SHA-256 values, with `paths_rewritten=0`.
+- `python experiments/migrate_gs_shared_clean_source.py --tr-metadata data/tr/diffusiondb/metadata.csv data/gs/diffusiondb_shared_tr/GS/metadata.csv`
+  migrated 475 GS rows and passed GS pairing plus TR-GS shared-clean audit.
+- Independent TR flat-path SHA check: `rows=1001`, `missing_paths=0`,
+  `sha_mismatches=0`.
+- `python -m py_compile experiments/wait_and_run_raven_eval_all_datasets.py experiments/generate_gs_from_tr_shared_clean.py experiments/migrate_tr_flat_layout.py experiments/migrate_gs_shared_clean_source.py raven_repro/raven/eval_protocol.py`: passed.
+- `python -m pytest -q raven_repro/tests/test_canonical_layout.py raven_repro/tests/test_gaussian_shading_shared_tr_clean.py`: 69 passed, 14 warnings.
+- `python -m pytest -q tests` from `raven_repro/`: 339 passed, 61 warnings.
+- `git diff --check`: passed.
+
+### Watermark integrity
+- Source-data validity: TR metadata has 1001 rows and all recorded
+  watermarked SHA-256 values match files at the flat layout.
+- Clean/watermarked pairing status: TR pairing audit passes; GS generated rows
+  pass pairing audit after recomputing V2 pairing hashes.
+- Base-latent uniqueness status: TR has 1001 unique base latent hashes; GS
+  generated rows have 475 unique base latent hashes.
+- Watermark target and mask status: unchanged; migration does not touch target,
+  mask or image content hashes.
+- Attack pairing: not rerun; formal GS attacks were not launched.
+- Detector score definition: unchanged (`bit_accuracy` for GS, method-specific
+  TR detector definitions unchanged).
+- Threshold calibration source / actual empirical FPR / quality / CLIP / FID:
+  not evaluated by this metadata migration.
+- Outputs requiring regeneration: none from this path migration; interrupted GS
+  generation remains partial and resumable only after this migration commit is
+  validated.
+
+### Git provenance
+- Repository: `kellen931214/RAVEN`
+- Branch: `agent/cleanup-quality-decomposition`
+- Commit: pending at time of entry
+- Remote branch: `origin/agent/cleanup-quality-decomposition`
+- Push status: pending
+- Entry point: `experiments/generate_gs_from_tr_shared_clean.py`
+- Formal output eligibility: metadata migration/audit only; no formal attack
+  launched.
 
 
 ## 2026-07-21 - Idle-GPU strict protocol rerun dispatcher

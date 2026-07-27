@@ -54,7 +54,7 @@ python scripts/run_raven.py \
 
 ```bash
 python scripts/attack_folder.py \
-  --input_dir data/tr/diffusiondb/TR \
+  --input_dir data/tr/diffusiondb \
   --output_dir /tmp/raven-tr-folder \
   --model_id RedbeardNZ/stable-diffusion-2-1-base \
   --steps 50 \
@@ -87,7 +87,7 @@ directory. An explicit `--output-root` must still live under the canonical root 
 ```bash
 python experiments/run_raven_formal_eval.py \
   --dataset diffusiondb --method TR \
-  --source-metadata data/tr/diffusiondb/TR/metadata.csv \
+  --source-metadata data/tr/diffusiondb/metadata.csv \
   --expected-count 30 --batch-size 10 --device cuda --gpu 0 --stage snapshot
 ```
 
@@ -152,7 +152,7 @@ Audit metadata and image pairing before loading a model:
 
 ```bash
 python scripts/audit_dataset.py \
-  --metadata /workspace/RAVEN/data/tr/diffusiondb/TR/metadata.csv \
+  --metadata /workspace/RAVEN/data/tr/diffusiondb/metadata.csv \
   --workspace-root /workspace \
   --output outputs/tr/diffusiondb/_audit/diffusiondb_TR.json
 ```

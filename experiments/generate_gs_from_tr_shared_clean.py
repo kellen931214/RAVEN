@@ -44,7 +44,7 @@ for root in (str(RAVEN_ROOT), str(BENCH_ROOT)):
     if root not in sys.path:
         sys.path.insert(0, root)
 
-from raven.eval_protocol import method_data_root
+from raven.eval_protocol import method_data_root, source_metadata_path
 from raven.gpu_utils import (
     configure_gpu,
     finalize_gpu_logging,
@@ -66,7 +66,8 @@ from raven.pairing_provenance import (
     tensor_sha256,
 )
 
-DEFAULT_TR_METADATA = WORKSPACE / "data" / "tr" / "diffusiondb" / "TR" / "metadata.csv"
+# Single authoritative definition of the canonical TR cohort location.
+DEFAULT_TR_METADATA = source_metadata_path("TR", "diffusiondb")
 DEFAULT_DATASET_NAME = "diffusiondb_shared_tr"
 LATENT_CHANNELS = 4
 

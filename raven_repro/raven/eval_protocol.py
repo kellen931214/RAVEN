@@ -74,9 +74,39 @@ def method_output_root(method: str) -> Path:
         ) from None
 
 
+# Methods whose cohort uses the flat layout:
+#
+#   data/<method>/<dataset>/metadata.csv
+#   data/<method>/<dataset>/<run_id>/watermarked.png
+#
+# Every other method keeps the nested per-method form:
+#
+#   data/<method>/<dataset>/<METHOD>/metadata.csv
+#   data/<method>/<dataset>/<METHOD>/<run_id>/watermarked.png
+#
+# Tree-Ring moved to the flat layout on 2026-07-27. This is a per-method fact,
+# not a global rule: a method is listed here only once its cohort on disk has
+# actually been moved.
+FLAT_COHORT_METHODS = frozenset({"TR"})
+
+
+def cohort_dir(method: str, dataset: str) -> Path:
+    """Directory holding one method's cohort metadata and per-run image dirs."""
+    root = method_data_root(method) / dataset
+    if str(method).upper() in FLAT_COHORT_METHODS:
+        return root
+    return root / str(method).upper()
+
+
 def source_metadata_path(method: str, dataset: str) -> Path:
     """Canonical source metadata CSV for a generated cohort."""
-    return method_data_root(method) / dataset / str(method).upper() / "metadata.csv"
+    return cohort_dir(method, dataset) / "metadata.csv"
+
+
+def watermarked_image_path(method: str, dataset: str, run_id: int | str) -> Path:
+    """Canonical watermarked image path for one run of a cohort."""
+    name = f"{int(run_id):06d}" if str(run_id).isdigit() else str(run_id)
+    return cohort_dir(method, dataset) / name / "watermarked.png"
 
 
 def clean_data_dir(dataset: str, method: str | None = None) -> Path:

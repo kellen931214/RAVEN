@@ -44,7 +44,7 @@ from utils.wm import gs_provider as gs_provider_module  # noqa: E402
 from utils.wm.gs_provider import GsProvider  # noqa: E402
 
 LATENT_SHAPE = (1, 4, 64, 64)
-REAL_TR_METADATA = REPO / "data" / "tr" / "diffusiondb" / "TR" / "metadata.csv"
+REAL_TR_METADATA = REPO / "data" / "tr" / "diffusiondb" / "metadata.csv"
 
 
 def load_shared_clean_module():
@@ -104,8 +104,11 @@ def official_seeded_provider(secret_index: int, sampling_seed: int) -> GsProvide
 
 
 def read_real_tr_rows(limit=None):
-    if not REAL_TR_METADATA.is_file():
-        pytest.skip(f"real TR cohort not present: {REAL_TR_METADATA}")
+    # Deliberately not a skip: if the canonical TR cohort is not where the
+    # protocol says it is, that is a failure to report, not a test to bypass.
+    assert REAL_TR_METADATA.is_file(), (
+        f"canonical TR cohort metadata missing: {REAL_TR_METADATA}"
+    )
     with REAL_TR_METADATA.open(newline="", encoding="utf-8") as handle:
         rows = list(csv.DictReader(handle))
     return rows if limit is None else rows[:limit]

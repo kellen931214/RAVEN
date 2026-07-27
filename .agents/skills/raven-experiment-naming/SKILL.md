@@ -33,6 +33,30 @@ outputs/tr/diffusiondb/ddim_nearest_reflection_aligned_color/<run-key>/
 
 outputs/tr/diffusiondb/ddim_nearest_reflection_no_color/<run-key>/
 
+## Cohort data layout
+
+Cohort layout is a per-method fact, not a global rule. It is declared by
+FLAT_COHORT_METHODS in raven_repro/raven/eval_protocol.py.
+
+Tree-Ring uses the flat layout (since 2026-07-27):
+
+data/tr/<dataset>/metadata.csv
+
+data/tr/<dataset>/<run_id>/watermarked.png
+
+Every other method keeps the nested per-method layout:
+
+data/<method>/<dataset>/<METHOD>/metadata.csv
+
+data/<method>/<dataset>/<METHOD>/<run_id>/watermarked.png
+
+Do not change one method's layout because another method's layout changed. A
+method is added to FLAT_COHORT_METHODS only after its cohort on disk has
+actually been moved.
+
+Resolve these paths with cohort_dir(), source_metadata_path() and
+watermarked_image_path(). Do not hard-code a cohort path string.
+
 ## Results table location
 
 The summary table for one method and one dataset lives at:

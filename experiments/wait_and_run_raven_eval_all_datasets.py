@@ -16,7 +16,11 @@ REPO = Path(__file__).resolve().parents[1]
 DEFAULT_RUNNER = REPO / "experiments" / "run_raven_formal_eval.py"
 sys.path.insert(0, str(REPO / "raven_repro"))
 
-from raven.eval_protocol import formal_attack_config_hash, method_output_root  # noqa: E402
+from raven.eval_protocol import (  # noqa: E402
+    formal_attack_config_hash,
+    method_output_root,
+    source_metadata_path,
+)
 
 
 def parser() -> argparse.ArgumentParser:
@@ -31,9 +35,14 @@ def parser() -> argparse.ArgumentParser:
         type=Path,
         default=REPO / "audit" / "formal_source_manifest.json",
     )
-    # Canonical layout (migration 2026-07-26): watermarked cohorts live under
-    # data/<method>/<dataset>/<METHOD>/ and runs under outputs/<method>/.
-    result.add_argument("--source-template", default="data/{method_lower}/{dataset}/{method}/metadata.csv")
+    result.add_argument(
+        "--source-template",
+        default=None,
+        help=(
+            "legacy override template for source metadata; omitted uses "
+            "source_metadata_path(method, dataset), including TR's flat layout"
+        ),
+    )
     result.add_argument("--output-root", type=Path, default=None)
     result.add_argument("--expected-count", action="append", default=[], metavar="DATASET=COUNT")
     result.add_argument("--device", default="cuda")
@@ -97,12 +106,15 @@ def run_stage(args, dataset: str, method: str, source: Path, output: Path, count
 
 
 def process_cohort(args, dataset: str, method: str, count: int) -> None:
-    source = (
-        REPO
-        / args.source_template.format(
-            dataset=dataset, method=method, method_lower=method.lower()
-        )
-    ).resolve()
+    if args.source_template:
+        source = (
+            REPO
+            / args.source_template.format(
+                dataset=dataset, method=method, method_lower=method.lower()
+            )
+        ).resolve()
+    else:
+        source = source_metadata_path(method, dataset).resolve()
     if not source.is_file():
         print(f"waiting: missing source metadata {source}", flush=True)
         return

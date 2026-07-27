@@ -10,6 +10,15 @@ clean image and the exact same pre-watermark base latent for each run_id.
 
 The canonical shared source is the TR clean-generation process.
 
+The canonical TR cohort lives at:
+
+data/tr/<dataset>/metadata.csv
+
+data/tr/<dataset>/<run_id>/watermarked.png
+
+Resolve it with source_metadata_path("TR", dataset) and
+watermarked_image_path("TR", dataset, run_id), never by hard-coded string.
+
 This skill applies to TR, GS and every watermark method added later.
 
 ## Canonical base randomness

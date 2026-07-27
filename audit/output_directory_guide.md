@@ -17,8 +17,17 @@ outputs/gs/   every Gaussian Shading run artifact
 ```
 
 Resolve them in code with `raven_repro/raven/eval_protocol.py` rather than hard-coding:
-`method_data_root`, `method_output_root`, `source_metadata_path`, `clean_data_dir`,
-`formal_output_root`, `formal_run_key`, `scratch_run_root`, `assert_canonical_output_root`.
+`method_data_root`, `method_output_root`, `cohort_dir`, `source_metadata_path`,
+`watermarked_image_path`, `clean_data_dir`, `formal_output_root`, `formal_run_key`,
+`scratch_run_root`, `assert_canonical_output_root`.
+
+Cohort layout is per method (`FLAT_COHORT_METHODS`). Tree-Ring uses the flat form
+since 2026-07-27; every other method keeps the nested per-method form:
+
+```
+data/tr/<dataset>/metadata.csv             data/gs/<dataset>/GS/metadata.csv
+data/tr/<dataset>/<run_id>/watermarked.png data/gs/<dataset>/GS/<run_id>/watermarked.png
+```
 
 The old→new prefix table for pre-migration paths is in
 [`path_migration_20260726.md`](path_migration_20260726.md).
@@ -29,13 +38,13 @@ The old→new prefix table for pre-migration paths is in
 |---|---|
 | TR clean images (1001) | `data/clean/diffusiondb/` |
 | TR prompts + manifest | `data/clean/diffusiondb/inputs/` |
-| TR watermarked + metadata | `data/tr/diffusiondb/TR/` |
-| GS clean images (1001) | `data/clean/gs_diffusiondb_1001_match_tr/GS/` |
-| GS watermarked + metadata | `data/gs/gs_diffusiondb_1001_match_tr/GS/` |
-| GS 10-pair gate cohorts | `data/clean/gs_*_10_50step/GS/`, `data/gs/gs_*_10_50step/GS/` |
-| TR runs | `outputs/tr/diffusiondb/<family>/<run>/` |
-| GS runs | `outputs/gs/<cohort>/<family>/<run>/` |
-| TR result tables | `outputs/tr/_tables/` |
+| TR watermarked + metadata | `data/tr/diffusiondb/` (flat) |
+| GS clean images | none of its own — GS shares `data/clean/diffusiondb/` |
+| GS watermarked + metadata | `data/gs/diffusiondb_shared_tr/GS/` |
+| TR runs | `outputs/tr/diffusiondb/<experiment-parameter-slug>/` |
+| GS runs | `outputs/gs/<dataset>/<experiment-parameter-slug>/` |
+| Per-method/dataset result table | `outputs/<method>/<dataset>/_table/experiment_results.md` |
+| TR result tables (legacy) | `outputs/tr/_tables/` |
 | TR readable aliases | `outputs/tr/_readable/` |
 | Quarantined invalid runs | `outputs/tr/diffusiondb/_invalid/` |
 

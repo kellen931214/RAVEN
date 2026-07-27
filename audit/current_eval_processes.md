@@ -18,7 +18,7 @@ Historical worker PIDs recorded by immutable run state were generation 476711/47
 already completed. The historical chain directly invoked paired generation, manifest
 merge, P1 plan, attacked-watermarked and attacked-clean workers, NFPA synchronization,
 then quality/detector metrics. It wrote below
-`outputs/tr/diffusiondb/paired_formal_generation` (images now in `data/clean/diffusiondb/` and `data/tr/diffusiondb/TR/`); its root logs remain at
+`outputs/tr/diffusiondb/paired_formal_generation` (images now in `data/clean/diffusiondb/` and `data/tr/diffusiondb/`); its root logs remain at
 `orchestrator.log`, `run.log`, and `logs/`. Derived evaluation directories were
 quarantined at `outputs/tr/diffusiondb/_invalid/legacy_20260718T072817Z/` while generated clean and
 watermarked images were not moved.
