@@ -521,7 +521,12 @@ def test_gs_attack_success_only_from_authoritative_aggregate(tmp_path):
     update_experiment_table(root, table)
     assert read_rows(table)[0]["Attack Success"] == MISSING
 
-    metric = gs_metric_block(attack_success_rate=0.75)
+    # A published attack success must still be the complement of this run's own
+    # official one-bit detection rate, so the fixture moves both together.
+    metric = gs_metric_block(
+        attack_success_rate=0.75,
+        official_onebit_rates={"clean": 0.0, "watermarked": 1.0, "attacked": 0.25},
+    )
     root2 = make_gs_run(tmp_path, metric=metric, run_key="rk_gs_as",
                         experiment="gs_with_attack_success")
     update_experiment_table(root2, table)

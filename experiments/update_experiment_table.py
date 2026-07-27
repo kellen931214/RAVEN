@@ -614,6 +614,16 @@ def extract_gs_detector_metrics(sources: Sources) -> DetectorMetrics:
 
     # Attack success only when the authoritative aggregate provides it.
     result.attack_success = authoritative_attack_success(sources)
+    if result.attack_success is not None:
+        # The published value must be the complement of the same official
+        # one-bit detection rate rendered in the After Detection Rate cell;
+        # otherwise the two cells would describe different thresholds.
+        expected = 1.0 - float(result.after_detection_rate)
+        if abs(float(result.attack_success) - expected) > 1e-9:
+            raise UpdaterError(
+                f"GS attack success in {source} is {result.attack_success!r}, which is not "
+                f"1 - official_onebit_rates.attacked ({expected!r})"
+            )
     return result
 
 
@@ -780,9 +790,13 @@ def clean_threshold_type(target_fpr: Any) -> str:
 
 
 ATTACK_SUCCESS_KEYS = (
+    # Each name below is a threshold-family-specific attack-success definition
+    # published by the run's own aggregate. The updater never derives attack
+    # success itself, so a method that does not publish one still renders "—".
     "attack_success",
     "attack_success_rate",
     "attack_success_rate_at_recalibrated_threshold",
+    "attack_success_rate_at_official_onebit_threshold",
 )
 
 

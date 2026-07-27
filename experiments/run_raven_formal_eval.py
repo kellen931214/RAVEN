@@ -39,7 +39,9 @@ from raven.eval_protocol import (  # noqa: E402
     formal_run_key,
     current_clip_provenance,
     formal_attack_config_hash,
+    formal_quality_summary,
     formal_runtime_provenance,
+    gs_attack_success_summary,
     load_and_validate_source_manifest,
     load_formal_attack_config,
     normalize_formal_attack_config,
@@ -1016,7 +1018,7 @@ def verify_stage(args: argparse.Namespace, config: dict[str, Any]) -> int:
 
 
 def aggregate_stage(args: argparse.Namespace, config: dict[str, Any]) -> int:
-    require_complete_records(args, config, "watermarked")
+    records = require_complete_records(args, config, "watermarked")
     detector = (
         args.output_root / "verification" / "tr_nfpa" / "aggregate_results.json"
         if args.method == "TR"
@@ -1028,6 +1030,18 @@ def aggregate_stage(args: argparse.Namespace, config: dict[str, Any]) -> int:
     for path in (detector, quality, fid, clip):
         if not path.is_file():
             raise FileNotFoundError(path)
+    detector_payload = json.loads(detector.read_text(encoding="utf-8"))
+    # Reduce the per-sample quality records here so the aggregate carries the
+    # scalars the experiment table reads; storing only the path left PSNR/SSIM
+    # unreportable. GS additionally publishes its own attack-success definition.
+    quality_summary = formal_quality_summary(
+        quality,
+        expected_count=args.expected_count,
+        expected_run_ids={str(row["run_id"]) for row in records},
+    )
+    method_summary: dict[str, Any] = {}
+    if args.method == "GS":
+        method_summary = gs_attack_success_summary(detector_payload)
     aggregate = {
         **config,
         "status": (
@@ -1048,7 +1062,8 @@ def aggregate_stage(args: argparse.Namespace, config: dict[str, Any]) -> int:
         "detector_result": str(detector.resolve()),
         "detector_result_sha256": sha256_path(detector),
         "quality_records": str(quality.resolve()),
-        "quality_records_sha256": sha256_path(quality),
+        **quality_summary,
+        **method_summary,
         "fid_result": json.loads(fid.read_text(encoding="utf-8")),
         "clip_result": json.loads(clip.read_text(encoding="utf-8")),
     }

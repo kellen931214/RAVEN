@@ -805,6 +805,127 @@ def validate_resume_record(
             )
 
 
+# --------------------------------------------------------------------------- #
+# Formal aggregate scalars (2026-07-27)
+# --------------------------------------------------------------------------- #
+# ``formal_aggregate.json`` used to record only the quality-record path/SHA and
+# the raw detector payload, so the experiment table had no field to read for
+# PSNR, SSIM or attack success and printed the absent marker instead. These are
+# the single authoritative reducers for those scalars: the aggregate stage and
+# any backfill of an already-attacked run must both call them so a table cell
+# can never disagree with the per-sample records it came from.
+
+# The formal reference for RAVEN PSNR/SSIM is the *watermarked input*, compared
+# against the final post-color-transfer attacked image over the verified valid
+# overlap. The explicit ``post_color_vs_watermarked_*`` fields carry that
+# definition in their name; the bare ``overlap_*`` aliases are not read here so
+# a future record that separates them cannot silently change the metric.
+QUALITY_PSNR_FIELD = "post_color_vs_watermarked_overlap_psnr"
+QUALITY_SSIM_FIELD = "post_color_vs_watermarked_overlap_ssim"
+QUALITY_REFERENCE = "watermarked input"
+
+
+def _finite_metric(value: Any, field: str, run_id: Any) -> float:
+    number = float(value)
+    if not math.isfinite(number):
+        raise RuntimeError(f"non-finite formal quality metric run_id={run_id}: {field}={value}")
+    return number
+
+
+def formal_quality_summary(
+    quality_records_path: str | Path,
+    *,
+    expected_count: int,
+    expected_run_ids: Iterable[Any] | None = None,
+    expected_records_sha256: str | None = None,
+) -> dict[str, Any]:
+    """Reduce ``quality_records.jsonl`` to the aggregate PSNR/SSIM scalars.
+
+    Fails closed on a SHA, count, run-ID, duplicate, missing-field or non-finite
+    problem so a mean can never be published for a cohort that is not exactly
+    the verified one.
+    """
+    path = Path(quality_records_path)
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    actual_sha = sha256_path(path)
+    if expected_records_sha256 is not None and actual_sha != expected_records_sha256:
+        raise RuntimeError(
+            f"quality records SHA mismatch: stored={expected_records_sha256} actual={actual_sha}"
+        )
+    rows = [
+        json.loads(line)
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    if len(rows) != int(expected_count):
+        raise RuntimeError(
+            f"quality record count mismatch: found={len(rows)} expected={expected_count}"
+        )
+    run_ids = [str(row["run_id"]) for row in rows]
+    if len(set(run_ids)) != len(run_ids):
+        raise RuntimeError("duplicate run_id in quality records")
+    if expected_run_ids is not None:
+        expected_ids = {str(value) for value in expected_run_ids}
+        if set(run_ids) != expected_ids:
+            raise RuntimeError("quality record run-ID set differs from the verified cohort")
+    references = {str(row.get("quality_reference", "")) for row in rows}
+    if references != {QUALITY_REFERENCE}:
+        raise RuntimeError(f"unexpected quality reference definition: {sorted(references)}")
+    psnr = [_finite_metric(row[QUALITY_PSNR_FIELD], QUALITY_PSNR_FIELD, row["run_id"]) for row in rows]
+    ssim = [_finite_metric(row[QUALITY_SSIM_FIELD], QUALITY_SSIM_FIELD, row["run_id"]) for row in rows]
+    overlap_protocols = sorted({str(row.get("overlap_protocol", "")) for row in rows})
+    return {
+        "quality_count": len(rows),
+        "quality_psnr_mean": math.fsum(psnr) / len(psnr),
+        "quality_ssim_mean": math.fsum(ssim) / len(ssim),
+        "quality_psnr_field": QUALITY_PSNR_FIELD,
+        "quality_ssim_field": QUALITY_SSIM_FIELD,
+        "quality_reference": QUALITY_REFERENCE,
+        "quality_overlap_protocols": overlap_protocols,
+        "quality_records_sha256": actual_sha,
+    }
+
+
+GS_ATTACK_SUCCESS_FIELD = "attack_success_rate_at_official_onebit_threshold"
+
+
+def gs_attack_success_summary(detector_payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Attack success for GS, defined only against the official one-bit threshold.
+
+    ``1 - official_onebit_rates["attacked"]`` — the share of attacked
+    watermarked samples that the official beta-tail detector no longer flags.
+    This is a different threshold family from the TR clean-calibrated TPR and
+    must never be filled in from a TR-style recalibrated rate.
+    """
+    metric = detector_payload.get("metric")
+    if not isinstance(metric, Mapping):
+        metric = detector_payload
+    rates = metric.get("official_onebit_rates")
+    if not isinstance(rates, Mapping) or "attacked" not in rates:
+        raise RuntimeError("GS detector payload has no official_onebit_rates.attacked")
+    operator = metric.get("official_threshold_comparison_operator")
+    if operator not in (">", ">="):
+        raise RuntimeError(f"unsupported GS official threshold operator: {operator!r}")
+    threshold = float(metric["official_tau_onebit"])
+    attacked_rate = float(rates["attacked"])
+    if not math.isfinite(attacked_rate) or not 0.0 <= attacked_rate <= 1.0:
+        raise RuntimeError(f"invalid official_onebit_rates.attacked: {rates['attacked']!r}")
+    if not math.isfinite(threshold):
+        raise RuntimeError("non-finite official_tau_onebit")
+    return {
+        GS_ATTACK_SUCCESS_FIELD: 1.0 - attacked_rate,
+        "attack_success_definition": (
+            "1 - official_onebit_rates.attacked; share of attacked watermarked samples "
+            "no longer detected at the official beta-tail one-bit threshold"
+        ),
+        "attack_success_threshold_type": "official_beta_tail_tau_onebit",
+        "attack_success_threshold": threshold,
+        "attack_success_threshold_comparison_operator": operator,
+        "attack_success_detected_rate": attacked_rate,
+    }
+
+
 NO_COLOR_FID_ATTACKED_DEFINITION = (
     "formal RAVEN pre-color view_guided_output attacked-watermarked images"
 )

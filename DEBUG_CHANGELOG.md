@@ -6,6 +6,7 @@ This file records implementation bugs, validated non-bugs, ablations, and the ev
 
 | Date | Area | Status | Evidence |
 | --- | --- | --- | --- |
+| 2026-07-27 | GS aggregate PSNR/SSIM/attack-success reduction | `formal_aggregate.json` now reduces the per-sample quality records to `quality_psnr_mean`/`quality_ssim_mean` and GS publishes `attack_success_rate_at_official_onebit_threshold = 1 - official_onebit_rates["attacked"]`, so the three GS aligned-color rows no longer render `—`. Re-audit of the same runs found no bit-accuracy, secret-mapping or bit-order bug; nothing was rerun or invalidated. | `raven_repro/raven/eval_protocol.py`; `experiments/backfill_formal_aggregate_metrics.py`; `raven_repro/tests/test_formal_aggregate_scalars.py` |
 | 2026-07-27 | TensorFlow FID protocol as the default | Primary FID is now the TensorFlow FID protocol (clean-fid `legacy_tensorflow`: TF Inception-2015-12-05 features + TF-compatible bilinear resize); clean-fid `clean` is still computed and recorded as a secondary value so earlier TR numbers stay comparable. The formal quality-config hash now carries the FID protocol descriptor, and the runner accepts `scratch_run_root()` gate roots so gates stay out of `outputs/`. | `raven_repro/raven/quality.py`; `experiments/run_raven_formal_eval.py`; `raven_repro/tests/test_fid_staging.py`; `raven_repro/tests/test_canonical_layout.py` |
 | 2026-07-27 | TR flat cohort canonical path migration | Canonical TR source metadata is `data/tr/diffusiondb/metadata.csv`; all 1001 TR watermarked image paths point at `data/tr/diffusiondb/<run_id>/watermarked.png`; existing GS shared-clean V2 rows were repointed at the new TR metadata SHA and pairing hashes recomputed with the formal helper. | `experiments/migrate_tr_flat_layout.py`; `experiments/migrate_gs_shared_clean_source.py`; `data/gs/diffusiondb_shared_tr/GS/cross_method_shared_clean_audit.json` |
 | 2026-07-21 | Formal provenance and validation hardening | Source HEAD self-reference removed; runtime manifest copy, clean-tree/current-commit binding, pairing re-audit, detector tensor target/mask checks, explicit pre-color hashes, runtime scheduler/device/dtype/package provenance, threshold-specific table fields, and accurate no-color FID definitions added. CPU regression suite evidence is recorded below. | audit/formal_eval_protocol.md; formal runner and protocol regression tests |
@@ -17,6 +18,208 @@ This file records implementation bugs, validated non-bugs, ablations, and the ev
 | 2026-07-14 | NFPA-style Tree-Ring complex L1 evaluation | Completed for DiffusionDB only. MS-COCO was not run after scope was corrected. | `outputs/raven_nfpa_tr_eval/diffusiondb/20260714T161952Z/aggregate_results.json` |
 
 
+
+
+## 2026-07-27 — GS aggregate never reduced PSNR/SSIM or attack success (table showed `—`)
+
+### Problem
+The three validated GS aligned-color runs
+(`ddim_inverse_ddim_forward_nearest_reflection_aligned_color`,
+`ddim_inverse_ddim_forward_bilinear_reflection_aligned_color`,
+`ddim_inverse_ddpm_forward_nearest_reflection_aligned_color`, N=1001 each)
+rendered `PSNR`, `SSIM` and `Attack Success` as the absent marker `—` in
+`outputs/gs/diffusiondb_shared_tr/_table/experiment_results.md`, even though all
+1001 per-sample quality records existed, were finite, and covered exactly the
+verified cohort. Reported quality was therefore unreadable from the formal
+table.
+
+A full re-audit of the same three runs (detector scores, secrets, paths, SHAs,
+bit mapping) was performed at the same time and found **no** bit-accuracy,
+secret-mapping or path-role bug — see *Validation* below. Nothing was
+invalidated and no attack or verification was rerun.
+
+### Root cause
+Two missing reductions, both on the reporting side only:
+
+1. `run_raven_formal_eval.aggregate_stage` wrote only
+   `quality_records` (path) and `quality_records_sha256` into
+   `formal_aggregate.json`. It never reduced
+   `post_color_vs_watermarked_overlap_psnr` / `..._ssim` to the
+   `quality_psnr_mean` / `quality_ssim_mean` scalars that
+   `update_experiment_table.extract_quality_metrics` reads. With no field to
+   read, the updater correctly rendered the absent marker (it never derives a
+   metric itself, and `—` never means zero).
+2. The GS branch published no attack-success field at all.
+   `authoritative_attack_success` only accepts a value the run's own aggregate
+   states, and GS stated none, so the column stayed empty. GS attack success is
+   a different threshold family from TR's recalibrated TPR and must not be
+   borrowed from it.
+
+### Affected files
+- `raven_repro/raven/eval_protocol.py:formal_quality_summary` (new authoritative reducer)
+- `raven_repro/raven/eval_protocol.py:gs_attack_success_summary` (new authoritative reducer)
+- `experiments/run_raven_formal_eval.py:aggregate_stage`
+- `experiments/update_experiment_table.py:ATTACK_SUCCESS_KEYS`, `extract_gs_detector_metrics`
+- `experiments/backfill_formal_aggregate_metrics.py` (new)
+
+### Affected outputs
+No output was invalidated. The per-sample records, detector scores, verification
+CSVs and images of all three runs remain valid; only their
+`formal_aggregate.json` was incomplete. Each aggregate was backfilled in place
+from its own already-hash-verified artifacts and records the backfill under
+`aggregate_scalar_backfill`. The GS table rows were then regenerated by the
+normal updater. No table cell was edited by hand.
+
+### Fix
+* `formal_quality_summary()` reduces `quality_records.jsonl` to
+  `quality_psnr_mean` / `quality_ssim_mean`, and records the metric identity it
+  used (`quality_psnr_field`, `quality_ssim_field`, `quality_reference`,
+  `quality_overlap_protocols`, `quality_count`). It reads the explicitly named
+  `post_color_vs_watermarked_*` fields, never the bare `overlap_*` aliases, so
+  the RAVEN quality reference (watermarked input, valid overlap only) cannot
+  drift silently.
+* `gs_attack_success_summary()` publishes
+  `attack_success_rate_at_official_onebit_threshold = 1 -
+  official_onebit_rates["attacked"]` together with its threshold type, value and
+  comparison operator.
+* `aggregate_stage` now calls both, so newly aggregated runs carry the scalars.
+* The updater accepts the new GS key and additionally *rejects* a GS attack
+  success that is not the complement of the same run's
+  `official_onebit_rates.attacked`, so the Attack Success and After Detection
+  Rate cells can never describe different thresholds.
+* `backfill_formal_aggregate_metrics.py` applies the same two reducers to runs
+  attacked before the fix. It re-verifies the recorded quality-records SHA and
+  detector-result SHA, the cohort size and run-ID set against
+  `attack_records_watermarked.jsonl`, requires `VALIDATED.json`, refuses to
+  overwrite a conflicting stored scalar, and performs no GPU work.
+
+### Reused code
+`sha256_path`, the existing `formal_aggregate.json` schema, the existing
+per-sample `quality_records.jsonl` produced by `quality_stage`, the existing
+`update_experiment_table` upsert path, and the existing GS detector extractor.
+No second PSNR/SSIM implementation, threshold rule or overlap helper was added —
+the reducers only average records that `pair_quality_metrics` already produced.
+
+### Historical bug coverage
+Reviewed the 2026-07-27 GS V2 detector fix, the 2026-07-27 TF-FID default entry
+and the 2026-07-21 formal provenance hardening entry. Searched for other
+aggregate writers and quality reducers (`rg -n "quality_psnr_mean|quality_ssim_mean|
+formal_aggregate|attack_success"`): `experiments/run_raven_aligned_color_eval.py`,
+`experiments/run_raven_color_transfer_eval.py` and
+`experiments/run_raven_no_color_eval.py` already emit their own
+`quality_psnr_mean`/`quality_ssim_mean`, and `raven_p1_full.py` /
+`raven_nfpa_tr_eval.py` are TR paths with their own recalibrated attack-success
+field; none reproduced the missing-scalar pattern. The `—`-never-means-zero rule
+in the updater was preserved rather than weakened.
+
+### Regression prevention
+`raven_repro/tests/test_formal_aggregate_scalars.py` (31 tests):
+* means equal a manual reduction; the named field is read, not the alias;
+* fail-closed on count, duplicate run_id, run-ID-set drift, NaN, Inf, wrong
+  quality reference, quality-records SHA drift and a missing named field;
+* GS attack success equals `1 - official_onebit_rates.attacked` across rates,
+  and fails closed on a missing rates block, bad operator and out-of-range rate;
+* the table renders the scalars, still prints `—` (never `0.0`) for a run that
+  has none, and **rejects** a TR-style recalibrated rate pasted into a GS
+  aggregate;
+* the backfill tool is idempotent, is a no-op without `--apply`, and rejects
+  quality-record SHA drift, detector payload drift, a cohort-size disagreement,
+  a conflicting stored scalar and a non-validated run;
+* a backfilled aggregate is asserted equal to the aggregate-stage reducers.
+
+`raven_repro/tests/test_update_experiment_table.py::test_gs_attack_success_only_from_authoritative_aggregate`
+was updated so its fixture moves the detection rate with the attack success it
+publishes, matching the new consistency gate.
+
+### Validation
+Independent read-only re-audit of the three runs (scratch script, no GPU):
+* **Table vs `verification_result.json`** — `macro_bit_accuracy_before` → Before
+  Score, `macro_bit_accuracy_attacked` → After Score,
+  `official_onebit_rates.watermarked/attacked` → Detection Rate,
+  `attacked_roc_auc` → ROC-AUC, plus threshold and N: all match exactly on all
+  three runs.
+* **Recomputed means from `verification/scores.csv`** — 1001 rows per run; the
+  mean of `attacked_raw_score` reproduces `macro_bit_accuracy_attacked`
+  bit-for-bit (`abs diff = 0.0`, and the plain `sum/len` equals the stored float
+  exactly): 0.5037657654845155 (nearest DDIM), 0.5031374875124875 (bilinear
+  DDIM), 0.5037189373126874 (nearest DDPM). Clean and watermarked stages
+  reproduce identically; `raw == canonical` on every row and stage.
+* **Full-cohort integrity** — 1001 unique run_ids per run, no duplicates, no
+  error rows, scores/manifest run-ID sets identical; every `attacked_path` lies
+  under this run's own `attack_cache/<attack_config_hash>/<run_id>/watermarked/
+  output/final_color_corrected.png` and never equals a clean or watermarked path
+  or SHA; every `watermarked_path` is the run's own `GS/<run_id:06d>/
+  watermarked.png`; all 3×3003 = 9009 referenced files were re-hashed on disk
+  with 0 missing and 0 mismatches; per-sample GS provenance is genuinely
+  per-sample (1001 distinct `gs_secret_index`, `gs_message_sha256`,
+  `gs_key_sha256`, `gs_nonce_sha256`, `gs_secret_bundle_sha256`,
+  `gs_sampling_uniform_sha256`, `target_watermark_hash`) and matches the
+  snapshot manifest row-for-row with 0 mismatches; detector-side target and mask
+  hashes equal the source-side values on every row.
+* **Bit order / reshape** — embedding and decoding both go through the single
+  authoritative `_official_payload` layout in
+  `eval_bench_wm/utils/wm/gs_provider.py`; `_official_majority_vote` inverts
+  exactly the `repeat(1, cc, hw, hw)` diffusion, and the decoder compares
+  against `_official_payload(message)`. Empirically all 3×1001 watermarked-stage
+  decodes are exactly 1.0 and every score is an exact multiple of 1/256, which a
+  transposed or misordered reshape could not produce.
+
+**Conclusion: no bit-accuracy, secret-mapping, path-role or bit-order bug. The
+only defect was the missing aggregate reduction.**
+
+Backfilled values (identical to the independent audit means):
+
+| Run | PSNR | SSIM | Attack success @ official one-bit tau |
+| --- | --- | --- | --- |
+| ddim_inverse_ddim_forward_nearest_reflection_aligned_color | 30.318383653017662 | 0.9175139504539772 | 1.0 |
+| ddim_inverse_ddim_forward_bilinear_reflection_aligned_color | 23.800185249983567 | 0.6706546159291374 | 1.0 |
+| ddim_inverse_ddpm_forward_nearest_reflection_aligned_color | 25.558739248826175 | 0.7721175269327346 | 1.0 |
+
+Attack success is 1.0 on all three because `official_onebit_rates["attacked"] =
+0.0`: no attacked watermarked sample reaches tau_onebit = 0.6484375.
+
+Commands:
+```
+python3 experiments/backfill_formal_aggregate_metrics.py <3 run roots>            # dry run
+python3 experiments/backfill_formal_aggregate_metrics.py --apply <3 run roots>
+python3 experiments/update_experiment_table.py --run-root <each run root>
+cd raven_repro && python3 -m pytest tests -q                                      # 376 passed
+```
+Post-update re-audit of the table re-ran with 0 problems.
+
+### Watermark-specific status
+- Source-data validity: unchanged, valid (V2 shared-TR-clean GS cohort, 1001 samples).
+- Clean/watermarked pairing: unchanged and re-audited; per-sample GS secrets and
+  shared-TR-clean base latents verified distinct per sample.
+- Base-latent uniqueness: unchanged (1001 distinct `gs_sampling_uniform_sha256`).
+- Watermark target and mask: detector == source on every row, all three runs.
+- Attack pairing: unchanged; these are storage-light runs with
+  `attack_clean_enabled=false`, so no attacked-clean cohort exists and no
+  recalibrated threshold is claimed.
+- Detector score definition: unchanged — GS macro bit accuracy, higher is
+  watermarked, official beta-tail one-bit threshold tau_onebit = 0.6484375,
+  operator `>=`.
+- Threshold calibration source: unchanged (official GS beta-tail math at nominal
+  FPR 1e-06, not empirically recalibrated).
+- Actual empirical FPR: unchanged — `official_onebit_rates["clean"] = 0.0` over
+  the 1001-sample clean cohort.
+- Quality metric reference: watermarked input vs final post-color-transfer
+  attacked image, valid overlap only — now stated explicitly in the aggregate.
+- CLIP input definition: unchanged (attacked-watermarked image vs source prompt).
+- FID staging: untouched.
+- Outputs requiring regeneration: none.
+
+### Git provenance
+- Repository: git@github.com:kellen931214/RAVEN.git
+- Branch: agent/cleanup-quality-decomposition
+- Commit: see below
+- Remote branch: origin/agent/cleanup-quality-decomposition
+- Push status: see below
+- Entry point: `experiments/run_raven_formal_eval.py` (aggregate stage);
+  `experiments/backfill_formal_aggregate_metrics.py` (already-attacked runs)
+- Formal output eligibility: the three GS aligned-color runs remain
+  `validated_formal_result`; their aggregates are now complete for quality and
+  attack-success reporting.
 
 
 ## 2026-07-27 — GS detector rejected every V2 shared-clean cohort (`missing gs_sampling_seed`)
