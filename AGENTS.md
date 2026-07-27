@@ -87,3 +87,38 @@ CUDA OOM:
    and the exact failure, and end with:
 
 `STOPPED: No idle usable GPU remained after CUDA OOM. No further work was performed.`
+
+## Mandatory RAVEN Experiment Skills
+
+For every watermark generation task, read and follow:
+
+- .agents/skills/raven-shared-clean/SKILL.md
+- skills/watermark-evaluation/SKILL.md
+
+For every RAVEN attack or evaluation task, read and follow:
+
+- .agents/skills/raven-attack-artifacts/SKILL.md
+- .agents/skills/raven-experiment-naming/SKILL.md
+- .agents/skills/raven-experiment-table/SKILL.md
+- skills/watermark-evaluation/SKILL.md
+
+After a generation, attack or evaluation experiment finishes, use:
+
+python experiments/update_experiment_table.py --run-root <completed-run-root>
+
+Do not manually transcribe metrics.
+
+Do not infer metrics from logs.
+
+Do not autonomously monitor detached jobs.
+
+For Gaussian Shading, report bit_accuracy and official-threshold detection
+rates. Do not relabel GS results as TPR@1%FPR unless a separate empirical
+clean-negative 1%-FPR calibration was actually performed.
+
+The GS bit-accuracy family and the Tree-Ring TPR family are examples, not the
+complete set. Every watermark method reports its own detector metric, its own
+score direction, its own threshold family and its own detection-rate
+definition, and every method must satisfy these same rules. A method without a
+registered method-specific extractor fails closed instead of being coerced into
+another method's schema.
