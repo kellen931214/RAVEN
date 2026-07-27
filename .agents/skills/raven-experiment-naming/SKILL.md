@@ -11,17 +11,60 @@ Directory names must describe the experiment actually being run.
 
 Use:
 
-outputs/<method>/<dataset>/<experiment-slug>/<run-key>/
+outputs/<method>/<dataset>/<experiment-parameter-slug>/
+
+optionally with a content-addressed run key below it:
+
+outputs/<method>/<dataset>/<experiment-parameter-slug>/<run-key>/
+
+The experiment-parameter-slug level is mandatory. The run-key level is optional:
+include it when several immutable configurations share one slug, and omit it when
+the slug already identifies the experiment completely.
 
 Examples:
 
-outputs/gs/diffusiondb/shared_clean_gs_from_tr/<run-key>/
+outputs/gs/diffusiondb/ddim_inverse_ddpm_forward_nearest/
 
-outputs/gs/diffusiondb/ddim_inverse_ddpm_reflection/<run-key>/
+outputs/gs/diffusiondb/ddim_inverse_ddpm_forward_bilinear/
+
+outputs/gs/diffusiondb/shared_clean_gs_from_tr/<run-key>/
 
 outputs/tr/diffusiondb/ddim_nearest_reflection_aligned_color/<run-key>/
 
 outputs/tr/diffusiondb/ddim_nearest_reflection_no_color/<run-key>/
+
+## Results table location
+
+The summary table for one method and one dataset lives at:
+
+outputs/<method>/<dataset>/_table/experiment_results.md
+
+`_table` is a reserved directory name at that level. Never use it as an
+experiment slug, and never place run artifacts inside it.
+
+One table per method and dataset. Do not merge methods or datasets into one
+table, and do not keep a second copy of the same table elsewhere.
+
+## The folder name must state the experiment parameters
+
+The slug must name the primary experiment parameters directly, so the directory is
+readable without opening any config. State, in this order where applicable:
+
+1. inversion scheduler (for example `ddim_inverse`)
+2. reconstruction / reverse-sampling scheduler (for example `ddpm_forward`)
+3. latent sampling mode (`nearest` / `bilinear`)
+4. warp / padding mode when it is the variable under test
+5. color-transfer mode when it is the variable under test
+6. the ablation variable when the run exists to isolate one
+
+Two runs that differ in any of these parameters must have different slugs, and
+the slug must show which parameter differs. `ddim_inverse_ddpm_forward_nearest`
+and `ddim_inverse_ddpm_forward_bilinear` are correct: everything else about the
+two runs is identical and the name says exactly what changed.
+
+Do not encode a parameter in the slug that the run does not actually use. The
+slug is provenance, not decoration: it must agree with the recorded attack
+config.
 
 ## Method component
 

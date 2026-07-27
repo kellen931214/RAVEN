@@ -173,7 +173,7 @@ def test_first_insert_creates_table_with_exact_columns(tmp_path):
     root = make_gs_run(tmp_path)
     table = tmp_path / "reports" / "runtime" / "experiment_results.md"
 
-    action, identity = update_experiment_table(root, table)
+    action, _table, identity = update_experiment_table(root, table)
 
     assert action == "inserted"
     assert identity.as_tuple() == (
@@ -207,7 +207,7 @@ def test_same_run_processed_twice_keeps_one_row_with_new_values(tmp_path):
     aggregate = json.loads((root / "formal_aggregate.json").read_text())
     aggregate["fid_result"]["value"] = 42.5
     write_json(root / "formal_aggregate.json", aggregate)
-    action, _ = update_experiment_table(root, table)
+    action, _table, _identity = update_experiment_table(root, table)
 
     rows = read_rows(table)
     assert action == "updated"
@@ -709,3 +709,64 @@ def test_rates_are_not_multiplied_by_100(tmp_path):
     row = read_rows(table)[0]
     assert row["After Detection Rate"] == "0.1048951048951049"
     assert row["Empirical Clean FPR"].startswith("0.0089")
+
+
+# ---------------------------------------------------------------------------
+# canonical per-method/per-dataset table location
+# ---------------------------------------------------------------------------
+
+
+def test_default_table_is_per_method_and_dataset(tmp_path, monkeypatch):
+    import experiments.update_experiment_table as updater
+
+    monkeypatch.setattr(updater, "REPO_ROOT", tmp_path)
+    root = make_gs_run(tmp_path)
+    action, table_path, identity = updater.update_experiment_table(root)
+
+    assert action == "inserted"
+    assert table_path == tmp_path / "outputs/gs/diffusiondb/_table/experiment_results.md"
+    assert table_path.is_file()
+    assert identity.method == "GS" and identity.dataset == "diffusiondb"
+
+
+def test_default_table_separates_methods_and_datasets(tmp_path, monkeypatch):
+    import experiments.update_experiment_table as updater
+
+    monkeypatch.setattr(updater, "REPO_ROOT", tmp_path)
+    gs = updater.update_experiment_table(make_gs_run(tmp_path))[1]
+    tr = updater.update_experiment_table(make_tr_run(tmp_path))[1]
+    assert gs != tr
+    assert gs.parent == tmp_path / "outputs/gs/diffusiondb/_table"
+    assert tr.parent == tmp_path / "outputs/tr/diffusiondb/_table"
+    # one row each, never mixed across methods
+    assert len(updater.read_rows(gs)) == 1
+    assert len(updater.read_rows(tr)) == 1
+
+
+def test_table_path_fails_closed_on_bad_components():
+    import experiments.update_experiment_table as updater
+
+    for method, dataset in (("GS", "../escape"), ("", "diffusiondb"), ("GS", "")):
+        with pytest.raises(updater.UpdaterError, match="invalid"):
+            updater.method_dataset_table_path(method, dataset)
+
+
+def test_two_variants_of_one_dataset_share_one_table(tmp_path, monkeypatch):
+    """Both sampling-mode variants upsert into the same summary table."""
+    import experiments.update_experiment_table as updater
+
+    monkeypatch.setattr(updater, "REPO_ROOT", tmp_path)
+    nearest = make_gs_run(
+        tmp_path, experiment="ddim_inverse_ddpm_forward_nearest", run_key="rk_n"
+    )
+    bilinear = make_gs_run(
+        tmp_path, experiment="ddim_inverse_ddpm_forward_bilinear", run_key="rk_b"
+    )
+    table = updater.update_experiment_table(nearest)[1]
+    assert updater.update_experiment_table(bilinear)[1] == table
+    rows = updater.read_rows(table)
+    assert len(rows) == 2
+    assert {row["Experiment"] for row in rows} == {
+        "ddim_inverse_ddpm_forward_nearest",
+        "ddim_inverse_ddpm_forward_bilinear",
+    }

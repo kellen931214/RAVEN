@@ -2,7 +2,8 @@
 """Deterministic experiment-result table updater.
 
 Reads only structured JSON/JSONL result files under a completed run root and
-upserts a single Markdown row into ``reports/runtime/experiment_results.md``.
+upserts a single Markdown row into
+``outputs/<method>/<dataset>/_table/experiment_results.md``.
 
 Policy source: ``.agents/skills/raven-experiment-table/SKILL.md``.
 
@@ -26,6 +27,7 @@ from typing import Any, Iterable
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
+# Legacy default, kept only for callers that pass an explicit --table.
 DEFAULT_TABLE = Path("reports/runtime/experiment_results.md")
 
 MISSING = "—"
@@ -1232,14 +1234,41 @@ def upsert(table_path: Path, identity: Identity, row: dict[str, str]) -> str:
 # --------------------------------------------------------------------------
 
 
-def update_experiment_table(run_root: Path, table_path: Path) -> tuple[str, Identity]:
+def method_dataset_table_path(method: str, dataset: str) -> Path:
+    """Canonical per-method/per-dataset results table.
+
+    ``outputs/<method>/<dataset>/_table/experiment_results.md`` — one summary
+    table per method and dataset, sitting beside the runs it summarises, so
+    experiment folders stay named after their parameters and the table is never
+    mixed across methods or datasets.
+    """
+    for name, value in (("method", method), ("dataset", dataset)):
+        text = str(value)
+        if not text or "/" in text or text in {".", ".."}:
+            raise UpdaterError(f"invalid {name} for table path: {value!r}")
+    return (
+        REPO_ROOT
+        / "outputs"
+        / str(method).lower()
+        / str(dataset)
+        / "_table"
+        / "experiment_results.md"
+    )
+
+
+def update_experiment_table(
+    run_root: Path, table_path: Path | None = None
+) -> tuple[str, Identity]:
     run_root = Path(run_root)
     if not run_root.is_dir():
         raise UpdaterError(f"run root does not exist or is not a directory: {run_root}")
     sources = collect_sources(run_root)
     identity, row = build_row(sources)
+    if table_path is None:
+        # Resolved from the run's own structured provenance, never from the path.
+        table_path = method_dataset_table_path(identity.method, identity.dataset)
     action = upsert(Path(table_path), identity, row)
-    return action, identity
+    return action, Path(table_path), identity
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -1252,8 +1281,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--table",
         type=Path,
-        default=REPO_ROOT / DEFAULT_TABLE,
-        help=f"Markdown table path (default: {DEFAULT_TABLE})",
+        default=None,
+        help=(
+            "Markdown table path. Default: outputs/<method>/<dataset>/_table/"
+            "experiment_results.md, resolved from the run's structured provenance."
+        ),
     )
     parser.add_argument(
         "--print-table",
@@ -1266,15 +1298,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     try:
-        action, identity = update_experiment_table(args.run_root, args.table)
+        action, table_path, identity = update_experiment_table(args.run_root, args.table)
     except UpdaterError as exc:
         print(f"FAILED: {exc}", file=sys.stderr)
         return 1
     print(action)
-    print(relative_to_repo(args.table))
+    print(relative_to_repo(table_path))
     print(identity.describe())
     if args.print_table:
-        print(Path(args.table).read_text(encoding="utf-8"))
+        print(Path(table_path).read_text(encoding="utf-8"))
     return 0
 
 

@@ -21,16 +21,42 @@ Always use:
 python experiments/update_experiment_table.py \
   --run-root <completed-run-root>
 
-The generated table is:
+## Table location
 
-reports/runtime/experiment_results.md
+The table is written to:
 
-Add:
+outputs/<method>/<dataset>/_table/experiment_results.md
 
-reports/runtime/
+The updater resolves this from the run's own structured provenance (its recorded
+method and dataset), not from the run-root path string. Passing --table
+overrides it; do not override it merely to collect unrelated runs together.
 
-to .gitignore so runtime result records do not make the formal source worktree
-dirty.
+One table per method and one per dataset:
+
+- Do not merge two methods into one table.
+- Do not merge two datasets into one table.
+- Do not keep a second copy of the same table at another path.
+- `_table` is reserved at that level and never holds run artifacts.
+
+All runs of the same method and dataset upsert into that one table, so two
+sampling-mode variants of one cohort appear as two rows sharing a table, each
+row named by its experiment-parameter slug. See
+`.agents/skills/raven-experiment-naming/SKILL.md` for the slug rules.
+
+Add the table directory to .gitignore if runtime result records would otherwise
+make the formal source worktree dirty during a run.
+
+## The table is written by a program, never by hand
+
+After an experiment finishes, the row must be produced by running the updater.
+
+- Do not hand-write, hand-edit or hand-transcribe a metric value into the table.
+- Do not copy a number out of a log, a console line or a chat message.
+- Do not fill a cell from memory or from a previous run's value.
+- Do not add a row for a run that has not finished.
+
+If the updater cannot produce a value, the cell stays as the missing marker. A
+missing metric is reported as missing; it is never supplied by a human.
 
 ## No autonomous monitoring
 
