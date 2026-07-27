@@ -26,6 +26,23 @@ from utils.image_utils import torch_to_PIL
 
 
 
+# Gaussian Shading embedding math is identical across these two modes (message
+# construction, payload replication, ChaCha20 encryption, encrypted-bit layout,
+# norm.ppf((u + b) / 2), majority vote, official thresholds, detector). They
+# differ ONLY in where the uniforms u come from:
+#
+#   official_compatible          u drawn from a seeded RNG inside this provider
+#   official_math_shared_tr_clean u supplied externally as norm.cdf(TR base latent)
+#
+# The shared-TR-clean mode is NOT a byte-identical reproduction of upstream
+# Gaussian Shading sampling — upstream draws its own uniforms. What it does
+# reproduce exactly is the official Gaussian quantile-partition embedding math,
+# applied to the canonical Tree-Ring clean latent so both methods share one
+# clean image and one pre-watermark latent.
+GS_SHARED_TR_CLEAN_MODE = "official_math_shared_tr_clean"
+OFFICIAL_MATH_PROTOCOL_MODES = frozenset({"official_compatible", GS_SHARED_TR_CLEAN_MODE})
+GS_PROTOCOL_MODES = ("legacy",) + tuple(sorted(OFFICIAL_MATH_PROTOCOL_MODES))
+
 parser = argparse.ArgumentParser(add_help=False)
 
 parser.add_argument('--l', default=1, type=int, help="The size of slide windows for m")
@@ -34,10 +51,13 @@ parser.add_argument('--message_width_in_bytes', default=32, type=int, help="Mess
 parser.add_argument(
     '--gs_protocol_mode',
     default='official_compatible',
-    choices=('legacy', 'official_compatible'),
+    choices=GS_PROTOCOL_MODES,
     help='Gaussian Shading implementation path. Default is official_compatible '
          '(bsmhmmlf/Gaussian-Shading); the legacy path is retained but must be '
-         'requested explicitly with --gs_protocol_mode legacy.',
+         'requested explicitly with --gs_protocol_mode legacy. '
+         'official_math_shared_tr_clean uses the same official embedding math but '
+         'requires externally supplied uniforms and a shared clean latent '
+         '(get_wm_latents_from_uniforms).',
 )
 parser.add_argument(
     '--gs_detection_mode',
@@ -124,7 +144,7 @@ class GsProvider(WmProvider):
         self.l = l
         self.offset = offset  # the exact messages, keys, nonces used when calling get_wm_latents are decided by batch_size starting from offset
         self.gs_protocol_mode = str(gs_protocol_mode)
-        if self.gs_protocol_mode not in {"legacy", "official_compatible"}:
+        if self.gs_protocol_mode not in set(GS_PROTOCOL_MODES):
             raise ValueError(f"unsupported gs_protocol_mode: {self.gs_protocol_mode!r}")
         self.gs_detection_mode = str(gs_detection_mode)
         if self.gs_detection_mode not in {
@@ -179,7 +199,7 @@ class GsProvider(WmProvider):
             self.keys = [key for _ in range(self.batch_size)]
             self.nonces = [nonce for _ in range(self.batch_size)]
 
-        if self.gs_protocol_mode == "official_compatible":
+        if self.gs_protocol_mode in OFFICIAL_MATH_PROTOCOL_MODES:
             for index in range(self.offset, self.offset + self.batch_size):
                 message_bytes, key_bytes, nonce_bytes = self._secret_bytes(index)
                 if len(message_bytes) != self.message_width_in_bytes:
@@ -211,7 +231,9 @@ class GsProvider(WmProvider):
             nonce = bytes.fromhex(nonce)
         message = bytes(message[:self.message_width_in_bytes])
         key = bytes(key)
-        nonce = bytes(nonce[:12] if self.gs_protocol_mode == "official_compatible" else nonce)
+        nonce = bytes(
+            nonce[:12] if self.gs_protocol_mode in OFFICIAL_MATH_PROTOCOL_MODES else nonce
+        )
         return message, key, nonce
 
 
@@ -252,7 +274,7 @@ class GsProvider(WmProvider):
     def watermark_target_tensor(self, index: typing.Optional[int] = None) -> torch.Tensor:
         secret_index = self.gs_secret_index if index is None else int(index)
         message, _, _ = self._secret_bytes(secret_index)
-        if self.gs_protocol_mode == "official_compatible":
+        if self.gs_protocol_mode in OFFICIAL_MATH_PROTOCOL_MODES:
             payload, _ = self._official_payload(message)
             return payload.to(device=self.device)
         bits = np.unpackbits(np.frombuffer(message, dtype=np.uint8))
@@ -319,6 +341,129 @@ class GsProvider(WmProvider):
             "sampling_uniform_sha256_list": uniform_hashes,
             "secret_provenance_list": secret_records,
             "gs_protocol_mode": self.gs_protocol_mode,
+        }
+
+
+    def _normalized_uniforms(self, uniforms: np.ndarray) -> np.ndarray:
+        """Validate externally supplied uniforms without repairing them."""
+        if not isinstance(uniforms, np.ndarray):
+            raise TypeError(
+                f"uniforms must be a numpy.ndarray, got {type(uniforms).__name__}"
+            )
+        if uniforms.dtype != np.float64:
+            raise ValueError(
+                "uniforms must be float64 so the recorded uniform SHA-256 is "
+                f"reproducible; got {uniforms.dtype}"
+            )
+        expected = tuple(self.latent_shape)
+        values = uniforms
+        if values.shape == expected[1:]:
+            values = values.reshape((1,) + expected[1:])
+        if values.shape != expected:
+            raise ValueError(
+                f"uniforms shape {uniforms.shape} does not match latent shape {expected}"
+            )
+        # Fail closed: never clamp, repair or resample. A uniform outside (0, 1)
+        # means the caller's derivation is wrong, and silently fixing it would
+        # break the correspondence with the shared clean latent.
+        if not np.isfinite(values).all():
+            raise ValueError("uniforms contain non-finite values")
+        if not (values > 0.0).all():
+            raise ValueError("uniforms must be strictly greater than 0")
+        if not (values < 1.0).all():
+            raise ValueError("uniforms must be strictly less than 1")
+        return values
+
+    def _normalized_clean_latent(self, clean_latent: torch.Tensor) -> torch.Tensor:
+        """Accept the shared clean latent verbatim; never rebuild it."""
+        if not torch.is_tensor(clean_latent):
+            raise TypeError(
+                f"clean_latent must be a torch.Tensor, got {type(clean_latent).__name__}"
+            )
+        expected = tuple(self.latent_shape)
+        value = clean_latent
+        if tuple(value.shape) == expected[1:]:
+            value = value.unsqueeze(0)
+        if tuple(value.shape) != expected:
+            raise ValueError(
+                f"clean_latent shape {tuple(clean_latent.shape)} does not match "
+                f"latent shape {expected}"
+            )
+        if value.dtype != self.dtype:
+            # Casting here would silently change the tensor bytes and therefore
+            # the shared base-latent SHA-256 the whole cohort is keyed on.
+            raise ValueError(
+                f"clean_latent dtype {value.dtype} does not match provider dtype "
+                f"{self.dtype}; refusing to cast the shared latent"
+            )
+        return value.to(device=self.device)
+
+    def get_wm_latents_from_uniforms(
+        self,
+        uniforms: np.ndarray,
+        clean_latent: torch.Tensor,
+    ) -> typing.Dict[str, typing.Any]:
+        """Official Gaussian Shading embedding from externally supplied uniforms.
+
+        Used by the shared-clean protocol: the caller derives the uniforms from
+        the canonical Tree-Ring float32 base latent (``norm.cdf``) and passes that
+        exact latent in as ``clean_latent``.
+
+        Every official element is unchanged from :meth:`_get_official_wm_latents`
+        — message construction, payload replication, secret index, key, nonce,
+        PyCryptodome ChaCha20, encrypted-bit layout, ``norm.ppf((u + b) / 2)``,
+        majority vote, thresholds and detector. The only difference is the source
+        of ``u``: no RNG is consulted here at all.
+
+        ``zT_clean_torch`` is the supplied tensor itself — the same storage, not a
+        copy. It is deliberately NOT rebuilt with ``norm.ppf(uniforms)``: that
+        would make the shared base-latent SHA-256 depend on a float round trip
+        that is not guaranteed to be bit-exact. (Measured on the diffusiondb
+        cohort the float32 round trip does agree element-for-element, but the
+        invariant must hold structurally, not by numerical luck.)
+        """
+        if self.gs_protocol_mode not in OFFICIAL_MATH_PROTOCOL_MODES:
+            raise ValueError(
+                "get_wm_latents_from_uniforms requires an official-math protocol "
+                f"mode ({sorted(OFFICIAL_MATH_PROTOCOL_MODES)}), got "
+                f"{self.gs_protocol_mode!r}"
+            )
+        values = self._normalized_uniforms(uniforms)
+        clean = self._normalized_clean_latent(clean_latent)
+
+        latents = []
+        targets = []
+        target_strings = []
+        uniform_hashes = []
+        secret_records = []
+        for batch_index, secret_index in enumerate(
+            range(self.offset, self.offset + self.batch_size)
+        ):
+            message, key, nonce = self._secret_bytes(secret_index)
+            payload, diffused = self._official_payload(message)
+            encrypted_bits = self._official_encrypt_bits(diffused, key, nonce)
+            flat = np.ascontiguousarray(values[batch_index].reshape(-1), dtype=np.float64)
+            if flat.size != encrypted_bits.size:
+                raise ValueError(
+                    f"uniform count {flat.size} does not match encrypted bit count "
+                    f"{encrypted_bits.size}"
+                )
+            latents.append(self._official_latent_from_bits(encrypted_bits, flat))
+            targets.append(payload.squeeze(0).to(device=self.device))
+            target_strings.append("".join(f"{byte:08b}" for byte in message))
+            # float64 C-order bytes, identical convention to the seeded path.
+            uniform_hashes.append(self._sha256_bytes(flat.tobytes(order="C")))
+            secret_records.append(self.secret_provenance(secret_index))
+        return {
+            "zT_torch": torch.stack(latents, dim=0),
+            "zT_clean_torch": clean,
+            "barcodes_torch": torch.stack(targets, dim=0),
+            "message_bits_str_list": target_strings,
+            "sampling_uniform_sha256_list": uniform_hashes,
+            "secret_provenance_list": secret_records,
+            "gs_protocol_mode": self.gs_protocol_mode,
+            "uniform_source": "externally_supplied",
+            "clean_latent_source": "externally_supplied_verbatim",
         }
 
 
@@ -431,6 +576,14 @@ class GsProvider(WmProvider):
                         
         @return: dict
         """
+        if self.gs_protocol_mode == GS_SHARED_TR_CLEAN_MODE:
+            # This mode has no internal randomness source by construction: the
+            # uniforms and the clean latent must come from the shared TR cohort.
+            raise RuntimeError(
+                f"gs_protocol_mode={GS_SHARED_TR_CLEAN_MODE!r} embeds only from an "
+                "externally supplied clean latent; call "
+                "get_wm_latents_from_uniforms(uniforms, clean_latent) instead"
+            )
         if self.gs_protocol_mode == "official_compatible":
             return self._get_official_wm_latents()
 
@@ -683,7 +836,7 @@ class GsProvider(WmProvider):
         @param latents: latent either tensor with batch dim or numpy with batch dim
         @return: dict
         """
-        if self.gs_protocol_mode == "official_compatible":
+        if self.gs_protocol_mode in OFFICIAL_MATH_PROTOCOL_MODES:
             if isinstance(latents, np.ndarray):
                 latents = torch.from_numpy(latents).to(device=self.device, dtype=self.dtype)
             return self._get_official_accuracies(latents)

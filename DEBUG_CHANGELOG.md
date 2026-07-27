@@ -653,3 +653,104 @@ TR and GS pairing audits pass at the new locations.
 Earlier entries in this changelog reference pre-migration paths. They are kept as
 written (they are a historical log); resolve them with the old→new prefix table in
 `audit/path_migration_20260726.md`.
+
+## 2026-07-27 — GS shared-clean V2: Gaussian Shading from the canonical TR clean latent
+
+### Problem
+The TR and GS cohorts were generated from different clean latents. TR sampled
+`torch.randn(seed)`; GS (V1, `gaussian_shading_shared_uniform_v1`) drew its own
+uniforms from a seeded numpy RNG and reconstructed a clean latent with
+`norm.ppf(u)`. The two cohorts therefore had different clean images with the same
+filenames, and no paired quality metric across methods could use one shared clean
+reference.
+
+### Root cause
+`GsProvider` had no way to embed from an externally supplied clean latent: the only
+official entrypoint, `_get_official_wm_latents()`, always sampled its own uniforms.
+
+### Affected files
+- `eval_bench_wm/utils/wm/gs_provider.py:get_wm_latents_from_uniforms` (new),
+  `:_normalized_uniforms`, `:_normalized_clean_latent`, `:get_wm_latents` (fail
+  closed in the new mode), plus `GS_SHARED_TR_CLEAN_MODE` /
+  `OFFICIAL_MATH_PROTOCOL_MODES`.
+- `raven_repro/raven/pairing_provenance.py`: `GS_SHARED_TR_CLEAN_PROTOCOL`,
+  `GS_V2_REQUIRED_FIELDS`, `gs_fields_for_protocol`, protocol-aware
+  `build_pairing_sha256` / `audit_pairing_rows`, new `audit_tr_gs_shared_clean`.
+- `experiments/generate_gs_from_tr_shared_clean.py` (new generator).
+- `experiments/run_raven_formal_eval.py`,
+  `raven_repro/scripts/build_verification_manifest.py`: protocol-aware GS field set.
+- `raven_repro/tests/test_gaussian_shading_shared_tr_clean.py` (new, 53 tests).
+
+### Affected outputs
+None invalidated. The V1 GS cohort keeps its own protocol name, metadata and
+pairing hashes and is never relabelled. TR clean, TR watermarked and TR metadata
+were not read-modified at all (verified: 0 files under `data/tr/` or `data/clean/`
+modified during this work).
+
+### Fix
+New protocol `gaussian_shading_shared_tr_clean_v2`:
+rebuild the TR base latent from `base_latent_seed`, verify its tensor SHA against
+both `base_latent_sha256` and `clean_base_latent_sha256`, verify the existing TR
+clean image against `clean_sha256`, derive `u = norm.cdf(float64(base))`, and embed
+with the unchanged official quantile partition `norm.ppf((u + b) / 2)`. The GS row
+points at the TR clean path and SHA. Only the GS watermarked image is generated.
+
+### Reused code
+`tensor_sha256`, `sha256_path`, `canonical_json_sha256`, `build_pairing_sha256`,
+`audit_pairing_rows`, `configure_gpu`/`setup_run_logging`, `pipe_utils`, and the
+existing official payload/cipher/threshold/detector helpers on `GsProvider`.
+
+### Historical bug coverage
+The 2026-07-25/26 GS entries were reviewed. The V1 re-derivation and shard-config
+work is untouched: `GS_REQUIRED_FIELDS` keeps its exact field set and order, and
+`migrate_gs_detection_metadata.py` still targets V1 only.
+
+### Regression prevention
+- `zT_clean_torch` is the supplied tensor's own storage, asserted via `data_ptr()`,
+  so the shared-latent SHA cannot drift through a float round trip.
+- `get_wm_latents()` raises in the shared-clean mode: the mode has no RNG at all,
+  and a test monkeypatches `np.random.default_rng`/`uniform` to prove it.
+- Uniforms must be float64 and strictly inside (0, 1); never clamped or resampled.
+- V2 rows must satisfy `tr_base_latent_sha256 == base_latent_sha256`,
+  `tr_clean_sha256 == clean_sha256`, `tr_clean_path == clean_path`, and
+  `shared_clean_sample_sha256 == base_latent_sha256`.
+- `audit_tr_gs_shared_clean` re-checks those against the TR rows themselves, so a
+  hand-edited GS row cannot self-certify.
+- The generator fails closed if the pipeline dtype is not float32, if the latent
+  shape differs from the TR cohort, or if its `generation_config_sha256` differs
+  from the TR cohort's.
+
+### Validation
+- `python3 -m pytest -q` in `raven_repro/`: 352 passed (299 before + 53 new).
+- N=1 GPU gate in `/tmp` (deleted on success), run_id=0:
+  TR base latent SHA == GS base latent SHA == `bea48052…825a`;
+  TR clean SHA == GS clean SHA == `c60db047…bebac`;
+  `clean_path` identical (`data/clean/diffusiondb/000000.png`);
+  before-attack `bit_accuracy = 1.0`, detected under
+  `official_beta_tail_tau_onebit = 0.6484375` with `>=`;
+  cross-method shared-clean audit passed against all 1001 TR rows.
+- Resume gate: second run wrote 0 rows, verified and skipped 1, left the image
+  byte-identical and the metadata at 1 row.
+
+### Watermark integrity
+- Source data: TR clean/watermarked/metadata unchanged and byte-verified.
+- Clean/watermarked pairing: TR and GS now share one clean image and one
+  pre-watermark latent per run_id.
+- Base-latent uniqueness: one distinct latent per run_id (audited).
+- Watermark target: one GS target per run, as V1.
+- Attack pairing: not rerun; no attack artifacts produced.
+- Detector: unchanged official GS bit-accuracy detector.
+- Threshold: official beta-tail `tau_onebit`; this is NOT a 1%-FPR calibrated
+  threshold and the detection rate must not be reported as TPR@1%FPR.
+- Empirical clean FPR: not measured (no clean-negative cohort evaluated).
+- Quality/CLIP/FID: unchanged; not run.
+- Outputs requiring regeneration: none. The full 1001-sample V2 cohort has not
+  been generated yet — only the N=1 gate.
+
+### Git provenance
+- Repository: `kellen931214/RAVEN`
+- Branch: `agent/cleanup-quality-decomposition`
+- Commit: see below
+- Remote branch: `origin/agent/cleanup-quality-decomposition`
+- Entry point: `experiments/generate_gs_from_tr_shared_clean.py`
+- Formal output eligibility: code validated; N=1 gate only, full cohort not run.

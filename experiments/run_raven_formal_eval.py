@@ -54,9 +54,9 @@ from raven.eval_protocol import (  # noqa: E402
 )
 from raven.metrics import pair_quality_metrics  # noqa: E402
 from raven.pairing_provenance import (  # noqa: E402
-    GS_REQUIRED_FIELDS,
     PAIRING_REQUIRED_FIELDS,
     audit_pairing_rows,
+    gs_fields_for_rows,
 )
 
 
@@ -509,7 +509,9 @@ def snapshot_stage(args: argparse.Namespace, config: dict[str, Any]) -> int:
         if args.method in {"TR", "GS"}:
             drift_fields.extend(PAIRING_REQUIRED_FIELDS)
         if args.method == "GS":
-            drift_fields.extend(GS_REQUIRED_FIELDS)
+            # V1 and V2 GS cohorts carry different provenance field sets; use the
+            # one this cohort's recorded protocol actually defines.
+            drift_fields.extend(gs_fields_for_rows([new]))
         for field in dict.fromkeys(drift_fields):
             if str(old.get(field, "")) != str(new.get(field, "")):
                 raise RuntimeError(f"snapshotted source drift run_id={run_id}: {field}")
@@ -621,7 +623,11 @@ def expected_resume_fields(
         "provider_config_hash": str(row.get("provider_config_hash", "")),
         "watermark_target_sha256": str(row.get("watermark_target_sha256", "")),
         "watermark_mask_sha256": str(row.get("watermark_mask_sha256", "")),
-        **({field: row.get(field, "") for field in GS_REQUIRED_FIELDS} if config["method"] == "GS" else {}),
+        **(
+            {field: row.get(field, "") for field in gs_fields_for_rows([row])}
+            if config["method"] == "GS"
+            else {}
+        ),
         **config["attack_runtime"],
     }
 
@@ -743,7 +749,11 @@ def attack_stage(args: argparse.Namespace, config: dict[str, Any], role: str) ->
             "watermark_mask_sha256": row.get("watermark_mask_sha256", ""),
             "generation_config_sha256": row.get("generation_config_sha256", ""),
             "watermark_config_sha256": row.get("watermark_config_sha256", ""),
-            **({field: row.get(field, "") for field in GS_REQUIRED_FIELDS} if args.method == "GS" else {}),
+            **(
+                {field: row.get(field, "") for field in gs_fields_for_rows([row])}
+                if args.method == "GS"
+                else {}
+            ),
             "pre_color_attacked_path": str(pre_color_path.resolve()),
             "pre_color_attacked_sha256": sha256_path(pre_color_path),
             "attacked_path": str(attacked_path.resolve()),

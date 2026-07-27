@@ -13,7 +13,7 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from raven.pairing_provenance import GS_REQUIRED_FIELDS  # noqa: E402
+from raven.pairing_provenance import gs_fields_for_rows  # noqa: E402
 from raven.eval_protocol import (  # noqa: E402
     FORMAL_ATTACK_CONFIG,
     load_formal_attack_config,
@@ -130,7 +130,7 @@ def main() -> int:
             "watermarked_sha256", "provider_config_hash",
         ]
         if args.method == "GS":
-            provenance_fields.extend(GS_REQUIRED_FIELDS)
+            provenance_fields.extend(gs_fields_for_rows([source]))
         for field in provenance_fields:
             if str(source.get(field)) != str(attack.get(field)):
                 raise RuntimeError(f"run_id={run_id}: {field} mismatch")
@@ -200,7 +200,11 @@ def main() -> int:
             "watermark_mask_sha256": attack.get("watermark_mask_sha256", ""),
             "generation_config_sha256": attack.get("generation_config_sha256", ""),
             "watermark_config_sha256": attack.get("watermark_config_sha256", ""),
-            **({field: attack.get(field, "") for field in GS_REQUIRED_FIELDS} if args.method == "GS" else {}),
+            **(
+                {field: attack.get(field, "") for field in gs_fields_for_rows([source])}
+                if args.method == "GS"
+                else {}
+            ),
             **provider,
         })
 

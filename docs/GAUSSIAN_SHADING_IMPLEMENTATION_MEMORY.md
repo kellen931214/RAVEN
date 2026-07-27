@@ -381,6 +381,52 @@ Usage: `python experiments/migrate_gs_detection_metadata.py [--dry-run] <metadat
 - N=10 is **not** enough for a statistically valid 1% FPR result; it only verifies pipeline
   wiring and provenance.
 
+## Shared-clean V2 cohort (`gaussian_shading_shared_tr_clean_v2`, 2026-07-27)
+
+A second, separately-named GS protocol that embeds from the **canonical Tree-Ring
+clean latent** instead of its own sampled one. The V1 cohort
+(`gaussian_shading_shared_uniform_v1`) is untouched and is never relabelled.
+
+| | V1 `shared_uniform` | V2 `shared_tr_clean` |
+|---|---|---|
+| `gs_protocol_mode` | `official_compatible` | `official_math_shared_tr_clean` |
+| uniforms | `np.random.default_rng(base_seed + run_id)` | `norm.cdf(float64(TR base latent))` |
+| clean latent | `norm.ppf(u)` | the TR latent itself (same storage) |
+| clean image | own GS cohort | the existing TR clean image |
+| `gs_sampling_seed` | recorded | absent (no RNG draw exists) |
+| extra fields | — | `GS_SHARED_CLEAN_V2_FIELDS` |
+
+Identical in both: message construction, payload replication
+(`repeat(1, channel_copy, hw_copy, hw_copy)`), secret index = run_id, key, nonce,
+PyCryptodome ChaCha20, encrypted-bit layout, `norm.ppf((u + b) / 2)`, majority
+vote (ties -> 0), official beta-tail thresholds and the detector.
+
+**Claim discipline.** V2 reproduces the official Gaussian *quantile-partition
+embedding math*. It is **not** byte-identical to upstream sampling — upstream
+draws its own uniforms. The generator records this verbatim in
+`watermark_config.json` (`official_math_claim` / `not_claimed`).
+
+Generator: `experiments/generate_gs_from_tr_shared_clean.py`
+(default output `data/gs/diffusiondb_shared_tr/GS/`, shard-safe `--resume`,
+`--run-ids` for gates). It generates **only** GS watermarked images; it has no
+clean-image write path at all.
+
+Cross-method proof: `audit_tr_gs_shared_clean(tr_rows, gs_rows)` writes
+`cross_method_shared_clean_audit.json` and requires equality of `prompt_sha256`,
+`generation_config_sha256`, `base_latent_seed`, `base_latent_sha256`,
+`clean_base_latent_sha256`, `clean_path` and `clean_sha256`, plus on-disk SHA
+verification of the clean and GS watermarked images.
+
+Path fields are required metadata but deliberately excluded from the V2 pairing
+hash, so a canonical-layout move cannot invalidate an audited cohort; the content
+each path points at is still bound in through its SHA-256.
+
+N=1 gate (2026-07-27, run_id=0, `/tmp`, deleted on success):
+TR/GS base-latent SHA `bea48052…825a` equal; TR/GS clean SHA `c60db047…bebac`
+equal; `clean_path` identical; before-attack `bit_accuracy = 1.0`, detected at
+`official_beta_tail_tau_onebit = 0.6484375` (`>=`); cross-method audit passed
+against all 1001 TR rows. Full 1001-sample cohort not yet generated.
+
 ## Next steps
 1. ~~Run the 10-pair 50-step generation and identical-command resume gate.~~ Done
    (2026-07-25, HEAD `c648efa`).
