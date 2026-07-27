@@ -153,10 +153,29 @@ def scratch_run_root(method: str, purpose: str) -> Path:
     return Path(tempfile.mkdtemp(prefix=f"raven-{safe_method.lower()}-{safe_purpose}-"))
 
 
+def is_scratch_run_root(path: str | Path, method: str) -> bool:
+    """True only for a gate/smoke root created by ``scratch_run_root(method, …)``.
+
+    Gates must live in /tmp rather than under ``outputs/``, so the canonical-root
+    guard has to recognise exactly those roots — and nothing else in /tmp.
+    """
+    import tempfile
+
+    resolved = Path(path).resolve()
+    temporary = Path(tempfile.gettempdir()).resolve()
+    if temporary not in resolved.parents:
+        return False
+    relative = resolved.relative_to(temporary)
+    return relative.parts[0].startswith(f"raven-{str(method).lower()}-")
+
+
 def assert_canonical_output_root(path: str | Path, method: str) -> Path:
     """Fail closed when a run would write outside its canonical method root."""
     resolved = Path(path).resolve()
     expected = method_output_root(method).resolve()
+    if is_scratch_run_root(resolved, method):
+        # Explicitly labelled throwaway gate root; never a formal output location.
+        return resolved
     if resolved != expected and expected not in resolved.parents:
         raise ValueError(
             f"output root {resolved} is outside the canonical root for method "

@@ -43,16 +43,87 @@ def openclip_text_image_scores(
     }
 
 
-def clean_fid(reference_dir: str | Path, attacked_dir: str | Path, device: str = "cuda") -> dict:
+# FID protocol. The primary reported value uses the TensorFlow FID protocol:
+# the original TF Inception-2015-12-05 graph features with TensorFlow-compatible
+# bilinear resizing, which is what the watermarking literature reports as "FID".
+# clean-fid's ``legacy_tensorflow`` mode is that protocol, so no TensorFlow
+# runtime is needed next to the torch/diffusers attack pipeline.
+FID_PRIMARY_MODE = "legacy_tensorflow"
+# Recorded alongside the primary value so results stay directly comparable with
+# earlier runs, which reported clean-fid's own ``clean`` mode.
+FID_SECONDARY_MODES: tuple[str, ...] = ("clean",)
+FID_MODES: dict[str, str] = {
+    "legacy_tensorflow": (
+        "TF Inception-2015-12-05 pool3 features with TensorFlow-compatible "
+        "bilinear resizing (original TensorFlow FID protocol)"
+    ),
+    "legacy_pytorch": (
+        "pytorch-fid ported Inception-2015-12-05 weights with PIL bilinear resizing"
+    ),
+    "clean": (
+        "clean-fid default: Inception-2015-12-05 features with clean-fid "
+        "anti-aliased bicubic resizing"
+    ),
+}
+
+
+def require_fid_mode(mode: str) -> str:
+    """Fail closed on an unregistered FID mode instead of silently using another."""
+    if mode not in FID_MODES:
+        raise ValueError(f"unknown FID mode {mode!r}; known modes: {sorted(FID_MODES)}")
+    return mode
+
+
+def fid_protocol_descriptor(
+    mode: str = FID_PRIMARY_MODE,
+    secondary_modes: Sequence[str] = FID_SECONDARY_MODES,
+) -> str:
+    """Stable provenance string for the FID protocol actually used.
+
+    Part of the recorded quality-config hash, so changing the primary or
+    secondary FID protocol makes prior run configs fail closed instead of
+    silently mixing two FID definitions under one metric name.
+    """
+    require_fid_mode(mode)
+    secondary = [require_fid_mode(name) for name in secondary_modes if name != mode]
+    text = f"clean-fid {mode} watermarked-vs-raven"
+    if secondary:
+        text += " (also recorded: " + ", ".join(sorted(secondary)) + ")"
+    return text
+
+
+def clean_fid(
+    reference_dir: str | Path,
+    attacked_dir: str | Path,
+    device: str = "cuda",
+    mode: str = FID_PRIMARY_MODE,
+    secondary_modes: Sequence[str] = FID_SECONDARY_MODES,
+) -> dict:
+    """FID between two staged folders, primary value under the TF FID protocol."""
+    import importlib.metadata
+
     from cleanfid import fid
 
-    value = fid.compute_fid(str(reference_dir), str(attacked_dir), device=device)
+    require_fid_mode(mode)
+    modes = [mode, *[name for name in secondary_modes if name != mode]]
+    values: dict[str, float] = {}
+    for name in modes:
+        values[require_fid_mode(name)] = float(
+            fid.compute_fid(str(reference_dir), str(attacked_dir), device=device, mode=name)
+        )
     return {
         "implementation": "clean-fid",
-        "feature_extractor": "clean-fid default InceptionV3",
+        "clean_fid_version": importlib.metadata.version("clean-fid"),
+        "mode": mode,
+        "primary_mode": mode,
+        "secondary_modes": [name for name in modes if name != mode],
+        "protocol": fid_protocol_descriptor(mode, secondary_modes),
+        "feature_extractor": FID_MODES[mode],
+        "mode_values": values,
+        "mode_feature_extractors": {name: FID_MODES[name] for name in modes},
         "reference_dir": str(Path(reference_dir).resolve()),
         "attacked_dir": str(Path(attacked_dir).resolve()),
-        "value": float(value),
+        "value": values[mode],
     }
 
 

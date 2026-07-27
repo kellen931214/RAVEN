@@ -6,6 +6,7 @@ This file records implementation bugs, validated non-bugs, ablations, and the ev
 
 | Date | Area | Status | Evidence |
 | --- | --- | --- | --- |
+| 2026-07-27 | TensorFlow FID protocol as the default | Primary FID is now the TensorFlow FID protocol (clean-fid `legacy_tensorflow`: TF Inception-2015-12-05 features + TF-compatible bilinear resize); clean-fid `clean` is still computed and recorded as a secondary value so earlier TR numbers stay comparable. The formal quality-config hash now carries the FID protocol descriptor, and the runner accepts `scratch_run_root()` gate roots so gates stay out of `outputs/`. | `raven_repro/raven/quality.py`; `experiments/run_raven_formal_eval.py`; `raven_repro/tests/test_fid_staging.py`; `raven_repro/tests/test_canonical_layout.py` |
 | 2026-07-27 | TR flat cohort canonical path migration | Canonical TR source metadata is `data/tr/diffusiondb/metadata.csv`; all 1001 TR watermarked image paths point at `data/tr/diffusiondb/<run_id>/watermarked.png`; existing GS shared-clean V2 rows were repointed at the new TR metadata SHA and pairing hashes recomputed with the formal helper. | `experiments/migrate_tr_flat_layout.py`; `experiments/migrate_gs_shared_clean_source.py`; `data/gs/diffusiondb_shared_tr/GS/cross_method_shared_clean_audit.json` |
 | 2026-07-21 | Formal provenance and validation hardening | Source HEAD self-reference removed; runtime manifest copy, clean-tree/current-commit binding, pairing re-audit, detector tensor target/mask checks, explicit pre-color hashes, runtime scheduler/device/dtype/package provenance, threshold-specific table fields, and accurate no-color FID definitions added. CPU regression suite evidence is recorded below. | audit/formal_eval_protocol.md; formal runner and protocol regression tests |
 | 2026-07-18 | Formal evaluation protocol audit | Implemented immutable snapshots, explicit formal attack/debug assertions, effective-grid quality flow, strict resume/FID/provider/CLIP provenance, full/rounded TR reporting, formal waiter/table, and quarantined pre-audit derived outputs. Complete CPU suite: 148 passed; new 2/10/30 GPU gates remain blocked by unavailable NVML, so full eval is not safe. | `audit/formal_eval_protocol.md`; `audit/current_eval_processes.md`; `outputs/legacy_invalid/20260718T072817Z/DO_NOT_USE.md` |
@@ -16,6 +17,123 @@ This file records implementation bugs, validated non-bugs, ablations, and the ev
 | 2026-07-14 | NFPA-style Tree-Ring complex L1 evaluation | Completed for DiffusionDB only. MS-COCO was not run after scope was corrected. | `outputs/raven_nfpa_tr_eval/diffusiondb/20260714T161952Z/aggregate_results.json` |
 
 
+
+
+## 2026-07-27 — TensorFlow FID protocol becomes the default FID
+
+### Problem
+FID was computed only with clean-fid's own `clean` mode (anti-aliased bicubic
+resizing). The watermarking literature reports FID under the original
+TensorFlow protocol (Inception-2015-12-05 pool3 features with
+TensorFlow-compatible bilinear resizing), so the reported numbers were not the
+FID definition the comparison targets. The FID protocol was also written as a
+free-text string inside the formal quality-config hash, so a protocol change
+would not have been visible in provenance.
+
+### Root cause
+`raven_repro/raven/quality.py:clean_fid` called `cleanfid.fid.compute_fid`
+without a `mode` argument, silently taking the library default, and
+`run_raven_formal_eval.py:fid_stage` then stamped `"mode": "clean"` on the
+result. No caller could choose or record another FID protocol.
+
+### Affected files
+- `raven_repro/raven/quality.py:clean_fid`, `:fid_protocol_descriptor`,
+  `:require_fid_mode` (new).
+- `experiments/run_raven_formal_eval.py:run_config` (quality-config hash),
+  `:fid_stage`.
+- `raven_repro/raven/eval_protocol.py:is_scratch_run_root` (new),
+  `:assert_canonical_output_root`.
+- `raven_repro/tests/test_fid_staging.py`,
+  `raven_repro/tests/test_canonical_layout.py`.
+
+### Affected outputs
+No existing output was modified, deleted or recomputed. Every FID value already
+on disk under `outputs/tr/` was produced with clean-fid `clean` mode and stays
+valid **as a clean-fid `clean` result** — it is not a TensorFlow-protocol FID
+and must not be relabelled as one. Those runs are complete and validated, so
+they need no resume; a `--resume` of one of them would now fail closed on the
+changed `quality_config_hash`, which is the intended behaviour.
+
+### Fix
+`clean_fid()` computes the primary value with `mode="legacy_tensorflow"` (the
+TensorFlow FID protocol) and additionally records clean-fid `clean` as a
+secondary value in the same `fid_result.json`
+(`mode_values`, `secondary_modes`, `mode_feature_extractors`, `protocol`).
+`value`/`mode` are the TensorFlow-protocol primary, so the experiment table's
+`FID` column reports the TF value. Unknown FID modes fail closed via
+`require_fid_mode()`. The formal `quality_config_hash` now embeds
+`fid_protocol_descriptor()` instead of a hand-written string.
+`assert_canonical_output_root()` additionally accepts a root created by
+`scratch_run_root(method, …)`, so the required 10-sample gate can run in `/tmp`
+instead of polluting `outputs/` — an arbitrary `/tmp` path is still rejected.
+
+### Reused code
+Existing `cleanfid` package, the existing `clean_fid()` call sites (all four
+runners take the default and therefore switch together), the existing
+`stage_fid_records()` staging/manifest gate, and the existing
+`scratch_run_root()` helper. No second FID implementation was added; TensorFlow
+itself is not installed next to the torch/diffusers attack pipeline because
+clean-fid's `legacy_tensorflow` mode is that protocol.
+
+### Historical bug coverage
+Reviewed the 2026-07-21 provenance-hardening entry (which introduced the FID
+definitions and no-color FID staging) and the 2026-07-27 layout entries.
+Searched for every `clean_fid` / `clean-fid` call site: `run_raven_formal_eval.py`,
+`run_raven_no_color_eval.py`, `run_raven_aligned_color_eval.py`,
+`run_raven_color_transfer_eval.py` — all four call the shared helper with the
+default mode, so no stale per-runner FID copy remains. The no-color/aligned
+variant hashes already include `source_code_manifest_sha256`, so the protocol
+change is covered there transitively.
+
+### Regression prevention
+New tests assert: the primary mode is `legacy_tensorflow` with `clean` recorded
+as secondary; both modes are actually computed and reported under
+`mode_values`; an unregistered mode raises; the formal quality-config hash uses
+the shared descriptor rather than the old literal; and the canonical-root guard
+accepts only `scratch_run_root()` gate roots in `/tmp`.
+
+### Validation
+- `python -m pytest -q raven_repro/tests/test_fid_staging.py raven_repro/tests/test_canonical_layout.py`: 22 passed.
+- `python -m pytest -q tests` from `raven_repro/`: 342 passed, 61 warnings
+  (339 before + 3 new FID protocol tests, plus the extended layout test).
+- Real-image FID probe on 12 clean vs 12 GS watermarked images with
+  `CUDA_VISIBLE_DEVICES=0`: `legacy_tensorflow`, `legacy_pytorch` (275.36) and
+  `clean` (271.68) all execute; clean-fid downloads the TF Inception graph to
+  `/tmp/inception-2015-12-05.pt`. With several GPUs visible clean-fid wraps the
+  feature extractor in `nn.DataParallel` and fails with an NCCL error, so FID
+  must run with a single visible GPU — the formal runner's `--gpu` already
+  pins `CUDA_VISIBLE_DEVICES`.
+
+### Watermark integrity
+- Source-data validity: unchanged; GS cohort
+  `data/gs/diffusiondb_shared_tr/GS/metadata.csv` has 1001 rows, all
+  watermarked images present.
+- Clean/watermarked pairing status: untouched by this change.
+- Base-latent uniqueness status: untouched.
+- Watermark target and mask status: untouched.
+- Attack-pairing status: untouched; no attack was rerun.
+- Detector score definition: unchanged (GS `bit_accuracy`, TR `l1_complex`).
+- Threshold calibration source: unchanged.
+- Actual empirical FPR: not affected by this change.
+- Quality metric reference: unchanged (watermarked input vs final
+  post-color-transfer attacked image, effective-flow overlap).
+- CLIP input definition: unchanged (attacked-watermarked image vs source prompt).
+- FID staging status: unchanged strict fresh staging; only the feature
+  extractor/resize protocol behind the value changed.
+- Outputs requiring regeneration: none. Existing `outputs/tr/` FID values remain
+  valid clean-fid `clean` results and are not comparable to the new primary
+  TensorFlow-protocol value; the secondary `clean` value recorded in new runs is
+  what should be compared against them.
+
+### Git provenance
+- Repository: `kellen931214/RAVEN`
+- Branch: `agent/cleanup-quality-decomposition`
+- Commit: pending at time of entry
+- Remote branch: `origin/agent/cleanup-quality-decomposition`
+- Push status: pending
+- Entry point: `experiments/run_raven_formal_eval.py`
+- Formal output eligibility: metric-protocol change only; the GS runs that use
+  it are recorded separately below when they finish.
 
 
 ## 2026-07-27 — TR flat cohort canonical path migration and GS shared-clean source refresh

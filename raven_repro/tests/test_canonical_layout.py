@@ -24,6 +24,7 @@ from raven.eval_protocol import (
     clean_data_dir,
     formal_output_root,
     formal_run_key,
+    is_scratch_run_root,
     method_data_root,
     method_output_root,
     scratch_run_root,
@@ -158,6 +159,15 @@ def test_gates_and_smoke_runs_go_to_tmp_not_outputs():
         assert str(root).startswith("/tmp/")
         assert REPO / "outputs" not in root.parents
         assert "raven-gs-gate10" in root.name
+        # The formal runner must accept its own scratch gate root, and only that:
+        # an arbitrary /tmp path is still outside the canonical method root.
+        assert assert_canonical_output_root(root / "formal_attack", "GS") == (
+            root / "formal_attack"
+        ).resolve()
+        assert is_scratch_run_root(root, "GS")
+        assert not is_scratch_run_root(root, "TR")
+        with pytest.raises(ValueError, match="outside the canonical root"):
+            assert_canonical_output_root(Path("/tmp/some-other-run"), "GS")
     finally:
         root.rmdir()
 

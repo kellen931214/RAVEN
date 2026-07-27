@@ -53,6 +53,7 @@ from raven.eval_protocol import (  # noqa: E402
     validate_resume_record,
 )
 from raven.metrics import pair_quality_metrics  # noqa: E402
+from raven.quality import fid_protocol_descriptor  # noqa: E402
 from raven.pairing_provenance import (  # noqa: E402
     PAIRING_REQUIRED_FIELDS,
     audit_pairing_rows,
@@ -345,7 +346,7 @@ def run_config(
                 "reference": "watermarked input",
                 "comparison": "final post-color-transfer attacked image",
                 "overlap": "effective source flow inverse warp",
-                "fid": "clean-fid watermarked-vs-raven",
+                "fid": fid_protocol_descriptor(),
                 "clip": CLIP_CONFIG,
                 "attack_config_hash": formal_attack_config_hash(attack_config),
             }
@@ -879,12 +880,8 @@ def fid_stage(args: argparse.Namespace, config: dict[str, Any]) -> int:
     result = clean_fid(
         fid_root / "reference_watermarked", fid_root / "attacked", device=args.device
     )
-    import importlib.metadata
-
     result.update(
         {
-            "clean_fid_version": importlib.metadata.version("clean-fid"),
-            "mode": "clean",
             "image_count": args.expected_count,
             "reference_definition": manifest["reference_definition"],
             "attacked_definition": manifest["attacked_definition"],

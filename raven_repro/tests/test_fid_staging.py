@@ -74,3 +74,52 @@ def test_no_color_record_and_fid_definition_use_explicit_pre_color_provenance(tm
     pre_color.write_bytes(b"replaced")
     with pytest.raises(RuntimeError, match="pre-color attacked SHA mismatch"):
         bind_pre_color_attack_record(base)
+
+
+def test_fid_primary_protocol_is_tensorflow_and_records_clean_as_secondary(monkeypatch):
+    import sys
+    import types
+
+    from raven import quality
+
+    assert quality.FID_PRIMARY_MODE == "legacy_tensorflow"
+    assert quality.FID_SECONDARY_MODES == ("clean",)
+    descriptor = quality.fid_protocol_descriptor()
+    assert "legacy_tensorflow" in descriptor and "clean" in descriptor
+
+    calls = []
+    fake = types.ModuleType("cleanfid")
+    fake.fid = types.SimpleNamespace(
+        compute_fid=lambda a, b, device, mode: calls.append(mode) or {"legacy_tensorflow": 12.5, "clean": 13.75}[mode]
+    )
+    monkeypatch.setitem(sys.modules, "cleanfid", fake)
+
+    result = quality.clean_fid("reference", "attacked", device="cuda")
+    assert calls == ["legacy_tensorflow", "clean"]
+    assert result["mode"] == "legacy_tensorflow"
+    assert result["value"] == 12.5
+    assert result["mode_values"] == {"legacy_tensorflow": 12.5, "clean": 13.75}
+    assert result["protocol"] == descriptor
+
+
+def test_fid_rejects_unregistered_mode():
+    from raven import quality
+
+    with pytest.raises(ValueError, match="unknown FID mode"):
+        quality.require_fid_mode("inception_v3_torchmetrics")
+    with pytest.raises(ValueError, match="unknown FID mode"):
+        quality.fid_protocol_descriptor("tensorflow")
+
+
+def test_formal_quality_config_hash_uses_the_shared_fid_protocol_descriptor():
+    import pathlib
+    import re
+
+    from raven import quality
+
+    source = (pathlib.Path(__file__).resolve().parents[2] / "experiments/run_raven_formal_eval.py").read_text(
+        encoding="utf-8"
+    )
+    assert '"fid": fid_protocol_descriptor()' in source
+    assert not re.search(r'"fid":\s*"clean-fid watermarked-vs-raven"', source)
+    assert quality.fid_protocol_descriptor() != "clean-fid watermarked-vs-raven"
