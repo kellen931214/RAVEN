@@ -671,19 +671,29 @@ def test_append_row_rejects_schema_drift(tmp_path):
 # --------------------------------------------------------------------------- #
 
 
-def test_real_v1_gs_cohort_still_audits_as_v1():
-    path = REPO / "data" / "gs" / "gs_diffusiondb_1001_match_tr" / "GS" / "metadata.csv"
-    if not path.is_file():
-        pytest.skip(f"V1 GS cohort not present: {path}")
-    with path.open(newline="", encoding="utf-8") as handle:
-        rows = list(csv.DictReader(handle))
-    audit = audit_pairing_rows(rows, expected_count=len(rows), verify_files=False)
+def test_v1_protocol_still_audits_as_v1(tmp_path):
+    """V1 support is retained in code even though the V1 cohort data was deleted.
+
+    Built synthetically here because ``data/gs/gs_diffusiondb_1001_match_tr`` was
+    removed on 2026-07-27 when GS moved to the shared-clean protocol.
+    """
+    _, gs_rows, _ = make_cohort(tmp_path)
+    v1_rows = []
+    for row in gs_rows:
+        v1 = {
+            key: value
+            for key, value in row.items()
+            if key not in set(GS_SHARED_CLEAN_V2_FIELDS)
+        }
+        v1["protocol"] = GS_PAIRING_PROTOCOL
+        v1["gs_protocol_mode"] = "official_compatible"
+        v1["gs_sampling_seed"] = int(row["base_latent_seed"])
+        v1["pairing_sha256"] = build_pairing_sha256(v1)
+        v1_rows.append(v1)
+    audit = audit_pairing_rows(v1_rows, expected_count=len(v1_rows), verify_files=True)
     assert audit["protocol"] == GS_PAIRING_PROTOCOL
-    assert audit["unique_gs_sampling_seeds"] == len(rows)
+    assert audit["unique_gs_sampling_seeds"] == len(v1_rows)
     assert "shared_clean_protocol" not in audit
-    for row in rows[:5]:
-        assert row["gs_protocol_mode"] == "official_compatible"
-        assert row["pairing_sha256"] == build_pairing_sha256(row)
 
 
 def test_real_tr_cohort_pairing_hashes_are_unchanged():

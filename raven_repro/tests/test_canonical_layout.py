@@ -58,23 +58,29 @@ def test_unknown_method_fails_closed():
 # --------------------------------------------------------------------------- #
 # Source data resolution
 # --------------------------------------------------------------------------- #
-def test_source_metadata_paths_resolve_to_real_cohorts():
+def test_source_metadata_paths_are_method_and_dataset_specific():
     tr = source_metadata_path("TR", "diffusiondb")
-    gs = source_metadata_path("GS", "gs_diffusiondb_1001_match_tr")
+    gs = source_metadata_path("GS", "diffusiondb_shared_tr")
     assert tr == REPO / "data/tr/diffusiondb/TR/metadata.csv"
-    assert gs == REPO / "data/gs/gs_diffusiondb_1001_match_tr/GS/metadata.csv"
-    assert tr.is_file() and gs.is_file()
+    assert gs == REPO / "data/gs/diffusiondb_shared_tr/GS/metadata.csv"
+    assert tr.is_file(), "the canonical Tree-Ring source cohort must exist"
 
 
-def test_clean_dirs_keep_tr_and_gs_cohorts_separate():
+def test_shared_clean_cohorts_reuse_the_tr_clean_directory():
+    """Under the shared-clean protocol GS has no clean directory of its own.
+
+    The V1 method-specific layout (``data/clean/<dataset>/GS/``) is still
+    resolvable for legacy cohorts, but the current GS cohort points straight at
+    the Tree-Ring clean images, so there is exactly one clean image per run_id.
+    """
     tr_clean = clean_data_dir("diffusiondb")
-    gs_clean = clean_data_dir("gs_diffusiondb_1001_match_tr", "GS")
-    assert tr_clean != gs_clean
-    assert tr_clean.is_dir() and gs_clean.is_dir()
-    # Same filenames, different image sets -> must never share a directory.
+    assert tr_clean == REPO / "data/clean/diffusiondb"
+    assert tr_clean.is_dir()
     assert (tr_clean / "000000.png").is_file()
-    assert (gs_clean / "000000.png").is_file()
-    assert (tr_clean / "000000.png").read_bytes() != (gs_clean / "000000.png").read_bytes()
+    # data/clean holds no method-specific GS cohort any more.
+    assert not list(CLEAN_DATA_ROOT.glob("gs_*"))
+    # The legacy helper still resolves a method-specific path without creating it.
+    assert clean_data_dir("legacy_cohort", "GS") == CLEAN_DATA_ROOT / "legacy_cohort" / "GS"
 
 
 # --------------------------------------------------------------------------- #
@@ -82,9 +88,9 @@ def test_clean_dirs_keep_tr_and_gs_cohorts_separate():
 # --------------------------------------------------------------------------- #
 def test_formal_output_root_is_method_aware():
     tr = formal_output_root("TR", "diffusiondb", "formal", "abc123_def456")
-    gs = formal_output_root("GS", "gs_diffusiondb_1001_match_tr", "formal", "abc123_def456")
+    gs = formal_output_root("GS", "diffusiondb_shared_tr", "formal", "abc123_def456")
     assert tr == REPO / "outputs/tr/diffusiondb/formal/abc123_def456"
-    assert gs == REPO / "outputs/gs/gs_diffusiondb_1001_match_tr/formal/abc123_def456"
+    assert gs == REPO / "outputs/gs/diffusiondb_shared_tr/formal/abc123_def456"
 
 
 def test_formal_output_root_rejects_path_traversal():
@@ -104,7 +110,7 @@ def test_run_key_is_content_addressed_not_timestamped():
 
 
 def test_output_root_guard_rejects_cross_method_and_non_canonical():
-    ok = REPO / "outputs/gs/gs_diffusiondb_1001_match_tr/formal/x"
+    ok = REPO / "outputs/gs/diffusiondb_shared_tr/formal/x"
     assert assert_canonical_output_root(ok, "GS") == ok.resolve()
     with pytest.raises(ValueError, match="outside the canonical root"):
         assert_canonical_output_root(REPO / "outputs/tr/diffusiondb/x", "GS")

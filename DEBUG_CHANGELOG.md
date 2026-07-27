@@ -754,3 +754,60 @@ work is untouched: `GS_REQUIRED_FIELDS` keeps its exact field set and order, and
 - Remote branch: `origin/agent/cleanup-quality-decomposition`
 - Entry point: `experiments/generate_gs_from_tr_shared_clean.py`
 - Formal output eligibility: code validated; N=1 gate only, full cohort not run.
+
+## 2026-07-27 — GS V1 data and migration tool removed
+
+### Problem
+After GS moved to the shared-clean protocol, the V1 cohorts and their attack
+outputs described a protocol the project no longer uses, and the V1-only metadata
+migration tool had no remaining input.
+
+### Root cause
+Not a bug — a deliberate, user-authorised protocol change.
+
+### Affected files
+- Deleted: `experiments/migrate_gs_detection_metadata.py` and its 19 tests in
+  `raven_repro/tests/test_gaussian_shading_official.py`.
+- `raven_repro/scripts/build_formal_source_manifest.py`: dropped from `CORE_FILES`.
+- `raven_repro/tests/test_canonical_layout.py`: the two tests that asserted the
+  deleted V1 cohort existed on disk now assert the shared-clean invariant instead
+  (GS has no clean directory of its own; `data/clean` holds no `gs_*` cohort).
+- `raven_repro/tests/test_gaussian_shading_shared_tr_clean.py`: the real-V1-cohort
+  audit test was replaced with a synthetic V1 cohort so V1 protocol coverage
+  survives the data deletion.
+
+### Affected outputs
+Deleted, irreversibly, on explicit user instruction:
+`data/gs/*` (445 MB, 4 cohorts), `data/clean/gs_*` (440 MB),
+`outputs/gs/*` (2.7 GB, including the validated V1 1001 attack/eval results).
+`data/gs/` and `outputs/gs/` remain as empty canonical roots.
+
+**Not touched, verified:** `data/clean/diffusiondb/` (1004 files before and after)
+and `data/tr/` (1020 files before and after); `data/tr/diffusiondb/TR/metadata.csv`
+SHA `ade3792423850bc519ac8383ac332e4c013cf0c72f258f11693b9381a34d04bc` unchanged.
+
+### Fix
+V1 *code* is retained deliberately — `GS_PAIRING_PROTOCOL`, `GS_REQUIRED_FIELDS`
+and the `official_compatible` seeded-sampling path are still reachable from the
+standalone reproduction runners, so only the V1-specific migration tool was
+removed.
+
+### Regression prevention
+`audit_pairing_rows` still accepts and validates V1 rows; a synthetic V1 cohort
+test asserts the V1 field set, protocol name and sampling-seed uniqueness so the
+retained V1 code cannot silently rot now that no V1 data exists.
+
+### Validation
+`python3 -m pytest -q` in `raven_repro/`: 333 passed (352 − 19 removed).
+
+### Watermark integrity
+- Source data: TR clean/watermarked/metadata verified unchanged.
+- Outputs requiring regeneration: the GS cohort itself — regenerated with
+  `experiments/generate_gs_from_tr_shared_clean.py` into
+  `data/gs/diffusiondb_shared_tr/GS/`.
+- Previous V1 GS results: no longer usable and no longer present.
+
+### Git provenance
+- Branch: `agent/cleanup-quality-decomposition`
+- Entry point: `experiments/generate_gs_from_tr_shared_clean.py`
+- Formal output eligibility: V1 results withdrawn; V2 cohort generation in progress.

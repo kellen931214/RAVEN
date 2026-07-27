@@ -332,46 +332,12 @@ does not need a code change:
 An orchestrator must therefore simply omit the `attack-clean` stage for GS (running it is a
 fail-closed error, not a silent no-op).
 
-## Metadata migration (existing GS cohorts — no image regeneration)
-`experiments/migrate_gs_detection_metadata.py` upgrades pre-`02b669c` GS metadata (legacy
-`detection_threshold=0.70703125`, legacy `before_detection_successful`, missing official
-detection columns) to the official schema **without regenerating images**. It:
-- **Fully re-derives** GS latent/sampling/secret provenance per row: it rebuilds a fresh
-  `GsProvider` from the row's `gs_secret_index` / `gs_sampling_seed`, the sidecar
-  `watermark_config` layout (`message_width_in_bytes` / `channel_copy` / `hw_copy`), the
-  `generation_config` `resolution`+`dtype`, and re-runs `get_wm_latents()`, then verifies
-  that `gs_message/key/nonce/secret_bundle_sha256`, `gs_sampling_uniform_sha256`,
-  `watermarked_latent_sha256`, `watermark_target_sha256`, and the base-latent SHAs
-  (`base_latent_sha256` / `clean_base_latent_sha256` / `watermarked_base_latent_sha256`) all
-  recompute **exactly**. The `dtype` used for re-derivation comes from `generation_config`
-  (whose canonical SHA is verified against the row), so it is exactly the generation dtype.
-- Verifies the **formal mapping** `gs_secret_index == run_id` and
-  `gs_sampling_seed == base_latent_seed`.
-- **Resolves the sidecar configs by the metadata filename's shard suffix**:
-  `metadata.csv` → `generation_config.json` / `watermark_config.json`;
-  `metadata.shard-003-of-008.csv` → `generation_config.shard-003-of-008.json` /
-  `watermark_config.shard-003-of-008.json`. A **missing** sidecar **fails closed** (never
-  falls back to default parameters). Both configs' canonical SHA-256 is recomputed and
-  compared with each row's `generation_config_sha256` / `watermark_config_sha256`, and their
-  content (`model_id` / `model_revision` / `scheduler` / `resolution` / GS `gs_protocol_mode`
-  + layout) must agree with the row.
-- Still verifies on-disk PNG SHA-256 and `pairing_sha256`.
-- recomputes `before_detection_successful = before_bit_accuracy >= 0.6484375` from an
-  existing bit-accuracy column (`before_bit_accuracy` / `before_detection_metric_value`;
-  fail closed if absent or inconsistent — re-run inversion/score extraction, never
-  regenerate the PNG);
-- writes `gs_detection_mode`, `detection_threshold`, `detection_threshold_type`,
-  `detection_threshold_comparison_operator`, `gs_official_tau_onebit/tau_bits`, and the
-  three protocol-layer fields;
-- never touches PNG bytes, `clean_sha256`, `watermarked_sha256`, `watermarked_latent_sha256`,
-  `gs_sampling_uniform_sha256`, `gs_sampling_seed`, the secret SHAs, `base_latent_seed`,
-  the base-latent SHAs, `generation_config_sha256`, `watermark_config_sha256`, or
-  `pairing_sha256` (detection fields are not in `PAIRING_HASH_FIELDS`/`GS_REQUIRED_FIELDS`;
-  the immutable set is verified byte-for-byte after building each migrated row);
-- backs up (`*.premigration.<ts>.bak`), writes atomically, is idempotent, and re-runs the
-  full pairing audit; any inconsistency fails closed.
-Usage: `python experiments/migrate_gs_detection_metadata.py [--dry-run] <metadata.csv> ...`
-(also accepts sharded `metadata.shard-003-of-008.csv` inputs).
+## Metadata migration (removed 2026-07-27)
+`experiments/migrate_gs_detection_metadata.py` upgraded pre-`02b669c` V1 GS metadata to
+the official detection schema in place. It was deleted together with the V1 GS cohorts
+it served (see "GS V1 data removal" below); no GS metadata on disk needs it any more.
+Its 19 unit tests were removed with it. Historical detail remains in
+`DEBUG_CHANGELOG.md` (2026-07-25 / 2026-07-26 entries).
 
 ## N=1000 readiness (explicit)
 - **N=1000 generation**: the 50-step generation and resume gate **passed** (2026-07-25,
@@ -426,6 +392,28 @@ TR/GS base-latent SHA `bea48052…825a` equal; TR/GS clean SHA `c60db047…bebac
 equal; `clean_path` identical; before-attack `bit_accuracy = 1.0`, detected at
 `official_beta_tail_tau_onebit = 0.6484375` (`>=`); cross-method audit passed
 against all 1001 TR rows. Full 1001-sample cohort not yet generated.
+
+## GS V1 data removal (2026-07-27)
+
+All Gaussian Shading data and outputs from the V1 protocol were deleted at the
+user's request when GS moved to the shared-clean protocol:
+
+| Deleted | Size |
+|---|---|
+| `data/gs/{gs_diffusiondb_1001_match_tr, gs_formal_gate_10_50step, gs_gate_cleanup_10_50step, gs_gate_recheck_10_50step}` | 445 MB |
+| `data/clean/gs_*` (the GS-specific clean cohorts) | 440 MB |
+| `outputs/gs/*` (all GS attack / eval / verification output) | 2.7 GB |
+| `experiments/migrate_gs_detection_metadata.py` (+19 tests) | — |
+
+`data/clean/diffusiondb/` (the Tree-Ring clean cohort, 1004 files) and all of
+`data/tr/` (1020 files) were **not** touched — verified by file count and by the
+unchanged metadata SHA `ade37924…4d04bc`. `data/gs/` and `outputs/gs/` remain as
+empty canonical roots.
+
+V1 *code* is retained: `GS_PAIRING_PROTOCOL`, `GS_REQUIRED_FIELDS` and the
+`official_compatible` seeded-sampling path still exist and are still tested
+(synthetically, since the V1 data is gone), because the standalone reproduction
+runners use that mode.
 
 ## Next steps
 1. ~~Run the 10-pair 50-step generation and identical-command resume gate.~~ Done
