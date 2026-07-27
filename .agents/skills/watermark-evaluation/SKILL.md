@@ -16,7 +16,7 @@ This includes pipelines involving:
 
 This skill extends:
 
-`skills/experiment-integrity/SKILL.md`
+`.agents/skills/experiment-integrity/SKILL.md`
 
 Both skills must be followed.
 
@@ -169,7 +169,7 @@ The evaluator must fail when required pairing or watermark provenance is missing
 
 Watermark pairing and provider metadata must use the canonical hashing implementation from:
 
-`skills/experiment-integrity/SKILL.md`
+`.agents/skills/experiment-integrity/SKILL.md`
 
 Normalize fields such as:
 

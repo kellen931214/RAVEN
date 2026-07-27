@@ -2,7 +2,7 @@
 
 Before reviewing, modifying, debugging, testing, rerunning, or evaluating this repository, you must first read and follow:
 
-`skills/experiment-integrity/SKILL.md`
+`.agents/skills/experiment-integrity/SKILL.md`
 
 You must also read the entries in `DEBUG_CHANGELOG.md` that are relevant to the current task.
 
@@ -19,7 +19,7 @@ If the task involves any of the following:
 
 you must also read and follow:
 
-`skills/watermark-evaluation/SKILL.md`
+`.agents/skills/watermark-evaluation/SKILL.md`
 
 Do not begin implementation until all applicable instructions and checks have been completed.
 
@@ -93,14 +93,14 @@ CUDA OOM:
 For every watermark generation task, read and follow:
 
 - .agents/skills/raven-shared-clean/SKILL.md
-- skills/watermark-evaluation/SKILL.md
+- .agents/skills/watermark-evaluation/SKILL.md
 
 For every RAVEN attack or evaluation task, read and follow:
 
 - .agents/skills/raven-attack-artifacts/SKILL.md
 - .agents/skills/raven-experiment-naming/SKILL.md
 - .agents/skills/raven-experiment-table/SKILL.md
-- skills/watermark-evaluation/SKILL.md
+- .agents/skills/watermark-evaluation/SKILL.md
 
 After a generation, attack or evaluation experiment finishes, use:
 
