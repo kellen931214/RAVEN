@@ -60,6 +60,7 @@ All forgery execution scripts are located under the `eval_bench_wm/` directory.
 | `run_removal.py` | Run watermark removal attacks and evaluate detection performance. |
 | `run_reprompting.py` | Run reprompting-based forgery evaluation. |
 | `run_imprint_forgery.py` | Run imprinting-based forgery evaluation. |
+| `run_verification.py` | Verify suspect images against a saved portable watermark state, in a standalone process. |
 
 ## Supported Diffusion Backbones
 
@@ -112,6 +113,113 @@ python run_imprint_forgery.py --wm_type GS --cover_image_path images/stalin.jpg
 ```
 
 Note that some watermarking methods (e.g., GM, SHALLOW, MaXsive) are tested for 4-channel latent diffusion models only. We therefore recommend evaluating them on SDXL or SD2.1. We have not yet extended these methods to 16-channel latent models.
+
+## T2S (T2SMark)
+
+Upstream reference: <https://github.com/0xD009/T2SMark>, pinned comparison commit
+`0c1fbfd50fcd1fba135477a2c016e284d5d7914d`.
+
+### Generation
+
+Each sample gets its own base latent, session key and watermarked latent; images
+and states are written per sample instead of overwriting a single file.
+
+`--t2s_fix_key` follows upstream `run.py`: it fixes **both the master key and the
+message** across samples to simulate a single account, and only the session key
+and base latent stay per-sample.
+
+`--t2s_rng_mode` selects the generation RNG lifecycle:
+
+| Mode | Behaviour |
+| :--- | :--- |
+| `official_compatible` (default) | Reproduces upstream's whole per-sample RNG lifecycle: reseeds the process-global RNG with `set_random_seed(seed + index)` and draws in upstream's order (master key, message, session key, then each `encode`'s `randn` and noise-sign `randint`). |
+| `raven_deterministic` | Uses one explicit CPU generator per sample and never touches global RNG state. A RAVEN provenance adaptation; it does **not** reproduce upstream's global-RNG side effects, so an end-to-end run diverges from upstream. Never describe it as upstream-exact. |
+
+```bash
+python run_watermark.py --wm_type T2S --num 2 \
+    --modelid_target stabilityai/stable-diffusion-2-1-base \
+    --scheduler_target DDIM --out_dir out/t2s
+# -> out/t2s/images/00000.png ...    out/t2s/t2s_state/<watermark_id>.json
+```
+
+### Standalone verification
+
+`run_verification.py` runs in a fresh process. It needs only the saved state,
+the suspect image, and the model/inversion configuration. It does not need the
+generating provider instance, a prior `get_wm_latents()` call, or the original
+latent, and it never infers pairing from filename or row order.
+
+```bash
+# Explicit pairs
+python run_verification.py --wm_type T2S \
+    --pair out/t2s/t2s_state/sd21-t2s-00000.json=out/t2s/images/00000.png \
+    --modelid_target stabilityai/stable-diffusion-2-1-base --strict_image_sha
+
+# Or content-addressed, matching each state's recorded image_sha256
+python run_verification.py --wm_type T2S \
+    --state_dir out/t2s/t2s_state --image_dir out/t2s/images \
+    --modelid_target stabilityai/stable-diffusion-2-1-base
+```
+
+Reported fields: `score_true_key`, `score_control_key`, `score_margin`,
+`score_direction`, `decision_rule`, `detection_success`, the recovered session
+key and message, plus `key_accuracy` / `message_accuracy` when the state carries
+the corresponding expectation (otherwise `null` / `N/A`, never a false 0%).
+
+Fail-closed gates: a state without a valid `state_sha256` is rejected outright;
+states whose model, revision, scheduler, resolution, latent shape, channel
+layout, RNG mode, inversion mode/steps or provider-config SHA disagree cannot be
+verified in one run; and a CLI flag that contradicts the state aborts unless
+`--allow_config_override` is passed. The first state's configuration is never
+silently applied to the rest. The loaded model's latent shape is also checked
+against the state.
+
+### Detection semantics
+
+Upstream's **formal evaluation is a cohort ROC**: `run.py` pools `norm1_no_w` as
+negatives and `norm1_w` as positives across the whole run and reports AUC plus
+TPR at FPR < 1e-6. Upstream defines **no per-image binary decision rule**.
+
+The per-image test reported here is therefore labelled as a RAVEN deployment
+extension, `paired_key_comparison`:
+
+```
+decision_rule            = paired_key_comparison
+decision_rule_expression = score_true_key > score_control_key   (higher is watermarked)
+decision_rule_provenance = raven_deployment_extension
+official_evaluation      = cohort_roc_auc_and_tpr_at_fpr_1e-6
+```
+
+where the control key is `1 - master_key`. It is **not** an upstream rule and
+**not** `TPR@1%FPR`. It has no calibrated margin threshold, so a mismatched state
+can occasionally land marginally above zero; the discriminating signals are the
+margin magnitude and the message accuracy. Report TPR/FPR only after running and
+recording an actual negative cohort and threshold-calibration protocol.
+
+### Inversion modes
+
+The official T2S inversion and the benchmark's generic DDIM inversion are not
+equivalent and are never silently substituted:
+
+| `--t2s_inversion_mode` | Protocol |
+| :--- | :--- |
+| `t2s_official` (default) | Upstream `naive_forward_diffusion`: walks `reversed(scheduler.timesteps)` with a null prompt at `guidance_scale=1.0`, default 10 steps (`--t2s_num_inversion_steps`). SD3/SD3.5 use the flow-matching sigma update. |
+| `benchmark_ddim` | The benchmark's `PipeProvider.invert_images` -> diffusers `DDIMInverseScheduler`, driven at the generation step count. |
+
+### Channel layouts
+
+| Latents | Key channels | Message channels |
+| :--- | :--- | :--- |
+| 4 (SD2.1) | `[--t2s_key_channel_idx]` (default `[0]`) | the other three |
+| 16 (SD3/SD3.5) | `[0, 1, 2, 3]` | the other twelve |
+
+### Cross-watermark shared-clean cohorts
+
+`T2SProvider.new_sample(base_latent=...)` accepts the canonical shared TR base
+latent and uses it as the tail-truncated source, so the pre-injection latent is
+byte-identical to the shared one. A shape mismatch fails closed rather than
+silently sampling a method-specific replacement. No formal shared-clean T2S
+cohort is produced by this change.
 
 ## Acknowledgement
 
