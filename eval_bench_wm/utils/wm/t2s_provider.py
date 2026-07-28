@@ -13,7 +13,8 @@ RNG modes
 ---------
 ``official_compatible`` (default) reproduces upstream's *whole* generation RNG
 lifecycle, not merely the encoder given fixed inputs. Per sample it reseeds the
-process-global RNG with ``set_random_seed(seed + sample_index)`` and then draws
+process-global RNG with :func:`official_set_random_seed` (a verbatim copy of
+upstream ``src/utils.py``, deliberately not the RAVEN helper) and then draws
 from the global CPU stream in upstream's exact order:
 
     master_key, message   (only when --t2s_fix_key is off)
@@ -80,9 +81,28 @@ import torch
 from scipy.stats import norm
 
 from utils.canonical import canonical_json_dumps, canonical_json_sha256
-from utils.utils import set_random_seed
 
 from .wm_provider import WmProvider
+
+
+def official_set_random_seed(seed: int) -> None:
+    """Verbatim upstream ``src/utils.py:set_random_seed``.
+
+    Deliberately NOT ``utils.utils.set_random_seed``: the RAVEN helper also does
+    ``np.random.seed(seed + 3)``, a second ``torch.cuda.manual_seed_all(seed + 4)``
+    and ``random.seed(seed + 5)``. Those extra calls leave a different global RNG
+    state than upstream. They do not change the CPU torch stream that T2S draws
+    from, so the watermark latents would be identical either way, but
+    ``official_compatible`` exists precisely to reproduce upstream's global RNG
+    side effects for whatever samples next, so it must seed exactly as upstream
+    does.
+    """
+    import random
+
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed + 1)
+    torch.cuda.manual_seed_all(seed + 2)
+    random.seed(seed + 3)
 
 
 T2S_STATE_SCHEMA_VERSION = 2
@@ -522,7 +542,7 @@ class T2SProvider(WmProvider):
         self.fixed_msg = None
         if self.fix_key:
             if self.rng_mode == "official_compatible":
-                set_random_seed(self.seed)
+                official_set_random_seed(self.seed)
                 self.fixed_master_key = torch.randint(0, 2, (self.key_length,))
                 self.fixed_msg = torch.randint(0, 2, (self.msg_length,))
             else:
@@ -585,7 +605,7 @@ class T2SProvider(WmProvider):
         if self.rng_mode == "official_compatible":
             # Upstream run.py line 89: reseed the process-global RNG per sample,
             # then draw from the global CPU stream in upstream's exact order.
-            set_random_seed(int(sample_seed))
+            official_set_random_seed(int(sample_seed))
             gen = None
         else:
             # RAVEN provenance mode: one explicit CPU generator per sample, no

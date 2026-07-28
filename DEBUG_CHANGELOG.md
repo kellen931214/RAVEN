@@ -91,11 +91,17 @@ incomplete**; no formal cohort existed, so no published result is invalidated.
   "cohort_roc_auc_and_tpr_at_fpr_1e-6"`. Logs and README match.
 
 ### Reused code
-`utils.utils.set_random_seed` is reused as the single seeding helper. Its extra
-numpy/`random` seeding does not affect T2S, which draws only from the CPU torch
-stream that both it and upstream seed with `torch.manual_seed(seed)`; the
-lifecycle parity test asserts bit-equality against a verbatim transcription of
-upstream's own `set_random_seed`.
+`official_compatible` uses a T2S-local `official_set_random_seed()` that is a
+verbatim copy of upstream `src/utils.py`, **not** the RAVEN
+`utils.utils.set_random_seed`. The RAVEN helper additionally performs
+`np.random.seed(seed + 3)`, a second `torch.cuda.manual_seed_all(seed + 4)` and
+`random.seed(seed + 5)`, which leaves a different global RNG state than upstream.
+Since `official_compatible` exists specifically to reproduce upstream's global
+RNG side effects for whatever samples next, it must seed exactly as upstream
+does. Verified: the CPU torch stream is identical under both helpers (so the
+watermark latents and all smoke SHAs are unchanged), while the Python `random`
+state differs — which is the reason the RAVEN helper is unsuitable here.
+`raven_deterministic` is unaffected; it touches no global RNG at all.
 
 ### Historical bug coverage
 Re-read the pinned `run.py`, `run_sd35.py`, `option.py`, `src/utils.py` and
