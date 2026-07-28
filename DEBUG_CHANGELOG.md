@@ -224,9 +224,10 @@ Determinism: rerunning generation with identical arguments reproduced identical
 ### Git provenance
 - Repository: RAVEN
 - Branch: `agent/t2smark-official-standalone-verification`
-- Commit: see below
+- Commit: `a9d036d888005f3529ce91c3177c00ff575650b1` (implementation); this
+  provenance block was completed in the immediately following commit
 - Remote branch: `origin/agent/t2smark-official-standalone-verification`
-- Push status: see below
+- Push status: pushed and verified via `git ls-remote`
 - Entry point: `eval_bench_wm/run_watermark.py`, `eval_bench_wm/run_verification.py`
 - Formal output eligibility: **smoke only, incomplete** — not eligible for formal reporting
 
