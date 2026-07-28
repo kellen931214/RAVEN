@@ -32,7 +32,13 @@ class PipeProvider(ABC):
                  device: torch.device,
                  scheduler_classes: typing.Tuple[any, any] = (DDIMScheduler, DDIMInverseScheduler),
                  eager_loading: bool = False,
+                 torch_dtype: torch.dtype = None,
                  **kwargs):
+
+        # Optional per-run dtype override. Defaults to the repository-wide DTYPE so
+        # no existing pipeline changes behaviour; the GaussMarker official SD2.1
+        # profile uses it to load fp16 weights exactly like the official code.
+        self.torch_dtype = torch_dtype
 
         # model id or path
         self.pretrained_model_name_or_path = pretrained_model_name_or_path
@@ -61,7 +67,7 @@ class PipeProvider(ABC):
         pass
 
     def get_dtype(self):
-        return DTYPE
+        return DTYPE if getattr(self, "torch_dtype", None) is None else self.torch_dtype
 
     # -------------------------------------------------------- LOAD PIPE --------------------------------------------------------
 

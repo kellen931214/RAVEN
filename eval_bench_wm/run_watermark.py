@@ -35,6 +35,7 @@ from utils.prompt_utils import get_text_prompts
 
 import dataclasses
 import hashlib
+import json
 import os
 import sys
 from pathlib import Path
@@ -128,6 +129,187 @@ def build_parser():
     return parser
 
 
+def run_gm_generation(args, argv):
+    """Official-compatible GaussMarker generation.
+
+    One command produces ``--num`` watermarked images. The bundle identity
+    (watermark bits, encrypted message, key/nonce, ring target) is fixed for the
+    whole run while every sample independently samples its *complete* initial
+    latent from a deterministic per-sample seed, exactly as official
+    ``gaussmarker_gen.py`` does.
+
+    All algorithms live in ``utils/wm/gm_provider.py``; this function only does
+    seeding bookkeeping, IO and provenance.
+    """
+    from utils.wm import gm_bundle, gm_runtime
+    from utils.wm.gm_provider import apply_arg_defaults as gm_apply_profile
+
+    profile_info = gm_apply_profile(args, argv)
+    print(f"[GM] profile: {profile_info}", flush=True)
+
+    out_dir = Path(args.out_dir)
+    images_dir = out_dir / "images" / "watermarked"
+    prompts_dir = out_dir / "prompts"
+    metadata_dir = out_dir / "sample_metadata"
+    results_path = out_dir / "results.jsonl"
+    manifest_path = out_dir / "run_manifest.json"
+
+    gpu_info = gm_runtime.gpu_preflight(DEVICE)
+    print(f"[GM] device preflight: {gpu_info}", flush=True)
+
+    # A run that resumes into an existing output directory must not be able to
+    # create anything before its manifest has been validated. If the manifest
+    # exists, the bundle it was produced with must exist too and is loaded
+    # read-only; a new bundle may only be created for a genuinely new run.
+    resuming = manifest_path.exists()
+    if resuming:
+        bundle_dir = getattr(args, "gm_bundle_dir", None)
+        if bundle_dir is None or not gm_bundle.GmBundle(Path(bundle_dir)).complete():
+            raise RuntimeError(
+                f"{manifest_path} already exists, so this run resumes an existing cohort and must "
+                f"reuse the bundle that produced it, but --gm_bundle_dir ({bundle_dir}) is not a "
+                "complete bundle. Nothing was modified."
+            )
+
+    pipe_provider_target = gm_runtime.build_pipe_provider(args, DEVICE)
+    wm_provider = gm_runtime.build_provider(
+        args,
+        latent_shape=pipe_provider_target.get_latent_shape(),
+        device=DEVICE,
+        create_bundle=not resuming,
+    )
+    if wm_provider.bundle is None:
+        raise RuntimeError(
+            "GM generation requires --gm_bundle_dir so that w1/w2 and the manifest persist"
+        )
+    print(
+        f"[GM] bundle {wm_provider.bundle.dir} ({wm_provider.state_source}), "
+        f"config {wm_provider.bundle.manifest['bundle_config_sha256'][:16]}",
+        flush=True,
+    )
+
+    target_prompts = get_text_prompts(num_prompts=args.num, dataset_id=args.dataset_id)
+    provenance = gm_runtime.run_provenance(args, wm_provider, pipe_provider_target)
+    run_config = dict(provenance)
+    run_config.update({"base_seed": int(args.seed), "num_samples": int(args.num),
+                       "dataset_id": args.dataset_id})
+    # ``created_utc`` is volatile, ``gm_state_source`` records whether *this* process
+    # created or reloaded the bundle, and ``num_samples`` only says how far the cohort
+    # was extended. None of them is part of a *sample's* configuration identity, which
+    # is what the resume gate compares; each sample is still bound to its own seed,
+    # prompt, bundle and model configuration.
+    volatile_fields = ("created_utc", "gm_state_source", "num_samples")
+    run_config_sha256 = gm_bundle.canonical_sha256(
+        {k: v for k, v in run_config.items() if k not in volatile_fields}
+    )
+
+    # The run manifest is the resume gate for the whole output directory and is
+    # validated *before* anything is written. An incompatible manifest stops the
+    # run with the output directory byte-for-byte untouched; a compatible one is
+    # kept verbatim so `created_utc` and the recorded provenance stay those of the
+    # run that actually produced the existing samples.
+    manifest = gm_runtime.assert_run_manifest_compatible(manifest_path, run_config_sha256)
+    if manifest is None:
+        manifest = dict(run_config)
+        manifest["run_config_sha256"] = run_config_sha256
+        manifest["entrypoint"] = "eval_bench_wm/run_watermark.py:run_gm_generation"
+        manifest["report_label"] = (
+            "official_profile_raw_scores" if wm_provider.profile_is_official else "legacy_or_ablation_mode"
+        )
+        out_dir.mkdir(parents=True, exist_ok=True)
+        manifest_path.write_text(gm_bundle.canonical_json(manifest) + "\n", encoding="utf-8")
+
+    for directory in (images_dir, prompts_dir, metadata_dir):
+        directory.mkdir(parents=True, exist_ok=True)
+
+    rows = []
+    for sample_id, target_prompt in tqdm(
+        list(enumerate(target_prompts)), total=len(target_prompts), desc="GM generation"
+    ):
+        # Official semantics: seed = i + gen_seed.
+        sample_seed = int(args.seed) + int(sample_id)
+        name = f"{sample_id:06d}"
+        image_path = images_dir / f"{name}.png"
+        prompt_path = prompts_dir / f"{name}.txt"
+        metadata_path = metadata_dir / f"{name}.json"
+        prompt_sha256 = gm_bundle.sha256_text(target_prompt)
+
+        if metadata_path.exists() or image_path.exists():
+            # Resume: never overwrite and never silently mix incompatible runs.
+            if not (metadata_path.exists() and image_path.exists()):
+                raise RuntimeError(
+                    f"GM sample {name} is half-written ({image_path.exists()=}, "
+                    f"{metadata_path.exists()=}); use a fresh --out_dir"
+                )
+            existing = json.loads(metadata_path.read_text(encoding="utf-8"))
+            gm_runtime.assert_resumable(
+                name,
+                existing,
+                {
+                    "sample_seed": sample_seed,
+                    "prompt_sha256": prompt_sha256,
+                    "run_config_sha256": run_config_sha256,
+                    "gm_bundle_config_sha256": wm_provider.bundle.manifest["bundle_config_sha256"],
+                },
+            )
+            actual_image_sha = gm_bundle.sha256_file(image_path)
+            if existing.get("image_sha256") != actual_image_sha:
+                raise RuntimeError(
+                    f"GM sample {name} image hash changed on disk; refusing to resume"
+                )
+            rows.append(existing)
+            continue
+
+        sample = wm_provider.build_sample_latents(sample_seed)
+        generated = wm_provider.generate(
+            pipe_provider_target=pipe_provider_target,
+            prompts=target_prompt,
+            latents=sample["latent"],
+            num_inference_steps=args.num_inference_steps_target,
+            guidance_scale=args.guidance_scale_target,
+        )
+        image = generated["images_PIL"][0]
+        image.save(image_path)
+        prompt_path.write_text(target_prompt, encoding="utf-8")
+
+        row = {
+            "sample_id": sample_id,
+            "sample_name": name,
+            "sample_seed": sample_seed,
+            "prompt": target_prompt,
+            "prompt_sha256": prompt_sha256,
+            "image_path": image_path.as_posix(),
+            "image_sha256": gm_bundle.sha256_file(image_path),
+            "pre_injection_latent_sha256": sample["pre_injection_latent_sha256"],
+            "post_injection_latent_sha256": sample["post_injection_latent_sha256"],
+            "gm_watermark_sha256": wm_provider.bundle.manifest["watermark_sha256"],
+            "gm_m_sha256": wm_provider.bundle.manifest["m_sha256"],
+            "gm_target_sha256": wm_provider.bundle.manifest["w2_tensor_sha256"],
+            "gm_mask_sha256": gm_bundle.sha256_tensor(wm_provider.watermarking_mask),
+            "gm_bundle_config_sha256": wm_provider.bundle.manifest["bundle_config_sha256"],
+            "run_config_sha256": run_config_sha256,
+        }
+        row.update({k: v for k, v in provenance.items() if k != "created_utc"})
+        row["created_utc"] = gm_bundle.utc_now()
+        metadata_path.write_text(gm_bundle.canonical_json(row) + "\n", encoding="utf-8")
+        gm_bundle.append_jsonl(results_path, row)
+        rows.append(row)
+
+    latent_hashes = {row["post_injection_latent_sha256"] for row in rows}
+    if len(rows) > 1 and len(latent_hashes) != len(rows):
+        raise RuntimeError(
+            "GM generation produced repeated complete initial latents across samples; "
+            "this invalidates the run for independent-sample evaluation"
+        )
+    print(
+        f"[GM] generated {len(rows)} sample(s) into {out_dir}; "
+        f"{len(latent_hashes)} distinct complete initial latents; "
+        f"watermark identity {wm_provider.bundle.manifest['watermark_sha256'][:16]} (constant)",
+        flush=True,
+    )
+    return rows
+
+
 def value_log_label(wm_type):
     if wm_type == "PRC":
         return "PRC value"
@@ -149,6 +331,12 @@ def main(argv=None):
             args.num_inference_steps_target = 40
         if "--guidance_scale_target" not in sys.argv:
             args.guidance_scale_target = 4.5
+
+    # GaussMarker has its own single-command generation flow: a persistent bundle,
+    # a deterministic per-sample seed, an independently sampled complete initial
+    # latent per sample and indexed, never-overwritten outputs.
+    if args.wm_type == "GM":
+        return run_gm_generation(args, argv)
 
     wm_provider_cls = WmProviders[args.wm_type].value
     if args.wm_type == "GS" and int(args.num) != 1:
