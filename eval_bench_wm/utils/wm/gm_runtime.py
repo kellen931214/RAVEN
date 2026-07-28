@@ -10,6 +10,7 @@ copy.
 
 from __future__ import annotations
 
+import json
 import platform
 import typing
 from pathlib import Path
@@ -86,6 +87,218 @@ def build_provider(args, latent_shape, device: torch.device, create_bundle: bool
     )
 
 
+# ---------------------------------------------------------------------------
+# Paired cohort provenance (official paper protocol)
+# ---------------------------------------------------------------------------
+
+#: Per-image fields required before a positive/negative pair may be treated as a
+#: genuine pair of the official paper protocol.
+PAIR_REQUIRED_FIELDS = ("sample_id", "prompt_sha256", "sample_seed")
+
+#: Distortion/attack fields. If either side of a pair declares any of them, both
+#: sides must declare all of them and they must be identical.
+PAIR_DISTORTION_FIELDS = ("distortion_config_sha256", "distortion_seed")
+
+
+def load_pair_metadata(image_path: Path) -> typing.Optional[typing.Dict[str, typing.Any]]:
+    """Locate the per-sample metadata sidecar for a cohort image.
+
+    Looked up as ``<dir>/../sample_metadata/<stem>.json`` (the layout written by
+    ``run_watermark.py``) and then ``<dir>/<stem>.json``.
+    """
+    image_path = Path(image_path)
+    candidates = (
+        image_path.parent.parent / "sample_metadata" / f"{image_path.stem}.json",
+        image_path.parent / "sample_metadata" / f"{image_path.stem}.json",
+        image_path.parent / f"{image_path.stem}.json",
+    )
+    for candidate in candidates:
+        if candidate.is_file():
+            return json.loads(candidate.read_text(encoding="utf-8"))
+    return None
+
+
+def _pair_entry(positive: Path, negative: Path, explicit: typing.Optional[typing.Mapping] = None):
+    """Validate one positive/negative pair; returns (entry, reason)."""
+    pos_meta = load_pair_metadata(positive)
+    neg_meta = load_pair_metadata(negative)
+    explicit = dict(explicit or {})
+
+    if pos_meta is None or neg_meta is None:
+        side = "positive" if pos_meta is None else "negative"
+        return None, f"{side} image {(positive if pos_meta is None else negative).name} has no sample metadata"
+
+    for field in PAIR_REQUIRED_FIELDS:
+        for role, meta, path in (("positive", pos_meta, positive), ("negative", neg_meta, negative)):
+            if meta.get(field) is None:
+                return None, f"{role} metadata for {path.name} is missing {field!r}"
+
+    for field in ("sample_id", "prompt_sha256"):
+        if pos_meta[field] != neg_meta[field]:
+            return None, (
+                f"pair {positive.name}/{negative.name} disagrees on {field} "
+                f"({pos_meta[field]!r} vs {neg_meta[field]!r})"
+            )
+
+    # "generation seed OR explicit pairing provenance": an explicit pair manifest
+    # entry may declare the pairing, otherwise the generation seeds must match.
+    if not explicit and pos_meta["sample_seed"] != neg_meta["sample_seed"]:
+        return None, (
+            f"pair {positive.name}/{negative.name} disagrees on sample_seed "
+            f"({pos_meta['sample_seed']!r} vs {neg_meta['sample_seed']!r}) and no explicit "
+            "pairing provenance was supplied"
+        )
+
+    declared = [f for f in PAIR_DISTORTION_FIELDS if pos_meta.get(f) is not None or neg_meta.get(f) is not None]
+    if declared:
+        for field in PAIR_DISTORTION_FIELDS:
+            if pos_meta.get(field) is None or neg_meta.get(field) is None:
+                return None, (
+                    f"pair {positive.name}/{negative.name} declares distortion but is missing {field!r} "
+                    "on one side"
+                )
+            if pos_meta[field] != neg_meta[field]:
+                return None, (
+                    f"pair {positive.name}/{negative.name} was distorted with a different {field} "
+                    f"({pos_meta[field]!r} vs {neg_meta[field]!r})"
+                )
+
+    entry = {
+        "positive": positive.name,
+        "negative": negative.name,
+        "sample_id": pos_meta["sample_id"],
+        "prompt_sha256": pos_meta["prompt_sha256"],
+        "positive_sample_seed": pos_meta["sample_seed"],
+        "negative_sample_seed": neg_meta["sample_seed"],
+        "distortion_config_sha256": pos_meta.get("distortion_config_sha256"),
+        "distortion_seed": pos_meta.get("distortion_seed"),
+        "protocol": pos_meta.get("protocol") or neg_meta.get("protocol"),
+        "pairing_source": "pair_manifest" if explicit else "sample_metadata",
+    }
+    return entry, None
+
+
+def resolve_pairing(
+    positives: typing.Sequence[Path],
+    negatives: typing.Sequence[Path],
+    pair_manifest: typing.Optional[typing.Union[str, Path]] = None,
+) -> typing.Dict[str, typing.Any]:
+    """Establish one-to-one pair identity between the two cohorts.
+
+    Counting the two cohorts is *not* pairing. A cohort pair only qualifies for
+    ``official_paper_evaluation`` when every positive is bound to exactly one
+    negative through explicit pairing provenance (a pair manifest) or matching
+    per-sample metadata (sample id, prompt hash, generation seed, and identical
+    distortion parameters/seed when a distortion was applied).
+    """
+    result = {
+        "paired": False,
+        "reason": None,
+        "pairs": [],
+        "pairing_sha256": None,
+        "protocol": None,
+        "pair_manifest": None if pair_manifest is None else Path(pair_manifest).as_posix(),
+    }
+
+    if len(positives) != len(negatives):
+        result["reason"] = (
+            f"cohort sizes differ ({len(positives)} positive vs {len(negatives)} negative)"
+        )
+        return result
+
+    if pair_manifest is not None:
+        manifest_path = Path(pair_manifest)
+        if not manifest_path.is_file():
+            result["reason"] = f"pair manifest {manifest_path} does not exist"
+            return result
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        declared = manifest.get("pairs")
+        if not isinstance(declared, list) or len(declared) != len(positives):
+            result["reason"] = "pair manifest does not declare one entry per cohort image"
+            return result
+        by_name_pos = {p.name: p for p in positives}
+        by_name_neg = {p.name: p for p in negatives}
+        candidates = []
+        for item in declared:
+            pos_name = Path(str(item.get("positive", ""))).name
+            neg_name = Path(str(item.get("negative", ""))).name
+            if pos_name not in by_name_pos or neg_name not in by_name_neg:
+                result["reason"] = f"pair manifest references unknown image(s) {pos_name!r}/{neg_name!r}"
+                return result
+            candidates.append((by_name_pos[pos_name], by_name_neg[neg_name], item))
+        result["protocol"] = manifest.get("protocol")
+    else:
+        pos_by_stem = {p.stem: p for p in positives}
+        neg_by_stem = {p.stem: p for p in negatives}
+        if set(pos_by_stem) != set(neg_by_stem):
+            result["reason"] = (
+                "cohort file stems do not correspond one-to-one; supply --pair_manifest to declare "
+                "the pairing explicitly"
+            )
+            return result
+        candidates = [(pos_by_stem[stem], neg_by_stem[stem], None) for stem in sorted(pos_by_stem)]
+
+    pairs = []
+    for positive, negative, explicit in candidates:
+        entry, reason = _pair_entry(positive, negative, explicit)
+        if entry is None:
+            result["reason"] = reason
+            return result
+        pairs.append(entry)
+
+    sample_ids = [entry["sample_id"] for entry in pairs]
+    if len(set(sample_ids)) != len(sample_ids):
+        result["reason"] = "the same sample_id appears in more than one pair"
+        return result
+
+    protocols = {entry["protocol"] for entry in pairs if entry["protocol"]}
+    if len(protocols) > 1:
+        result["reason"] = f"pairs declare more than one protocol: {sorted(protocols)}"
+        return result
+
+    result.update(
+        {
+            "paired": True,
+            "pairs": pairs,
+            "pairing_sha256": gm_bundle.canonical_sha256({"pairs": pairs}),
+            "protocol": result["protocol"] or (sorted(protocols)[0] if protocols else None),
+        }
+    )
+    return result
+
+
+def cohort_report_label(mode: str, profile_is_official: bool, paired: bool) -> str:
+    """Label for a cohort run. Only a verifiably paired official run qualifies."""
+    if mode == "paper_eval":
+        return "official_paper_evaluation" if (profile_is_official and paired) else "legacy_or_ablation_mode"
+    return "calibrated_deployment_verification"
+
+
+def assert_run_manifest_compatible(
+    manifest_path: typing.Union[str, Path],
+    run_config_sha256: str,
+) -> typing.Optional[typing.Dict[str, typing.Any]]:
+    """Validate an existing run manifest *before* anything in the run is mutated.
+
+    Returns the existing manifest verbatim when it is compatible (so no field,
+    ``created_utc`` included, is rewritten), or ``None`` when no manifest exists
+    yet and the caller may create one. An incompatible manifest raises and the
+    output directory is left untouched.
+    """
+    manifest_path = Path(manifest_path)
+    if not manifest_path.exists():
+        return None
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    existing = manifest.get("run_config_sha256")
+    if existing != run_config_sha256:
+        raise RuntimeError(
+            f"GM run manifest {manifest_path} was written by a different configuration "
+            f"(existing run_config_sha256 {existing!r}, current {run_config_sha256!r}); "
+            "nothing was modified. Use a fresh --out_dir."
+        )
+    return manifest
+
+
 RESUME_FIELDS = (
     "sample_seed",
     "prompt_sha256",
@@ -118,8 +331,14 @@ def run_provenance(args, provider: GmProvider, pipe_provider) -> typing.Dict[str
         "official_reference_repo": gm_bundle.OFFICIAL_GAUSSMARKER_REPO,
         "official_reference_commit": gm_bundle.OFFICIAL_GAUSSMARKER_COMMIT,
         "gm_profile": provider.profile,
+        # Effective officialness: the CLI profile AND the bundle's own provenance.
         "gm_profile_is_official": bool(provider.profile_is_official),
+        "gm_cli_profile_is_official": bool(
+            provider.profile == "official_sd21" and not provider.profile_overrides
+        ),
+        "gm_bundle_profile_is_official": provider.bundle_profile_is_official,
         "gm_profile_overrides": dict(provider.profile_overrides),
+        "gm_bundle_profile_overrides": dict(provider.bundle_profile_overrides),
         "model_id": args.modelid_target,
         "model_revision": getattr(args, "model_revision", None),
         "scheduler": args.scheduler_target,

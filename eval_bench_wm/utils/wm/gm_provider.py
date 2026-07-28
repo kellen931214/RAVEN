@@ -328,6 +328,8 @@ class GmProvider(WmProvider):
 
         # ---- state ----------------------------------------------------
         self.bundle: typing.Optional[GmBundle] = None
+        self.bundle_profile_is_official: typing.Optional[bool] = None
+        self.bundle_profile_overrides: typing.Dict[str, typing.Any] = {}
         self.state_source = None      # "bundle" | "bundle_created" | "w1_file" | "in_memory"
         self.watermark = None         # torch int64 (1, 4//ch, 64//w, 64//h)
         self.m_flat = None            # numpy uint8 (16384,) — official encrypted message
@@ -378,7 +380,11 @@ class GmProvider(WmProvider):
             existing = GmBundle(bundle_path)
             if existing.complete():
                 self.bundle = GmBundle.load(bundle_path)
-                self.bundle.assert_compatible(self.bundle_identity_config())
+                self.bundle.assert_compatible(
+                    self.bundle_compat_config(),
+                    required_fields=gm_bundle.REQUIRED_BUNDLE_COMPAT_FIELDS,
+                )
+                self._adopt_bundle_provenance(self.bundle)
                 self._adopt_w1(self.bundle.w1)
                 self.gt_patch = self.bundle.w2.to(self.device)
                 self.state_source = "bundle"
@@ -997,8 +1003,32 @@ class GmProvider(WmProvider):
             binding["w2_file_sha256"] = self.bundle.manifest.get("w2_file_sha256")
         return binding
 
+    def _adopt_bundle_provenance(self, bundle: GmBundle) -> None:
+        """A bundle can only ever downgrade the officialness of a run.
+
+        A bundle created under an ablation/override profile keeps its results
+        non-official even when the current command line selects the official
+        profile, so a non-official identity can never be relabelled as an
+        official result.
+        """
+        bundle_is_official = bundle.manifest.get("profile_is_official")
+        if bundle_is_official is None:
+            raise GmBundleError(
+                f"GM bundle {bundle.dir} manifest has no 'profile_is_official' field; "
+                "its provenance cannot be established"
+            )
+        self.bundle_profile_is_official = bool(bundle_is_official)
+        self.bundle_profile_overrides = dict(bundle.manifest.get("profile_overrides") or {})
+        self.profile_is_official = bool(self.profile_is_official and bundle_is_official)
+
+    def bundle_compat_config(self) -> typing.Dict[str, typing.Any]:
+        """Configuration an existing bundle must agree on before it may be reused."""
+        config = self.bundle_identity_config()
+        config.update(self._detector_config())
+        return config
+
     def bundle_identity_config(self) -> typing.Dict[str, typing.Any]:
-        """Fields an existing bundle must agree on before it may be reused."""
+        """Watermark-identity fields an existing bundle must agree on."""
         return {
             "channel_copy": int(self.ch),
             "w_copy": int(self.w),

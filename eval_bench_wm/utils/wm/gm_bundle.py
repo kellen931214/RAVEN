@@ -59,6 +59,39 @@ REPORT_LABELS = (
     "legacy_or_ablation_mode",
 )
 
+#: Manifest fields that must be present and equal before an existing bundle may
+#: be reused. Covers the watermark identity configuration *and* the detector
+#: configuration (model, inversion, VAE, GNR, classifier), because a bundle
+#: reused under a different detector configuration produces results that are not
+#: comparable with the ones the bundle was created for.
+REQUIRED_BUNDLE_COMPAT_FIELDS = (
+    "model_id",
+    "model_revision",
+    "torch_dtype",
+    "scheduler",
+    "resolution",
+    "inversion_prompt_sha256",
+    "inversion_guidance_scale",
+    "inversion_steps",
+    "vae_sample",
+    "vae_scaling_factor",
+    "gnr_sha256",
+    "classifier_sha256",
+    "classifier_type",
+    "model_nf",
+    "channel_copy",
+    "w_copy",
+    "h_copy",
+    "w_seed",
+    "w_channel",
+    "w_pattern",
+    "w_mask_shape",
+    "w_radius",
+    "w_measurement",
+    "w_injection",
+    "latent_shape",
+)
+
 #: Manifest fields a threshold artifact is bound to. A threshold whose recorded
 #: value for any of these differs from the current run is rejected.
 THRESHOLD_BINDING_FIELDS = (
@@ -461,17 +494,42 @@ class GmBundle:
 
     # -- compatibility ------------------------------------------------------
 
-    def assert_compatible(self, config: typing.Mapping[str, typing.Any]) -> None:
-        """Fail closed when the current configuration disagrees with the bundle."""
-        mismatched = {}
+    def assert_compatible(
+        self,
+        config: typing.Mapping[str, typing.Any],
+        required_fields: typing.Sequence[str] = (),
+    ) -> None:
+        """Fail closed when the current configuration disagrees with the bundle.
+
+        Every field in ``required_fields`` must be present in *both* the manifest
+        and ``config`` and must be equal. A required field missing from the
+        manifest is a rejection, never a silent continue: an old or hand-edited
+        manifest cannot be used to relax the gate.
+        """
+        missing, mismatched = [], {}
+
+        for field in required_fields:
+            if field not in config:
+                missing.append(f"{field} (not produced by this run)")
+            elif field not in self.manifest:
+                missing.append(f"{field} (absent from manifest)")
+
         for field, value in config.items():
             if field not in self.manifest:
                 continue
             if self.manifest[field] != _canonicalize(value):
                 mismatched[field] = (self.manifest[field], _canonicalize(value))
-        if mismatched:
-            detail = "; ".join(f"{k}: bundle={v[0]!r} run={v[1]!r}" for k, v in sorted(mismatched.items()))
-            raise GmBundleError(f"GM bundle {self.dir} is incompatible with this run ({detail})")
+
+        if missing or mismatched:
+            details = []
+            if missing:
+                details.append("missing required field(s): " + ", ".join(sorted(missing)))
+            if mismatched:
+                details.append(
+                    "mismatched: "
+                    + "; ".join(f"{k}: bundle={v[0]!r} run={v[1]!r}" for k, v in sorted(mismatched.items()))
+                )
+            raise GmBundleError(f"GM bundle {self.dir} is incompatible with this run ({' | '.join(details)})")
 
     def public_manifest(self) -> typing.Dict[str, typing.Any]:
         """Manifest copy safe for logs/CSV (it never contained secrets)."""

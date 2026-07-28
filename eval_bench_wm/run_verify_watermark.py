@@ -95,9 +95,13 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Non-watermarked cohort (calibrate / paper_eval).")
     parser.add_argument("--out_dir", type=str, default="out/gm_verification")
     parser.add_argument("--overwrite_threshold", action="store_true", default=False)
+    parser.add_argument("--pair_manifest", type=str, default=None,
+                        help="JSON file declaring the positive/negative pairing explicitly: "
+                             '{"protocol": ..., "pairs": [{"positive": ..., "negative": ...}, ...]}.')
     parser.add_argument("--allow_unmatched_cohorts", action="store_true", default=False,
-                        help="paper_eval requires matched cohort sizes unless this is set "
-                             "(the run is then no longer official_paper_evaluation).")
+                        help="paper_eval requires a verified one-to-one paired cohort unless this "
+                             "is set; the run is then labelled legacy_or_ablation_mode and is NOT "
+                             "an official paper evaluation.")
 
     # model / pipeline (defaults come from the GM profile, not from generic RAVEN defaults)
     parser.add_argument("--modelid_target", type=str, default="stabilityai/stable-diffusion-2-1-base")
@@ -164,13 +168,19 @@ def _resolve_inputs(args) -> typing.Dict[str, typing.Any]:
     if not positives or not negatives:
         raise SystemExit("error: both cohorts must contain at least one image")
 
-    matched = len(positives) == len(negatives)
-    if args.mode == "paper_eval" and not matched and not args.allow_unmatched_cohorts:
+    # Equal cohort sizes are necessary but nowhere near sufficient: the official
+    # paper protocol pairs each watermarked positive with the non-watermarked
+    # negative produced from the same prompt/seed under the same distortion.
+    pairing = gm_runtime.resolve_pairing(positives, negatives, args.pair_manifest)
+    if args.mode == "paper_eval" and not pairing["paired"] and not args.allow_unmatched_cohorts:
         raise SystemExit(
-            "error: the official paper protocol uses matched positive/negative cohort sizes "
-            f"({len(positives)} vs {len(negatives)}); pass --allow_unmatched_cohorts to run an ablation"
+            "error: the official paper protocol requires a verified one-to-one paired cohort "
+            f"({pairing['reason']}). Supply --pair_manifest or per-sample metadata, or pass "
+            "--allow_unmatched_cohorts to run a non-official ablation."
         )
-    return {"positives": positives, "negatives": negatives, "matched": matched}
+    if not pairing["paired"]:
+        print(f"[GM] cohorts are NOT verifiably paired: {pairing['reason']}", flush=True)
+    return {"positives": positives, "negatives": negatives, "pairing": pairing}
 
 
 def main(argv=None) -> int:
@@ -289,7 +299,7 @@ def _run_verify(args, provider, pipe_provider, out_dir: Path, provenance, inputs
 def _run_cohort(args, provider, pipe_provider, out_dir: Path, provenance, inputs) -> dict:
     positives = inputs["positives"]
     negatives = inputs["negatives"]
-    matched = inputs["matched"]
+    pairing = inputs["pairing"]
 
     # Cohort scoring uses the same provider/detector path as single-image verification.
     raw_threshold_info = {
@@ -320,10 +330,14 @@ def _run_cohort(args, provider, pipe_provider, out_dir: Path, provenance, inputs
     roc = gm_runtime.official_roc(positive_scores, negative_scores, args.gm_target_fpr)
 
     if args.mode == "paper_eval":
-        report_label = "official_paper_evaluation" if (provider.profile_is_official and matched) else "legacy_or_ablation_mode"
+        report_label = gm_runtime.cohort_report_label(
+            args.mode, provider.profile_is_official, pairing["paired"]
+        )
         evaluation_mode = "official_paper_evaluation"
     else:
-        report_label = "calibrated_deployment_verification"
+        report_label = gm_runtime.cohort_report_label(
+            args.mode, provider.profile_is_official, pairing["paired"]
+        )
         evaluation_mode = "threshold_calibration"
 
     for row in rows:
@@ -343,7 +357,12 @@ def _run_cohort(args, provider, pipe_provider, out_dir: Path, provenance, inputs
         {
             "evaluation_mode": evaluation_mode,
             "report_label": report_label,
-            "matched_cohorts": matched,
+            "paired_cohorts": pairing["paired"],
+            "pairing_reason": pairing["reason"],
+            "pairing_sha256": pairing["pairing_sha256"],
+            "pairing_protocol": pairing["protocol"],
+            "pair_manifest": pairing["pair_manifest"],
+            "pair_count": len(pairing["pairs"]),
             "positive_cohort_sha256": gm_bundle.cohort_sha256(positives),
             "negative_cohort_sha256": gm_bundle.cohort_sha256(negatives),
             "note": (

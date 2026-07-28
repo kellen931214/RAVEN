@@ -6,7 +6,7 @@ This file records implementation bugs, validated non-bugs, ablations, and the ev
 
 | Date | Area | Status | Evidence |
 | --- | --- | --- | --- |
-| 2026-07-28 | GaussMarker official parity, bundles and standalone verification | GM generation now samples a complete initial latent per sample from a deterministic seed with official legacy-RNG semantics, creates official ChaCha20 state, and persists an official-interchangeable `w1.pth`/`w2.pth`/`manifest.json` bundle. Standalone verification, threshold calibration and paper evaluation run from that bundle alone. Official reference frozen at `4ac9bfd4e152a56bd93c2a06a809ef6ff8e73155`. | `eval_bench_wm/utils/wm/gm_provider.py`; `eval_bench_wm/utils/wm/gm_bundle.py`; `eval_bench_wm/run_verify_watermark.py`; `eval_bench_wm/tests/test_gm_official_parity.py` |
+| 2026-07-28 | GaussMarker official parity, bundles and standalone verification | GM generation now samples a complete initial latent per sample from a deterministic seed with official legacy-RNG semantics, creates official ChaCha20 state, and persists an official-interchangeable `w1.pth`/`w2.pth`/`manifest.json` bundle. Standalone verification, threshold calibration and paper evaluation run from that bundle alone. Official reference frozen at `4ac9bfd4e152a56bd93c2a06a809ef6ff8e73155`. Bundle reuse, `paper_eval` cohort pairing and `run_manifest.json` resume are all fail-closed: a bundle must match the full detector configuration and can only lose officialness, never gain it; `official_paper_evaluation` requires a verified one-to-one pairing; a mismatched run manifest stops the run without modifying any file. | `eval_bench_wm/utils/wm/gm_provider.py`; `eval_bench_wm/utils/wm/gm_bundle.py`; `eval_bench_wm/run_verify_watermark.py`; `eval_bench_wm/tests/test_gm_official_parity.py` |
 | 2026-07-27 | GS aggregate PSNR/SSIM/attack-success reduction | `formal_aggregate.json` now reduces the per-sample quality records to `quality_psnr_mean`/`quality_ssim_mean` and GS publishes `attack_success_rate_at_official_onebit_threshold = 1 - official_onebit_rates["attacked"]`, so the three GS aligned-color rows no longer render `—`. Re-audit of the same runs found no bit-accuracy, secret-mapping or bit-order bug; nothing was rerun or invalidated. | `raven_repro/raven/eval_protocol.py`; `experiments/backfill_formal_aggregate_metrics.py`; `raven_repro/tests/test_formal_aggregate_scalars.py` |
 | 2026-07-27 | TensorFlow FID protocol as the default | Primary FID is now the TensorFlow FID protocol (clean-fid `legacy_tensorflow`: TF Inception-2015-12-05 features + TF-compatible bilinear resize); clean-fid `clean` is still computed and recorded as a secondary value so earlier TR numbers stay comparable. The formal quality-config hash now carries the FID protocol descriptor, and the runner accepts `scratch_run_root()` gate roots so gates stay out of `outputs/`. | `raven_repro/raven/quality.py`; `experiments/run_raven_formal_eval.py`; `raven_repro/tests/test_fid_staging.py`; `raven_repro/tests/test_canonical_layout.py` |
 | 2026-07-27 | TR flat cohort canonical path migration | Canonical TR source metadata is `data/tr/diffusiondb/metadata.csv`; all 1001 TR watermarked image paths point at `data/tr/diffusiondb/<run_id>/watermarked.png`; existing GS shared-clean V2 rows were repointed at the new TR metadata SHA and pairing hashes recomputed with the formal helper. | `experiments/migrate_tr_flat_layout.py`; `experiments/migrate_gs_shared_clean_source.py`; `data/gs/diffusiondb_shared_tr/GS/cross_method_shared_clean_audit.json` |
@@ -224,6 +224,97 @@ labelling.
 - Formal output eligibility: implementation + CPU/GPU gates only. No formal GM
   cohort was produced; a formal GM run additionally requires the official model
   weights and a trained GNR checkpoint.
+
+
+
+## 2026-07-28 — GaussMarker: three fail-closed gaps in the first parity commit
+
+### Problem
+Review of `76e83a47df2e9b8c57c039a5e886842fc00a50c1` found three ways an
+unsound GM result could still be produced and labelled as if it were sound:
+
+1. **Bundle reuse was not fail-closed.** `GmBundle.assert_compatible` was called
+   with `bundle_identity_config()` only, so a bundle created with one detector
+   configuration could be reused under a different model ID/revision, dtype,
+   scheduler, resolution, inversion prompt/guidance/steps, VAE sampling/scaling,
+   GNR, classifier or `model_nf` without any error. Fields absent from the
+   manifest were silently skipped rather than rejected. Worse,
+   `profile_is_official` came from the *current CLI only*, so a bundle created
+   with non-official overrides was relabelled `official_*` as soon as a later
+   process happened to run the official profile.
+2. **`paper_eval` only compared cohort sizes.** Two unrelated directories with
+   the same number of images were accepted as a paired cohort and labelled
+   `official_paper_evaluation`.
+3. **`run_manifest.json` was rewritten before resume validation.** The manifest
+   was written unconditionally at run start, so a rerun with a different seed
+   overwrote the record of the run whose images were about to be resumed —
+   destroying the evidence that the mismatch existed.
+
+### Root cause
+Each gate existed but was applied to the weakest available evidence: identity
+instead of full configuration (1), cardinality instead of identity (2), and
+write-then-check instead of check-then-write (3).
+
+### Fix
+- `gm_bundle.REQUIRED_BUNDLE_COMPAT_FIELDS` enumerates the 22 fields that must
+  agree. `assert_compatible(config, required_fields=...)` now reports both
+  *missing* (not produced by this run, or absent from the manifest) and
+  *mismatched* fields and raises `GmBundleError` for either.
+  `GmProvider.bundle_compat_config()` = identity ∪ detector configuration.
+- `GmProvider._adopt_bundle_provenance()` requires `profile_is_official` in the
+  manifest and computes `self.profile_is_official = cli AND bundle`; the bundle
+  value and its overrides are recorded as `gm_bundle_profile_is_official` /
+  `gm_bundle_profile_overrides` next to `gm_cli_profile_is_official`.
+- `gm_runtime.resolve_pairing()` builds an explicit one-to-one pairing from a
+  `--pair_manifest` or from per-sample metadata sidecars, requiring equal
+  `sample_id` and `prompt_sha256`, equal `sample_seed` unless a pair manifest
+  supplies the pairing provenance, and — when a distortion is declared —
+  identical `distortion_config_sha256` and `distortion_seed` on both sides. The
+  resulting `pairing_sha256` and protocol are recorded in the cohort summary.
+  `cohort_report_label()` returns `official_paper_evaluation` only when the
+  profile is official *and* the cohort is verifiably paired; otherwise
+  `legacy_or_ablation_mode`. `run_verify_watermark._resolve_inputs()` runs this
+  before any model is loaded and exits for `paper_eval` unless
+  `--allow_unmatched_cohorts` is given.
+- `gm_runtime.assert_run_manifest_compatible()` loads an existing
+  `run_manifest.json`, compares `run_config_sha256` first and raises without
+  touching any file on mismatch; on match it returns the original manifest
+  verbatim (`created_utc` is never rewritten). A new manifest is written only
+  when none exists.
+
+### Affected files
+- `eval_bench_wm/utils/wm/gm_bundle.py`, `.../gm_provider.py`, `.../gm_runtime.py`
+- `eval_bench_wm/run_watermark.py`, `eval_bench_wm/run_verify_watermark.py`
+- `eval_bench_wm/tests/test_gm_fail_closed.py` (new), `eval_bench_wm/README.md`
+
+### Evidence
+- `eval_bench_wm/tests/test_gm_fail_closed.py`: 10 tests, all passing — the three
+  requested regressions (incompatible bundle detector config rejected; unpaired
+  cohort never labelled official paper evaluation; changed-seed resume leaves the
+  `run_manifest.json` SHA256 identical) plus their direct corollaries.
+- Full suite: `pytest eval_bench_wm/tests` → 89 passed, 10 subtests passed.
+- GPU re-check (RedbeardNZ SD-2.1-base mirror, 2 samples): changed-seed rerun
+  stops with "nothing was modified" and the manifest SHA is unchanged; reusing a
+  bundle with a different GNR is rejected (`mismatched: gnr_sha256`); a matching
+  verify run yields `ok_count 2` with `report_label legacy_or_ablation_mode` and
+  `gm_bundle_profile_is_official False` (both correct — the mirror is an
+  override); `paper_eval` on unpaired cohorts fails closed.
+
+### Consequence to be aware of
+Because the GNR and classifier hashes are inside the compatibility gate, adding
+a GNR checkpoint after a bundle was created cannot reuse that bundle directory.
+Build a new bundle importing the same state via `--gm_w1_path`/`--gm_w2_path`.
+
+### Experimental integrity fields
+- Data source: none — no cohort was produced or invalidated by this change.
+- Detector score definition / threshold calibration source: unchanged.
+- Outputs requiring regeneration: none.
+
+### Git provenance
+- Repository: `kellen931214/RAVEN`
+- Branch: `agent/issue-1-gaussmarker-official-parity`
+- Base commit: `76e83a47df2e9b8c57c039a5e886842fc00a50c1`
+- Formal output eligibility: implementation + CPU/GPU gates only.
 
 
 

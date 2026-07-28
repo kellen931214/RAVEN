@@ -139,7 +139,7 @@ The implementation distinguishes two modes and never conflates them:
 
 | Mode | What it is | Label |
 | :--- | :--- | :--- |
-| `paper_eval` | The official paper protocol: paired watermarked positives + non-watermarked negatives, same inversion/detector path, ensemble probability, ROC, TPR at the requested FPR and the resulting *experiment-specific* threshold. | `official_paper_evaluation` |
+| `paper_eval` | The official paper protocol: **verifiably paired** watermarked positives + non-watermarked negatives, same inversion/detector path, ensemble probability, ROC, TPR at the requested FPR and the resulting *experiment-specific* threshold. | `official_paper_evaluation` |
 | `verify` | A RAVEN **deployment extension**: fixed-threshold decisions for individual suspect images from a bundle plus a compatible pre-calibrated threshold. | `deployment_verification_extension` / `calibrated_deployment_verification` / `user_supplied_threshold` |
 
 Every result carries one of the labels
@@ -189,6 +189,24 @@ are secrets: only their SHA256 appears in the manifest, and they never appear in
 logs, CSV files or console output. Existing bundles are validated and are never
 silently overwritten or regenerated.
 
+Reusing an existing bundle **fails closed** unless the manifest and the current
+run agree on every field in `gm_bundle.REQUIRED_BUNDLE_COMPAT_FIELDS`: model
+ID/revision, torch dtype, scheduler, resolution, inversion prompt/guidance/steps,
+VAE sampling and scaling factor, GNR SHA, classifier SHA and type, `model_nf`,
+and the copy/ring configuration. A required field that is *absent* from the
+manifest is also a rejection — an old or hand-edited manifest can never relax the
+gate. Because the GNR and classifier hashes are part of that gate, adding a GNR
+checkpoint after a bundle was created means building a new bundle that imports
+the same `w1`/`w2` (`--gm_w1_path` / `--gm_w2_path`), which keeps the watermark
+identity while recording the new detector configuration.
+
+Officialness can only ever be *downgraded* by a bundle: a bundle created under an
+ablation or with profile overrides keeps `profile_is_official=false`, and results
+produced from it stay `legacy_or_ablation_mode` even when the current command
+line selects the official profile. Runs record both `gm_cli_profile_is_official`
+and `gm_bundle_profile_is_official` alongside the effective
+`gm_profile_is_official`.
+
 ### Commands
 
 ```bash
@@ -227,6 +245,33 @@ Generation writes:
 ├── results.jsonl
 └── run_manifest.json
 ```
+
+`run_manifest.json` is the resume gate for the whole output directory and is
+validated **before anything is written**: a `run_config_sha256` mismatch stops the
+run with the directory byte-for-byte untouched, and a matching manifest is kept
+verbatim (so `created_utc` and the recorded provenance stay those of the run that
+actually produced the existing samples). A new manifest is only ever created when
+none exists.
+
+### Paired cohorts for `paper_eval`
+
+Equal cohort sizes are **not** pairing. `paper_eval` only reports
+`official_paper_evaluation` when every positive is bound to exactly one negative
+through verified pairing provenance:
+
+* an explicit `--pair_manifest`
+  (`{"protocol": ..., "pairs": [{"positive": ..., "negative": ...}, ...]}`), or
+* matching per-sample metadata sidecars, looked up as
+  `<cohort>/../sample_metadata/<stem>.json` or `<cohort>/<stem>.json`.
+
+Each pair must agree on `sample_id` and `prompt_sha256`; the generation
+`sample_seed` must match as well unless an explicit pair manifest declares the
+pairing. When a distortion/attack was applied, both sides must carry identical
+`distortion_config_sha256` and `distortion_seed`, and the declared `protocol` is
+recorded. The verified pairing is hashed into `pairing_sha256` in the summary.
+Without complete pairing provenance the run fails closed; `--allow_unmatched_cohorts`
+downgrades it to `legacy_or_ablation_mode` instead and never to an official
+paper evaluation.
 
 The bundle identity (bits, encrypted message, key/nonce, ring target) is fixed
 for the run, while **every sample independently samples its complete initial

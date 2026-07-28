@@ -148,9 +148,8 @@ def run_gm_generation(args, argv):
     images_dir = out_dir / "images" / "watermarked"
     prompts_dir = out_dir / "prompts"
     metadata_dir = out_dir / "sample_metadata"
-    for directory in (images_dir, prompts_dir, metadata_dir):
-        directory.mkdir(parents=True, exist_ok=True)
     results_path = out_dir / "results.jsonl"
+    manifest_path = out_dir / "run_manifest.json"
 
     gpu_info = gm_runtime.gpu_preflight(DEVICE)
     print(f"[GM] device preflight: {gpu_info}", flush=True)
@@ -187,15 +186,24 @@ def run_gm_generation(args, argv):
         {k: v for k, v in run_config.items() if k not in volatile_fields}
     )
 
-    manifest = dict(run_config)
-    manifest["run_config_sha256"] = run_config_sha256
-    manifest["entrypoint"] = "eval_bench_wm/run_watermark.py:run_gm_generation"
-    manifest["report_label"] = (
-        "official_profile_raw_scores" if wm_provider.profile_is_official else "legacy_or_ablation_mode"
-    )
-    (out_dir / "run_manifest.json").write_text(
-        gm_bundle.canonical_json(manifest) + "\n", encoding="utf-8"
-    )
+    # The run manifest is the resume gate for the whole output directory and is
+    # validated *before* anything is written. An incompatible manifest stops the
+    # run with the output directory byte-for-byte untouched; a compatible one is
+    # kept verbatim so `created_utc` and the recorded provenance stay those of the
+    # run that actually produced the existing samples.
+    manifest = gm_runtime.assert_run_manifest_compatible(manifest_path, run_config_sha256)
+    if manifest is None:
+        manifest = dict(run_config)
+        manifest["run_config_sha256"] = run_config_sha256
+        manifest["entrypoint"] = "eval_bench_wm/run_watermark.py:run_gm_generation"
+        manifest["report_label"] = (
+            "official_profile_raw_scores" if wm_provider.profile_is_official else "legacy_or_ablation_mode"
+        )
+        out_dir.mkdir(parents=True, exist_ok=True)
+        manifest_path.write_text(gm_bundle.canonical_json(manifest) + "\n", encoding="utf-8")
+
+    for directory in (images_dir, prompts_dir, metadata_dir):
+        directory.mkdir(parents=True, exist_ok=True)
 
     rows = []
     for sample_id, target_prompt in tqdm(
