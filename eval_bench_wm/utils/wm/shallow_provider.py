@@ -36,15 +36,8 @@ SHALLOW_ARG_DEFAULTS = {
 }
 
 
-def backward_ddim(x_t, alpha_t, alpha_tm1, eps_xt):
-    return (
-        alpha_tm1**0.5
-        * (
-            (alpha_t**-0.5 - alpha_tm1**-0.5) * x_t
-            + ((1 / alpha_tm1 - 1) ** 0.5 - (1 / alpha_t - 1) ** 0.5) * eps_xt
-        )
-        + x_t
-    )
+# Shared single implementation (previously an identical local copy).
+from .ddim_inversion import backward_ddim  # noqa: E402  (kept at original position)
 
 
 def circle_mask(size=64, r=10, x_offset=0, y_offset=0):

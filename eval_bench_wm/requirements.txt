@@ -21,7 +21,10 @@ protobuf==5.28.3
 pycocotools==2.0.10
 pycryptodome
 qrcode==8.2
+joblib
 scikit-image>=0.22,<0.25
+# GaussMarker's official sd21_cls2.pkl ensemble classifier was built with 1.5.2.
+scikit-learn==1.5.2
 scipy>=1.13.1,<1.14
 sentencepiece==0.2.0
 torch==2.5.1
