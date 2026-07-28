@@ -251,7 +251,10 @@ validated **before anything is written**: a `run_config_sha256` mismatch stops t
 run with the directory byte-for-byte untouched, and a matching manifest is kept
 verbatim (so `created_utc` and the recorded provenance stay those of the run that
 actually produced the existing samples). A new manifest is only ever created when
-none exists.
+none exists. Because that gate runs before any bundle may be created, a run whose
+`run_manifest.json` already exists must point `--gm_bundle_dir` at the complete
+bundle that produced it; the bundle is then loaded read-only. A new bundle is only
+created for a genuinely new output run.
 
 ### Paired cohorts for `paper_eval`
 
@@ -259,16 +262,31 @@ Equal cohort sizes are **not** pairing. `paper_eval` only reports
 `official_paper_evaluation` when every positive is bound to exactly one negative
 through verified pairing provenance:
 
-* an explicit `--pair_manifest`
-  (`{"protocol": ..., "pairs": [{"positive": ..., "negative": ...}, ...]}`), or
+* an explicit `--pair_manifest`, or
 * matching per-sample metadata sidecars, looked up as
   `<cohort>/../sample_metadata/<stem>.json` or `<cohort>/<stem>.json`.
+
+A pair manifest is a **standalone** source of pairing provenance — no sidecar is
+required when it declares the fields itself:
+
+```json
+{"protocol": "official_paper_eval",
+ "pairs": [{"positive": "000000.png", "negative": "000000.png",
+            "sample_id": 0, "prompt_sha256": "…",
+            "positive_sample_seed": 0, "negative_sample_seed": 1000,
+            "distortion_config_sha256": "…", "distortion_seed": 7}]}
+```
+
+Each field may be declared once for the pair (`sample_seed`) or per side
+(`positive_sample_seed`). When sidecars *are* present they are cross-validated
+against the manifest and any disagreement is a rejection.
 
 Each pair must agree on `sample_id` and `prompt_sha256`; the generation
 `sample_seed` must match as well unless an explicit pair manifest declares the
 pairing. When a distortion/attack was applied, both sides must carry identical
 `distortion_config_sha256` and `distortion_seed`, and the declared `protocol` is
-recorded. The verified pairing is hashed into `pairing_sha256` in the summary.
+recorded. A pair missing any required field — from both the manifest and the
+sidecar — fails closed. The verified pairing is hashed into `pairing_sha256` in the summary.
 Without complete pairing provenance the run fails closed; `--allow_unmatched_cohorts`
 downgrades it to `legacy_or_ablation_mode` instead and never to an official
 paper evaluation.

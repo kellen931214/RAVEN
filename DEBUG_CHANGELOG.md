@@ -227,6 +227,61 @@ labelling.
 
 
 
+## 2026-07-28 — GaussMarker: pair manifests were not standalone, bundles were created before the resume gate
+
+### Problem
+Review of PR #10 found two follow-ups to the fail-closed work below:
+
+1. `--pair_manifest` could not supply pairing provenance on its own.
+   `_pair_entry()` rejected any pair whose images had no metadata sidecar, so a
+   cohort that only ships an explicit pair manifest — the normal case for a
+   cohort assembled from two separate generation runs — could never reach
+   `official_paper_evaluation`.
+2. The resume gate ran too late. `run_gm_generation()` always built the provider
+   with `create_bundle=True`, so a rerun into an existing output directory could
+   create a brand-new bundle on disk and only *then* fail on the
+   `run_manifest.json` mismatch — leaving a stray bundle behind after a run that
+   claimed nothing was modified.
+
+### Fix
+- `_pair_side()` resolves each side of a pair from the pair-manifest entry and
+  the sidecar independently: a field declared in the manifest (per pair as
+  `sample_seed`, or per side as `positive_sample_seed`) needs no sidecar; when a
+  sidecar is present the two are cross-validated and any disagreement rejects
+  the pair. A required field absent from *both* sources still fails closed.
+  `pairing_source` now records `pair_manifest`, `sample_metadata` or
+  `pair_manifest+sample_metadata` per pair.
+- `run_gm_generation()` checks `run_manifest.json` existence before building
+  anything: when it exists, `--gm_bundle_dir` must already be a complete bundle
+  and the provider is built with `create_bundle=False`. A new bundle can only be
+  created for a new output run. The `run_config_sha256` comparison still happens
+  afterwards and still touches no file on mismatch.
+
+### Affected files
+- `eval_bench_wm/utils/wm/gm_runtime.py`, `eval_bench_wm/run_watermark.py`
+- `eval_bench_wm/tests/test_gm_fail_closed.py`, `eval_bench_wm/README.md`
+
+### Evidence
+- Two added focused tests: a complete pair manifest with no sidecar anywhere
+  produces a valid pairing labelled `official_paper_evaluation`
+  (`pairing_source == "pair_manifest"`); a changed-seed resume pointed at a
+  non-existent bundle path raises "Nothing was modified", and afterwards the
+  bundle path does not exist and the output directory still contains only the
+  original `run_manifest.json` with an unchanged SHA256.
+- `pytest eval_bench_wm/tests` → 91 passed, 10 subtests passed.
+
+### Experimental integrity fields
+- Data source / detector score definition / threshold calibration source:
+  unchanged. No cohort was produced or invalidated.
+- Outputs requiring regeneration: none.
+
+### Git provenance
+- Branch: `agent/issue-1-gaussmarker-official-parity` (PR #10, draft)
+- Base commit: `7e56c4cb7baa6a6fc567fb820c85c412535c5ccc`
+- `main` is intentionally not synced yet; that waits for the T2S PR #8 merge.
+
+
+
 ## 2026-07-28 — GaussMarker: three fail-closed gaps in the first parity commit
 
 ### Problem

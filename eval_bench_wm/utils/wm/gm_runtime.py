@@ -118,62 +118,108 @@ def load_pair_metadata(image_path: Path) -> typing.Optional[typing.Dict[str, typ
     return None
 
 
+def _declared_value(explicit: typing.Mapping, role: str, field: str):
+    """Read one field for one side of a pair out of a pair-manifest entry.
+
+    A pair manifest may declare a field once for the pair (``sample_seed``) or
+    per side (``positive_sample_seed``); the per-side key wins.
+    """
+    for key in (f"{role}_{field}", field):
+        if explicit.get(key) is not None:
+            return explicit[key]
+    return None
+
+
+def _pair_side(role: str, path: Path, explicit: typing.Mapping, fields: typing.Sequence[str]):
+    """Resolve one side of a pair from the pair manifest and/or its sidecar.
+
+    The pair manifest is an independent source of pairing provenance: when it
+    declares a field, no sidecar is required. When a sidecar *is* present, it
+    must agree with the manifest — a disagreement is a rejection, not a
+    precedence question.
+    """
+    meta = load_pair_metadata(path) or {}
+    resolved = {}
+    for field in fields:
+        declared = _declared_value(explicit, role, field)
+        observed = meta.get(field)
+        if declared is not None and observed is not None and declared != observed:
+            return None, (
+                f"pair manifest and sample metadata for {role} image {path.name} disagree on "
+                f"{field} ({declared!r} vs {observed!r})"
+            )
+        resolved[field] = declared if declared is not None else observed
+    resolved["_has_metadata"] = bool(meta)
+    resolved["protocol"] = _declared_value(explicit, role, "protocol") or meta.get("protocol")
+    return resolved, None
+
+
 def _pair_entry(positive: Path, negative: Path, explicit: typing.Optional[typing.Mapping] = None):
     """Validate one positive/negative pair; returns (entry, reason)."""
-    pos_meta = load_pair_metadata(positive)
-    neg_meta = load_pair_metadata(negative)
     explicit = dict(explicit or {})
+    fields = tuple(PAIR_REQUIRED_FIELDS) + tuple(PAIR_DISTORTION_FIELDS)
 
-    if pos_meta is None or neg_meta is None:
-        side = "positive" if pos_meta is None else "negative"
-        return None, f"{side} image {(positive if pos_meta is None else negative).name} has no sample metadata"
+    sides = {}
+    for role, path in (("positive", positive), ("negative", negative)):
+        side, reason = _pair_side(role, path, explicit, fields)
+        if side is None:
+            return None, reason
+        sides[role] = side
+    pos, neg = sides["positive"], sides["negative"]
 
     for field in PAIR_REQUIRED_FIELDS:
-        for role, meta, path in (("positive", pos_meta, positive), ("negative", neg_meta, negative)):
-            if meta.get(field) is None:
-                return None, f"{role} metadata for {path.name} is missing {field!r}"
+        for role, side, path in (("positive", pos, positive), ("negative", neg, negative)):
+            if side[field] is None:
+                source = "sample metadata" if side["_has_metadata"] else "pair manifest or sample metadata"
+                return None, (
+                    f"{role} image {path.name} has no {field!r}; supply it in the {source}"
+                )
 
     for field in ("sample_id", "prompt_sha256"):
-        if pos_meta[field] != neg_meta[field]:
+        if pos[field] != neg[field]:
             return None, (
                 f"pair {positive.name}/{negative.name} disagrees on {field} "
-                f"({pos_meta[field]!r} vs {neg_meta[field]!r})"
+                f"({pos[field]!r} vs {neg[field]!r})"
             )
 
-    # "generation seed OR explicit pairing provenance": an explicit pair manifest
-    # entry may declare the pairing, otherwise the generation seeds must match.
-    if not explicit and pos_meta["sample_seed"] != neg_meta["sample_seed"]:
+    # "generation seed OR explicit pairing provenance": a pair-manifest entry
+    # declares the pairing, otherwise the generation seeds must match.
+    if not explicit and pos["sample_seed"] != neg["sample_seed"]:
         return None, (
             f"pair {positive.name}/{negative.name} disagrees on sample_seed "
-            f"({pos_meta['sample_seed']!r} vs {neg_meta['sample_seed']!r}) and no explicit "
+            f"({pos['sample_seed']!r} vs {neg['sample_seed']!r}) and no explicit "
             "pairing provenance was supplied"
         )
 
-    declared = [f for f in PAIR_DISTORTION_FIELDS if pos_meta.get(f) is not None or neg_meta.get(f) is not None]
-    if declared:
+    if any(side[field] is not None for side in (pos, neg) for field in PAIR_DISTORTION_FIELDS):
         for field in PAIR_DISTORTION_FIELDS:
-            if pos_meta.get(field) is None or neg_meta.get(field) is None:
+            if pos[field] is None or neg[field] is None:
                 return None, (
                     f"pair {positive.name}/{negative.name} declares distortion but is missing {field!r} "
                     "on one side"
                 )
-            if pos_meta[field] != neg_meta[field]:
+            if pos[field] != neg[field]:
                 return None, (
                     f"pair {positive.name}/{negative.name} was distorted with a different {field} "
-                    f"({pos_meta[field]!r} vs {neg_meta[field]!r})"
+                    f"({pos[field]!r} vs {neg[field]!r})"
                 )
+
+    if explicit:
+        source = "pair_manifest+sample_metadata" if (pos["_has_metadata"] or neg["_has_metadata"]) else "pair_manifest"
+    else:
+        source = "sample_metadata"
 
     entry = {
         "positive": positive.name,
         "negative": negative.name,
-        "sample_id": pos_meta["sample_id"],
-        "prompt_sha256": pos_meta["prompt_sha256"],
-        "positive_sample_seed": pos_meta["sample_seed"],
-        "negative_sample_seed": neg_meta["sample_seed"],
-        "distortion_config_sha256": pos_meta.get("distortion_config_sha256"),
-        "distortion_seed": pos_meta.get("distortion_seed"),
-        "protocol": pos_meta.get("protocol") or neg_meta.get("protocol"),
-        "pairing_source": "pair_manifest" if explicit else "sample_metadata",
+        "sample_id": pos["sample_id"],
+        "prompt_sha256": pos["prompt_sha256"],
+        "positive_sample_seed": pos["sample_seed"],
+        "negative_sample_seed": neg["sample_seed"],
+        "distortion_config_sha256": pos["distortion_config_sha256"],
+        "distortion_seed": pos["distortion_seed"],
+        "protocol": pos["protocol"] or neg["protocol"],
+        "pairing_source": source,
     }
     return entry, None
 

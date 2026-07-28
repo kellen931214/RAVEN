@@ -154,6 +154,41 @@ class UnpairedCohortTests(unittest.TestCase):
                 "official_paper_evaluation",
             )
 
+    def test_pair_manifest_alone_establishes_the_pairing(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            positives, negatives = self._cohorts(root, with_metadata=False)
+            manifest_path = root / "pairs.json"
+            manifest_path.write_text(json.dumps({
+                "protocol": "official_paper_eval",
+                "pairs": [
+                    {
+                        "positive": positive.name,
+                        "negative": negative.name,
+                        "sample_id": index,
+                        "prompt_sha256": gm_bundle.sha256_text(f"prompt {index}"),
+                        "positive_sample_seed": index,
+                        "negative_sample_seed": 1000 + index,
+                        "distortion_config_sha256": "d" * 64,
+                        "distortion_seed": 7,
+                    }
+                    for index, (positive, negative) in enumerate(zip(positives, negatives))
+                ],
+            }))
+
+            # No sidecar metadata exists anywhere in either cohort.
+            self.assertIsNone(gm_runtime.load_pair_metadata(positives[0]))
+
+            pairing = gm_runtime.resolve_pairing(positives, negatives, manifest_path)
+            self.assertTrue(pairing["paired"], pairing["reason"])
+            self.assertEqual(pairing["protocol"], "official_paper_eval")
+            self.assertEqual([p["pairing_source"] for p in pairing["pairs"]], ["pair_manifest"] * 2)
+            self.assertEqual(pairing["pairs"][0]["negative_sample_seed"], 1000)
+            self.assertEqual(
+                gm_runtime.cohort_report_label("paper_eval", True, pairing["paired"]),
+                "official_paper_evaluation",
+            )
+
     def test_paper_eval_fails_closed_without_pairing(self):
         import run_verify_watermark
 
@@ -202,6 +237,33 @@ class RunManifestResumeTests(unittest.TestCase):
 
             manifest = gm_runtime.assert_run_manifest_compatible(manifest_path, "a" * 64)
             self.assertEqual(manifest["created_utc"], "2026-07-28T00:00:00Z")
+            self.assertEqual(before, gm_bundle.sha256_file(manifest_path))
+
+    def test_incompatible_resume_never_creates_a_new_bundle(self):
+        import run_watermark
+
+        with TemporaryDirectory() as tmp:
+            out_dir = Path(tmp) / "run"
+            out_dir.mkdir()
+            manifest_path = out_dir / "run_manifest.json"
+            before = self._manifest(manifest_path, "a" * 64)
+            bundle_dir = Path(tmp) / "new_bundle"  # does not exist
+
+            argv = [
+                "--wm_type", "GM",
+                "--out_dir", str(out_dir),
+                "--gm_bundle_dir", str(bundle_dir),
+                "--seed", "999",
+                "--num", "1",
+            ]
+            args = run_watermark.build_parser().parse_args(argv)
+
+            with self.assertRaises(RuntimeError) as ctx:
+                run_watermark.run_gm_generation(args, argv)
+            self.assertIn("Nothing was modified", str(ctx.exception))
+
+            self.assertFalse(bundle_dir.exists())
+            self.assertEqual([p.name for p in out_dir.iterdir()], ["run_manifest.json"])
             self.assertEqual(before, gm_bundle.sha256_file(manifest_path))
 
     def test_absent_manifest_may_be_created(self):

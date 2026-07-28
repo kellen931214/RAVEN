@@ -154,12 +154,26 @@ def run_gm_generation(args, argv):
     gpu_info = gm_runtime.gpu_preflight(DEVICE)
     print(f"[GM] device preflight: {gpu_info}", flush=True)
 
+    # A run that resumes into an existing output directory must not be able to
+    # create anything before its manifest has been validated. If the manifest
+    # exists, the bundle it was produced with must exist too and is loaded
+    # read-only; a new bundle may only be created for a genuinely new run.
+    resuming = manifest_path.exists()
+    if resuming:
+        bundle_dir = getattr(args, "gm_bundle_dir", None)
+        if bundle_dir is None or not gm_bundle.GmBundle(Path(bundle_dir)).complete():
+            raise RuntimeError(
+                f"{manifest_path} already exists, so this run resumes an existing cohort and must "
+                f"reuse the bundle that produced it, but --gm_bundle_dir ({bundle_dir}) is not a "
+                "complete bundle. Nothing was modified."
+            )
+
     pipe_provider_target = gm_runtime.build_pipe_provider(args, DEVICE)
     wm_provider = gm_runtime.build_provider(
         args,
         latent_shape=pipe_provider_target.get_latent_shape(),
         device=DEVICE,
-        create_bundle=True,
+        create_bundle=not resuming,
     )
     if wm_provider.bundle is None:
         raise RuntimeError(
