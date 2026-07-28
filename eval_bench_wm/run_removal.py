@@ -205,19 +205,31 @@ def main():
         wm_provider.active_detection_threshold() if args.wm_type == "GS" else None
     )
 
-    wm_initial_results = wm_provider.get_wm_latents()
-    wm_zT = wm_initial_results["zT_torch"]
-    message_bits_str_initial = (
-        wm_initial_results["message_bits_str_list"][0]
-        if "message_bits_str_list" in wm_initial_results
-        else None
-    )
+    # T2S rebuilds its base latent, session key and message per sample, so its
+    # latent is created inside the loop. Other providers keep the pre-existing
+    # behaviour of reusing one latent for the whole run.
+    per_sample_latents = args.wm_type == "T2S"
+    if per_sample_latents:
+        wm_zT = None
+        message_bits_str_initial = None
+    else:
+        wm_initial_results = wm_provider.get_wm_latents()
+        wm_zT = wm_initial_results["zT_torch"]
+        message_bits_str_initial = (
+            wm_initial_results["message_bits_str_list"][0]
+            if "message_bits_str_list" in wm_initial_results
+            else None
+        )
 
     remover = None
     all_rows = []
     for run_id, target_prompt in tqdm(enumerate(target_prompts), total=len(target_prompts), desc="Removal"):
         if args.wm_type in ["PRC"]:
             seed_everything(args.seed)
+
+        if per_sample_latents:
+            wm_zT, t2s_state = wm_provider.new_sample(sample_seed=args.seed + run_id)
+            message_bits_str_initial = t2s_state.expected_message_bits
 
         if hasattr(wm_provider, "generate"):
             generated = wm_provider.generate(
@@ -250,7 +262,11 @@ def main():
             do_msssim=False,
             do_lpips=False,
         )
-        if args.wm_type in ["SPH", "T2S"]:
+        if args.wm_type == "T2S":
+            # RAVEN paired_key_comparison extension, not an upstream per-image
+            # rule (upstream evaluates a cohort ROC). Not TPR@1%FPR.
+            before_successful = before["detection_success"]
+        elif args.wm_type == "SPH":
             before_successful = None
         elif args.wm_type in ["PRC", "MAXSIVE", "SHALLOW", "GM"]:
             before_successful = before["detection_success"]
@@ -296,7 +312,11 @@ def main():
             do_msssim=True,
             do_lpips=False,
         )
-        if args.wm_type in ["SPH", "T2S"]:
+        if args.wm_type == "T2S":
+            # RAVEN paired_key_comparison extension, not an upstream per-image
+            # rule (upstream evaluates a cohort ROC). Not TPR@1%FPR.
+            after_successful = after["detection_success"]
+        elif args.wm_type == "SPH":
             after_successful = None
         elif args.wm_type in ["PRC", "MAXSIVE", "SHALLOW", "GM"]:
             after_successful = after["detection_success"]
