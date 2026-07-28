@@ -68,6 +68,24 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--no-verify-files", dest="verify_files", action="store_false"
     )
+    parser.add_argument(
+        "--expected-run-ids",
+        type=int,
+        nargs="+",
+        default=None,
+        help=(
+            "run_ids every audited method must cover exactly. Use this for a smoke "
+            "audit (e.g. --expected-run-ids 0 1)."
+        ),
+    )
+    parser.add_argument(
+        "--expect-full-tr-cohort",
+        action="store_true",
+        help=(
+            "require every method to cover the complete TR cohort. This is the "
+            "formal-audit setting and is mutually exclusive with --expected-run-ids."
+        ),
+    )
     parser.add_argument("--output", type=Path, default=None, help="write the report JSON here")
     return parser.parse_args(argv)
 
@@ -112,11 +130,29 @@ def main(argv: Optional[List[str]] = None) -> int:
             "--t2s-metadata"
         )
 
+    if args.expected_run_ids is not None and args.expect_full_tr_cohort:
+        raise SystemExit(
+            "--expected-run-ids and --expect-full-tr-cohort are mutually exclusive"
+        )
+    expected_run_ids = args.expected_run_ids
+    if args.expect_full_tr_cohort:
+        expected_run_ids = [row["run_id"] for row in tr_rows]
+    if expected_run_ids is None:
+        print(
+            "WARNING: no run_id coverage requirement given. This audit proves the "
+            "rows present are consistent, NOT that the cohort is complete. Pass "
+            "--expected-run-ids for a smoke audit or --expect-full-tr-cohort for a "
+            "formal one.",
+            file=sys.stderr,
+        )
+
     report["cross_method"] = audit_shared_clean_cohorts(
         tr_rows,
         cohorts,
         verify_files=args.verify_files,
         require_methods=sorted(cohorts),
+        expected_run_ids=expected_run_ids,
+        tr_metadata_path=tr_path,
     )
     report["passed"] = True
 

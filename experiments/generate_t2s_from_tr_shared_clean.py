@@ -87,9 +87,12 @@ from shared_clean_tr import (  # noqa: E402
     canonical_json_sha256,
     entrypoint_provenance,
     existing_completed_rows,
+    finalize_run_manifest,
     git_provenance,
     load_tr_rows,
+    preflight_run_manifest,
     rebuild_shared_clean_latent,
+    run_manifest_path,
     save_json,
     select_rows,
     sha256_path,
@@ -220,6 +223,25 @@ def run(args: argparse.Namespace, guard: Any, device: Any) -> Dict[str, Any]:
     suffix = shard_suffix(args.num_shards, args.shard_index)
     metadata_csv = method_dir / f"metadata{suffix}.csv"
     state_dir = method_dir / "watermark_state"
+    manifest_path = run_manifest_path(method_dir, suffix)
+    selected_run_ids = sorted(int(row["run_id"]) for row in selected)
+    provenance = entrypoint_provenance(Path(__file__), t2s_provider_module)
+    git = git_provenance(WORKSPACE)
+
+    # --- gate 1: run manifest, before any pipeline or provider state is built ---
+    stored_manifest = preflight_run_manifest(
+        manifest_path,
+        {
+            "shared_clean_source_metadata_sha256": tr_metadata_sha256,
+            "selected_run_ids": json.dumps(selected_run_ids),
+            "entrypoint_sha256": provenance["entrypoint_sha256"],
+            "t2s_provider_entrypoint_sha256": provenance["provider_entrypoint_sha256"],
+            "smoke_only": bool(args.smoke_only),
+        },
+        resume=args.resume,
+    )
+
+    # --- gate 2: existing cohort re-audit ---
     completed = existing_completed_rows(metadata_csv, resume=args.resume)
 
     print(f"[T2S-v2] loading target pipeline: {args.model_id}", flush=True)
@@ -277,7 +299,6 @@ def run(args: argparse.Namespace, guard: Any, device: Any) -> Dict[str, Any]:
             f"T2S channel layout mismatch: provider={provider.t2s_channels} "
             f"cohort={LATENT_CHANNELS}"
         )
-    provenance = entrypoint_provenance(Path(__file__), t2s_provider_module)
 
     watermark_mask_sha256 = canonical_json_sha256(
         {
@@ -313,8 +334,38 @@ def run(args: argparse.Namespace, guard: Any, device: Any) -> Dict[str, Any]:
     }
     watermark_config_sha256 = canonical_json_sha256(watermark_config)
 
+    # --- gate 3: the full run identity, now that the provider and pipeline exist ---
+    run_manifest = finalize_run_manifest(
+        manifest_path,
+        stored_manifest,
+        {
+            "protocol": T2S_SHARED_TR_CLEAN_PROTOCOL,
+            "method": "T2S",
+            "dataset_name": args.dataset_name,
+            "shared_clean_source_metadata_path": str(tr_metadata),
+            "shared_clean_source_metadata_sha256": tr_metadata_sha256,
+            "selected_run_ids": json.dumps(selected_run_ids),
+            "selected_run_id_count": len(selected_run_ids),
+            "num_shards": int(args.num_shards),
+            "shard_index": int(args.shard_index),
+            "generation_config_sha256": generation_config_sha256,
+            "watermark_config_sha256": watermark_config_sha256,
+            "t2s_provider_config_sha256": provider_config_sha256,
+            "t2s_protocol_mode": T2S_SHARED_TR_CLEAN_MODE,
+            "t2s_rng_mode": args.t2s_rng_mode,
+            "t2s_inversion_mode": args.t2s_inversion_mode,
+            "entrypoint_path": provenance["entrypoint_path"],
+            "entrypoint_sha256": provenance["entrypoint_sha256"],
+            "t2s_provider_entrypoint_sha256": provenance["provider_entrypoint_sha256"],
+            "git_branch": git["git_branch"],
+            "git_commit": git["git_commit"],
+            "smoke_only": bool(args.smoke_only),
+            "incomplete": bool(args.smoke_only),
+            "formal_output_eligible": not bool(args.smoke_only),
+        },
+    )
+
     clean_guard = CleanImageGuard()
-    git = git_provenance(WORKSPACE)
     rows_written = 0
     skipped = 0
     gate_records: List[Dict[str, Any]] = []
@@ -541,7 +592,9 @@ def run(args: argparse.Namespace, guard: Any, device: Any) -> Dict[str, Any]:
                 "git_commit": git["git_commit"],
                 "git_dirty": git["git_dirty"],
                 "smoke_only": bool(args.smoke_only),
+                "incomplete": bool(args.smoke_only),
                 "formal_output_eligible": not bool(args.smoke_only),
+                "run_config_sha256": run_manifest["run_config_sha256"],
                 "watermark_implementation_protocol": T2S_SHARED_TR_CLEAN_MODE,
                 "generation_benchmark_protocol": "shared_formal_cohort_redbeardnz_ddim",
                 "upstream_official_reproduction_runner": (
@@ -583,9 +636,16 @@ def run(args: argparse.Namespace, guard: Any, device: Any) -> Dict[str, Any]:
 
     with metadata_csv.open(newline="", encoding="utf-8") as handle:
         t2s_rows = list(csv.DictReader(handle))
-    audit = audit_pairing_rows(t2s_rows, expected_count=len(t2s_rows), verify_files=True)
+    audit = audit_pairing_rows(t2s_rows, expected_count=len(selected), verify_files=True)
+    # Coverage is explicit: this run must have produced a row for exactly the
+    # run_ids it selected — no missing, extra or duplicated rows.
     cross = audit_shared_clean_cohorts(
-        tr_rows, {"T2S": t2s_rows}, verify_files=True, require_methods=("T2S",)
+        tr_rows,
+        {"T2S": t2s_rows},
+        verify_files=True,
+        require_methods=("T2S",),
+        expected_run_ids=selected_run_ids,
+        tr_metadata_path=tr_metadata,
     )
     clean_report = clean_guard.assert_unchanged()
     save_json(method_dir / f"pairing_audit{suffix}.json", audit)
@@ -613,7 +673,11 @@ def run(args: argparse.Namespace, guard: Any, device: Any) -> Dict[str, Any]:
         "t2s_state_dir": str(state_dir),
         "entrypoint": provenance,
         "git": git,
+        "run_manifest_path": str(manifest_path),
+        "run_config_sha256": run_manifest["run_config_sha256"],
+        "selected_run_ids": selected_run_ids,
         "smoke_only": bool(args.smoke_only),
+        "incomplete": bool(args.smoke_only),
         "formal_output_eligible": not bool(args.smoke_only),
         "pairing_audit": audit,
         "cross_method_shared_clean_audit": {

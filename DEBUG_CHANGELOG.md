@@ -24,6 +24,131 @@ This file records implementation bugs, validated non-bugs, ablations, and the ev
 
 
 
+## 2026-07-28 — Shared-clean review follow-up: run-id coverage, source binding, artifact verification and a fail-closed run manifest
+
+### Problem
+Review of PR #11 found four ways an incomplete or drifted `shared_tr_clean_v2`
+cohort could still pass every gate:
+
+1. **Coverage was never checked.** `audit_shared_clean_cohorts` proved the rows
+   *present* were consistent. A cohort that generated 3 of 1001 rows, or a smoke
+   that silently produced one row instead of two, passed unchanged.
+2. **The recorded source SHA was never compared to the source file.** Rows
+   carried `shared_clean_source_metadata_sha256`, but nothing recomputed the TR
+   metadata file's SHA and compared it, so a cohort generated against a
+   since-changed source could not be distinguished from a current one.
+3. **`verify_files=true` only verified images.** The GM bundle and the T2S
+   portable state — the state each cohort's watermark identity actually lives in
+   — were never checked for existence or drift, so a deleted or edited
+   `w1.pth`/state JSON left an apparently valid cohort.
+4. **No run manifest.** The runners had a per-row resume gate but nothing bound
+   the run as a whole, so an incompatible rerun (different selection, different
+   bundle, different provider profile) was only caught row by row, after the
+   pipeline had been loaded.
+
+Separately, smoke rows recorded `smoke_only` / `formal_output_eligible` but not
+the explicit `incomplete` flag the experiment-integrity skill's output
+classification calls for.
+
+### Root cause
+Each is a missing gate rather than a wrong computation. The audit was written
+around "do these rows agree with the TR rows", which is necessary but says
+nothing about completeness, about the identity of the file that was read, or
+about the non-image artifacts a cohort depends on.
+
+### Affected files
+- `raven_repro/raven/pairing_provenance.py`: `expected_run_ids` and
+  `tr_metadata_path` parameters on `audit_shared_clean_cohorts` (and passed
+  through by `audit_tr_gs_shared_clean`), the per-method coverage check,
+  the per-row source-SHA comparison, new `_verify_gm_bundle_artifacts` /
+  `_verify_t2s_state_artifact` / `METHOD_ARTIFACT_VERIFIERS`, and
+  `_run_id_sort_key`.
+- `experiments/shared_clean_tr.py`: `run_manifest_path`,
+  `preflight_run_manifest`, `finalize_run_manifest`.
+- `experiments/generate_gm_from_tr_shared_clean.py`,
+  `experiments/generate_t2s_from_tr_shared_clean.py`: three-stage run-manifest
+  gate, `incomplete` and `run_config_sha256` row fields, and audits that assert
+  coverage against the run's own selection and bind the source path.
+- `raven_repro/scripts/audit_shared_clean_cohorts.py`: `--expected-run-ids`,
+  `--expect-full-tr-cohort`, source-path binding, and a warning when no coverage
+  requirement is given.
+- `raven_repro/tests/test_shared_tr_clean_gm_t2s.py`, `docs/SHARED_TR_CLEAN_V2.md`.
+
+### Affected outputs
+None. No canonical clean artifact was touched and no cohort was produced by this
+change. The earlier two-row GPU smoke predates the new metadata columns
+(`incomplete`, `run_config_sha256`) and the run manifest, so it was regenerated
+from scratch in a fresh scratch root rather than resumed; its outputs remain
+smoke-only. **No formal 1000/1001-sample cohort was generated.**
+
+### Fix
+- `audit_shared_clean_cohorts(..., expected_run_ids=…)` requires each required
+  method's run_id set to equal the expected set exactly; missing, extra and
+  duplicated rows are all rejected, with numeric run_ids reported in numeric
+  order. The runners pass their own selection, so a smoke audit verifies exactly
+  `{0, 1}` and a formal audit covers the whole TR cohort via
+  `--expect-full-tr-cohort`.
+- `audit_shared_clean_cohorts(..., tr_metadata_path=…)` recomputes the source
+  file's SHA-256 from disk and compares it to every method row's
+  `shared_clean_source_metadata_sha256`.
+- Under `verify_files`, GM rows verify `manifest.json` + `w1.pth` + `w2.pth`
+  exist, the manifest's `bundle_config_sha256` is the row's, and both weight
+  hashes agree with the manifest *and* the row; T2S rows verify the state JSON
+  exists, is signed, re-signs to its declared digest, and matches the row's
+  `t2s_state_sha256`. `raven/` still does not import `eval_bench_wm`: both checks
+  are structural, using the canonical JSON rules the providers themselves use.
+- Both runners write a `run_manifest.json` binding source metadata SHA, selected
+  run_ids, generation/watermark config SHAs, GM bundle or T2S provider config
+  SHA, runner and provider entrypoint SHAs, git branch/commit and smoke mode.
+  The preflight gate runs before any pipeline load or bundle creation and only
+  reads; the full `run_config_sha256` is compared after the provider exists. Any
+  mismatch stops with "Nothing was modified". A compatible resume returns the
+  stored manifest unchanged, so `created_utc` is not rewritten.
+- Rows and summaries now record `incomplete` (true exactly when `smoke_only`).
+
+### Reused code
+`canonical_json_sha256`, `sha256_path`, `_required`, `save_json`, the existing
+`audit_pairing_rows` / `audit_shared_clean_cohorts` structure, and the
+GaussMarker bundle-before-resume ordering established on 2026-07-28.
+
+### Historical bug coverage
+The 2026-07-28 "bundles were created before the resume gate" entry is the direct
+precedent for the manifest preflight, and its ordering is now enforced for both
+methods and covered by a test that asserts no manifest, bundle, state, image or
+metadata row changes on an incompatible resume. The 2026-07-27 GS V2 entry was
+re-checked: `audit_tr_gs_shared_clean` keeps its exact return shape and the new
+parameters default to `None`, so existing GS behaviour is unchanged.
+
+### Regression prevention
+Six focused tests: a method missing an expected run_id (and an extra run_id)
+fails the audit; a row recording a wrong TR metadata SHA fails; GM `w1.pth`
+content drift, deletion and manifest edit each fail; T2S state edit, valid-but-
+re-signed drift and deletion each fail; an incompatible resume leaves every
+artifact byte-identical and creates no new bundle; a compatible resume keeps the
+original manifest including `created_utc`; smoke rows carry `incomplete=True`
+and formal rows `incomplete=False`. Two existing resume tests were updated: the
+GM foreign-bundle and T2S profile-drift cases are now caught earlier, by the
+manifest gate, which is the stronger behaviour.
+
+### Validation
+- `raven_repro`: 425 passed (413 before + 12 new/updated).
+- `eval_bench_wm/tests`: 136 passed, 10 subtests passed.
+- Two-row GPU smoke regenerated on an idle sm_86 GPU; canonical clean images
+  byte-identical before and after; smoke audit passed with
+  `--expected-run-ids 0 1`; GPU resume wrote 0 rows, skipped 2 and left every
+  artifact byte-identical.
+
+### Watermark integrity
+Unchanged from the entry below: no attack, detector, threshold, CLIP or FID work
+was run, and no detection metric is claimed. Smoke outputs remain `incomplete`
+and ineligible for formal reporting.
+
+### Git provenance
+- Repository: `kellen931214/RAVEN`
+- Branch: `issue-9-shared-tr-clean-v2-gm-t2s` (PR #11, draft)
+- Base `main` commit: `df5f651ac239733275e4252f5d59441d363faab8`
+- Formal output eligibility: code validated; two-row GPU smoke only.
+
 ## 2026-07-28 — GM and T2S generate from the canonical Tree-Ring clean source (`shared_tr_clean_v2`, Issue #9)
 
 ### Problem

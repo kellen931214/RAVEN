@@ -149,24 +149,56 @@ python3 experiments/generate_t2s_from_tr_shared_clean.py \
 ```
 
 Smoke outputs go to a scratch directory, never to `data/` or `outputs/`, and
-every row carries `smoke_only=True` / `formal_output_eligible=False`.
+every row carries `smoke_only=True`, `incomplete=True` and
+`formal_output_eligible=False`. A formal run records `incomplete=False`.
 
 ### Cross-method audit (TR + GS + GM + T2S)
+
+Smoke audit — must cover exactly run_ids `{0, 1}`:
+
+```bash
+python3 raven_repro/scripts/audit_shared_clean_cohorts.py \
+  --tr-metadata  data/tr/diffusiondb/metadata.csv \
+  --gm-metadata  "$SMOKE/gm/metadata.csv" \
+  --t2s-metadata "$SMOKE/t2s/metadata.csv" \
+  --expected-run-ids 0 1 \
+  --output       audit/shared_clean_smoke.json
+```
+
+Formal audit — must cover the complete TR cohort:
 
 ```bash
 python3 raven_repro/scripts/audit_shared_clean_cohorts.py \
   --tr-metadata  data/tr/diffusiondb/metadata.csv \
   --gs-metadata  data/gs/diffusiondb_shared_tr/GS/metadata.csv \
-  --gm-metadata  "$SMOKE/gm/metadata.csv" \
-  --t2s-metadata "$SMOKE/t2s/metadata.csv" \
+  --gm-metadata  data/gm/diffusiondb_shared_tr/GM/metadata.csv \
+  --t2s-metadata data/t2s/diffusiondb_shared_tr/T2S/metadata.csv \
+  --expect-full-tr-cohort \
   --output       audit/shared_clean_tr_gs_gm_t2s.json
 ```
 
-The audit matches by `run_id` only. It rejects duplicate or missing rows,
-re-hashes every referenced image, and fails closed on prompt, latent, clean,
-generation-config, bundle/state or protocol drift. Where two methods cover the
-same `run_id` they must agree on the clean artifacts and must have produced
-different watermarked images.
+The audit matches by `run_id` only, and checks four independent things:
+
+1. **Coverage.** Each required method's run_id set must equal the expected set
+   exactly — a missing, extra or duplicated row all fail closed. Running without
+   `--expected-run-ids` or `--expect-full-tr-cohort` proves only that the rows
+   present are consistent, *not* that the cohort is complete, and the script
+   warns loudly when neither is given.
+2. **Source binding.** The TR metadata file's SHA-256 is recomputed from disk and
+   must equal the `shared_clean_source_metadata_sha256` recorded by every method
+   row, so a cohort generated against a since-changed source cannot pass.
+3. **Shared-clean identity.** Prompt, latent, clean path/SHA and generation
+   config must match the TR row, and the row's TR mirror fields must match the TR
+   row itself so a hand-edited row cannot self-certify.
+4. **Artifacts** (under `verify_files`, the default). Every referenced image is
+   re-hashed, and each method's own state artifact is verified: the GM bundle
+   (`manifest.json` + `w1.pth` + `w2.pth`, with the manifest's
+   `bundle_config_sha256` and both file hashes matching the row) and the T2S
+   portable state JSON (present, self-signature valid, `state_sha256` equal to
+   the row's).
+
+Where two methods cover the same `run_id` they must agree on the clean artifacts
+and must have produced different watermarked images.
 
 ### Formal cohort generation — gated
 
@@ -189,16 +221,32 @@ python3 experiments/generate_t2s_from_tr_shared_clean.py \
   --device cuda --gpu <idle-gpu>          # -> data/t2s/diffusiondb_shared_tr/T2S
 ```
 
-## 6. Resume
+## 6. Resume and the run manifest
 
-Resume is deterministic and fail closed. Passing `--resume` re-audits every
-stored row, then per `run_id` re-derives the full identity — source row, bundle
-or state identity, provider entrypoint SHA, watermark and generation config
-hashes, and the recorded output's SHA — and refuses to skip on any mismatch.
-Without `--resume`, a runner will not touch an existing cohort at all. A GM
-bundle can only be created for a brand-new cohort: once a `metadata.csv` exists,
-`--create-bundle` is ignored, so a rejected resume can never leave a stray bundle
-behind.
+Each cohort directory carries a `run_manifest.json` binding the run's identity:
+source metadata SHA, the selected run_ids, generation and watermark config SHAs,
+the GM bundle or T2S provider config SHA, the runner and provider entrypoint
+SHAs, the git branch and commit, and the smoke/formal mode. Its
+`run_config_sha256` is the canonical digest of all of that.
+
+Resume runs through three gates, in this order:
+
+1. **Manifest preflight** — *before any pipeline is loaded or GM bundle is
+   created*. Without `--resume`, an existing manifest stops the run outright.
+   With it, the early fields (source SHA, selected run_ids, entrypoint SHAs,
+   smoke mode) must match. This gate only reads.
+2. **Cohort re-audit** — every stored row is re-audited, and an existing run
+   disables `--create-bundle` entirely.
+3. **Full run identity** — once the provider and pipeline exist, the complete
+   `run_config_sha256` must match.
+
+Any mismatch stops with *"Nothing was modified"*: no manifest, bundle, state
+file, image or metadata row is created or changed. On a compatible resume the
+stored manifest is kept as-is, so `created_utc` still records when the cohort was
+actually started. Per `run_id`, resume additionally re-derives the full row
+identity — source row, bundle or state identity, provider entrypoint SHA,
+watermark and generation config hashes, and the recorded output's SHA — and
+refuses to skip on any mismatch.
 
 ## 7. GPU gate
 

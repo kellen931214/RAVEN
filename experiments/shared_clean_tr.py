@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import datetime
 import hashlib
 import json
 import os
@@ -60,10 +61,13 @@ __all__ = [
     "canonical_json_sha256",
     "entrypoint_provenance",
     "existing_completed_rows",
+    "finalize_run_manifest",
     "git_provenance",
     "load_tr_rows",
+    "preflight_run_manifest",
     "rebuild_shared_clean_latent",
     "save_json",
+    "run_manifest_path",
     "select_rows",
     "sha256_path",
     "shard_suffix",
@@ -265,6 +269,76 @@ def verify_generation_config(
             "steps/guidance/resolution/dtype configuration"
         )
     return generation_config_sha256
+
+
+#: Name of the fail-closed run manifest each cohort directory carries.
+RUN_MANIFEST_FILENAME = "run_manifest"
+
+
+def run_manifest_path(method_dir: Path, suffix: str = "") -> Path:
+    return Path(method_dir) / f"{RUN_MANIFEST_FILENAME}{suffix}.json"
+
+
+def preflight_run_manifest(
+    path: Path, early: Mapping[str, Any], *, resume: bool
+) -> Optional[Dict[str, Any]]:
+    """First gate of a rerun — runs before any pipeline or bundle is built.
+
+    Returns the stored manifest when this run may continue an existing cohort,
+    or ``None`` for a brand-new one. It reads; it never writes. That ordering is
+    the point: a rerun that will be rejected must be rejected *before* a model is
+    loaded or a GM bundle is created, so a failed resume cannot leave a stray
+    artifact behind (see the 2026-07-28 GaussMarker entry in DEBUG_CHANGELOG.md).
+    """
+    path = Path(path)
+    if not path.exists():
+        return None
+    try:
+        stored = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise SharedCleanError(f"run manifest is not valid JSON: {path}: {exc}") from None
+    if not resume:
+        raise SharedCleanError(
+            f"{path} already describes a run of this cohort; pass --resume to "
+            "continue it. Nothing was modified."
+        )
+    for field, value in early.items():
+        if str(stored.get(field, "")) != str(value):
+            raise SharedCleanError(
+                f"run manifest mismatch for {path} field={field}: "
+                f"stored={stored.get(field)!r} requested={value!r}. "
+                "Nothing was modified."
+            )
+    return stored
+
+
+def finalize_run_manifest(
+    path: Path, stored: Optional[Mapping[str, Any]], payload: Mapping[str, Any]
+) -> Dict[str, Any]:
+    """Second gate — the full run identity, once the provider and pipeline exist.
+
+    On a compatible resume the stored manifest is returned untouched, so its
+    ``created_utc`` keeps recording when the cohort was actually started. On any
+    mismatch nothing is written.
+    """
+    payload = dict(payload)
+    run_config_sha256 = canonical_json_sha256(payload)
+    if stored is not None:
+        if str(stored.get("run_config_sha256", "")) != run_config_sha256:
+            raise SharedCleanError(
+                f"run configuration changed since {path} was written: "
+                f"stored={stored.get('run_config_sha256')} current={run_config_sha256}. "
+                "Nothing was modified; use a new output directory for a new "
+                "configuration."
+            )
+        return dict(stored)
+    record = dict(payload)
+    record["run_config_sha256"] = run_config_sha256
+    record["created_utc"] = datetime.datetime.now(datetime.timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+    save_json(Path(path), record)
+    return record
 
 
 class CleanImageGuard:

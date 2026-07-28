@@ -691,6 +691,12 @@ SHARED_CLEAN_METHOD_PROTOCOLS = {
 }
 
 
+def _run_id_sort_key(run_id: str) -> tuple[int, Any]:
+    """Numeric run_ids sort numerically; anything else sorts as text after them."""
+    text = str(run_id)
+    return (0, int(text)) if text.lstrip("-").isdigit() else (1, text)
+
+
 def _index_tr_source(tr_rows: Iterable[Mapping[str, Any]]) -> dict[str, Mapping[str, Any]]:
     tr_by_id: dict[str, Mapping[str, Any]] = {}
     for row in tr_rows:
@@ -705,12 +711,117 @@ def _index_tr_source(tr_rows: Iterable[Mapping[str, Any]]) -> dict[str, Mapping[
     return tr_by_id
 
 
+def _verify_gm_bundle_artifacts(row: Mapping[str, Any], run_id: str) -> dict[str, str]:
+    """The GM bundle this row names must still exist, byte-for-byte.
+
+    ``raven/`` must not import ``eval_bench_wm``, so the bundle is checked
+    structurally: the three artifacts exist, the manifest's own
+    ``bundle_config_sha256`` is the one the row recorded, and the two weight
+    files hash to the values the manifest and the row agree on.
+    """
+    bundle_dir = Path(str(_required(row, "gm_bundle_dir", run_id)))
+    manifest_path = bundle_dir / "manifest.json"
+    w1_path = bundle_dir / "w1.pth"
+    w2_path = bundle_dir / "w2.pth"
+    for label, path in (
+        ("manifest", manifest_path), ("w1", w1_path), ("w2", w2_path)
+    ):
+        if not path.is_file():
+            raise FileNotFoundError(
+                f"GM bundle {label} missing for run_id={run_id}: {path}"
+            )
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"GM bundle manifest is not valid JSON run_id={run_id}: {exc}") from None
+
+    expected_config = str(_required(row, "gm_bundle_config_sha256", run_id))
+    if str(manifest.get("bundle_config_sha256") or "") != expected_config:
+        raise ValueError(
+            f"GM bundle config SHA drift run_id={run_id}: row={expected_config} "
+            f"manifest={manifest.get('bundle_config_sha256')}"
+        )
+    hashes = {}
+    for label, path, row_field in (
+        ("w1", w1_path, "gm_w1_file_sha256"),
+        ("w2", w2_path, "gm_w2_file_sha256"),
+    ):
+        actual = sha256_path(path)
+        expected_row = str(_required(row, row_field, run_id))
+        expected_manifest = str(manifest.get(f"{label}_file_sha256") or "")
+        if actual != expected_row:
+            raise ValueError(
+                f"GM bundle {label}.pth SHA drift run_id={run_id}: "
+                f"expected {expected_row}, got {actual}"
+            )
+        if expected_manifest != actual:
+            raise ValueError(
+                f"GM bundle manifest disagrees with {label}.pth run_id={run_id}: "
+                f"manifest={expected_manifest}, file={actual}"
+            )
+        hashes[row_field] = actual
+    return {
+        "gm_bundle_dir": str(bundle_dir),
+        "gm_bundle_config_sha256": expected_config,
+        **hashes,
+    }
+
+
+def _verify_t2s_state_artifact(row: Mapping[str, Any], run_id: str) -> dict[str, str]:
+    """The T2S portable state this row names must exist and still be self-signed.
+
+    An unsigned or edited state is rejected exactly as ``T2SWatermarkState``
+    rejects it: the recomputed canonical digest of the payload must equal both
+    the digest stored inside the file and the one recorded in the metadata row.
+    """
+    state_path = Path(str(_required(row, "t2s_state_path", run_id)))
+    if not state_path.is_file():
+        raise FileNotFoundError(f"T2S state artifact missing for run_id={run_id}: {state_path}")
+    try:
+        record = json.loads(state_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"T2S state is not valid JSON run_id={run_id}: {exc}") from None
+    if not isinstance(record, dict):
+        raise ValueError(f"T2S state is not a JSON object run_id={run_id}: {state_path}")
+
+    declared = record.get("state_sha256")
+    if not isinstance(declared, str) or len(declared) != 64:
+        raise ValueError(
+            f"T2S state is unsigned or has a malformed state_sha256 run_id={run_id}: "
+            f"{declared!r}"
+        )
+    payload = {key: value for key, value in record.items() if key != "state_sha256"}
+    recomputed = canonical_json_sha256(payload)
+    if recomputed != declared:
+        raise ValueError(
+            f"T2S state signature invalid run_id={run_id}: declared={declared} "
+            f"recomputed={recomputed}"
+        )
+    expected_row = str(_required(row, "t2s_state_sha256", run_id))
+    if declared != expected_row:
+        raise ValueError(
+            f"T2S state SHA drift run_id={run_id}: row={expected_row} artifact={declared}"
+        )
+    return {"t2s_state_path": str(state_path), "t2s_state_sha256": declared}
+
+
+#: Per-method artifact verification run under ``verify_files=True``. A method
+#: cohort is only trustworthy if the state it was generated from still exists
+#: unchanged, not merely if its images hash correctly.
+METHOD_ARTIFACT_VERIFIERS = {
+    "GM": _verify_gm_bundle_artifacts,
+    "T2S": _verify_t2s_state_artifact,
+}
+
+
 def audit_shared_clean_cohorts(
     tr_rows: Iterable[Mapping[str, Any]],
     cohorts: Mapping[str, Iterable[Mapping[str, Any]]],
     *,
     verify_files: bool = True,
     require_methods: Iterable[str] | None = None,
+    expected_run_ids: Iterable[Any] | None = None,
+    tr_metadata_path: str | Path | None = None,
 ) -> dict[str, Any]:
     """Prove one or more V2 cohorts really reuse the canonical TR clean source.
 
@@ -720,6 +831,21 @@ def audit_shared_clean_cohorts(
     agree with the TR row itself (so a hand-edited row cannot self-certify), and
     both the clean image and the method's watermarked image must exist on disk
     with the recorded SHA-256.
+
+    ``expected_run_ids`` makes coverage explicit and is the difference between
+    "the rows present are consistent" and "the cohort is complete". Every
+    required method's run_id set must equal it *exactly*: a missing row, an extra
+    row and a duplicated row are all rejected. Passing ``None`` for a formal
+    audit is not an option worth taking — use the full TR cohort's run_ids.
+
+    ``tr_metadata_path`` binds the cohorts to the actual source file: its
+    SHA-256 is recomputed from disk and must equal the
+    ``shared_clean_source_metadata_sha256`` recorded by every method row, so a
+    cohort generated against a since-changed TR metadata file cannot pass.
+
+    Under ``verify_files`` each method's own state artifact is verified too — the
+    GM bundle (manifest + ``w1.pth`` + ``w2.pth``) and the T2S portable state
+    JSON, including its signature.
 
     Where two methods cover the same run_id they must agree with each other on
     the shared clean artifacts and must have produced *different* watermarked
@@ -737,6 +863,24 @@ def audit_shared_clean_cohorts(
         raise ValueError(
             f"shared-clean audit requires cohorts for {sorted(missing_required)}"
         )
+
+    expected_ids: set[str] | None = None
+    if expected_run_ids is not None:
+        expected_ids = {str(value) for value in expected_run_ids}
+        if not expected_ids:
+            raise ValueError("expected_run_ids was supplied but is empty")
+        unknown_ids = expected_ids - set(tr_by_id)
+        if unknown_ids:
+            raise ValueError(
+                f"expected_run_ids are not in the TR source cohort: {sorted(unknown_ids)}"
+            )
+
+    source_metadata_sha256: str | None = None
+    if tr_metadata_path is not None:
+        source_path = Path(tr_metadata_path)
+        if not source_path.is_file():
+            raise FileNotFoundError(f"TR source metadata not found: {source_path}")
+        source_metadata_sha256 = sha256_path(source_path)
 
     per_method: dict[str, list[dict[str, Any]]] = {}
     for raw_method, rows in cohorts.items():
@@ -803,7 +947,22 @@ def audit_shared_clean_cohorts(
                 raise ValueError(
                     f"{method} watermarked image is the clean image run_id={run_id}"
                 )
+            # The row must name the source file this audit actually read.
+            if source_metadata_sha256 is not None:
+                recorded_source = str(
+                    _required(row, "shared_clean_source_metadata_sha256", run_id)
+                )
+                if recorded_source != source_metadata_sha256:
+                    raise ValueError(
+                        f"shared_clean_source_metadata_sha256 drift run_id={run_id} "
+                        f"method={method}: row={recorded_source} "
+                        f"actual={source_metadata_sha256}"
+                    )
+            artifacts: dict[str, str] = {}
             if verify_files:
+                verifier = METHOD_ARTIFACT_VERIFIERS.get(method)
+                if verifier is not None:
+                    artifacts = verifier(row, run_id)
                 for label, path_field, hash_field in (
                     ("clean", "clean_path", "clean_sha256"),
                     (f"{method.lower()}_watermarked", "watermarked_path", "watermarked_sha256"),
@@ -826,11 +985,23 @@ def audit_shared_clean_cohorts(
                 "clean_sha256": str(row["clean_sha256"]),
                 "watermarked_path": str(row["watermarked_path"]),
                 "watermarked_sha256": str(row["watermarked_sha256"]),
+                "artifacts": artifacts,
             })
         if not checked:
             raise ValueError(
                 f"cross-method shared-clean audit requires at least one {method} row"
             )
+        # Coverage: the cohort must be exactly the expected set, not a subset
+        # that happens to be internally consistent.
+        if expected_ids is not None and (method in requested or not requested):
+            missing = sorted(expected_ids - seen, key=_run_id_sort_key)
+            extra = sorted(seen - expected_ids, key=_run_id_sort_key)
+            if missing or extra:
+                raise ValueError(
+                    f"{method} cohort does not cover the expected run_ids: "
+                    f"missing={missing} unexpected={extra} "
+                    f"(expected {len(expected_ids)} rows, got {len(seen)})"
+                )
         per_method[method] = checked
 
     # Cross-method agreement for every run_id covered by more than one method.
@@ -864,6 +1035,19 @@ def audit_shared_clean_cohorts(
         "verified_files": bool(verify_files),
         "compared_fields": list(SHARED_CLEAN_IDENTITY_FIELDS),
         "tr_source_rows": len(tr_by_id),
+        "tr_metadata_path": None if tr_metadata_path is None else str(tr_metadata_path),
+        "tr_metadata_sha256": source_metadata_sha256,
+        "source_metadata_sha256_verified": source_metadata_sha256 is not None,
+        "expected_run_ids": (
+            None if expected_ids is None
+            else sorted(expected_ids, key=_run_id_sort_key)
+        ),
+        "expected_run_id_count": None if expected_ids is None else len(expected_ids),
+        "run_id_coverage_verified": expected_ids is not None,
+        "method_artifacts_verified": sorted(
+            method for method in per_method
+            if verify_files and method in METHOD_ARTIFACT_VERIFIERS
+        ),
         "methods": sorted(per_method),
         "method_protocols": {
             method: SHARED_CLEAN_METHOD_PROTOCOLS[method] for method in sorted(per_method)
@@ -891,11 +1075,18 @@ def audit_tr_gs_shared_clean(
     gs_rows: Iterable[Mapping[str, Any]],
     *,
     verify_files: bool = True,
+    expected_run_ids: Iterable[Any] | None = None,
+    tr_metadata_path: str | Path | None = None,
 ) -> dict[str, Any]:
     """GS-shaped view of :func:`audit_shared_clean_cohorts` (unchanged contract)."""
     gs_rows = list(gs_rows)
     result = audit_shared_clean_cohorts(
-        tr_rows, {"GS": gs_rows}, verify_files=verify_files, require_methods=("GS",)
+        tr_rows,
+        {"GS": gs_rows},
+        verify_files=verify_files,
+        require_methods=("GS",),
+        expected_run_ids=expected_run_ids,
+        tr_metadata_path=tr_metadata_path,
     )
     by_id = {str(row["run_id"]): row for row in gs_rows}
     checked = [

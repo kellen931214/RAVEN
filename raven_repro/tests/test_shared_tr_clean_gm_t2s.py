@@ -679,7 +679,8 @@ def test_resume_rejects_a_different_gm_bundle(cohort, tmp_path, stub_pipeline):
     assert read_rows(tmp_path / "gm" / "metadata.csv") == rows_before
 
     # 2. A complete but *different* bundle (different ChaCha20 state and ring
-    #    target) is rejected by the per-row resume gate.
+    #    target) is rejected by the run-manifest gate, which binds the bundle
+    #    config SHA, before any row is regenerated.
     foreign = tmp_path / "gm_bundle_foreign"
     build = gm_args(tmp_path / "throwaway", cohort, bundle_dir=foreign, create_bundle=True)
     build.gm_watermark_bits_seed = 999
@@ -687,7 +688,7 @@ def test_resume_rejects_a_different_gm_bundle(cohort, tmp_path, stub_pipeline):
 
     args = gm_args(tmp_path, cohort, bundle_dir=foreign, create_bundle=False)
     args.resume = True
-    with pytest.raises(SharedCleanError, match="resume mismatch"):
+    with pytest.raises(SharedCleanError, match="Nothing was modified"):
         gm_runner.run(args, DummyGuard(), torch.device("cpu"))
     assert read_rows(tmp_path / "gm" / "metadata.csv") == rows_before
 
@@ -696,9 +697,11 @@ def test_resume_rejects_a_different_t2s_profile(cohort, tmp_path, stub_pipeline)
     run_t2s(tmp_path, cohort)
     rows_before = read_rows(tmp_path / "t2s" / "metadata.csv")
 
+    # The provider config SHA is bound into the run manifest, so a different RNG
+    # profile is rejected before any row is regenerated.
     args = t2s_args(tmp_path, cohort, t2s_rng_mode="raven_deterministic")
     args.resume = True
-    with pytest.raises(SharedCleanError, match="resume mismatch"):
+    with pytest.raises(SharedCleanError, match="Nothing was modified"):
         t2s_runner.run(args, DummyGuard(), torch.device("cpu"))
     assert read_rows(tmp_path / "t2s" / "metadata.csv") == rows_before
 
@@ -912,6 +915,201 @@ def test_audit_script_runs_end_to_end(cohort, tmp_path, stub_pipeline):
     report = json.loads(output.read_text())
     assert report["passed"] is True
     assert report["cross_method"]["rows_checked"] == {"GM": 2, "T2S": 2}
+
+
+# --------------------------------------------------------------------------- #
+# 7. Run-id coverage, source-SHA binding and method-artifact verification
+# --------------------------------------------------------------------------- #
+
+def test_audit_fails_when_a_method_is_missing_an_expected_run_id(
+    cohort, tmp_path, stub_pipeline
+):
+    run_gm(tmp_path, cohort)
+    tr_rows = read_rows(cohort)
+    gm_rows = read_rows(tmp_path / "gm" / "metadata.csv")
+
+    # The full set passes; dropping one row must not.
+    audit_shared_clean_cohorts(
+        tr_rows, {"GM": gm_rows}, verify_files=False, expected_run_ids=[0, 1]
+    )
+    with pytest.raises(ValueError, match="does not cover the expected run_ids"):
+        audit_shared_clean_cohorts(
+            tr_rows, {"GM": gm_rows[:1]}, verify_files=False, expected_run_ids=[0, 1]
+        )
+    # An extra run_id outside the expected set is rejected too.
+    with pytest.raises(ValueError, match="does not cover the expected run_ids"):
+        audit_shared_clean_cohorts(
+            tr_rows, {"GM": gm_rows}, verify_files=False, expected_run_ids=[0]
+        )
+
+
+def test_audit_fails_on_a_wrong_recorded_tr_metadata_sha(cohort, tmp_path, stub_pipeline):
+    run_t2s(tmp_path, cohort)
+    tr_rows = read_rows(cohort)
+    rows = read_rows(tmp_path / "t2s" / "metadata.csv")
+
+    # Without the source path the recorded SHA is unchecked; with it, it is.
+    audit_shared_clean_cohorts(tr_rows, {"T2S": rows}, verify_files=False)
+    audit_shared_clean_cohorts(
+        tr_rows, {"T2S": rows}, verify_files=False, tr_metadata_path=cohort
+    )
+    lying = [dict(row, shared_clean_source_metadata_sha256="0" * 64) for row in rows]
+    with pytest.raises(ValueError, match="shared_clean_source_metadata_sha256 drift"):
+        audit_shared_clean_cohorts(
+            tr_rows, {"T2S": lying}, verify_files=False, tr_metadata_path=cohort
+        )
+
+
+def test_audit_detects_gm_bundle_artifact_drift(cohort, tmp_path, stub_pipeline):
+    run_gm(tmp_path, cohort)
+    tr_rows = read_rows(cohort)
+    rows = read_rows(tmp_path / "gm" / "metadata.csv")
+    audit_shared_clean_cohorts(tr_rows, {"GM": rows}, verify_files=True)
+
+    bundle = Path(rows[0]["gm_bundle_dir"])
+    w1 = bundle / "w1.pth"
+    original = w1.read_bytes()
+
+    w1.write_bytes(original + b"drift")
+    with pytest.raises(ValueError, match="w1.pth SHA drift"):
+        audit_shared_clean_cohorts(tr_rows, {"GM": rows}, verify_files=True)
+
+    w1.unlink()
+    with pytest.raises(FileNotFoundError, match="GM bundle w1 missing"):
+        audit_shared_clean_cohorts(tr_rows, {"GM": rows}, verify_files=True)
+
+    w1.write_bytes(original)
+    audit_shared_clean_cohorts(tr_rows, {"GM": rows}, verify_files=True)
+
+    manifest = bundle / "manifest.json"
+    payload = json.loads(manifest.read_text())
+    payload["bundle_config_sha256"] = "0" * 64
+    manifest.write_text(json.dumps(payload))
+    with pytest.raises(ValueError, match="GM bundle config SHA drift"):
+        audit_shared_clean_cohorts(tr_rows, {"GM": rows}, verify_files=True)
+
+
+def test_audit_detects_t2s_state_artifact_drift(cohort, tmp_path, stub_pipeline):
+    run_t2s(tmp_path, cohort)
+    tr_rows = read_rows(cohort)
+    rows = read_rows(tmp_path / "t2s" / "metadata.csv")
+    audit_shared_clean_cohorts(tr_rows, {"T2S": rows}, verify_files=True)
+
+    state_path = Path(rows[0]["t2s_state_path"])
+    original = state_path.read_text()
+
+    # An edited payload breaks the self-signature.
+    payload = json.loads(original)
+    payload["tau"] = 0.5
+    state_path.write_text(json.dumps(payload))
+    with pytest.raises(ValueError, match="T2S state signature invalid"):
+        audit_shared_clean_cohorts(tr_rows, {"T2S": rows}, verify_files=True)
+
+    # A correctly re-signed but different state no longer matches the row.
+    payload = json.loads(original)
+    payload["tau"] = 0.5
+    payload.pop("state_sha256")
+    payload["state_sha256"] = canonical_json_sha256(payload)
+    state_path.write_text(json.dumps(payload))
+    with pytest.raises(ValueError, match="T2S state SHA drift"):
+        audit_shared_clean_cohorts(tr_rows, {"T2S": rows}, verify_files=True)
+
+    state_path.unlink()
+    with pytest.raises(FileNotFoundError, match="T2S state artifact missing"):
+        audit_shared_clean_cohorts(tr_rows, {"T2S": rows}, verify_files=True)
+
+    state_path.write_text(original)
+    audit_shared_clean_cohorts(tr_rows, {"T2S": rows}, verify_files=True)
+
+
+# --------------------------------------------------------------------------- #
+# 8. Run manifest: an incompatible resume must not create or modify anything
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.parametrize("runner", ["gm", "t2s"])
+def test_incompatible_resume_modifies_no_artifact(cohort, tmp_path, stub_pipeline, runner):
+    driver = run_gm if runner == "gm" else run_t2s
+    driver(tmp_path, cohort)
+
+    root = tmp_path / runner
+    manifest_path = root / "run_manifest.json"
+    assert manifest_path.is_file()
+    before_root = _artifact_state(root)
+    before_bundle = _artifact_state(tmp_path / "gm_bundle") if runner == "gm" else {}
+    manifest_before = json.loads(manifest_path.read_text())
+
+    # A different selection is a different run: the manifest gate must reject it
+    # before a pipeline is loaded or a GM bundle is created.
+    if runner == "gm":
+        extra = {"bundle_dir": tmp_path / "gm_bundle_new", "create_bundle": True}
+    else:
+        extra = {}
+    args = (gm_args if runner == "gm" else t2s_args)(tmp_path, cohort, **extra)
+    args.resume = True
+    args.run_ids = [0]
+    with pytest.raises(SharedCleanError, match="Nothing was modified"):
+        (gm_runner if runner == "gm" else t2s_runner).run(
+            args, DummyGuard(), torch.device("cpu")
+        )
+
+    assert _artifact_state(root) == before_root
+    assert json.loads(manifest_path.read_text()) == manifest_before
+    if runner == "gm":
+        assert not (tmp_path / "gm_bundle_new").exists()
+        assert _artifact_state(tmp_path / "gm_bundle") == before_bundle
+
+
+@pytest.mark.parametrize("runner", ["gm", "t2s"])
+def test_compatible_resume_keeps_the_original_manifest(
+    cohort, tmp_path, stub_pipeline, runner
+):
+    driver = run_gm if runner == "gm" else run_t2s
+    driver(tmp_path, cohort)
+    manifest_path = tmp_path / runner / "run_manifest.json"
+    before = json.loads(manifest_path.read_text())
+
+    extra = {"bundle_dir": tmp_path / "gm_bundle", "create_bundle": False} if runner == "gm" else {}
+    args = (gm_args if runner == "gm" else t2s_args)(tmp_path, cohort, **extra)
+    args.resume = True
+    (gm_runner if runner == "gm" else t2s_runner).run(
+        args, DummyGuard(), torch.device("cpu")
+    )
+
+    after = json.loads(manifest_path.read_text())
+    assert after == before
+    # The creation time is not rewritten by a resume.
+    assert after["created_utc"] == before["created_utc"]
+    assert after["run_config_sha256"] == before["run_config_sha256"]
+
+
+# --------------------------------------------------------------------------- #
+# 9. Smoke labelling
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.parametrize("runner", ["gm", "t2s"])
+def test_smoke_rows_are_labelled_incomplete(cohort, tmp_path, stub_pipeline, runner):
+    summary = (run_gm if runner == "gm" else run_t2s)(tmp_path, cohort)
+    assert summary["incomplete"] is True
+    assert summary["smoke_only"] is True
+    assert summary["formal_output_eligible"] is False
+    for row in read_rows(tmp_path / runner / "metadata.csv"):
+        assert row["incomplete"] == "True"
+        assert row["smoke_only"] == "True"
+        assert row["formal_output_eligible"] == "False"
+
+
+@pytest.mark.parametrize("runner", ["gm", "t2s"])
+def test_a_formal_run_is_not_labelled_incomplete(cohort, tmp_path, stub_pipeline, runner):
+    args = (gm_args if runner == "gm" else t2s_args)(tmp_path, cohort)
+    args.smoke_only = False
+    summary = (gm_runner if runner == "gm" else t2s_runner).run(
+        args, DummyGuard(), torch.device("cpu")
+    )
+    assert summary["incomplete"] is False
+    assert summary["formal_output_eligible"] is True
+    for row in read_rows(tmp_path / runner / "metadata.csv"):
+        assert row["incomplete"] == "False"
+        assert row["formal_output_eligible"] == "True"
 
 
 def test_provider_and_protocol_mode_names_agree():
