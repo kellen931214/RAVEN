@@ -6,6 +6,7 @@ This file records implementation bugs, validated non-bugs, ablations, and the ev
 
 | Date | Area | Status | Evidence |
 | --- | --- | --- | --- |
+| 2026-07-28 | GM + T2S `shared_tr_clean_v2` (Issue #9, phase 1) | GaussMarker and T2SMark now consume the canonical Tree-Ring source row — same prompt, base latent, clean image and generation config — and generate only their own watermarked image. New authoritative provider entrypoints `GmProvider.get_wm_latents_from_base_latent` and the T2S `|z|`-multiset consumption gate prove the supplied latent was embedded into rather than replaced. Cross-method audit extended to TR/GS/GM/T2S. Two-row GPU smoke passed; the canonical clean images are byte-identical before and after. No formal 1000/1001 cohort generated. | `experiments/generate_gm_from_tr_shared_clean.py`; `experiments/generate_t2s_from_tr_shared_clean.py`; `experiments/shared_clean_tr.py`; `raven_repro/scripts/audit_shared_clean_cohorts.py`; `raven_repro/tests/test_shared_tr_clean_gm_t2s.py`; `docs/SHARED_TR_CLEAN_V2.md` |
 | 2026-07-28 | GaussMarker official parity, bundles and standalone verification | GM generation now samples a complete initial latent per sample from a deterministic seed with official legacy-RNG semantics, creates official ChaCha20 state, and persists an official-interchangeable `w1.pth`/`w2.pth`/`manifest.json` bundle. Standalone verification, threshold calibration and paper evaluation run from that bundle alone. Official reference frozen at `4ac9bfd4e152a56bd93c2a06a809ef6ff8e73155`. Bundle reuse, `paper_eval` cohort pairing and `run_manifest.json` resume are all fail-closed: a bundle must match the full detector configuration and can only lose officialness, never gain it; `official_paper_evaluation` requires a verified one-to-one pairing; a mismatched run manifest stops the run without modifying any file. | `eval_bench_wm/utils/wm/gm_provider.py`; `eval_bench_wm/utils/wm/gm_bundle.py`; `eval_bench_wm/run_verify_watermark.py`; `eval_bench_wm/tests/test_gm_official_parity.py` |
 | 2026-07-28 | T2S review follow-up (PR #8) | Restored upstream's full generation RNG lifecycle (`official_compatible`, default) and separated the RAVEN `raven_deterministic` mode without claiming upstream-exactness; `--t2s_fix_key` now fixes master key AND message per upstream `run.py`; `state_sha256` is mandatory; verification fails closed on mixed state/config; per-image rule relabelled `paired_key_comparison` (RAVEN extension) since upstream evaluates a cohort ROC. | `eval_bench_wm/utils/wm/t2s_provider.py`; `eval_bench_wm/run_verification.py`; `eval_bench_wm/tests/test_t2s_parity.py` |
 | 2026-07-28 | T2S official parity + standalone verification | T2S key PRNG restored to upstream's CPU generator (a CUDA generator had silently remapped every key to a different watermark pattern); per-sample base latent/session key/message/state replaces one latent reused for the whole run; per-sample image and canonical-JSON state files replace the overwritten `watermarked_image.png`; new `run_verification.py` verifies suspect images in a fresh process; official vs benchmark inversion exposed as explicit modes. | `eval_bench_wm/utils/wm/t2s_provider.py`; `eval_bench_wm/utils/wm/t2s_inversion.py`; `eval_bench_wm/run_verification.py`; `eval_bench_wm/tests/test_t2s_parity.py` |
@@ -22,6 +23,304 @@ This file records implementation bugs, validated non-bugs, ablations, and the ev
 
 
 
+
+## 2026-07-28 — Shared-clean review follow-up: run-id coverage, source binding, artifact verification and a fail-closed run manifest
+
+### Problem
+Review of PR #11 found four ways an incomplete or drifted `shared_tr_clean_v2`
+cohort could still pass every gate:
+
+1. **Coverage was never checked.** `audit_shared_clean_cohorts` proved the rows
+   *present* were consistent. A cohort that generated 3 of 1001 rows, or a smoke
+   that silently produced one row instead of two, passed unchanged.
+2. **The recorded source SHA was never compared to the source file.** Rows
+   carried `shared_clean_source_metadata_sha256`, but nothing recomputed the TR
+   metadata file's SHA and compared it, so a cohort generated against a
+   since-changed source could not be distinguished from a current one.
+3. **`verify_files=true` only verified images.** The GM bundle and the T2S
+   portable state — the state each cohort's watermark identity actually lives in
+   — were never checked for existence or drift, so a deleted or edited
+   `w1.pth`/state JSON left an apparently valid cohort.
+4. **No run manifest.** The runners had a per-row resume gate but nothing bound
+   the run as a whole, so an incompatible rerun (different selection, different
+   bundle, different provider profile) was only caught row by row, after the
+   pipeline had been loaded.
+
+Separately, smoke rows recorded `smoke_only` / `formal_output_eligible` but not
+the explicit `incomplete` flag the experiment-integrity skill's output
+classification calls for.
+
+### Root cause
+Each is a missing gate rather than a wrong computation. The audit was written
+around "do these rows agree with the TR rows", which is necessary but says
+nothing about completeness, about the identity of the file that was read, or
+about the non-image artifacts a cohort depends on.
+
+### Affected files
+- `raven_repro/raven/pairing_provenance.py`: `expected_run_ids` and
+  `tr_metadata_path` parameters on `audit_shared_clean_cohorts` (and passed
+  through by `audit_tr_gs_shared_clean`), the per-method coverage check,
+  the per-row source-SHA comparison, new `_verify_gm_bundle_artifacts` /
+  `_verify_t2s_state_artifact` / `METHOD_ARTIFACT_VERIFIERS`, and
+  `_run_id_sort_key`.
+- `experiments/shared_clean_tr.py`: `run_manifest_path`,
+  `preflight_run_manifest`, `finalize_run_manifest`.
+- `experiments/generate_gm_from_tr_shared_clean.py`,
+  `experiments/generate_t2s_from_tr_shared_clean.py`: three-stage run-manifest
+  gate, `incomplete` and `run_config_sha256` row fields, and audits that assert
+  coverage against the run's own selection and bind the source path.
+- `raven_repro/scripts/audit_shared_clean_cohorts.py`: `--expected-run-ids`,
+  `--expect-full-tr-cohort`, source-path binding, and a warning when no coverage
+  requirement is given.
+- `raven_repro/tests/test_shared_tr_clean_gm_t2s.py`, `docs/SHARED_TR_CLEAN_V2.md`.
+
+### Affected outputs
+None. No canonical clean artifact was touched and no cohort was produced by this
+change. The earlier two-row GPU smoke predates the new metadata columns
+(`incomplete`, `run_config_sha256`) and the run manifest, so it was regenerated
+from scratch in a fresh scratch root rather than resumed; its outputs remain
+smoke-only. **No formal 1000/1001-sample cohort was generated.**
+
+### Fix
+- `audit_shared_clean_cohorts(..., expected_run_ids=…)` requires each required
+  method's run_id set to equal the expected set exactly; missing, extra and
+  duplicated rows are all rejected, with numeric run_ids reported in numeric
+  order. The runners pass their own selection, so a smoke audit verifies exactly
+  `{0, 1}` and a formal audit covers the whole TR cohort via
+  `--expect-full-tr-cohort`.
+- `audit_shared_clean_cohorts(..., tr_metadata_path=…)` recomputes the source
+  file's SHA-256 from disk and compares it to every method row's
+  `shared_clean_source_metadata_sha256`.
+- Under `verify_files`, GM rows verify `manifest.json` + `w1.pth` + `w2.pth`
+  exist, the manifest's `bundle_config_sha256` is the row's, and both weight
+  hashes agree with the manifest *and* the row; T2S rows verify the state JSON
+  exists, is signed, re-signs to its declared digest, and matches the row's
+  `t2s_state_sha256`. `raven/` still does not import `eval_bench_wm`: both checks
+  are structural, using the canonical JSON rules the providers themselves use.
+- Both runners write a `run_manifest.json` binding source metadata SHA, selected
+  run_ids, generation/watermark config SHAs, GM bundle or T2S provider config
+  SHA, runner and provider entrypoint SHAs, git branch/commit and smoke mode.
+  The preflight gate runs before any pipeline load or bundle creation and only
+  reads; the full `run_config_sha256` is compared after the provider exists. Any
+  mismatch stops with "Nothing was modified". A compatible resume returns the
+  stored manifest unchanged, so `created_utc` is not rewritten.
+- Rows and summaries now record `incomplete` (true exactly when `smoke_only`).
+
+### Reused code
+`canonical_json_sha256`, `sha256_path`, `_required`, `save_json`, the existing
+`audit_pairing_rows` / `audit_shared_clean_cohorts` structure, and the
+GaussMarker bundle-before-resume ordering established on 2026-07-28.
+
+### Historical bug coverage
+The 2026-07-28 "bundles were created before the resume gate" entry is the direct
+precedent for the manifest preflight, and its ordering is now enforced for both
+methods and covered by a test that asserts no manifest, bundle, state, image or
+metadata row changes on an incompatible resume. The 2026-07-27 GS V2 entry was
+re-checked: `audit_tr_gs_shared_clean` keeps its exact return shape and the new
+parameters default to `None`, so existing GS behaviour is unchanged.
+
+### Regression prevention
+Six focused tests: a method missing an expected run_id (and an extra run_id)
+fails the audit; a row recording a wrong TR metadata SHA fails; GM `w1.pth`
+content drift, deletion and manifest edit each fail; T2S state edit, valid-but-
+re-signed drift and deletion each fail; an incompatible resume leaves every
+artifact byte-identical and creates no new bundle; a compatible resume keeps the
+original manifest including `created_utc`; smoke rows carry `incomplete=True`
+and formal rows `incomplete=False`. Two existing resume tests were updated: the
+GM foreign-bundle and T2S profile-drift cases are now caught earlier, by the
+manifest gate, which is the stronger behaviour.
+
+### Validation
+- `raven_repro`: 425 passed (413 before + 12 new/updated).
+- `eval_bench_wm/tests`: 136 passed, 10 subtests passed.
+- Two-row GPU smoke regenerated on an idle sm_86 GPU; canonical clean images
+  byte-identical before and after; smoke audit passed with
+  `--expected-run-ids 0 1`; GPU resume wrote 0 rows, skipped 2 and left every
+  artifact byte-identical.
+
+### Watermark integrity
+Unchanged from the entry below: no attack, detector, threshold, CLIP or FID work
+was run, and no detection metric is claimed. Smoke outputs remain `incomplete`
+and ineligible for formal reporting.
+
+### Git provenance
+- Repository: `kellen931214/RAVEN`
+- Branch: `issue-9-shared-tr-clean-v2-gm-t2s` (PR #11, draft)
+- Base `main` commit: `df5f651ac239733275e4252f5d59441d363faab8`
+- Formal output eligibility: code validated; two-row GPU smoke only.
+
+## 2026-07-28 — GM and T2S generate from the canonical Tree-Ring clean source (`shared_tr_clean_v2`, Issue #9)
+
+### Problem
+Only Gaussian Shading consumed the canonical Tree-Ring clean source. GaussMarker
+and T2SMark each generated their own clean latent and their own clean image, so
+no paired quality metric across TR/GS/GM/T2S could use one shared clean
+reference, and any cross-method comparison silently compared different clean
+distributions.
+
+### Root cause
+`GmProvider` had no external-base-latent entrypoint at all: the only generation
+path, `build_sample_latents(sample_seed)`, always drew its own truncated-Gaussian
+latent from the legacy NumPy RNG. `T2SProvider.new_sample(base_latent=...)`
+already accepted a supplied latent but nothing proved it was actually consumed
+rather than quietly replaced, and there was no runner, protocol name, metadata
+schema or audit for either method under the shared-clean contract.
+
+### Affected files
+- `eval_bench_wm/utils/wm/gm_provider.py`: new `GM_SHARED_TR_CLEAN_MODE`,
+  `GM_UNIFORM_DERIVATION`, `_shared_clean_uniforms`,
+  `trunc_sampling_from_uniforms`, `build_sample_latents_from_base_latent`,
+  `get_wm_latents_from_base_latent`.
+- `eval_bench_wm/utils/wm/t2s_provider.py`: new `T2S_SHARED_TR_CLEAN_MODE`,
+  `abs_magnitude_multiset_sha256`, and a fail-closed consumption gate inside
+  `new_sample`.
+- `raven_repro/raven/pairing_provenance.py`: `GM_/T2S_SHARED_TR_CLEAN_PROTOCOL`
+  and modes, `SHARED_CLEAN_COMMON_FIELDS`, `GM_REQUIRED_FIELDS`,
+  `T2S_REQUIRED_FIELDS`, `_assert_shared_clean_identity`, method-aware
+  `pairing_method` / `build_pairing_sha256` / `audit_pairing_rows`, and the
+  generalized `audit_shared_clean_cohorts` (with `audit_tr_gs_shared_clean` kept
+  as a thin GS-shaped adapter over it).
+- `raven_repro/raven/eval_protocol.py`: canonical `data/gm`, `data/t2s`,
+  `outputs/gm`, `outputs/t2s` roots.
+- `experiments/shared_clean_tr.py` (new), `experiments/generate_gm_from_tr_shared_clean.py`
+  (new), `experiments/generate_t2s_from_tr_shared_clean.py` (new).
+- `experiments/generate_gs_from_tr_shared_clean.py`: now imports the shared
+  canonical-source helpers instead of keeping its own copies.
+- `raven_repro/scripts/audit_shared_clean_cohorts.py` (new).
+- `raven_repro/tests/test_shared_tr_clean_gm_t2s.py` (new, 37 tests),
+  `raven_repro/tests/test_canonical_layout.py`.
+- `docs/SHARED_TR_CLEAN_V2.md` (new).
+
+### Affected outputs
+None invalidated. No canonical clean artifact was generated, copied,
+re-encoded, renamed or modified: the two smoke clean images and the TR metadata
+are byte-identical before and after (SHA, size and mtime_ns all unchanged), and
+`data/clean/diffusiondb` still holds exactly 1001 files. The existing 1001-row GS
+V2 cohort keeps its protocol, metadata and pairing hashes and was only read. The
+GM/T2S smoke outputs are labelled `smoke_only=True` /
+`formal_output_eligible=False` and live in a scratch directory, never under
+`data/` or `outputs/`. **No formal 1000/1001-sample cohort was generated.**
+
+### Fix
+Two new protocols, `gaussmarker_shared_tr_clean_v2` and
+`t2smark_shared_tr_clean_v2`. Each runner rebuilds the TR base latent from
+`base_latent_seed` with the canonical CPU float32 procedure, verifies it against
+both `base_latent_sha256` and `clean_base_latent_sha256`, verifies the prompt
+hash, the clean image against `clean_sha256` and the full generation
+configuration against `generation_config_sha256`, hands that exact tensor to the
+authoritative provider, proves the provider consumed it, and generates only the
+method-specific watermarked image.
+
+GM keeps the official ChaCha20 message, quantile partition and complex ring
+injection but takes the truncated-Gaussian draw deterministically from the shared
+latent via `norm.ppf((norm.cdf(base) + bit) / 2)` — the same transform GS V2 uses
+— and runs the TR float32 DDIM configuration instead of the official fp16
+DPMSolver profile. T2S keeps the upstream encoder and `official_compatible` RNG
+lifecycle and supplies the shared latent as the tail-truncated Gaussian source.
+Both are labelled RAVEN shared-clean profiles and explicitly `not_claimed` as
+end-to-end official generation parity.
+
+### Reused code
+`tensor_sha256`, `sha256_path`, `canonical_json_sha256`, `build_pairing_sha256`,
+`audit_pairing_rows`, `gm_bundle.GmBundle`/`git_provenance`, `configure_gpu` /
+`setup_run_logging` / `write_experiment_records`, `CpuMemoryGuard`, `pipe_utils`,
+and the existing official GM and T2S algorithm implementations. The canonical
+TR-source plumbing that the GS runner had defined inline was moved into
+`experiments/shared_clean_tr.py` and the GS runner now imports it, so there is
+one authoritative copy of row loading, latent reconstruction, clean verification,
+CSV append and resume loading.
+
+### Historical bug coverage
+- The 2026-07-27 GS shared-clean V2 entry: GS's field set, pairing-hash inputs
+  and `audit_tr_gs_shared_clean` return shape are unchanged, verified by the
+  existing 59 GS/pairing tests and by re-auditing the real 1001-row GS cohort.
+- The 2026-07-28 "bundles were created before the resume gate" entry: the GM
+  runner checks the resume gate *first*; once a `metadata.csv` exists,
+  `--create-bundle` is disabled, so a rejected resume cannot leave a stray
+  bundle. Covered by a test that asserts the bundle path does not exist
+  afterwards.
+- The 2026-07-27 TR flat-layout migration: the runners resolve the TR cohort
+  through `source_metadata_path("TR", …)` and never by string.
+- Searched for other shared-clean/latent-substitution paths
+  (`rg "base_latent|shared_clean|get_wm_latents"`); no other reachable generator
+  duplicates this logic.
+
+### Regression prevention
+- GM: `zT_clean_torch` is the supplied tensor's own storage (asserted via
+  `data_ptr()`), its SHA must stay canonical, and the uniforms re-derived from the
+  pre-injection latent must match `norm.cdf(base)` within `1e-6`. That bound is a
+  float32 storage round trip, not a similarity threshold: an unrelated latent is
+  off by more than `0.1`, which the test asserts.
+- T2S: `T2SProvider.new_sample` itself raises when the `|z|` multiset changes, so
+  a substituted latent fails inside the authoritative provider, not only in the
+  runner.
+- Both runners fail closed on latent shape, dtype, non-finite values, pipeline
+  dtype ≠ float32, latent-shape mismatch, generation-config drift, prompt/clean
+  SHA drift, an unrecorded pre-existing output, and provider/protocol mode-name
+  disagreement.
+- `CleanImageGuard` snapshots size, mtime_ns and SHA-256 of every clean image read
+  and re-checks all three after generation; results are written to
+  `clean_source_integrity.json`.
+- `audit_pairing_rows` enforces per-method cohort-constant fields (GM bundle
+  config/state/target/mask, T2S provider config) and per-sample unique fields (GM
+  pre/post-injection latent and uniform hashes; T2S watermark id, state SHA,
+  session key, magnitude digest).
+- `audit_shared_clean_cohorts` re-checks the TR mirror fields against the TR rows
+  themselves, so a hand-edited method row cannot self-certify, and rejects two
+  methods that produced the identical watermarked image for one `run_id`.
+
+### Validation
+- `raven_repro`: 413 passed (376 before + 37 new).
+- `eval_bench_wm/tests`: 136 passed, 10 subtests passed.
+- Focused suite `tests/test_shared_tr_clean_gm_t2s.py`: 37 passed on CPU with a
+  stub pipeline and a synthetic two-row TR cohort; no network, no GPU.
+- A CPU test caught a real defect before the GPU run: the first
+  `UNIFORM_ROUNDTRIP_TOLERANCE` of `1e-9` was unreachable because the
+  pre-injection latent is stored as float32 (measured error `2.8e-8`). Corrected
+  to the documented float32 bound of `1e-6`.
+- GPU preflight: `torch 2.5.1+cu124`, CUDA available, 9 devices, kernel probe OK;
+  run pinned to nvidia-smi GPU 0 (idle RTX 3090, sm_86) by UUID. The host also
+  exposes an sm_120 Blackwell card that this torch build does not support; it was
+  not used.
+- Two-row GPU smoke, run_ids 0 and 1, scratch root
+  `…/scratchpad/smoke/{gm,t2s}`: four separately indexed images, all four SHAs
+  distinct, all mandatory TR identities equal, watermarked latent/image hashes
+  different from the clean/base artifacts.
+- Cross-method audit over the real cohorts (TR 1001 rows, GS 1001 rows, GM 2, T2S
+  2) passed with `verify_files=true`.
+- Resume gate on the real GPU outputs: both runners wrote 0 rows, verified and
+  skipped 2, and every `metadata.csv` and `watermarked.png` was byte-identical
+  afterwards (`md5sum -c` OK).
+
+### Watermark integrity
+- Source data: TR clean/watermarked/metadata unchanged and byte-verified.
+- Clean/watermarked pairing: TR, GS, GM and T2S share one clean image and one
+  pre-watermark latent per `run_id`.
+- Base-latent uniqueness: one distinct latent per `run_id` (audited).
+- Watermark target/mask: GM uses one cohort-wide ring target and mask from its
+  bundle; T2S derives a per-sample key/message target. Both audited.
+- Attack pairing: not run; no attack artifacts produced.
+- Detector score definition: unchanged for both methods. Detection was **not**
+  evaluated in this smoke — `--validate-before` defaults to false and the GM GNR
+  checkpoint is not present in `GM_utils/`, so no bit accuracy, ROC or TPR is
+  claimed here.
+- Threshold calibration source: none. No threshold was calibrated and no
+  empirical FPR was measured.
+- Quality metrics / CLIP / FID: not run.
+- Outputs requiring regeneration: none. The formal GM and T2S cohorts have not
+  been generated; that is gated on this PR being merged and run from a fixed
+  clean `main` commit.
+- Formal output eligibility: smoke only — `incomplete`, not eligible for formal
+  reporting.
+
+### Git provenance
+- Repository: `kellen931214/RAVEN`
+- Branch: `issue-9-shared-tr-clean-v2-gm-t2s`
+- Base `main` commit: `df5f651ac239733275e4252f5d59441d363faab8`
+- Entry points: `experiments/generate_gm_from_tr_shared_clean.py`,
+  `experiments/generate_t2s_from_tr_shared_clean.py`
+- Formal output eligibility: code validated; two-row GPU smoke only, no formal
+  cohort run.
 
 ## 2026-07-28 — GaussMarker: official parity, reusable bundles and standalone verification
 

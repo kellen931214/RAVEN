@@ -42,8 +42,8 @@ def test_canonical_roots_exist_on_disk():
 
 
 def test_data_and_outputs_tops_contain_only_canonical_entries():
-    assert {p.name for p in (REPO / "data").iterdir()} == {"clean", "tr", "gs"}
-    assert {p.name for p in (REPO / "outputs").iterdir()} == {"tr", "gs"}
+    assert {p.name for p in (REPO / "data").iterdir()} == {"clean", "tr", "gs", "gm", "t2s"}
+    assert {p.name for p in (REPO / "outputs").iterdir()} == {"tr", "gs", "gm", "t2s"}
 
 
 def test_method_roots_are_method_specific():
@@ -95,8 +95,10 @@ def test_tr_cohort_is_flat_on_disk_and_matches_its_metadata():
     assert not (REPO / "data/tr/diffusiondb/TR").exists()
     for row in rows[:5] + rows[-1:]:
         expected = watermarked_image_path("TR", "diffusiondb", row["run_id"])
-        assert row["watermarked_path"] == str(expected)
-        assert row["watermarked_image_path"] == str(expected)
+        # Compare resolved paths so a git worktree (which reaches data/ through a
+        # link) checks the same file identity rather than the same prefix string.
+        assert Path(row["watermarked_path"]).resolve() == expected.resolve()
+        assert Path(row["watermarked_image_path"]).resolve() == expected.resolve()
         assert expected.is_file()
 
 

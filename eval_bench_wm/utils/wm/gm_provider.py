@@ -109,6 +109,19 @@ GM_ARG_DEFAULTS = {
 
 GM_SCORE_DEFINITION = "gm_ensemble_classifier_probability"
 
+#: RAVEN shared-clean profile. The GaussMarker *math* is unchanged — the same
+#: ChaCha20 encrypted message, the same per-element truncated-Gaussian partition
+#: and the same Tree-Ring ring injection — but the truncated-Gaussian draw is
+#: replaced by a deterministic quantile transform of an externally supplied
+#: standard-normal latent (the canonical Tree-Ring clean latent). This is NOT
+#: end-to-end official GaussMarker generation parity: official
+#: ``gaussmarker_gen.py`` draws its own latent from the legacy NumPy RNG.
+GM_SHARED_TR_CLEAN_MODE = "official_math_shared_tr_clean"
+
+#: How the shared-clean uniforms are obtained. Mirrors the Gaussian Shading V2
+#: derivation so the two cross-method cohorts are described the same way.
+GM_UNIFORM_DERIVATION = "normal_cdf_of_tr_float32_base_latent"
+
 TORCH_DTYPES = {
     "float16": torch.float16,
     "float32": torch.float32,
@@ -624,6 +637,120 @@ class GmProvider(WmProvider):
             "pre_injection_latent_sha256": gm_bundle.sha256_tensor(pre),
             "post_injection_latent_sha256": gm_bundle.sha256_tensor(injected_official),
             "latent": injected_official.to(device=self.device, dtype=self.dtype),
+        }
+
+    # ------------------------------------------------------------------
+    # Shared-clean generation from an externally supplied base latent
+    # ------------------------------------------------------------------
+
+    def _shared_clean_uniforms(self, base_latent: torch.Tensor) -> np.ndarray:
+        """``u = norm.cdf(base)`` in float64, validated and never clamped."""
+        base = base_latent.detach().cpu()
+        if tuple(base.shape) != (1, 4, 64, 64):
+            raise ValueError(
+                f"shared base latent has shape {tuple(base.shape)}, expected (1, 4, 64, 64); "
+                "refusing to substitute a method-specific latent"
+            )
+        if base.dtype != torch.float32:
+            raise ValueError(
+                f"shared base latent must be float32 (the hashed canonical dtype), got {base.dtype}"
+            )
+        if not torch.isfinite(base).all():
+            raise ValueError("shared base latent contains NaN or Inf")
+        uniforms = norm.cdf(base.numpy().astype(np.float64))
+        if not np.isfinite(uniforms).all():
+            raise ValueError("derived uniforms contain non-finite values")
+        if not ((uniforms > 0.0).all() and (uniforms < 1.0).all()):
+            raise ValueError("derived uniforms are not strictly inside (0, 1)")
+        return np.ascontiguousarray(uniforms.reshape(-1), dtype=np.float64)
+
+    def trunc_sampling_from_uniforms(self, message_bits, uniforms: np.ndarray) -> torch.Tensor:
+        """Deterministic counterpart of :meth:`trunc_sampling`.
+
+        Official ``truncSampling`` draws element ``i`` from the truncated normal
+        restricted to ``(ppf(b/2), ppf((b+1)/2))``. Drawing that truncated normal
+        from a uniform ``u`` is exactly ``norm.ppf((u + b) / 2)`` — the identical
+        quantile partition Gaussian Shading uses. No RNG is consulted here: the
+        randomness is entirely inherited from the supplied latent.
+        """
+        bits = np.ascontiguousarray(np.asarray(message_bits).reshape(-1)).astype(np.float64)
+        values = np.ascontiguousarray(np.asarray(uniforms).reshape(-1), dtype=np.float64)
+        if bits.size != self.latentlength or values.size != self.latentlength:
+            raise ValueError(
+                f"shared-clean sampling needs {self.latentlength} bits and uniforms, "
+                f"got bits={bits.size} uniforms={values.size}"
+            )
+        if not np.isin(bits, (0.0, 1.0)).all():
+            raise ValueError("GM encrypted message must be binary")
+        z = norm.ppf((values + bits) / 2.0)
+        if not np.isfinite(z).all():
+            raise ValueError("shared-clean truncated-Gaussian sampling produced non-finite values")
+        # The sign map is what the detector reads back; it must be the message.
+        if not ((z > 0).astype(np.float64) == bits).all():
+            raise ValueError("shared-clean latent sign map does not encode the GM message")
+        return torch.from_numpy(z).reshape(1, 4, 64, 64).float()
+
+    def build_sample_latents_from_base_latent(
+        self, base_latent: torch.Tensor
+    ) -> typing.Dict[str, typing.Any]:
+        """Full GM generation step driven by an externally supplied base latent.
+
+        The bundle identity (bits, ChaCha20-encrypted message, key/nonce, ring
+        target, mask) is untouched; only the source of the per-element
+        truncated-Gaussian draw changes. Unlike :meth:`build_sample_latents`, the
+        injected latent is NOT cast to fp16: the shared-clean cohort runs the
+        float32 configuration of the canonical Tree-Ring cohort, and a fp16 cast
+        would make the shared base-latent SHA-256 unprovable.
+        """
+        if self.m_flat is None:
+            raise GmBundleError("GM watermark state is not initialised")
+        uniforms = self._shared_clean_uniforms(base_latent)
+        pre = self.trunc_sampling_from_uniforms(self.m_flat, uniforms)
+        injected = self.inject_ring(pre).float()
+        return {
+            "sample_seed": None,
+            "gm_protocol_mode": GM_SHARED_TR_CLEAN_MODE,
+            "uniform_source": "externally_supplied_base_latent",
+            "gm_uniform_derivation": GM_UNIFORM_DERIVATION,
+            "shared_clean_uniforms": uniforms,
+            "pre_frequency_latent": pre,
+            "pre_injection_latent_sha256": gm_bundle.sha256_tensor(pre),
+            "post_injection_latent_sha256": gm_bundle.sha256_tensor(injected),
+            "sampling_uniform_sha256": gm_bundle.sha256_array(uniforms),
+            "latent": injected.to(device=self.device, dtype=self.dtype),
+        }
+
+    def get_wm_latents_from_base_latent(
+        self, base_latent: torch.Tensor
+    ) -> typing.Dict[str, typing.Any]:
+        """Shared-clean analogue of :meth:`get_wm_latents`.
+
+        ``zT_clean_torch`` is the supplied tensor itself — the same storage, not a
+        copy and not a ``norm.ppf`` round trip — so the caller can prove by
+        ``data_ptr()`` and by SHA-256 that the canonical shared latent was
+        consumed rather than replaced.
+        """
+        sample = self.build_sample_latents_from_base_latent(base_latent)
+        watermarked = sample["latent"]
+        return {
+            "zT_clean_torch": base_latent,
+            "zT_torch": watermarked,
+            "zT_PIL": torch_to_PIL(watermarked),
+            "zT": torch_to_PIL(watermarked),
+            "gm_protocol_mode": GM_SHARED_TR_CLEAN_MODE,
+            "gm_uniform_derivation": GM_UNIFORM_DERIVATION,
+            "uniform_source": sample["uniform_source"],
+            "clean_latent_source": "externally_supplied_verbatim",
+            "gm_pre_frequency_latent": sample["pre_frequency_latent"],
+            "gm_pre_injection_latent_sha256": sample["pre_injection_latent_sha256"],
+            "gm_post_injection_latent_sha256": sample["post_injection_latent_sha256"],
+            "gm_sampling_uniform_sha256": sample["sampling_uniform_sha256"],
+            "gm_watermark_torch": self.watermark,
+            "gm_m_torch": self.m,
+            "gm_watermark_sha256": gm_bundle.sha256_tensor(self.watermark),
+            "gm_m_sha256": gm_bundle.sha256_array(self.m_flat),
+            "gm_target_sha256": gm_bundle.sha256_tensor(self.gt_patch),
+            "gm_mask_sha256": gm_bundle.sha256_tensor(self.watermarking_mask),
         }
 
     # ------------------------------------------------------------------

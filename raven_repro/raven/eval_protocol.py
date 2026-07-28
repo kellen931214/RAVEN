@@ -39,10 +39,17 @@ CLEAN_DATA_ROOT = DATA_ROOT / "clean"
 METHOD_DATA_ROOTS: dict[str, Path] = {
     "TR": DATA_ROOT / "tr",
     "GS": DATA_ROOT / "gs",
+    # shared_tr_clean_v2 cohorts (Issue #9). These roots hold only the
+    # method-specific watermarked images; the clean images stay in data/clean/
+    # and are never duplicated per method.
+    "GM": DATA_ROOT / "gm",
+    "T2S": DATA_ROOT / "t2s",
 }
 METHOD_OUTPUT_ROOTS: dict[str, Path] = {
     "TR": OUTPUTS_ROOT / "tr",
     "GS": OUTPUTS_ROOT / "gs",
+    "GM": OUTPUTS_ROOT / "gm",
+    "T2S": OUTPUTS_ROOT / "t2s",
 }
 
 # Methods whose formal protocol includes the attacked-clean recalibration branch.
