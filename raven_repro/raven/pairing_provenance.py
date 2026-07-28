@@ -21,6 +21,22 @@ GS_SHARED_TR_CLEAN_MODE = "official_math_shared_tr_clean"
 SHARED_CLEAN_SOURCE_METHOD = "TR"
 GS_UNIFORM_DERIVATION = "normal_cdf_of_tr_float32_base_latent"
 
+# --------------------------------------------------------------------------- #
+# shared_tr_clean_v2 — GaussMarker and T2SMark (Issue #9)
+# --------------------------------------------------------------------------- #
+# Same contract as the GS V2 cohort: the canonical Tree-Ring clean image and base
+# latent are read-only inputs, and only the method-specific watermarked image is
+# produced. Each method keeps its own protocol name so a cohort can never be
+# silently relabelled as another method's.
+GM_SHARED_TR_CLEAN_PROTOCOL = "gaussmarker_shared_tr_clean_v2"
+T2S_SHARED_TR_CLEAN_PROTOCOL = "t2smark_shared_tr_clean_v2"
+# gm_provider.GM_SHARED_TR_CLEAN_MODE / t2s_provider.T2S_SHARED_TR_CLEAN_MODE —
+# duplicated here because raven/ must not import eval_bench_wm. The runners and
+# test_shared_tr_clean_gm_t2s assert they match.
+GM_SHARED_TR_CLEAN_MODE = "official_math_shared_tr_clean"
+T2S_SHARED_TR_CLEAN_MODE = "official_encoder_shared_tr_clean"
+GM_UNIFORM_DERIVATION = "normal_cdf_of_tr_float32_base_latent"
+
 PAIRING_PROTOCOL = TR_PAIRING_PROTOCOL
 # Default protocol written by a new cohort for each method.
 PAIRING_PROTOCOLS = {"TR": TR_PAIRING_PROTOCOL, "GS": GS_PAIRING_PROTOCOL}
@@ -29,7 +45,14 @@ PAIRING_PROTOCOLS = {"TR": TR_PAIRING_PROTOCOL, "GS": GS_PAIRING_PROTOCOL}
 ALLOWED_PAIRING_PROTOCOLS = {
     "TR": (TR_PAIRING_PROTOCOL,),
     "GS": (GS_PAIRING_PROTOCOL, GS_SHARED_TR_CLEAN_PROTOCOL),
+    "GM": (GM_SHARED_TR_CLEAN_PROTOCOL,),
+    "T2S": (T2S_SHARED_TR_CLEAN_PROTOCOL,),
 }
+
+# Methods whose watermark target is one cohort-wide artifact (Tree-Ring style
+# ring pattern) versus methods that derive a fresh target per sample.
+SINGLE_TARGET_METHODS = frozenset({"TR", "GM"})
+PER_SAMPLE_TARGET_METHODS = frozenset({"GS", "T2S"})
 
 # V1 GS provenance. Field order is preserved byte-for-byte from the original
 # cohort so existing metadata column order and consumers are untouched.
@@ -74,6 +97,114 @@ GS_V2_PAIRING_FIELDS = tuple(
     for field in GS_V2_REQUIRED_FIELDS
     if field not in {"shared_clean_source_metadata_path", "tr_clean_path"}
 )
+
+
+# Shared-clean identity recorded by every GM and T2S V2 row. This is the GS V2
+# set plus ``watermark_pre_injection_base_latent_sha256``, which Issue #9 makes
+# an explicit mandatory identity. GS's own tuple is deliberately left untouched:
+# changing it would invalidate every already-validated GS pairing hash.
+SHARED_CLEAN_COMMON_FIELDS = (
+    "shared_clean_protocol",
+    "shared_clean_source_method",
+    "shared_clean_source_metadata_path",
+    "shared_clean_source_metadata_sha256",
+    "shared_clean_sample_sha256",
+    "watermark_pre_injection_base_latent_sha256",
+    "tr_base_latent_sha256",
+    "tr_clean_path",
+    "tr_clean_sha256",
+)
+
+# GaussMarker shared-clean provenance: bundle identity (ChaCha20 state, ring
+# target, mask), the deterministic uniform derivation, and both sides of the
+# ring injection.
+GM_CORE_FIELDS = (
+    "gm_protocol_mode",
+    "gm_uniform_derivation",
+    "gm_state_source",
+    "gm_bundle_dir",
+    "gm_bundle_config_sha256",
+    "gm_w1_file_sha256",
+    "gm_w2_file_sha256",
+    "gm_watermark_sha256",
+    "gm_m_sha256",
+    "gm_target_sha256",
+    "gm_mask_sha256",
+    "gm_pre_injection_latent_sha256",
+    "gm_post_injection_latent_sha256",
+    "gm_sampling_uniform_sha256",
+    "gm_provider_entrypoint_sha256",
+)
+GM_REQUIRED_FIELDS = GM_CORE_FIELDS + SHARED_CLEAN_COMMON_FIELDS
+
+# T2SMark shared-clean provenance: the portable state artifact and its digest,
+# the RNG/inversion profile, and the magnitude-multiset proof that the canonical
+# latent really was the encoder's Gaussian source.
+T2S_CORE_FIELDS = (
+    "t2s_protocol_mode",
+    "t2s_rng_mode",
+    "t2s_inversion_mode",
+    "t2s_watermark_id",
+    "t2s_state_path",
+    "t2s_state_sha256",
+    "t2s_provider_config_sha256",
+    "t2s_base_latent_sha256",
+    "t2s_abs_magnitude_sha256",
+    "t2s_master_key_sha256",
+    "t2s_session_key_sha256",
+    "t2s_message_sha256",
+    "t2s_provider_entrypoint_sha256",
+)
+T2S_REQUIRED_FIELDS = T2S_CORE_FIELDS + SHARED_CLEAN_COMMON_FIELDS
+
+# Path fields are locations, not identities (same rule as GS V2): required
+# metadata, excluded from the pairing hash, but everything they point at is
+# still bound through its SHA-256.
+SHARED_CLEAN_PATH_FIELDS = frozenset(
+    {
+        "shared_clean_source_metadata_path",
+        "tr_clean_path",
+        "gm_bundle_dir",
+        "t2s_state_path",
+    }
+)
+GM_PAIRING_FIELDS = tuple(f for f in GM_REQUIRED_FIELDS if f not in SHARED_CLEAN_PATH_FIELDS)
+T2S_PAIRING_FIELDS = tuple(f for f in T2S_REQUIRED_FIELDS if f not in SHARED_CLEAN_PATH_FIELDS)
+
+METHOD_REQUIRED_FIELDS = {
+    "GM": GM_REQUIRED_FIELDS,
+    "T2S": T2S_REQUIRED_FIELDS,
+}
+METHOD_PAIRING_FIELDS = {
+    "GM": GM_PAIRING_FIELDS,
+    "T2S": T2S_PAIRING_FIELDS,
+}
+# Per-method constants that must hold for every row of a shared-clean cohort.
+METHOD_PROTOCOL_MODES = {
+    "GM": ("gm_protocol_mode", GM_SHARED_TR_CLEAN_MODE),
+    "T2S": ("t2s_protocol_mode", T2S_SHARED_TR_CLEAN_MODE),
+}
+# Fields that identify one cohort-wide watermark state; exactly one value each.
+METHOD_COHORT_CONSTANT_FIELDS = {
+    "GM": (
+        "gm_bundle_config_sha256",
+        "gm_w1_file_sha256",
+        "gm_w2_file_sha256",
+        "gm_watermark_sha256",
+        "gm_m_sha256",
+        "gm_target_sha256",
+        "gm_mask_sha256",
+    ),
+    "T2S": ("t2s_provider_config_sha256",),
+}
+# Fields that must be distinct for every row; a repeat means two samples share
+# state that is supposed to be per-sample.
+METHOD_PER_SAMPLE_UNIQUE_FIELDS = {
+    "GM": ("gm_pre_injection_latent_sha256", "gm_post_injection_latent_sha256",
+           "gm_sampling_uniform_sha256"),
+    "T2S": ("t2s_watermark_id", "t2s_state_sha256", "t2s_abs_magnitude_sha256",
+            "t2s_session_key_sha256"),
+}
 
 
 def gs_fields_for_protocol(protocol: str) -> tuple[str, ...]:
@@ -190,6 +321,10 @@ def pairing_method(row: Mapping[str, Any]) -> str:
         return "TR"
     if protocol in {GS_PAIRING_PROTOCOL, GS_SHARED_TR_CLEAN_PROTOCOL}:
         return "GS"
+    if protocol == GM_SHARED_TR_CLEAN_PROTOCOL:
+        return "GM"
+    if protocol == T2S_SHARED_TR_CLEAN_PROTOCOL:
+        return "T2S"
     return ""
 
 
@@ -197,7 +332,8 @@ def build_pairing_sha256(row: Mapping[str, Any]) -> str:
     # CSV is the durable provenance format. Canonicalize scalar types exactly
     # as they will be interpreted after a CSV round trip.
     extra: tuple[str, ...] = ()
-    if pairing_method(row) == "GS":
+    method = pairing_method(row)
+    if method == "GS":
         protocol = str(row.get("protocol") or "")
         # V1 hashes exactly the fields it always hashed; V2 additionally binds the
         # full shared-clean identity (source metadata SHA, shared sample SHA, TR
@@ -207,9 +343,11 @@ def build_pairing_sha256(row: Mapping[str, Any]) -> str:
             if protocol == GS_SHARED_TR_CLEAN_PROTOCOL
             else GS_REQUIRED_FIELDS
         )
+    elif method in METHOD_PAIRING_FIELDS:
+        extra = METHOD_PAIRING_FIELDS[method]
     payload = {field: str(row[field]) for field in PAIRING_HASH_FIELDS + extra}
     payload["base_latent_seed"] = int(row["base_latent_seed"])
-    if extra:
+    if method == "GS" and extra:
         payload["gs_secret_index"] = int(row["gs_secret_index"])
         if "gs_sampling_seed" in extra:
             payload["gs_sampling_seed"] = int(row["gs_sampling_seed"])
@@ -240,6 +378,43 @@ def _required(row: Mapping[str, Any], field: str, run_id: str) -> Any:
     return row[field]
 
 
+def _assert_shared_clean_identity(
+    row: Mapping[str, Any], run_id: str, *, require_pre_injection: bool
+) -> None:
+    """The V2 promise: this row's clean image and pre-watermark latent ARE the TR ones.
+
+    Shared by every ``shared_tr_clean_v2`` method. Anything else is not
+    shared-clean, however well-formed the rest of the row looks.
+    """
+    if str(row["shared_clean_protocol"]) != SHARED_CLEAN_PROTOCOL:
+        raise ValueError(
+            f"unsupported shared_clean_protocol run_id={run_id}: "
+            f"{row['shared_clean_protocol']!r}"
+        )
+    if str(row["shared_clean_source_method"]) != SHARED_CLEAN_SOURCE_METHOD:
+        raise ValueError(
+            f"shared clean source must be {SHARED_CLEAN_SOURCE_METHOD} "
+            f"run_id={run_id}: {row['shared_clean_source_method']!r}"
+        )
+    base_hash = str(row["base_latent_sha256"])
+    if str(row["tr_base_latent_sha256"]) != base_hash:
+        raise ValueError(f"TR base latent SHA mismatch run_id={run_id}")
+    if str(row["tr_clean_sha256"]) != str(row["clean_sha256"]):
+        raise ValueError(f"TR clean image SHA mismatch run_id={run_id}")
+    if str(row["tr_clean_path"]) != str(row["clean_path"]):
+        raise ValueError(f"TR clean path mismatch run_id={run_id}")
+    if str(row["shared_clean_sample_sha256"]) != base_hash:
+        raise ValueError(
+            f"shared_clean_sample_sha256 is not the shared latent SHA run_id={run_id}"
+        )
+    if require_pre_injection:
+        if str(row["watermark_pre_injection_base_latent_sha256"]) != base_hash:
+            raise ValueError(
+                f"watermark_pre_injection_base_latent_sha256 is not the shared latent "
+                f"SHA run_id={run_id}"
+            )
+
+
 def audit_pairing_rows(
     rows: Iterable[Mapping[str, Any]],
     *,
@@ -264,6 +439,8 @@ def audit_pairing_rows(
     gs_secret_hashes: set[str] = set()
     gs_sampling_seeds: set[int] = set()
     gs_sampling_hashes: set[str] = set()
+    method_constant_fields: dict[str, set[str]] = {}
+    method_unique_fields: dict[str, set[str]] = {}
     count = 0
 
     for row in rows:
@@ -307,34 +484,12 @@ def audit_pairing_rows(
             gs_secret_hashes.add(secret_hash)
             gs_sampling_hashes.add(sampling_hash)
             if shared_tr_clean:
-                if str(row["shared_clean_protocol"]) != SHARED_CLEAN_PROTOCOL:
-                    raise ValueError(
-                        f"unsupported shared_clean_protocol run_id={run_id}: "
-                        f"{row['shared_clean_protocol']!r}"
-                    )
-                if str(row["shared_clean_source_method"]) != SHARED_CLEAN_SOURCE_METHOD:
-                    raise ValueError(
-                        f"shared clean source must be {SHARED_CLEAN_SOURCE_METHOD} "
-                        f"run_id={run_id}: {row['shared_clean_source_method']!r}"
-                    )
                 if str(row["gs_uniform_derivation"]) != GS_UNIFORM_DERIVATION:
                     raise ValueError(
                         f"unsupported gs_uniform_derivation run_id={run_id}: "
                         f"{row['gs_uniform_derivation']!r}"
                     )
-                # The V2 promise: the row's own clean image and pre-watermark
-                # latent ARE the Tree-Ring ones. Anything else is not shared-clean.
-                if str(row["tr_base_latent_sha256"]) != str(row["base_latent_sha256"]):
-                    raise ValueError(f"TR/GS base latent SHA mismatch run_id={run_id}")
-                if str(row["tr_clean_sha256"]) != str(row["clean_sha256"]):
-                    raise ValueError(f"TR/GS clean image SHA mismatch run_id={run_id}")
-                if str(row["tr_clean_path"]) != str(row["clean_path"]):
-                    raise ValueError(f"TR/GS clean path mismatch run_id={run_id}")
-                if str(row["shared_clean_sample_sha256"]) != str(row["base_latent_sha256"]):
-                    raise ValueError(
-                        f"shared_clean_sample_sha256 is not the shared latent SHA "
-                        f"run_id={run_id}"
-                    )
+                _assert_shared_clean_identity(row, run_id, require_pre_injection=False)
                 shared_source_hashes.add(str(row["shared_clean_source_metadata_sha256"]))
             else:
                 sampling_seed = int(row["gs_sampling_seed"])
@@ -343,6 +498,38 @@ def audit_pairing_rows(
                         f"duplicate GS sampling seed run_id={run_id}: {sampling_seed}"
                     )
                 gs_sampling_seeds.add(sampling_seed)
+        elif method in METHOD_REQUIRED_FIELDS:
+            for field in METHOD_REQUIRED_FIELDS[method]:
+                _required(row, field, run_id)
+            mode_field, expected_mode = METHOD_PROTOCOL_MODES[method]
+            if str(row[mode_field]) != expected_mode:
+                raise ValueError(
+                    f"protocol {protocol} requires {mode_field}={expected_mode!r} "
+                    f"run_id={run_id}: got {row[mode_field]!r}"
+                )
+            if method == "GM" and str(row["gm_uniform_derivation"]) != GM_UNIFORM_DERIVATION:
+                raise ValueError(
+                    f"unsupported gm_uniform_derivation run_id={run_id}: "
+                    f"{row['gm_uniform_derivation']!r}"
+                )
+            if method == "T2S" and str(row["t2s_base_latent_sha256"]) != str(
+                row["base_latent_sha256"]
+            ):
+                raise ValueError(
+                    f"t2s_base_latent_sha256 is not the shared latent SHA run_id={run_id}"
+                )
+            _assert_shared_clean_identity(row, run_id, require_pre_injection=True)
+            for field in METHOD_COHORT_CONSTANT_FIELDS[method]:
+                method_constant_fields.setdefault(field, set()).add(str(row[field]))
+            for field in METHOD_PER_SAMPLE_UNIQUE_FIELDS[method]:
+                value = str(row[field])
+                seen = method_unique_fields.setdefault(field, set())
+                if value in seen:
+                    raise ValueError(
+                        f"duplicate {field} run_id={run_id}: {value}"
+                    )
+                seen.add(value)
+            shared_source_hashes.add(str(row["shared_clean_source_metadata_sha256"]))
         if run_id in seen_run_ids:
             raise ValueError(f"duplicate run_id in pairing provenance: {run_id}")
         seen_run_ids.add(run_id)
@@ -418,12 +605,15 @@ def audit_pairing_rows(
     ):
         if len(values) != 1:
             raise ValueError(f"inconsistent {label}: {sorted(values)}")
-    if method == "TR" and len(target_hashes) != 1:
+    if method in SINGLE_TARGET_METHODS and len(target_hashes) != 1:
         raise ValueError(f"inconsistent watermark_target_sha256: {sorted(target_hashes)}")
-    if method == "GS" and len(target_hashes) != count:
+    if method in PER_SAMPLE_TARGET_METHODS and len(target_hashes) != count:
         raise ValueError(
-            f"GS requires one target per run: unique={len(target_hashes)} count={count}"
+            f"{method} requires one target per run: unique={len(target_hashes)} count={count}"
         )
+    for field, values in sorted(method_constant_fields.items()):
+        if len(values) != 1:
+            raise ValueError(f"inconsistent {field}: {sorted(values)}")
 
     result = {
         "passed": True,
@@ -437,7 +627,9 @@ def audit_pairing_rows(
         "unique_clean_image_hashes": len(seen_clean_hashes),
         "unique_watermarked_image_hashes": len(seen_watermarked_hashes),
         "unique_watermark_target_hashes": len(target_hashes),
-        "watermark_target_sha256": next(iter(target_hashes)) if method == "TR" else None,
+        "watermark_target_sha256": (
+            next(iter(target_hashes)) if method in SINGLE_TARGET_METHODS else None
+        ),
         "watermark_mask_sha256": next(iter(mask_hashes)),
         "generation_config_sha256": next(iter(generation_hashes)),
         "watermark_config_sha256": next(iter(watermark_hashes)),
@@ -459,6 +651,23 @@ def audit_pairing_rows(
                 ),
                 "gs_uniform_derivation": GS_UNIFORM_DERIVATION,
             })
+    if method in METHOD_REQUIRED_FIELDS:
+        result.update({
+            "shared_clean_protocol": SHARED_CLEAN_PROTOCOL,
+            "shared_clean_source_method": SHARED_CLEAN_SOURCE_METHOD,
+            "shared_clean_source_metadata_sha256": (
+                next(iter(shared_source_hashes)) if shared_source_hashes else None
+            ),
+            "method_protocol_mode": METHOD_PROTOCOL_MODES[method][1],
+            "cohort_constant_fields": {
+                field: next(iter(values))
+                for field, values in sorted(method_constant_fields.items())
+            },
+            "per_sample_unique_field_counts": {
+                field: len(values)
+                for field, values in sorted(method_unique_fields.items())
+            },
+        })
     return result
 
 
@@ -473,19 +682,16 @@ SHARED_CLEAN_IDENTITY_FIELDS = (
 )
 
 
-def audit_tr_gs_shared_clean(
-    tr_rows: Iterable[Mapping[str, Any]],
-    gs_rows: Iterable[Mapping[str, Any]],
-    *,
-    verify_files: bool = True,
-) -> dict[str, Any]:
-    """Prove a GS V2 cohort really reuses the canonical TR clean source.
+#: Every method that may take part in a ``shared_tr_clean_v2`` cohort, and the
+#: exact protocol name its rows must carry.
+SHARED_CLEAN_METHOD_PROTOCOLS = {
+    "GS": GS_SHARED_TR_CLEAN_PROTOCOL,
+    "GM": GM_SHARED_TR_CLEAN_PROTOCOL,
+    "T2S": T2S_SHARED_TR_CLEAN_PROTOCOL,
+}
 
-    For every run_id present in the GS cohort the TR and GS rows must agree on
-    the full shared-clean identity, and both the clean image and the GS
-    watermarked image must exist on disk with the recorded SHA-256. Equal seeds,
-    equal filenames or equal run_ids are never accepted as evidence.
-    """
+
+def _index_tr_source(tr_rows: Iterable[Mapping[str, Any]]) -> dict[str, Mapping[str, Any]]:
     tr_by_id: dict[str, Mapping[str, Any]] = {}
     for row in tr_rows:
         run_id = str(_required(row, "run_id", "unknown"))
@@ -494,73 +700,218 @@ def audit_tr_gs_shared_clean(
         if pairing_method(row) != "TR":
             raise ValueError(f"shared-clean source row is not TR: run_id={run_id}")
         tr_by_id[run_id] = row
+    if not tr_by_id:
+        raise ValueError("shared-clean audit requires a non-empty TR source cohort")
+    return tr_by_id
 
-    checked: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    for row in gs_rows:
-        run_id = str(_required(row, "run_id", "unknown"))
-        if run_id in seen:
-            raise ValueError(f"duplicate GS run_id in shared-clean cohort: {run_id}")
-        seen.add(run_id)
-        if pairing_method(row) != "GS":
-            raise ValueError(f"shared-clean cohort row is not GS: run_id={run_id}")
-        protocol = str(row.get("protocol") or "")
-        if protocol != GS_SHARED_TR_CLEAN_PROTOCOL:
+
+def audit_shared_clean_cohorts(
+    tr_rows: Iterable[Mapping[str, Any]],
+    cohorts: Mapping[str, Iterable[Mapping[str, Any]]],
+    *,
+    verify_files: bool = True,
+    require_methods: Iterable[str] | None = None,
+) -> dict[str, Any]:
+    """Prove one or more V2 cohorts really reuse the canonical TR clean source.
+
+    ``cohorts`` maps a method name (``GS`` / ``GM`` / ``T2S``) to its metadata
+    rows. For every run_id in a method cohort, the TR and method rows must agree
+    on the full shared-clean identity, the method row's TR mirror fields must
+    agree with the TR row itself (so a hand-edited row cannot self-certify), and
+    both the clean image and the method's watermarked image must exist on disk
+    with the recorded SHA-256.
+
+    Where two methods cover the same run_id they must agree with each other on
+    the shared clean artifacts and must have produced *different* watermarked
+    images. Equal seeds, equal filenames or equal run_ids are never accepted as
+    evidence of anything.
+    """
+    tr_by_id = _index_tr_source(tr_rows)
+
+    requested = {str(name).upper() for name in (require_methods or ())}
+    unknown_required = requested - set(SHARED_CLEAN_METHOD_PROTOCOLS)
+    if unknown_required:
+        raise ValueError(f"unknown shared-clean methods required: {sorted(unknown_required)}")
+    missing_required = requested - {str(name).upper() for name in cohorts}
+    if missing_required:
+        raise ValueError(
+            f"shared-clean audit requires cohorts for {sorted(missing_required)}"
+        )
+
+    per_method: dict[str, list[dict[str, Any]]] = {}
+    for raw_method, rows in cohorts.items():
+        method = str(raw_method).upper()
+        expected_protocol = SHARED_CLEAN_METHOD_PROTOCOLS.get(method)
+        if expected_protocol is None:
             raise ValueError(
-                f"cross-method shared-clean audit requires "
-                f"{GS_SHARED_TR_CLEAN_PROTOCOL}: run_id={run_id} has {protocol!r}"
+                f"unsupported shared-clean method {raw_method!r}; "
+                f"known: {sorted(SHARED_CLEAN_METHOD_PROTOCOLS)}"
             )
-        tr_row = tr_by_id.get(run_id)
-        if tr_row is None:
-            raise ValueError(f"GS run_id={run_id} has no matching TR source row")
-        for field in SHARED_CLEAN_IDENTITY_FIELDS:
-            tr_value = str(_required(tr_row, field, run_id))
-            gs_value = str(_required(row, field, run_id))
-            if tr_value != gs_value:
+        checked: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for row in rows:
+            run_id = str(_required(row, "run_id", "unknown"))
+            if run_id in seen:
                 raise ValueError(
-                    f"shared-clean mismatch run_id={run_id} field={field}: "
-                    f"TR={tr_value!r} GS={gs_value!r}"
+                    f"duplicate {method} run_id in shared-clean cohort: {run_id}"
                 )
-        # The recorded TR-side mirror fields must agree with the TR row itself,
-        # so a hand-edited GS row cannot self-certify.
-        if str(row["tr_base_latent_sha256"]) != str(tr_row["base_latent_sha256"]):
-            raise ValueError(f"tr_base_latent_sha256 mismatch run_id={run_id}")
-        if str(row["tr_clean_sha256"]) != str(tr_row["clean_sha256"]):
-            raise ValueError(f"tr_clean_sha256 mismatch run_id={run_id}")
-        if str(row["tr_clean_path"]) != str(tr_row["clean_path"]):
-            raise ValueError(f"tr_clean_path mismatch run_id={run_id}")
-        if str(row["watermarked_sha256"]) == str(tr_row["watermarked_sha256"]):
-            raise ValueError(
-                f"GS and TR watermarked images are identical run_id={run_id}"
-            )
-        if verify_files:
-            for label, path_field, hash_field in (
-                ("clean", "clean_path", "clean_sha256"),
-                ("gs_watermarked", "watermarked_path", "watermarked_sha256"),
-            ):
-                path = Path(str(row[path_field]))
-                if not path.is_file():
-                    raise FileNotFoundError(path)
-                actual = sha256_path(path)
-                if actual != str(row[hash_field]):
+            seen.add(run_id)
+            if pairing_method(row) != method:
+                raise ValueError(
+                    f"shared-clean cohort row is not {method}: run_id={run_id}"
+                )
+            protocol = str(row.get("protocol") or "")
+            if protocol != expected_protocol:
+                raise ValueError(
+                    f"cross-method shared-clean audit requires {expected_protocol}: "
+                    f"run_id={run_id} has {protocol!r}"
+                )
+            tr_row = tr_by_id.get(run_id)
+            if tr_row is None:
+                raise ValueError(
+                    f"{method} run_id={run_id} has no matching TR source row"
+                )
+            for field in SHARED_CLEAN_IDENTITY_FIELDS:
+                tr_value = str(_required(tr_row, field, run_id))
+                method_value = str(_required(row, field, run_id))
+                if tr_value != method_value:
                     raise ValueError(
-                        f"{label} SHA drift run_id={run_id}: "
-                        f"expected {row[hash_field]}, got {actual}"
+                        f"shared-clean mismatch run_id={run_id} field={field}: "
+                        f"TR={tr_value!r} {method}={method_value!r}"
                     )
-        checked.append({
-            "run_id": run_id,
-            "base_latent_seed": int(row["base_latent_seed"]),
-            "base_latent_sha256": str(row["base_latent_sha256"]),
-            "clean_path": str(row["clean_path"]),
-            "clean_sha256": str(row["clean_sha256"]),
-            "gs_watermarked_path": str(row["watermarked_path"]),
-            "gs_watermarked_sha256": str(row["watermarked_sha256"]),
-            "gs_sampling_uniform_sha256": str(row["gs_sampling_uniform_sha256"]),
-            "gs_secret_bundle_sha256": str(row["gs_secret_bundle_sha256"]),
-        })
+            for mirror, source in (
+                ("tr_base_latent_sha256", "base_latent_sha256"),
+                ("tr_clean_sha256", "clean_sha256"),
+                ("tr_clean_path", "clean_path"),
+            ):
+                if str(_required(row, mirror, run_id)) != str(tr_row[source]):
+                    raise ValueError(f"{mirror} mismatch run_id={run_id}")
+            # Issue #9 mandatory identity; GS V2 rows predate the field name and
+            # bind the same fact through clean_base_latent_sha256 instead.
+            if "watermark_pre_injection_base_latent_sha256" in row:
+                if str(row["watermark_pre_injection_base_latent_sha256"]) != str(
+                    tr_row["base_latent_sha256"]
+                ):
+                    raise ValueError(
+                        f"watermark_pre_injection_base_latent_sha256 mismatch run_id={run_id}"
+                    )
+            if str(row["watermarked_sha256"]) == str(tr_row["watermarked_sha256"]):
+                raise ValueError(
+                    f"{method} and TR watermarked images are identical run_id={run_id}"
+                )
+            if str(row["watermarked_sha256"]) == str(row["clean_sha256"]):
+                raise ValueError(
+                    f"{method} watermarked image is the clean image run_id={run_id}"
+                )
+            if verify_files:
+                for label, path_field, hash_field in (
+                    ("clean", "clean_path", "clean_sha256"),
+                    (f"{method.lower()}_watermarked", "watermarked_path", "watermarked_sha256"),
+                ):
+                    path = Path(str(row[path_field]))
+                    if not path.is_file():
+                        raise FileNotFoundError(path)
+                    actual = sha256_path(path)
+                    if actual != str(row[hash_field]):
+                        raise ValueError(
+                            f"{label} SHA drift run_id={run_id}: "
+                            f"expected {row[hash_field]}, got {actual}"
+                        )
+            checked.append({
+                "run_id": run_id,
+                "method": method,
+                "base_latent_seed": int(row["base_latent_seed"]),
+                "base_latent_sha256": str(row["base_latent_sha256"]),
+                "clean_path": str(row["clean_path"]),
+                "clean_sha256": str(row["clean_sha256"]),
+                "watermarked_path": str(row["watermarked_path"]),
+                "watermarked_sha256": str(row["watermarked_sha256"]),
+            })
+        if not checked:
+            raise ValueError(
+                f"cross-method shared-clean audit requires at least one {method} row"
+            )
+        per_method[method] = checked
 
-    if not checked:
-        raise ValueError("cross-method shared-clean audit requires at least one GS row")
+    # Cross-method agreement for every run_id covered by more than one method.
+    overlap: dict[str, dict[str, dict[str, Any]]] = {}
+    for method, checked in per_method.items():
+        for item in checked:
+            overlap.setdefault(item["run_id"], {})[method] = item
+    shared_run_ids = sorted(
+        run_id for run_id, items in overlap.items() if len(items) > 1
+    )
+    for run_id in shared_run_ids:
+        items = overlap[run_id]
+        for field in ("clean_path", "clean_sha256", "base_latent_sha256"):
+            values = {item[field] for item in items.values()}
+            if len(values) != 1:
+                raise ValueError(
+                    f"cross-method shared-clean disagreement run_id={run_id} "
+                    f"field={field}: {sorted(values)}"
+                )
+        watermarked = [item["watermarked_sha256"] for item in items.values()]
+        if len(set(watermarked)) != len(watermarked):
+            raise ValueError(
+                f"two methods produced the identical watermarked image run_id={run_id}"
+            )
+
+    return {
+        "passed": True,
+        "audit": "cross_method_shared_clean",
+        "shared_clean_protocol": SHARED_CLEAN_PROTOCOL,
+        "shared_clean_source_method": SHARED_CLEAN_SOURCE_METHOD,
+        "verified_files": bool(verify_files),
+        "compared_fields": list(SHARED_CLEAN_IDENTITY_FIELDS),
+        "tr_source_rows": len(tr_by_id),
+        "methods": sorted(per_method),
+        "method_protocols": {
+            method: SHARED_CLEAN_METHOD_PROTOCOLS[method] for method in sorted(per_method)
+        },
+        "rows_checked": {method: len(items) for method, items in sorted(per_method.items())},
+        "unique_clean_sha256": {
+            method: len({item["clean_sha256"] for item in items})
+            for method, items in sorted(per_method.items())
+        },
+        "unique_base_latent_sha256": {
+            method: len({item["base_latent_sha256"] for item in items})
+            for method, items in sorted(per_method.items())
+        },
+        "unique_watermarked_sha256": {
+            method: len({item["watermarked_sha256"] for item in items})
+            for method, items in sorted(per_method.items())
+        },
+        "cross_method_run_ids": shared_run_ids,
+        "rows": {method: items for method, items in sorted(per_method.items())},
+    }
+
+
+def audit_tr_gs_shared_clean(
+    tr_rows: Iterable[Mapping[str, Any]],
+    gs_rows: Iterable[Mapping[str, Any]],
+    *,
+    verify_files: bool = True,
+) -> dict[str, Any]:
+    """GS-shaped view of :func:`audit_shared_clean_cohorts` (unchanged contract)."""
+    gs_rows = list(gs_rows)
+    result = audit_shared_clean_cohorts(
+        tr_rows, {"GS": gs_rows}, verify_files=verify_files, require_methods=("GS",)
+    )
+    by_id = {str(row["run_id"]): row for row in gs_rows}
+    checked = [
+        {
+            "run_id": item["run_id"],
+            "base_latent_seed": item["base_latent_seed"],
+            "base_latent_sha256": item["base_latent_sha256"],
+            "clean_path": item["clean_path"],
+            "clean_sha256": item["clean_sha256"],
+            "gs_watermarked_path": item["watermarked_path"],
+            "gs_watermarked_sha256": item["watermarked_sha256"],
+            "gs_sampling_uniform_sha256": str(by_id[item["run_id"]]["gs_sampling_uniform_sha256"]),
+            "gs_secret_bundle_sha256": str(by_id[item["run_id"]]["gs_secret_bundle_sha256"]),
+        }
+        for item in result["rows"]["GS"]
+    ]
     return {
         "passed": True,
         "audit": "cross_method_shared_clean",
@@ -570,13 +921,11 @@ def audit_tr_gs_shared_clean(
         "gs_uniform_derivation": GS_UNIFORM_DERIVATION,
         "verified_files": bool(verify_files),
         "compared_fields": list(SHARED_CLEAN_IDENTITY_FIELDS),
-        "tr_source_rows": len(tr_by_id),
+        "tr_source_rows": result["tr_source_rows"],
         "gs_rows_checked": len(checked),
-        "unique_clean_sha256": len({item["clean_sha256"] for item in checked}),
-        "unique_base_latent_sha256": len({item["base_latent_sha256"] for item in checked}),
-        "unique_gs_watermarked_sha256": len(
-            {item["gs_watermarked_sha256"] for item in checked}
-        ),
+        "unique_clean_sha256": result["unique_clean_sha256"]["GS"],
+        "unique_base_latent_sha256": result["unique_base_latent_sha256"]["GS"],
+        "unique_gs_watermarked_sha256": result["unique_watermarked_sha256"]["GS"],
         "rows": checked,
     }
 

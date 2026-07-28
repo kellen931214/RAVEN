@@ -123,6 +123,13 @@ T2S_INVERSION_MODES = ("t2s_official", "benchmark_ddim")
 #: and true-key scores; it defines no per-image binary decision. This per-image
 #: comparison is therefore named explicitly and is not a calibrated TPR at a
 #: target FPR.
+#: RAVEN shared-clean profile label. The T2S encoder is unchanged — same key
+#: pattern, same repeated-bit codeword, same tail/central magnitude split — but
+#: the Gaussian source whose order statistics it reuses is the canonical
+#: Tree-Ring clean latent instead of a fresh ``torch.randn``. This is NOT
+#: end-to-end upstream generation parity: upstream always draws its own ``z``.
+T2S_SHARED_TR_CLEAN_MODE = "official_encoder_shared_tr_clean"
+
 T2S_SCORE_DIRECTION = "higher_is_watermarked"
 T2S_DECISION_RULE = "paired_key_comparison"
 T2S_DECISION_RULE_EXPRESSION = "score_true_key > score_control_key"
@@ -153,6 +160,21 @@ parser.add_argument("--t2s_num_inversion_steps", type=int, default=10,
                     help="Upstream option.py default is 10")
 parser.add_argument("--t2s_state_dir", type=str, default=None,
                     help="Directory to write per-sample portable watermark state JSON")
+
+
+def abs_magnitude_multiset_sha256(tensor: torch.Tensor) -> str:
+    """Order-independent digest of ``|z|`` over a whole tensor.
+
+    T2S rebuilds a latent purely by *reordering and re-signing* the magnitudes of
+    its Gaussian source: the ``k`` largest ``|z|`` land on the watermark support
+    and the remaining ``n - k`` on the complement. The multiset of absolute
+    values is therefore invariant, which makes this digest a positive proof that
+    a supplied base latent was consumed rather than replaced by a fresh draw.
+    """
+    from utils.canonical import tensor_sha256
+
+    values = tensor.detach().float().cpu().flatten().abs()
+    return tensor_sha256(torch.sort(values).values.contiguous())
 
 
 def bits_to_str(bits: torch.Tensor) -> str:
@@ -641,6 +663,19 @@ class T2SProvider(WmProvider):
 
         z_key = self.t2s_key.encode(session_key, master_key, generator=gen, z=z_key_src)
         z_msg = self.t2s_msg.encode(msg, session_key, generator=gen, z=z_msg_src)
+
+        if base_latent is not None:
+            # Fail closed if the encoder discarded or replaced the supplied
+            # latent: T2S only permutes and re-signs its source's magnitudes, so
+            # the |z| multiset must survive encoding exactly.
+            encoded = torch.cat(
+                [z_key.detach().float().cpu().flatten(), z_msg.detach().float().cpu().flatten()]
+            )
+            if abs_magnitude_multiset_sha256(encoded) != abs_magnitude_multiset_sha256(base_cpu):
+                raise ValueError(
+                    "T2S encoder did not consume the supplied base latent: the |z| "
+                    "multiset changed, so a method-specific latent was substituted"
+                )
 
         latents = torch.zeros(self.latent_shape, device=self.device, dtype=self.dtype)
         latents[:, self.key_channels, :, :] = z_key.to(device=self.device, dtype=self.dtype).unsqueeze(0)

@@ -37,10 +37,11 @@ import traceback
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-WORKSPACE = Path(__file__).resolve().parents[1]
+EXPERIMENTS_ROOT = Path(__file__).resolve().parent
+WORKSPACE = EXPERIMENTS_ROOT.parent
 RAVEN_ROOT = WORKSPACE / "raven_repro"
 BENCH_ROOT = WORKSPACE / "eval_bench_wm"
-for root in (str(RAVEN_ROOT), str(BENCH_ROOT)):
+for root in (str(EXPERIMENTS_ROOT), str(RAVEN_ROOT), str(BENCH_ROOT)):
     if root not in sys.path:
         sys.path.insert(0, root)
 
@@ -66,25 +67,26 @@ from raven.pairing_provenance import (
     tensor_sha256,
 )
 
+# Canonical TR-source plumbing lives in one place and is shared with the
+# GaussMarker and T2SMark shared-clean runners. These names are re-exported into
+# this module's namespace so existing references keep working unchanged.
+from shared_clean_tr import (  # noqa: E402
+    LATENT_CHANNELS,
+    SharedCleanError,
+    append_row,
+    existing_completed_rows,
+    load_tr_rows,
+    rebuild_shared_clean_latent,
+    save_json,
+    select_rows,
+    shard_suffix,
+    str_to_bool,
+    verify_source_clean_image,
+)
+
 # Single authoritative definition of the canonical TR cohort location.
 DEFAULT_TR_METADATA = source_metadata_path("TR", "diffusiondb")
 DEFAULT_DATASET_NAME = "diffusiondb_shared_tr"
-LATENT_CHANNELS = 4
-
-
-class SharedCleanError(RuntimeError):
-    """Raised for any shared-clean provenance violation (always fail closed)."""
-
-
-def str_to_bool(value: Any) -> bool:
-    if isinstance(value, bool):
-        return value
-    normalized = str(value).strip().lower()
-    if normalized in {"1", "true", "yes", "y", "on"}:
-        return True
-    if normalized in {"0", "false", "no", "n", "off"}:
-        return False
-    raise argparse.ArgumentTypeError(f"invalid boolean value: {value}")
 
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
@@ -135,77 +137,6 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def shard_suffix(num_shards: int, shard_index: int) -> str:
-    if num_shards == 1:
-        return ""
-    return f".shard-{shard_index:03d}-of-{num_shards:03d}"
-
-
-def save_json(path: Path, payload: Dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
-
-
-def load_tr_rows(path: Path) -> List[Dict[str, str]]:
-    """Load and fully audit the Tree-Ring source cohort (fail closed)."""
-    if not path.is_file():
-        raise SharedCleanError(f"Tree-Ring source metadata not found: {path}")
-    with path.open(newline="", encoding="utf-8") as handle:
-        rows = list(csv.DictReader(handle))
-    if not rows:
-        raise SharedCleanError(f"Tree-Ring source metadata is empty: {path}")
-    audit_pairing_rows(rows, expected_count=len(rows), verify_files=True)
-    return rows
-
-
-def select_rows(
-    rows: List[Dict[str, str]],
-    *,
-    num_shards: int,
-    shard_index: int,
-    run_ids: Optional[List[int]],
-    limit: Optional[int],
-) -> List[Dict[str, str]]:
-    selected = [row for row in rows if int(row["run_id"]) % num_shards == shard_index]
-    if run_ids is not None:
-        wanted = {int(value) for value in run_ids}
-        selected = [row for row in selected if int(row["run_id"]) in wanted]
-        missing = wanted - {int(row["run_id"]) for row in selected}
-        if missing:
-            raise SharedCleanError(
-                f"requested run_ids not present in this shard: {sorted(missing)}"
-            )
-    if limit is not None:
-        selected = selected[: int(limit)]
-    if not selected:
-        raise SharedCleanError("no Tree-Ring source rows selected")
-    return selected
-
-
-def rebuild_shared_clean_latent(torch, tr_row: Dict[str, str], *, resolution: int, device, dtype):
-    """Rebuild the canonical TR base latent and prove it is the recorded one."""
-    run_id = str(tr_row["run_id"])
-    base_latent_seed = int(tr_row["base_latent_seed"])
-    latent_shape = (1, LATENT_CHANNELS, resolution // 8, resolution // 8)
-    generator = torch.Generator(device="cpu").manual_seed(base_latent_seed)
-    base_cpu = torch.randn(
-        latent_shape,
-        generator=generator,
-        dtype=torch.float32,
-        device="cpu",
-    )
-    shared_clean_latent = base_cpu.to(device=device, dtype=dtype)
-    actual = tensor_sha256(shared_clean_latent)
-    for field in ("base_latent_sha256", "clean_base_latent_sha256"):
-        expected = str(tr_row[field])
-        if actual != expected:
-            raise SharedCleanError(
-                f"rebuilt TR latent does not match {field} run_id={run_id}: "
-                f"expected {expected}, got {actual}"
-            )
-    return base_cpu, shared_clean_latent, actual
-
-
 def derive_uniforms(np, base_cpu):
     """GS uniforms from the TR float32 base latent, validated, never clamped."""
     from scipy.stats import norm
@@ -218,58 +149,6 @@ def derive_uniforms(np, base_cpu):
     if not (uniforms < 1.0).all():
         raise SharedCleanError("derived uniforms are not strictly less than 1")
     return np.ascontiguousarray(uniforms, dtype=np.float64)
-
-
-def verify_source_clean_image(tr_row: Dict[str, str]) -> Path:
-    run_id = str(tr_row["run_id"])
-    clean_path = Path(str(tr_row["clean_path"]))
-    if not clean_path.is_file():
-        raise SharedCleanError(f"TR clean image missing run_id={run_id}: {clean_path}")
-    actual = sha256_path(clean_path)
-    if actual != str(tr_row["clean_sha256"]):
-        raise SharedCleanError(
-            f"TR clean image SHA drift run_id={run_id}: "
-            f"expected {tr_row['clean_sha256']}, got {actual}"
-        )
-    return clean_path
-
-
-def existing_completed_rows(csv_path: Path, *, resume: bool) -> Dict[int, Dict[str, str]]:
-    if not csv_path.exists():
-        return {}
-    with csv_path.open(newline="", encoding="utf-8") as handle:
-        rows = list(csv.DictReader(handle))
-    if not rows:
-        return {}
-    if not resume:
-        raise SharedCleanError(
-            f"{csv_path} already has {len(rows)} rows; pass --resume to continue "
-            "an existing cohort"
-        )
-    audit_pairing_rows(rows, expected_count=len(rows), verify_files=True)
-    return {int(row["run_id"]): row for row in rows}
-
-
-def append_row(csv_path: Path, row: Dict[str, Any]) -> None:
-    csv_path.parent.mkdir(parents=True, exist_ok=True)
-    exists = csv_path.exists()
-    fields = list(row.keys())
-    if exists:
-        with csv_path.open(newline="", encoding="utf-8") as handle:
-            stored_fields = list(csv.DictReader(handle).fieldnames or [])
-        if stored_fields != fields:
-            raise SharedCleanError(
-                f"metadata schema mismatch for {csv_path}: "
-                f"missing={sorted(set(fields) - set(stored_fields))} "
-                f"extra={sorted(set(stored_fields) - set(fields))}"
-            )
-    with csv_path.open("a", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fields)
-        if not exists:
-            writer.writeheader()
-        writer.writerow(row)
-        handle.flush()
-        os.fsync(handle.fileno())
 
 
 def validate_resume_row(
