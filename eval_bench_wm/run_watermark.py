@@ -33,15 +33,20 @@ from utils.utils import set_random_seed, seed_everything
 
 from utils.prompt_utils import get_text_prompts
 
+import dataclasses
+import hashlib
 import os
 import sys
+from pathlib import Path
 from tqdm import tqdm
+from utils.canonical import sha256_path
 from utils.logger import get_logger
 
 
 model_id = ["CompVis/stable-diffusion-v1-4",
             "stable-diffusion-v1-5/stable-diffusion-v1-5",
             "stabilityai/stable-diffusion-2-1-base",
+            "RedbeardNZ/stable-diffusion-2-1-base",
             "stabilityai/stable-diffusion-xl-base-1.0",
             "PixArt-alpha/PixArt-Sigma-XL-2-512-MS",
             "cagliostrolab/animagine-xl-3.0",
@@ -62,6 +67,7 @@ model_name_mapping = {
     "stable-diffusion-v1-5/stable-diffusion-v1-5": "sd15",
     "stabilityai/stable-diffusion-xl-base-1.0": "sdxl",
     "stabilityai/stable-diffusion-2-1-base": "sd21",
+    "RedbeardNZ/stable-diffusion-2-1-base": "sd21",
     "PixArt-alpha/PixArt-Sigma-XL-2-512-MS": "pixart",
     "PixArt-alpha/PixArt-XL-2-512x512": "pixart-xl",
     "black-forest-labs/FLUX.1-dev": "flux",
@@ -192,11 +198,23 @@ def main(argv=None):
     # This way like it is done here is a simple way to obtain a watermark provider for a simple test run.
     # If you want to do mass experiments and have batch_sizes > 1, plz have look at the utils.wm_provider.WmProvider.generate_providers method
     wm_provider = WmProviders[args.wm_type].value(latent_shape=pipe_provider_target.get_latent_shape(), device=DEVICE, **vars(args))
-    wm_initial_results = wm_provider.get_wm_latents()
-    wm_zT = wm_initial_results["zT_torch"]
 
-    # for Gaussian Shading, we also get an initial message
-    message_bits_str_initial = wm_initial_results["message_bits_str_list"][0] if "message_bits_str_list" in wm_initial_results else None
+    # T2S draws a fresh base latent, session key and message for every sample, so
+    # its latent must be built inside the loop. Every other provider keeps the
+    # pre-existing behaviour of reusing one latent for the whole run.
+    per_sample_latents = args.wm_type == "T2S"
+    if per_sample_latents:
+        wm_initial_results = None
+        wm_zT = None
+        message_bits_str_initial = None
+        t2s_state_dir = os.path.join(args.out_dir, "t2s_state") if args.t2s_state_dir is None else args.t2s_state_dir
+        t2s_image_dir = os.path.join(args.out_dir, "images")
+    else:
+        wm_initial_results = wm_provider.get_wm_latents()
+        wm_zT = wm_initial_results["zT_torch"]
+
+        # for Gaussian Shading, we also get an initial message
+        message_bits_str_initial = wm_initial_results["message_bits_str_list"][0] if "message_bits_str_list" in wm_initial_results else None
 
     metric_map = {
         "PRC": "value",
@@ -222,6 +240,24 @@ def main(argv=None):
         if args.wm_type in ["PRC", "SPH"]:
             seed_everything(args.seed)
 
+        # T2S: one independent base latent, session key, message and portable
+        # state per sample. Only the master key may persist (--t2s_fix_key).
+        t2s_state = None
+        if per_sample_latents:
+            sample_seed = args.seed + id
+            wm_zT, t2s_state = wm_provider.new_sample(
+                sample_seed=sample_seed,
+                watermark_id=f"{model_name_mapping[args.modelid_target]}-t2s-{id:05d}",
+                model_id=args.modelid_target,
+                model_revision=getattr(args, "model_revision", None),
+                scheduler=args.scheduler_target,
+                num_inference_steps=args.num_inference_steps_target,
+                guidance_scale=args.guidance_scale_target,
+                resolution=args.resolution,
+                prompt_sha256=hashlib.sha256(target_prompt.encode("utf-8")).hexdigest(),
+            )
+            message_bits_str_initial = t2s_state.expected_message_bits
+
         # generate a watermarked image with the target model
         if hasattr(wm_provider, "generate"):
             generated = wm_provider.generate(
@@ -241,7 +277,26 @@ def main(argv=None):
 
         generated_PIL_list = generated["images_PIL"]
         benign_image = generated_PIL_list[0]
-        benign_image.save("watermarked_image.png")
+
+        # Save every sample separately instead of overwriting one file.
+        image_dir = t2s_image_dir if per_sample_latents else os.path.join(args.out_dir, "images")
+        os.makedirs(image_dir, exist_ok=True)
+        image_path = os.path.join(image_dir, f"{id:05d}.png")
+        benign_image.save(image_path)
+
+        if t2s_state is not None:
+            # Bind the state to the image it actually describes, so pairing never
+            # depends on filename or row ordering.
+            t2s_state = dataclasses.replace(
+                t2s_state, image_sha256=sha256_path(Path(image_path))
+            )
+            # Keep the provider's own state in sync so the compatibility
+            # get_accuracies() path scores against the identical record.
+            wm_provider.state = t2s_state
+            state_path = os.path.join(t2s_state_dir, f"{t2s_state.watermark_id}.json")
+            t2s_state.save(state_path)
+            print(f"[T2S] sample {id}: image={image_path} state={state_path} "
+                  f"state_sha256={t2s_state.state_sha256()}")
 
         # from PIL import Image
         # benign_image = Image.open("sana_vae_TR.png").convert("RGB")
@@ -257,7 +312,10 @@ def main(argv=None):
         # brightness_factor=(2,16), contrast_factor,
         # vertical_shift_ratio=(0.1, 0.8), horizontal_shift_ratio=(0.1, 0.8), flip_ratio=1,
 
-        if args.wm_type != "SHALLOW":
+        # T2S owns its inversion protocol (see utils/wm/t2s_inversion.py) and
+        # validate() invokes it; running the generic DDIM inversion here as well
+        # would only waste a second inversion and mix protocols.
+        if args.wm_type not in ("SHALLOW", "T2S"):
             with torch.no_grad(): # retrieve zT
                 zT_retrieved = pipe_provider_target.invert_images(benign_image, num_inference_steps=args.num_inference_steps_target)["zT_torch"]
             # mse = F.mse_loss(wm_zT, zT_retrieved)
@@ -282,7 +340,12 @@ def main(argv=None):
                 )
 
         # check if detection was successfull
-        if args.wm_type in ["SPH", "T2S"]:
+        if args.wm_type == "T2S":
+            # Upstream rule: the true (master) key must score above a control
+            # key on the same image. This is a true-key vs control-key
+            # comparison, NOT a calibrated TPR@1%FPR.
+            detection_successful = results["detection_success"]
+        elif args.wm_type == "SPH":
             detection_successful = None
         elif args.wm_type in ["PRC", "MAXSIVE", "SHALLOW", "GM"]:
             detection_successful = results["detection_success"]
