@@ -121,9 +121,19 @@ Upstream reference: <https://github.com/0xD009/T2SMark>, pinned comparison commi
 
 ### Generation
 
-Each sample gets its own base latent, session key, message and watermarked
-latent; images and states are written per sample instead of overwriting a single
-file. `--t2s_fix_key` fixes only the account-level master key.
+Each sample gets its own base latent, session key and watermarked latent; images
+and states are written per sample instead of overwriting a single file.
+
+`--t2s_fix_key` follows upstream `run.py`: it fixes **both the master key and the
+message** across samples to simulate a single account, and only the session key
+and base latent stay per-sample.
+
+`--t2s_rng_mode` selects the generation RNG lifecycle:
+
+| Mode | Behaviour |
+| :--- | :--- |
+| `official_compatible` (default) | Reproduces upstream's whole per-sample RNG lifecycle: reseeds the process-global RNG with `set_random_seed(seed + index)` and draws in upstream's order (master key, message, session key, then each `encode`'s `randn` and noise-sign `randint`). |
+| `raven_deterministic` | Uses one explicit CPU generator per sample and never touches global RNG state. A RAVEN provenance adaptation; it does **not** reproduce upstream's global-RNG side effects, so an end-to-end run diverges from upstream. Never describe it as upstream-exact. |
 
 ```bash
 python run_watermark.py --wm_type T2S --num 2 \
@@ -156,23 +166,35 @@ Reported fields: `score_true_key`, `score_control_key`, `score_margin`,
 key and message, plus `key_accuracy` / `message_accuracy` when the state carries
 the corresponding expectation (otherwise `null` / `N/A`, never a false 0%).
 
+Fail-closed gates: a state without a valid `state_sha256` is rejected outright;
+states whose model, revision, scheduler, resolution, latent shape, channel
+layout, RNG mode, inversion mode/steps or provider-config SHA disagree cannot be
+verified in one run; and a CLI flag that contradicts the state aborts unless
+`--allow_config_override` is passed. The first state's configuration is never
+silently applied to the rest. The loaded model's latent shape is also checked
+against the state.
+
 ### Detection semantics
 
-The default rule is upstream's **true-key versus control-key** comparison on the
-same image:
+Upstream's **formal evaluation is a cohort ROC**: `run.py` pools `norm1_no_w` as
+negatives and `norm1_w` as positives across the whole run and reports AUC plus
+TPR at FPR < 1e-6. Upstream defines **no per-image binary decision rule**.
+
+The per-image test reported here is therefore labelled as a RAVEN deployment
+extension, `paired_key_comparison`:
 
 ```
-detection_success := score_true_key > score_control_key      (higher is watermarked)
+decision_rule            = paired_key_comparison
+decision_rule_expression = score_true_key > score_control_key   (higher is watermarked)
+decision_rule_provenance = raven_deployment_extension
+official_evaluation      = cohort_roc_auc_and_tpr_at_fpr_1e-6
 ```
 
-where the control key is `1 - master_key`. This is **not** `TPR@1%FPR` and must
-not be reported as such. It has no calibrated margin threshold, so a mismatched
-state can occasionally land marginally above zero; the discriminating signals
-are the margin magnitude and the message accuracy. In a measured 2-sample smoke
-run, correct pairing gave margins of 1350.8 / 1828.0 with 100% message accuracy,
-while deliberately mispaired states gave 2.3 / −15.2 with ~50% (chance) message
-accuracy. Report TPR/FPR only after running and recording an actual negative
-cohort and threshold-calibration protocol.
+where the control key is `1 - master_key`. It is **not** an upstream rule and
+**not** `TPR@1%FPR`. It has no calibrated margin threshold, so a mismatched state
+can occasionally land marginally above zero; the discriminating signals are the
+margin magnitude and the message accuracy. Report TPR/FPR only after running and
+recording an actual negative cohort and threshold-calibration protocol.
 
 ### Inversion modes
 

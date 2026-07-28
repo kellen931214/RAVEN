@@ -249,6 +249,7 @@ def _make_state(**overrides) -> T2SWatermarkState:
         msg_length=256,
         tau=0.674,
         master_key_bits="0" * 8 + "1" * 8,
+        rng_mode="official_compatible",
         expected_session_key_bits="01" * 8,
         expected_message_bits="10" * 128,
         inversion_mode="t2s_official",
@@ -357,7 +358,9 @@ def test_detection_succeeds_on_matching_state():
     )
     assert result["key_accuracy"] == pytest.approx(1.0)
     assert result["message_accuracy"] == pytest.approx(1.0)
-    assert result["decision_rule"] == "score_true_key > score_control_key"
+    assert result["decision_rule"] == "paired_key_comparison"
+    assert result["decision_rule_expression"] == "score_true_key > score_control_key"
+    assert result["decision_rule_provenance"] == "raven_deployment_extension"
     assert result["score_direction"] == "higher_is_watermarked"
 
 
@@ -493,8 +496,8 @@ def test_samples_are_independent():
     assert first_state.provider_config_sha256 == second_state.provider_config_sha256
 
 
-def test_fix_key_keeps_master_key_but_varies_session_state():
-    """--t2s_fix_key is an account-level key, not a shared per-sample latent."""
+def test_fix_key_fixes_master_key_and_message_only_session_key_varies():
+    """Upstream run.py lines 57-60 / 91-94: --fix_key pins master key AND message."""
     from utils.wm.t2s_provider import T2SProvider
 
     provider = T2SProvider(latent_shape=(1, 4, 64, 64), device=torch.device("cpu"),
@@ -503,8 +506,17 @@ def test_fix_key_keeps_master_key_but_varies_session_state():
     _, second = provider.new_sample(sample_seed=2)
 
     assert first.master_key_bits == second.master_key_bits
+    assert first.expected_message_bits == second.expected_message_bits
     assert first.expected_session_key_bits != second.expected_session_key_bits
     assert first.watermarked_latent_sha256 != second.watermarked_latent_sha256
+
+    # Without --fix_key all three vary per sample.
+    free = T2SProvider(latent_shape=(1, 4, 64, 64), device=torch.device("cpu"), seed=5)
+    _, a = free.new_sample(sample_seed=1)
+    _, b = free.new_sample(sample_seed=2)
+    assert a.master_key_bits != b.master_key_bits
+    assert a.expected_message_bits != b.expected_message_bits
+    assert a.expected_session_key_bits != b.expected_session_key_bits
 
 
 def test_get_wm_latents_produces_a_new_sample_each_call():
@@ -528,3 +540,201 @@ def test_get_accuracies_requires_no_prior_state_for_standalone_path():
 def test_bits_str_round_trip():
     bits = torch.randint(0, 2, (32,), generator=torch.Generator().manual_seed(1))
     assert torch.equal(str_to_bits(bits_to_str(bits)), bits.int())
+
+
+# --------------------------------------------------------------------------
+# 6. Full generation RNG lifecycle parity (added because the RNG changed)
+# --------------------------------------------------------------------------
+
+
+def _official_set_random_seed(seed):
+    """Verbatim upstream src/utils.py:set_random_seed."""
+    import random
+
+    torch.manual_seed(seed + 0)
+    torch.cuda.manual_seed(seed + 1)
+    torch.cuda.manual_seed_all(seed + 2)
+    random.seed(seed + 3)
+
+
+def _official_generation_lifecycle(seed, prompt_id, fix_key=False, fixed=None):
+    """Verbatim upstream run.py per-sample lifecycle (lines 89-104), CPU."""
+    t2s_key = _OfficialT2SMark(m=16, tau=0.674, latent_shape=KEY_SHAPE_SD21)
+    t2s_msg = _OfficialT2SMark(m=256, tau=0.674, latent_shape=MSG_SHAPE_SD21)
+
+    _official_set_random_seed(seed + prompt_id)
+
+    if not fix_key:
+        master_key = torch.randint(0, 2, (16,))
+        msg = torch.randint(0, 2, (256,))
+    else:
+        master_key, msg = fixed
+    key = torch.randint(0, 2, (16,))
+
+    z_k = t2s_key.encode(key, master_key)
+    z_b = t2s_msg.encode(msg, key)
+
+    latents = torch.zeros(1, 4, 64, 64)
+    latents[:, 0, :, :] = z_k
+    latents[:, [1, 2, 3], :, :] = z_b
+    return latents, master_key, key, msg
+
+
+@pytest.mark.parametrize("prompt_id", [0, 1, 7])
+def test_official_compatible_mode_matches_full_upstream_lifecycle(prompt_id):
+    """Not just encode(): the whole per-sample RNG lifecycle must be bit-exact."""
+    from utils.wm.t2s_provider import T2SProvider
+
+    seed = 1
+    provider = T2SProvider(latent_shape=(1, 4, 64, 64), device=torch.device("cpu"),
+                           seed=seed, t2s_rng_mode="official_compatible")
+    latents, state = provider.new_sample(sample_seed=seed + prompt_id)
+
+    expected, master_key, session_key, msg = _official_generation_lifecycle(seed, prompt_id)
+
+    assert torch.equal(latents, expected)
+    assert state.master_key_bits == bits_to_str(master_key)
+    assert state.expected_session_key_bits == bits_to_str(session_key)
+    assert state.expected_message_bits == bits_to_str(msg)
+
+
+def test_official_compatible_fix_key_matches_upstream_lifecycle():
+    """Upstream draws the fixed master key AND message once, before the loop."""
+    from utils.wm.t2s_provider import T2SProvider
+
+    seed = 3
+    provider = T2SProvider(latent_shape=(1, 4, 64, 64), device=torch.device("cpu"),
+                           seed=seed, t2s_fix_key=True, t2s_rng_mode="official_compatible")
+
+    _official_set_random_seed(seed)
+    master_key = torch.randint(0, 2, (16,))
+    msg = torch.randint(0, 2, (256,))
+
+    for prompt_id in (0, 2):
+        latents, state = provider.new_sample(sample_seed=seed + prompt_id)
+        expected, _, session_key, _ = _official_generation_lifecycle(
+            seed, prompt_id, fix_key=True, fixed=(master_key, msg)
+        )
+        assert torch.equal(latents, expected)
+        assert state.master_key_bits == bits_to_str(master_key)
+        assert state.expected_message_bits == bits_to_str(msg)
+        assert state.expected_session_key_bits == bits_to_str(session_key)
+
+
+def test_raven_deterministic_mode_is_isolated_from_global_rng():
+    """The two RNG modes are distinct in their global-RNG behaviour.
+
+    With the same sample_seed and an otherwise untouched process, both modes draw
+    the same values, because torch.manual_seed(s) and torch.Generator().manual_seed(s)
+    seed the same CPU MT19937 stream and the draw order is identical. They differ in
+    what happens around that:
+
+      * official_compatible reseeds and advances the process-global RNG, exactly as
+        upstream run.py does, so downstream pipeline sampling sees upstream's state.
+      * raven_deterministic leaves the global RNG untouched and is therefore immune
+        to interleaved global draws.
+
+    Only official_compatible is claimed to reproduce upstream end to end.
+    """
+    from utils.wm.t2s_provider import T2SProvider
+
+    official = T2SProvider(latent_shape=(1, 4, 64, 64), device=torch.device("cpu"),
+                           seed=1, t2s_rng_mode="official_compatible")
+    raven = T2SProvider(latent_shape=(1, 4, 64, 64), device=torch.device("cpu"),
+                        seed=1, t2s_rng_mode="raven_deterministic")
+
+    assert official.new_sample(sample_seed=1)[1].rng_mode == "official_compatible"
+    assert raven.new_sample(sample_seed=1)[1].rng_mode == "raven_deterministic"
+
+    # official_compatible reseeds/advances the global RNG (upstream side effect).
+    torch.manual_seed(4242)
+    baseline = torch.randn(3)
+    torch.manual_seed(4242)
+    official.new_sample(sample_seed=1)
+    assert not torch.equal(baseline, torch.randn(3))
+
+    # raven_deterministic leaves the global RNG exactly as it found it.
+    torch.manual_seed(4242)
+    raven.new_sample(sample_seed=1)
+    assert torch.equal(baseline, torch.randn(3))
+
+    # raven_deterministic is unaffected by interleaved global consumption.
+    first, _ = raven.new_sample(sample_seed=9)
+    torch.randn(1000)
+    second, _ = raven.new_sample(sample_seed=9)
+    assert torch.equal(first, second)
+
+    # official_compatible reseeds per sample, so it is also stable here.
+    a, _ = official.new_sample(sample_seed=9)
+    torch.randn(1000)
+    b, _ = official.new_sample(sample_seed=9)
+    assert torch.equal(a, b)
+
+
+# --------------------------------------------------------------------------
+# 7. State signature is mandatory
+# --------------------------------------------------------------------------
+
+
+def test_state_without_sha_is_rejected(tmp_path):
+    """An unsigned state cannot be verified and must be refused."""
+    record = _make_state().to_dict()
+    record.pop("state_sha256")
+    path = tmp_path / "unsigned.json"
+    path.write_text(json.dumps(record), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="missing state_sha256"):
+        T2SWatermarkState.load(path)
+
+    with pytest.raises(ValueError, match="missing state_sha256"):
+        T2SWatermarkState.from_dict(record)
+
+
+# --------------------------------------------------------------------------
+# 8. Verification configuration compatibility
+# --------------------------------------------------------------------------
+
+
+def test_incompatible_verification_states_and_config_fail_closed(tmp_path):
+    import argparse
+
+    from run_verification import check_states_compatible
+
+    def args(**over):
+        base = dict(modelid_target="stabilityai/stable-diffusion-2-1-base",
+                    model_revision=None, scheduler_target=None, resolution=None,
+                    inversion_mode=None, num_inversion_steps=None,
+                    allow_config_override=False)
+        base.update(over)
+        return argparse.Namespace(**base)
+
+    good = _make_state()
+    image = tmp_path / "a.png"
+
+    # Baseline: a single consistent state passes.
+    check_states_compatible([(good, image)], args())
+
+    # Mixed inversion modes across states must fail closed.
+    other_mode = _make_state(watermark_id="t2s-test-0002", inversion_mode="benchmark_ddim")
+    with pytest.raises(SystemExit, match="incompatible watermark states"):
+        check_states_compatible([(good, image), (other_mode, image)], args())
+
+    # Mixed models across states must fail closed.
+    other_model = _make_state(watermark_id="t2s-test-0003", model_id="other/model")
+    with pytest.raises(SystemExit, match="incompatible watermark states"):
+        check_states_compatible([(good, image), (other_model, image)], args())
+
+    # A CLI override contradicting the state must fail closed...
+    with pytest.raises(SystemExit, match="contradicts the watermark state"):
+        check_states_compatible([(good, image)], args(scheduler_target="DPM"))
+    with pytest.raises(SystemExit, match="contradicts the watermark state"):
+        check_states_compatible([(good, image)], args(modelid_target="other/model"))
+
+    # ...unless explicitly allowed.
+    check_states_compatible([(good, image)], args(scheduler_target="DPM",
+                                                 allow_config_override=True))
+
+    # A channel layout that does not cover the latent must fail closed.
+    broken = _make_state(watermark_id="t2s-test-0004", msg_channels=[1, 2])
+    with pytest.raises(SystemExit, match="does not cover"):
+        check_states_compatible([(broken, image)], args())

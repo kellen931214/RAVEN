@@ -263,7 +263,8 @@ def main():
             do_lpips=False,
         )
         if args.wm_type == "T2S":
-            # True-key vs control-key comparison (upstream rule), not TPR@1%FPR.
+            # RAVEN paired_key_comparison extension, not an upstream per-image
+            # rule (upstream evaluates a cohort ROC). Not TPR@1%FPR.
             before_successful = before["detection_success"]
         elif args.wm_type == "SPH":
             before_successful = None
@@ -312,7 +313,8 @@ def main():
             do_lpips=False,
         )
         if args.wm_type == "T2S":
-            # True-key vs control-key comparison (upstream rule), not TPR@1%FPR.
+            # RAVEN paired_key_comparison extension, not an upstream per-image
+            # rule (upstream evaluates a cohort ROC). Not TPR@1%FPR.
             after_successful = after["detection_success"]
         elif args.wm_type == "SPH":
             after_successful = None

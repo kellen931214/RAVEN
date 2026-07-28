@@ -6,6 +6,7 @@ This file records implementation bugs, validated non-bugs, ablations, and the ev
 
 | Date | Area | Status | Evidence |
 | --- | --- | --- | --- |
+| 2026-07-28 | T2S review follow-up (PR #8) | Restored upstream's full generation RNG lifecycle (`official_compatible`, default) and separated the RAVEN `raven_deterministic` mode without claiming upstream-exactness; `--t2s_fix_key` now fixes master key AND message per upstream `run.py`; `state_sha256` is mandatory; verification fails closed on mixed state/config; per-image rule relabelled `paired_key_comparison` (RAVEN extension) since upstream evaluates a cohort ROC. | `eval_bench_wm/utils/wm/t2s_provider.py`; `eval_bench_wm/run_verification.py`; `eval_bench_wm/tests/test_t2s_parity.py` |
 | 2026-07-28 | T2S official parity + standalone verification | T2S key PRNG restored to upstream's CPU generator (a CUDA generator had silently remapped every key to a different watermark pattern); per-sample base latent/session key/message/state replaces one latent reused for the whole run; per-sample image and canonical-JSON state files replace the overwritten `watermarked_image.png`; new `run_verification.py` verifies suspect images in a fresh process; official vs benchmark inversion exposed as explicit modes. | `eval_bench_wm/utils/wm/t2s_provider.py`; `eval_bench_wm/utils/wm/t2s_inversion.py`; `eval_bench_wm/run_verification.py`; `eval_bench_wm/tests/test_t2s_parity.py` |
 | 2026-07-27 | GS aggregate PSNR/SSIM/attack-success reduction | `formal_aggregate.json` now reduces the per-sample quality records to `quality_psnr_mean`/`quality_ssim_mean` and GS publishes `attack_success_rate_at_official_onebit_threshold = 1 - official_onebit_rates["attacked"]`, so the three GS aligned-color rows no longer render `—`. Re-audit of the same runs found no bit-accuracy, secret-mapping or bit-order bug; nothing was rerun or invalidated. | `raven_repro/raven/eval_protocol.py`; `experiments/backfill_formal_aggregate_metrics.py`; `raven_repro/tests/test_formal_aggregate_scalars.py` |
 | 2026-07-27 | TensorFlow FID protocol as the default | Primary FID is now the TensorFlow FID protocol (clean-fid `legacy_tensorflow`: TF Inception-2015-12-05 features + TF-compatible bilinear resize); clean-fid `clean` is still computed and recorded as a secondary value so earlier TR numbers stay comparable. The formal quality-config hash now carries the FID protocol descriptor, and the runner accepts `scratch_run_root()` gate roots so gates stay out of `outputs/`. | `raven_repro/raven/quality.py`; `experiments/run_raven_formal_eval.py`; `raven_repro/tests/test_fid_staging.py`; `raven_repro/tests/test_canonical_layout.py` |
@@ -20,6 +21,139 @@ This file records implementation bugs, validated non-bugs, ablations, and the ev
 
 
 
+
+## 2026-07-28 — T2S review follow-up: full RNG lifecycle, fix_key, state signature, verification config, detector labelling
+
+### Problem
+PR #8 review found five defects in the first T2S commit (`a9d036d`).
+
+1. **Parity was only encoder-level.** Tests proved `encode`/`decode` matched
+   upstream given fixed bits/key, but nothing proved the *generation RNG
+   lifecycle* matched. It did not: the provider drew from an explicit generator
+   in the order master_key, session_key, msg, whereas upstream reseeds the
+   process-global RNG per sample and draws master_key, msg, session_key.
+2. **`--t2s_fix_key` was wrong.** Upstream `run.py` lines 57-60 draws BOTH the
+   master key and the message once before the loop; only the session key is
+   redrawn per sample. The local flag fixed only the master key and redrew the
+   message per sample.
+3. **`state_sha256` was optional.** `from_dict()` accepted a state with no
+   digest, so an unsigned state was silently trusted.
+4. **Verification applied the first state's configuration to all states.**
+   Mixed models, schedulers, resolutions, latent shapes, RNG modes, inversion
+   modes/steps or provider-config SHAs were not detected, and a CLI flag
+   contradicting the state was silently honoured.
+5. **The detector rule was mislabelled as upstream's.** Upstream's formal
+   evaluation is a cohort ROC (`run.py` lines 140-159: pooled `norm1_no_w`
+   negatives vs `norm1_w` positives, AUC and TPR at FPR < 1e-6). Upstream
+   defines no per-image binary rule, so calling `score_true_key >
+   score_control_key` "upstream's rule" was incorrect.
+
+### Root cause
+The first pass verified the encoder against upstream but not the surrounding
+generation and evaluation protocol, and it treated a per-image convenience
+comparison as if it were upstream's detector.
+
+### Affected files
+- `eval_bench_wm/utils/wm/t2s_provider.py` — `T2S_RNG_MODES`, decision-rule
+  constants, `T2SProvider.__init__`, `new_sample`, `T2SWatermarkState`
+  (`rng_mode` field, mandatory digest), `detect_from_reversed_latents`
+- `eval_bench_wm/run_verification.py` — `SHARED_STATE_FIELDS`, `CLI_OVERRIDES`,
+  `check_states_compatible`, `check_pipe_matches_states`,
+  `--allow_config_override`
+- `eval_bench_wm/run_watermark.py`, `eval_bench_wm/run_removal.py` — labelling
+- `eval_bench_wm/tests/test_t2s_parity.py`, `eval_bench_wm/README.md`
+
+### Affected outputs
+The RNG lifecycle fix changes the generated latents, so the smoke artifacts from
+`a9d036d` are superseded. Both old and new smoke runs remain **smoke only,
+incomplete**; no formal cohort existed, so no published result is invalidated.
+
+### Fix
+- Added `--t2s_rng_mode`. `official_compatible` (default) reseeds the global RNG
+  per sample via `set_random_seed(seed + index)` and draws in upstream's exact
+  order. `raven_deterministic` keeps the explicit per-sample generator and is
+  documented as a RAVEN adaptation that does not reproduce upstream's global-RNG
+  side effects. Only `official_compatible` is claimed to match upstream.
+- `--t2s_fix_key` now fixes the master key **and** the message, drawn once at
+  provider construction, matching upstream; only the session key varies.
+- `from_dict()` rejects a missing or malformed `state_sha256` before any other
+  validation. Schema version bumped to 2 (new required `rng_mode` field).
+- `run_verification.py` fails closed when states disagree on any of
+  `latent_shape`, `key_channels`, `msg_channels`, `key_length`, `msg_length`,
+  `tau`, `rng_mode`, `inversion_mode`, `num_inversion_steps`,
+  `provider_config_sha256`, `model_id`, `model_revision`, `scheduler`,
+  `resolution`, `num_inference_steps`; when a CLI flag contradicts the state
+  (unless `--allow_config_override`); when the channel layout does not cover the
+  latent; and when the loaded model's latent shape differs from the state.
+- Detector output now carries `decision_rule="paired_key_comparison"`,
+  `decision_rule_expression`, `decision_rule_provenance=
+  "raven_deployment_extension"` and `official_evaluation=
+  "cohort_roc_auc_and_tpr_at_fpr_1e-6"`. Logs and README match.
+
+### Reused code
+`utils.utils.set_random_seed` is reused as the single seeding helper. Its extra
+numpy/`random` seeding does not affect T2S, which draws only from the CPU torch
+stream that both it and upstream seed with `torch.manual_seed(seed)`; the
+lifecycle parity test asserts bit-equality against a verbatim transcription of
+upstream's own `set_random_seed`.
+
+### Historical bug coverage
+Re-read the pinned `run.py`, `run_sd35.py`, `option.py`, `src/utils.py` and
+`src/t2s.py` for this review. The earlier CPU-PRNG fix remains correct and its
+test still passes. No other reachable T2S path was found beyond the two runners.
+
+### Regression prevention
+Four focused tests, no broad edge-case expansion:
+- `test_official_compatible_mode_matches_full_upstream_lifecycle` (3 seeds) and
+  `test_official_compatible_fix_key_matches_upstream_lifecycle` compare whole
+  per-sample latents and all three secrets against a transcription of upstream
+  `run.py`.
+- `test_fix_key_fixes_master_key_and_message_only_session_key_varies`.
+- `test_state_without_sha_is_rejected`.
+- `test_incompatible_verification_states_and_config_fail_closed`.
+- `test_raven_deterministic_mode_is_isolated_from_global_rng` documents the
+  honest distinction: both modes coincide in a clean process because
+  `torch.manual_seed(s)` and `torch.Generator().manual_seed(s)` seed the same CPU
+  stream, and they differ in global-RNG side effects.
+
+### Validation
+```
+python -m pytest tests/ -q      ->  51 passed, 4 subtests passed
+```
+
+GPU re-run after the RNG change (`RedbeardNZ/stable-diffusion-2-1-base` + DDIM,
+512px, `t2s_official` inversion, 10 steps):
+
+```
+generation   sample 0: key_acc 1.00000  msg_acc 1.00000  margin 1171.52225
+             sample 1: key_acc 1.00000  msg_acc 1.00000  margin 1826.77356
+standalone   sd21-t2s-00000  score_true_key=1315.01111  score_control_key=143.48886
+             sd21-t2s-00001  score_true_key=2006.06311  score_control_key=179.28955
+```
+
+Standalone scores are bit-identical to generation time. Mixed-configuration
+verification fails closed:
+
+```
+incompatible watermark states in one verification run; run them separately:
+  inversion_mode: sd21-t2s-00000='t2s_official' vs sd21-t2s-00001='benchmark_ddim'
+exit 1
+```
+
+### Watermark-specific status
+Unchanged from the previous entry except: detector rule is now labelled
+`paired_key_comparison` (RAVEN deployment extension); upstream's evaluation is
+recorded as a cohort ROC; threshold calibration source remains none and no
+empirical FPR was measured.
+
+### Git provenance
+- Repository: RAVEN
+- Branch: `agent/t2smark-official-standalone-verification`
+- Commit: recorded in the commit that carries this entry
+- Remote branch: `origin/agent/t2smark-official-standalone-verification`
+- Push status: pushed and verified via `git ls-remote`
+- Entry point: `eval_bench_wm/run_watermark.py`, `eval_bench_wm/run_verification.py`
+- Formal output eligibility: **smoke only, incomplete**
 
 ## 2026-07-28 — T2S restored to official behavior and given standalone verification
 

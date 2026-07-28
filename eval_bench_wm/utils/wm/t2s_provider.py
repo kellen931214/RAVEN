@@ -9,6 +9,33 @@ This module holds the single authoritative implementation of the T2S encoder,
 decoder, and detector score. ``run_watermark.py`` and ``run_verification.py``
 both dispatch here; neither reimplements any part of it.
 
+RNG modes
+---------
+``official_compatible`` (default) reproduces upstream's *whole* generation RNG
+lifecycle, not merely the encoder given fixed inputs. Per sample it reseeds the
+process-global RNG with ``set_random_seed(seed + sample_index)`` and then draws
+from the global CPU stream in upstream's exact order:
+
+    master_key, message   (only when --t2s_fix_key is off)
+    session key
+    z_k randn, z_k noise-sign randint
+    z_b randn, z_b noise-sign randint
+
+``raven_deterministic`` instead uses one explicit CPU ``torch.Generator`` per
+sample and never touches process-global RNG state. It is a RAVEN provenance
+adaptation, not an upstream behaviour.
+
+The distinction is about global RNG side effects, and it is what the modes are
+tested on. In a process where nothing else consumes the global CPU stream, both
+modes happen to draw the same values for a given ``sample_seed``, because
+``torch.manual_seed(s)`` and ``torch.Generator().manual_seed(s)`` seed the same
+CPU MT19937 stream and the draw order is identical. That coincidence is not the
+guarantee. Upstream *advances the process-global RNG*, so the diffusion
+pipeline's own subsequent sampling inherits that state; ``raven_deterministic``
+deliberately leaves the global RNG untouched, so an end-to-end run diverges from
+upstream. Only ``official_compatible`` is claimed to reproduce upstream end to
+end; ``raven_deterministic`` must never be described as upstream-exact.
+
 Deliberate differences from upstream, and why each is necessary
 ---------------------------------------------------------------
 1. Key-derived PRNG stays on CPU (``torch.Generator()``), exactly as upstream.
@@ -23,17 +50,22 @@ Deliberate differences from upstream, and why each is necessary
    key's pattern and a detector's score bit-identical across devices, which
    standalone verification requires (the verifying process may not have the same
    GPU as the generating process). The values are mathematically identical.
-3. ``encode()`` accepts an explicit CPU ``torch.Generator``. Upstream relies on
-   the process-global RNG seeded by ``utils.set_random_seed(seed + prompt_id)``.
-   An explicit per-sample generator reproduces the same distribution while
-   giving each sample independent, deterministic, recorded randomness, as
-   required for provenance. Passing ``generator=None`` reproduces upstream's
-   global-RNG behaviour exactly.
+3. ``raven_deterministic`` exists in addition to ``official_compatible``; see
+   above. Only ``official_compatible`` is claimed to match upstream bit-for-bit.
 
 Everything else -- ``r``, ``k``, ``noise_size``, tail/central magnitude
 selection, repeated-bit layout, codeword signs, ``binlist2int``, the master /
 session / fake key and message lifecycle, and the 4-channel and 16-channel
 splits -- follows upstream.
+
+Detection
+---------
+Upstream's *formal* evaluation is a cohort ROC: it pools ``norm1_no_w`` as
+negatives and ``norm1_w`` as positives across the whole run and reports AUC plus
+TPR at FPR < 1e-6 (``run.py`` lines 140-159). It has no per-image binary rule.
+The per-image ``score_true_key > score_control_key`` test implemented here is a
+RAVEN deployment extension named ``paired_key_comparison``; it is neither an
+upstream rule nor a calibrated TPR at a target FPR.
 """
 
 from __future__ import annotations
@@ -48,11 +80,17 @@ import torch
 from scipy.stats import norm
 
 from utils.canonical import canonical_json_dumps, canonical_json_sha256
+from utils.utils import set_random_seed
 
 from .wm_provider import WmProvider
 
 
-T2S_STATE_SCHEMA_VERSION = 1
+T2S_STATE_SCHEMA_VERSION = 2
+
+#: ``official_compatible`` reproduces upstream's full generation RNG lifecycle
+#: bit-for-bit. ``raven_deterministic`` is a RAVEN provenance adaptation using an
+#: explicit per-sample generator; it is NOT bit-exact with upstream.
+T2S_RNG_MODES = ("official_compatible", "raven_deterministic")
 
 #: Upstream inversion (``naive_forward_diffusion`` in
 #: ``src/inversion/inverse_stable_diffusion.py``) versus the benchmark's generic
@@ -60,11 +98,16 @@ T2S_STATE_SCHEMA_VERSION = 1
 #: never substituted for one another; see ``t2s_inversion.py``.
 T2S_INVERSION_MODES = ("t2s_official", "benchmark_ddim")
 
-#: The default detector rule is upstream's: compare the true key's score against
-#: a control key's score on the same image. This is not a calibrated TPR at a
-#: fixed FPR and must never be reported as ``TPR@1%FPR``.
+#: RAVEN deployment extension, NOT an upstream rule. Upstream's formal
+#: evaluation is a cohort ROC (AUC + TPR at FPR < 1e-6) over pooled control-key
+#: and true-key scores; it defines no per-image binary decision. This per-image
+#: comparison is therefore named explicitly and is not a calibrated TPR at a
+#: target FPR.
 T2S_SCORE_DIRECTION = "higher_is_watermarked"
-T2S_DECISION_RULE = "score_true_key > score_control_key"
+T2S_DECISION_RULE = "paired_key_comparison"
+T2S_DECISION_RULE_EXPRESSION = "score_true_key > score_control_key"
+T2S_DECISION_RULE_PROVENANCE = "raven_deployment_extension"
+T2S_OFFICIAL_EVALUATION = "cohort_roc_auc_and_tpr_at_fpr_1e-6"
 
 
 parser = argparse.ArgumentParser(add_help=False)
@@ -74,8 +117,14 @@ parser.add_argument("--t2s_key_length", type=int, default=16)
 parser.add_argument("--t2s_msg_length", type=int, default=256)
 parser.add_argument("--t2s_tau", type=float, default=0.674)
 parser.add_argument("--t2s_fix_key", action="store_true", default=False,
-                    help="Fix the master key across samples to simulate a single account. "
-                         "Session key, message and base latent stay per-sample.")
+                    help="Upstream --fix_key: fix BOTH the master key and the message across "
+                         "samples to simulate a single account. Only the session key and the "
+                         "base latent stay per-sample.")
+parser.add_argument("--t2s_rng_mode", type=str, default="official_compatible",
+                    choices=list(T2S_RNG_MODES),
+                    help="official_compatible reproduces upstream's full generation RNG "
+                         "lifecycle bit-for-bit; raven_deterministic uses an explicit "
+                         "per-sample generator and is NOT bit-exact with upstream")
 parser.add_argument("--t2s_inversion_mode", type=str, default="t2s_official",
                     choices=list(T2S_INVERSION_MODES),
                     help="t2s_official reproduces upstream naive_forward_diffusion; "
@@ -242,6 +291,7 @@ class T2SWatermarkState:
     msg_length: int
     tau: float
     master_key_bits: str
+    rng_mode: str
     inversion_mode: str
     num_inversion_steps: int
     provider_config_sha256: str
@@ -278,7 +328,14 @@ class T2SWatermarkState:
     @classmethod
     def from_dict(cls, record: typing.Mapping[str, typing.Any]) -> "T2SWatermarkState":
         record = dict(record)
-        declared = record.pop("state_sha256", None)
+        if "state_sha256" not in record:
+            raise ValueError(
+                "T2S state is missing state_sha256; an unsigned state cannot be "
+                "verified and is rejected"
+            )
+        declared = record.pop("state_sha256")
+        if not isinstance(declared, str) or len(declared) != 64:
+            raise ValueError(f"T2S state_sha256 must be a 64-char hex digest, got {declared!r}")
 
         version = record.get("schema_version")
         if version != T2S_STATE_SCHEMA_VERSION:
@@ -301,7 +358,7 @@ class T2SWatermarkState:
 
         state = cls(**record)
         # Fail closed: the digest must survive the write/read round trip.
-        if declared is not None and declared != state.state_sha256():
+        if declared != state.state_sha256():
             raise ValueError(
                 "T2S state_sha256 mismatch after reload: "
                 f"declared={declared} recomputed={state.state_sha256()}"
@@ -343,9 +400,12 @@ def detect_from_reversed_latents(state: T2SWatermarkState,
                                  reversed_latents: torch.Tensor) -> typing.Dict[str, typing.Any]:
     """Authoritative T2S detector scoring. The only implementation.
 
-    Compares the true (master) key's L1 vote norm against a control key's norm
-    on the same reversed latent, which is upstream's rule. It is a true-key
-    versus control-key comparison, not a calibrated TPR at a target FPR.
+    ``score_true_key`` and ``score_control_key`` are upstream's ``norm1_w`` and
+    ``norm1_no_w``. Upstream consumes them as a *cohort* ROC (AUC and TPR at
+    FPR < 1e-6 over the pooled run) and defines no per-image decision. The
+    per-image ``score_true_key > score_control_key`` test reported here is a
+    RAVEN deployment extension (``paired_key_comparison``), not an upstream rule
+    and not a calibrated TPR at a target FPR.
     """
     if reversed_latents.dim() == 3:
         reversed_latents = reversed_latents.unsqueeze(0)
@@ -387,6 +447,9 @@ def detect_from_reversed_latents(state: T2SWatermarkState,
         "score_margin": score_true_key - score_control_key,
         "score_direction": T2S_SCORE_DIRECTION,
         "decision_rule": T2S_DECISION_RULE,
+        "decision_rule_expression": T2S_DECISION_RULE_EXPRESSION,
+        "decision_rule_provenance": T2S_DECISION_RULE_PROVENANCE,
+        "official_evaluation": T2S_OFFICIAL_EVALUATION,
         "detection_success": bool(score_true_key > score_control_key),
         "recovered_session_key_bits": bits_to_str(recovered_key),
         "recovered_message_bits": bits_to_str(recovered_msg),
@@ -407,6 +470,7 @@ class T2SProvider(WmProvider):
         t2s_msg_length: int = 256,
         t2s_tau: float = 0.674,
         t2s_fix_key: bool = False,
+        t2s_rng_mode: str = "official_compatible",
         t2s_inversion_mode: str = "t2s_official",
         t2s_num_inversion_steps: int = 10,
         seed: int = 0,
@@ -427,12 +491,17 @@ class T2SProvider(WmProvider):
             raise ValueError(
                 f"unknown --t2s_inversion_mode={t2s_inversion_mode!r}, expected one of {T2S_INVERSION_MODES}"
             )
+        if t2s_rng_mode not in T2S_RNG_MODES:
+            raise ValueError(
+                f"unknown --t2s_rng_mode={t2s_rng_mode!r}, expected one of {T2S_RNG_MODES}"
+            )
 
         self.key_channel_idx = t2s_key_channel_idx
         self.key_length = t2s_key_length
         self.msg_length = t2s_msg_length
         self.tau = t2s_tau
         self.fix_key = t2s_fix_key
+        self.rng_mode = t2s_rng_mode
         self.inversion_mode = t2s_inversion_mode
         self.num_inversion_steps = t2s_num_inversion_steps
         self.seed = seed
@@ -446,14 +515,21 @@ class T2SProvider(WmProvider):
         self.t2s_msg = T2SMark(m=self.msg_length, tau=self.tau,
                                latent_shape=(len(self.msg_channels), height, width), device=self.device)
 
-        # Account-level master key. Upstream ``run.py`` lines 57-61 fixes the
-        # master key when --fix_key is set; the session key and message stay
-        # per-sample either way.
+        # Account-level secrets. Upstream ``run.py`` lines 57-60 draws BOTH the
+        # master key and the message once, before the loop, when --fix_key is
+        # set; only the session key is redrawn per sample.
         self.fixed_master_key = None
+        self.fixed_msg = None
         if self.fix_key:
-            gen = torch.Generator()
-            gen.manual_seed(self.seed)
-            self.fixed_master_key = torch.randint(0, 2, (self.key_length,), generator=gen)
+            if self.rng_mode == "official_compatible":
+                set_random_seed(self.seed)
+                self.fixed_master_key = torch.randint(0, 2, (self.key_length,))
+                self.fixed_msg = torch.randint(0, 2, (self.msg_length,))
+            else:
+                gen = torch.Generator()
+                gen.manual_seed(self.seed)
+                self.fixed_master_key = torch.randint(0, 2, (self.key_length,), generator=gen)
+                self.fixed_msg = torch.randint(0, 2, (self.msg_length,), generator=gen)
 
         self.state: typing.Optional[T2SWatermarkState] = None
         self.wm_latents: typing.Optional[torch.Tensor] = None
@@ -472,6 +548,7 @@ class T2SProvider(WmProvider):
             "msg_length": self.msg_length,
             "tau": self.tau,
             "fix_key": bool(self.fix_key),
+            "rng_mode": self.rng_mode,
             "latent_shape": list(self.latent_shape),
             "inversion_mode": self.inversion_mode,
             "num_inversion_steps": self.num_inversion_steps,
@@ -505,18 +582,26 @@ class T2SProvider(WmProvider):
         if watermark_id is None:
             watermark_id = f"t2s-{sample_seed:08d}"
 
-        # One CPU generator per sample: independent of processing order,
-        # previous samples, batch history and resume position.
-        gen = torch.Generator()
-        gen.manual_seed(int(sample_seed))
+        if self.rng_mode == "official_compatible":
+            # Upstream run.py line 89: reseed the process-global RNG per sample,
+            # then draw from the global CPU stream in upstream's exact order.
+            set_random_seed(int(sample_seed))
+            gen = None
+        else:
+            # RAVEN provenance mode: one explicit CPU generator per sample, no
+            # process-global RNG side effects. NOT bit-exact with upstream.
+            gen = torch.Generator()
+            gen.manual_seed(int(sample_seed))
 
+        # Upstream order (run.py lines 91-94): master_key, msg, then session key.
         if self.fix_key:
             master_key = self.fixed_master_key.clone()
+            msg = self.fixed_msg.clone()
         else:
             master_key = torch.randint(0, 2, (self.key_length,), generator=gen)
+            msg = torch.randint(0, 2, (self.msg_length,), generator=gen)
 
         session_key = torch.randint(0, 2, (self.key_length,), generator=gen)
-        msg = torch.randint(0, 2, (self.msg_length,), generator=gen)
 
         from utils.canonical import tensor_sha256
 
@@ -552,6 +637,7 @@ class T2SProvider(WmProvider):
             master_key_bits=bits_to_str(master_key),
             expected_session_key_bits=bits_to_str(session_key),
             expected_message_bits=bits_to_str(msg),
+            rng_mode=self.rng_mode,
             inversion_mode=self.inversion_mode,
             num_inversion_steps=self.num_inversion_steps,
             provider_config_sha256=self.provider_config_sha256(),
@@ -641,7 +727,8 @@ class T2SProvider(WmProvider):
                 f"score_true_key: {result['score_true_key']:.5f}; "
                 f"score_control_key: {result['score_control_key']:.5f}; "
                 f"margin: {result['score_margin']:.5f} "
-                f"(true-key vs control-key rule, not TPR@1%FPR)"
+                f"(RAVEN paired_key_comparison deployment extension; "
+                f"upstream evaluates a cohort ROC, not a per-image rule; not TPR@1%FPR)"
             ),
             "t2s_key_accuracy": key_acc,
             "t2s_score_true_key": result["score_true_key"],

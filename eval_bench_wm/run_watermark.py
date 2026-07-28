@@ -341,9 +341,9 @@ def main(argv=None):
 
         # check if detection was successfull
         if args.wm_type == "T2S":
-            # Upstream rule: the true (master) key must score above a control
-            # key on the same image. This is a true-key vs control-key
-            # comparison, NOT a calibrated TPR@1%FPR.
+            # RAVEN paired_key_comparison deployment extension: the true
+            # (master) key must score above a control key on the same image.
+            # Upstream evaluates a cohort ROC, not a per-image rule. NOT TPR@1%FPR.
             detection_successful = results["detection_success"]
         elif args.wm_type == "SPH":
             detection_successful = None

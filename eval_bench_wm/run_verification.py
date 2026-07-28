@@ -69,6 +69,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--image_dir", type=str, default=None)
 
     parser.add_argument("--modelid_target", type=str, required=True)
+    parser.add_argument("--allow_config_override", action="store_true", default=False,
+                        help="Permit a verification configuration that contradicts the state. "
+                             "Results are then not comparable to generation.")
     parser.add_argument("--model_revision", type=str, default=None)
     parser.add_argument("--scheduler_target", type=str, default=None,
                         help="Defaults to the scheduler recorded in the state")
@@ -124,11 +127,111 @@ def resolve_pairs(args) -> list:
     return pairs
 
 
+#: State fields that must agree across every state in one verification run,
+#: because a single pipe/scheduler/inversion configuration is applied to all.
+SHARED_STATE_FIELDS = (
+    "latent_shape",
+    "key_channels",
+    "msg_channels",
+    "key_length",
+    "msg_length",
+    "tau",
+    "rng_mode",
+    "inversion_mode",
+    "num_inversion_steps",
+    "provider_config_sha256",
+    "model_id",
+    "model_revision",
+    "scheduler",
+    "resolution",
+    "num_inference_steps",
+)
+
+#: CLI flag -> state field, for detecting an override that contradicts the state.
+CLI_OVERRIDES = {
+    "modelid_target": "model_id",
+    "model_revision": "model_revision",
+    "scheduler_target": "scheduler",
+    "resolution": "resolution",
+    "inversion_mode": "inversion_mode",
+    "num_inversion_steps": "num_inversion_steps",
+}
+
+
+def check_states_compatible(pairs, args) -> None:
+    """Fail closed on mixed-configuration states or contradicting CLI overrides.
+
+    Never silently applies the first state's configuration to the rest.
+    """
+    reference_state, reference_path = pairs[0][0], pairs[0][1]
+
+    conflicts = []
+    for state, image_path in pairs[1:]:
+        for field in SHARED_STATE_FIELDS:
+            expected, actual = getattr(reference_state, field), getattr(state, field)
+            if expected != actual:
+                conflicts.append(
+                    f"  {field}: {reference_state.watermark_id}={expected!r} "
+                    f"vs {state.watermark_id}={actual!r}"
+                )
+    if conflicts:
+        raise SystemExit(
+            "incompatible watermark states in one verification run; "
+            "run them separately:\n" + "\n".join(conflicts)
+        )
+
+    overrides = []
+    for flag, field in CLI_OVERRIDES.items():
+        supplied = getattr(args, flag, None)
+        recorded = getattr(reference_state, field, None)
+        if supplied is None or recorded is None:
+            continue
+        if supplied != recorded:
+            overrides.append(f"  --{flag}={supplied!r} but state records {field}={recorded!r}")
+    if overrides and not args.allow_config_override:
+        raise SystemExit(
+            "verification configuration contradicts the watermark state:\n"
+            + "\n".join(overrides)
+            + "\npass --allow_config_override to verify under a deliberately "
+              "different configuration (results are not comparable to generation)"
+        )
+    for line in overrides:
+        print(f"[override]{line}", file=sys.stderr)
+
+    # Detection needs the state's channel layout to exist in the latent.
+    if len(reference_state.latent_shape) != 4:
+        raise SystemExit(
+            f"state {reference_state.watermark_id} has malformed latent_shape="
+            f"{reference_state.latent_shape}"
+        )
+    channels = reference_state.latent_shape[1]
+    declared = set(reference_state.key_channels) | set(reference_state.msg_channels)
+    if declared != set(range(channels)):
+        raise SystemExit(
+            f"state {reference_state.watermark_id} channel layout {sorted(declared)} "
+            f"does not cover its {channels}-channel latent"
+        )
+    if reference_path is None:
+        raise SystemExit("internal: missing image path")
+
+
+def check_pipe_matches_states(pipe_provider, state) -> None:
+    """The loaded model's latent shape must match what the state was made with."""
+    actual = tuple(pipe_provider.get_latent_shape(batch_size=1))
+    expected = tuple(state.latent_shape)
+    if actual != expected:
+        raise SystemExit(
+            f"model latent shape {actual} does not match state {state.watermark_id} "
+            f"latent_shape {expected}; wrong model or resolution"
+        )
+
+
 def main(argv=None) -> int:
     args = build_parser().parse_args(sys.argv[1:] if argv is None else argv)
     device = require_gpu()
 
     pairs = resolve_pairs(args)
+    check_states_compatible(pairs, args)
 
     # Fail closed before spending time loading a model.
     image_digests = {}
@@ -155,6 +258,7 @@ def main(argv=None) -> int:
         disable_tqdm=True,
         revision=args.model_revision or reference_state.model_revision,
     )
+    check_pipe_matches_states(pipe_provider, reference_state)
 
     records = []
     for state, image_path in pairs:
@@ -196,7 +300,9 @@ def main(argv=None) -> int:
             f"margin={result['score_margin']:.5f} "
             f"key_acc={'N/A' if key_acc is None else f'{key_acc:.5f}'} "
             f"msg_acc={'N/A' if msg_acc is None else f'{msg_acc:.5f}'} "
-            f"[{result['decision_rule']}; {result['score_direction']}; not TPR@1%FPR]"
+            f"[{result['decision_rule']} ({result['decision_rule_provenance']}): "
+            f"{result['decision_rule_expression']}; {result['score_direction']}; "
+            f"upstream evaluates {result['official_evaluation']}; not TPR@1%FPR]"
         )
 
     if args.out_json:
