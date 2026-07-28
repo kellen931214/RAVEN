@@ -281,6 +281,11 @@ Each field may be declared once for the pair (`sample_seed`) or per side
 (`positive_sample_seed`). When sidecars *are* present they are cross-validated
 against the manifest and any disagreement is a rejection.
 
+The pairing must be a bijection: every positive and every negative image takes
+part in exactly one pair, and the images the manifest references must be exactly
+the two input cohorts. Referencing an image twice, or leaving one unpaired, fails
+closed even when the manifest declares the right number of entries.
+
 Each pair must agree on `sample_id` and `prompt_sha256`; the generation
 `sample_seed` must match as well unless an explicit pair manifest declares the
 pairing. When a distortion/attack was applied, both sides must carry identical

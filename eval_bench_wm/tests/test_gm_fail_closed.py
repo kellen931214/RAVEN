@@ -189,6 +189,28 @@ class UnpairedCohortTests(unittest.TestCase):
                 "official_paper_evaluation",
             )
 
+    def test_pair_manifest_may_not_reuse_an_image_and_drop_another(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            positives, negatives = self._cohorts(root, with_metadata=True)
+            manifest_path = root / "pairs.json"
+            # Right number of entries, but the first positive is paired twice and
+            # the second positive is never paired at all.
+            manifest_path.write_text(json.dumps({
+                "pairs": [
+                    {"positive": positives[0].name, "negative": negatives[0].name},
+                    {"positive": positives[0].name, "negative": negatives[1].name},
+                ],
+            }))
+
+            pairing = gm_runtime.resolve_pairing(positives, negatives, manifest_path)
+            self.assertFalse(pairing["paired"])
+            self.assertIn("more than once", pairing["reason"])
+            self.assertEqual(
+                gm_runtime.cohort_report_label("paper_eval", True, pairing["paired"]),
+                "legacy_or_ablation_mode",
+            )
+
     def test_paper_eval_fails_closed_without_pairing(self):
         import run_verify_watermark
 

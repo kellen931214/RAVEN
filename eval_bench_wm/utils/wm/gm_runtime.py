@@ -265,13 +265,31 @@ def resolve_pairing(
         by_name_pos = {p.name: p for p in positives}
         by_name_neg = {p.name: p for p in negatives}
         candidates = []
+        used_pos, used_neg = set(), set()
         for item in declared:
             pos_name = Path(str(item.get("positive", ""))).name
             neg_name = Path(str(item.get("negative", ""))).name
             if pos_name not in by_name_pos or neg_name not in by_name_neg:
                 result["reason"] = f"pair manifest references unknown image(s) {pos_name!r}/{neg_name!r}"
                 return result
+            # One-to-one: an image may take part in exactly one pair. Without this
+            # a manifest could pair one image N times and silently drop the rest of
+            # the cohort while still declaring the right number of entries.
+            for role, name, used in (("positive", pos_name, used_pos), ("negative", neg_name, used_neg)):
+                if name in used:
+                    result["reason"] = f"pair manifest references {role} image {name!r} more than once"
+                    return result
+                used.add(name)
             candidates.append((by_name_pos[pos_name], by_name_neg[neg_name], item))
+
+        for role, used, by_name in (("positive", used_pos, by_name_pos), ("negative", used_neg, by_name_neg)):
+            unpaired = sorted(set(by_name) - used)
+            if unpaired:
+                result["reason"] = (
+                    f"pair manifest leaves {len(unpaired)} {role} image(s) unpaired "
+                    f"(e.g. {unpaired[0]!r})"
+                )
+                return result
         result["protocol"] = manifest.get("protocol")
     else:
         pos_by_stem = {p.stem: p for p in positives}

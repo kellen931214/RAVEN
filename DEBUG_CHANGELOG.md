@@ -251,6 +251,11 @@ Review of PR #10 found two follow-ups to the fail-closed work below:
   the pair. A required field absent from *both* sources still fails closed.
   `pairing_source` now records `pair_manifest`, `sample_metadata` or
   `pair_manifest+sample_metadata` per pair.
+- `resolve_pairing()` additionally enforces that a pair manifest declares a
+  *bijection*: each positive and each negative image may appear in exactly one
+  pair, and the referenced images must be exactly the two input cohorts. A
+  manifest with the right number of entries that pairs one image twice and drops
+  another is rejected.
 - `run_gm_generation()` checks `run_manifest.json` existence before building
   anything: when it exists, `--gm_bundle_dir` must already be a complete bundle
   and the provider is built with `create_bundle=False`. A new bundle can only be
@@ -268,7 +273,9 @@ Review of PR #10 found two follow-ups to the fail-closed work below:
   non-existent bundle path raises "Nothing was modified", and afterwards the
   bundle path does not exist and the output directory still contains only the
   original `run_manifest.json` with an unchanged SHA256.
-- `pytest eval_bench_wm/tests` → 91 passed, 10 subtests passed.
+- A pair manifest that pairs one image twice and leaves another unpaired is
+  rejected even though it declares the right number of entries.
+- `pytest eval_bench_wm/tests` → 92 passed, 10 subtests passed.
 
 ### Experimental integrity fields
 - Data source / detector score definition / threshold calibration source:
