@@ -425,6 +425,207 @@ calibration commit. Verification rejects an incompatible threshold artifact.
 
 ---
 
+## RingID (`--wm_type RID`)
+
+The RingID path is implemented for parity with the official code at
+
+```text
+https://github.com/showlab/RingID
+commit 45631a59aecd7d63ccdb640aaaf3e616fdb89fb9
+```
+
+(paper: *RingID: Rethinking Tree-Ring Watermarking for Enhanced Multi-Key
+Identification*, ECCV 2024). That commit is recorded in every bundle manifest,
+threshold artifact, result row and test. All RingID algorithms live in
+`utils/wm/ringid_provider.py`; `utils/wm/rid_bundle.py` holds the key-artifact
+schema/hashing and `utils/wm/rid_runtime.py` holds thin IO/scoring bookkeeping
+(reusing the shared GPU preflight, image enumeration, cohort pairing and ROC
+helpers). The runners only parse a CLI, enumerate inputs and serialize results.
+`tests/rid_official_reference.py` is a test-only transcription of the official
+code used for parity assertions and is never imported by runtime code.
+
+### Verification vs. identification
+
+RingID is not "one fixed key". Official `verify.py` uses candidate **628** as a
+single verification *example*; official `identify.py` traverses the whole
+candidate keybook. RAVEN keeps the two apart:
+
+| Mode | What it is | Label |
+| :--- | :--- | :--- |
+| `paper_eval_verification` | Official verification protocol: **verifiably paired** watermarked positives + non-watermarked negatives for ONE key, same inversion/detector path, canonical score, ROC, AUC and TPR at the requested FPR plus the resulting *experiment-specific* threshold. The paper uses 1000 + 1000 images; anything smaller is a smoke/debug run. | `official_paper_verification` |
+| `identify` / `paper_eval_identification` | Official multi-key identification: the channel-min distance against every candidate in the declared keybook, then `argmin`. Needs no true key; when per-image metadata declares one, identification accuracy is reported. | `official_paper_identification` |
+| `verify` | A RAVEN **deployment extension**: fixed-threshold decisions for individual suspect images from a bundle plus a compatible pre-calibrated threshold (or `--rid_threshold`). Not the paper protocol. | `deployment_verification_extension` / `calibrated_deployment_verification` / `user_supplied_threshold` |
+
+### Detector semantics (channel-min, not channel-average)
+
+```text
+recovered continuous latent -> FFT
+  -> masked complex L1 for channel 0 and channel 3 independently
+  -> rid_channel_min_l1 = min(channel_0_l1, channel_3_l1)      # official channel_min=1
+  -> rid_score = -rid_channel_min_l1                            # higher_is_watermarked
+  -> detected when rid_score >= threshold
+```
+
+Every result row carries `rid_channel_0_l1`, `rid_channel_3_l1`,
+`rid_channel_min_l1`, `rid_score`, `score_direction` and the comparison
+operator, so the raw positive distance always remains available. Batched input
+produces **one record per image**; a per-image failure is `status="error"`,
+never a negative detection.
+
+### The `official_sd21` profile
+
+`--rid_profile official_sd21` (the default) sets and validates the official
+values below. Generic RAVEN-wide parser defaults never override them. Any value
+given explicitly on the command line is recorded in `rid_profile_overrides` and
+the run is reported as an ablation (`rid_profile_is_official=false`).
+
+| Generation | Value | | Detection / key | Value |
+| :--- | ---: | --- | :--- | ---: |
+| model | `stabilityai/stable-diffusion-2-1-base` | | inversion prompt | `""` |
+| revision / dtype | `fp16` / `float16` | | inversion guidance | `1.0` |
+| scheduler | `DPMSolverMultistepScheduler` | | inversion steps | `50` |
+| resolution | `512` | | VAE | posterior **mode**, scale `0.18215` |
+| steps / guidance | `50` / `7.5` | | target FPR | `0.01` |
+| radius / cutoff | `14` / `3` | | `channel_min` | `1` |
+| ring / heterogeneous channel | `3` / `0` | | key RNG seed | `42` (official `--general_seed`) |
+| `ring_width` | `1` (anything else fails) | | key RNG device / dtype | `cpu` / `float32` |
+| quantization | `2` levels, `-64` / `+64` | | capacity | `2^(14-3) = 2048` |
+| `fix_gt` / `time_shift` | `1` / `1` | | shift semantics | `official_code_exact` |
+
+Inversion reuses the shared `official_forward_diffusion` transcription of the
+official `InversableStableDiffusionPipeline.forward_diffusion`: the DPM
+scheduler supplies only the timestep grid, `init_noise_sigma`,
+`scale_model_input` and `alphas_cumprod`, while the state update is the manual
+DDIM equation. `DPMSolverMultistepInverseScheduler` implements a *different*
+update rule and is deliberately not used on the RingID path.
+
+### Released code vs. paper-described shift
+
+| `--rid_shift_semantics` | Meaning |
+| :--- | :--- |
+| `official_code_exact` (default) | The released spatial shift. In the frozen commit the `* args.time_shift_factor` multiplication is **commented out**, so `--time_shift_factor` is an upstream **no-op**; passing anything but `1.0` in this mode fails with an explicit error. |
+| `paper_described_shift` | The paper's described scaling by eta (~0.8-0.9), applied explicitly. Available as `--rid_profile paper_shift_ablation`; it is never labelled released-code parity. |
+
+Upstream `--watermark_seed` (default 5) is parsed by both official scripts but
+never read; it is recorded in `upstream_unused_args` so it cannot be presented
+as an effective knob. RAVEN's one canonical key-generation seed is
+`--rid_key_seed`. The deprecated `--rid_seed` is accepted only with
+`--rid_profile legacy` and is never remapped onto an official key.
+
+### Key RNG and key identity
+
+Official `verify.py`/`identify.py` call `set_random_seed(general_seed)`, draw a
+base latent (whose *values* never reach the pattern — it starts from
+`zeros_like` — but whose *draw* advances the RNG), then draw one Gaussian
+tensor per candidate for the heterogeneous channel. RAVEN reproduces that call
+sequence exactly. The draws happen on the declared key-RNG device: the canonical
+default is a portable **CPU float32** draw so a key id means the same tensor on
+every machine; `--rid_key_rng_device cuda --rid_key_rng_dtype float16`
+reproduces the official runtime draw instead. The choice is always recorded in
+the bundle manifest (`rng_algorithm`, `rng_seed`, `rng_device`, `rng_dtype`).
+
+### Bundle layout
+
+```text
+<rid_bundle>/
+├── manifest.json          # schema, official commit, profile, key identity, RNG recipe, hashes
+├── selected_pattern.pt    # official complex pattern, shape (1, 4, 64, 64)
+├── watermark_mask.pt      # official bool mask, shape (2, 64, 64)
+└── threshold.json         # only after `calibrate` or an explicit import
+```
+
+The bundle stores the selected key verbatim plus the complete recipe needed to
+regenerate the candidate keybook for identification; a regenerated keybook is
+checked against `keybook_sha256`/`candidate_order_sha256` before it is used.
+Bundles are never silently overwritten, an edited manifest or tampered tensor is
+rejected on load, and a bundle whose key/detector configuration disagrees with
+the current run fails closed. An explicit `--rid_key_index` that disagrees with
+the bundle's key is rejected rather than silently substituted; omitting it
+adopts the bundle's own key.
+
+### Commands
+
+```bash
+# 1) Generate N watermarked images (+ their matched non-watermarked pair) for one key.
+#    Creates the bundle on first use and reuses it afterwards.
+python eval_bench_wm/run_watermark.py \
+  --wm_type RID --rid_profile official_sd21 --rid_key_index 628 \
+  --num 10 --seed 0 \
+  --rid_bundle_dir out/rid_bundle --out_dir out/rid_generation
+
+# 2) Official paper verification over paired cohorts (ROC, AUC, TPR@FPR)
+python eval_bench_wm/run_verify_watermark.py \
+  --mode paper_eval_verification --wm_type RID --rid_profile official_sd21 \
+  --rid_bundle_dir out/rid_bundle \
+  --clean_path data/rid/clean --watermarked_path data/rid/watermarked \
+  --target_fpr 0.01 --out_dir out/rid_verification
+
+# 3) Multi-key identification in a fresh process (no true key required)
+python eval_bench_wm/run_verify_watermark.py \
+  --mode identify --wm_type RID --rid_bundle_dir out/rid_bundle \
+  --suspect_path images/or_directory --out_dir out/rid_identification
+
+# 4) Deployment verification against a calibrated threshold
+python eval_bench_wm/run_verify_watermark.py \
+  --mode calibrate --wm_type RID --rid_bundle_dir out/rid_bundle \
+  --watermarked_path data/rid/watermarked --clean_path data/rid/clean \
+  --out_dir out/rid_calibration
+python eval_bench_wm/run_verify_watermark.py \
+  --mode verify --wm_type RID --rid_bundle_dir out/rid_bundle \
+  --suspect_path images/or_directory --out_dir out/rid_deployment
+```
+
+Generation output layout (indexed, never overwritten):
+
+```text
+<out_dir>/
+├── images/watermarked/000000.png ...
+├── images/no_watermark/000000.png ...   # matched pair, disable with --rid_no_clean_pair
+├── prompts/000000.txt ...
+├── sample_metadata/000000.json ...
+├── results.jsonl
+└── run_manifest.json
+```
+
+Each sample draws its own **complete** initial latent from an explicit
+`torch.Generator` seeded with `base_seed + sample_id`, so samples never share a
+latent, never depend on iteration order and reproduce exactly after a restart.
+Resume compares sample seed, prompt hash, run-config hash, bundle-config hash,
+selected-pattern hash and the on-disk image hash before skipping anything.
+
+### Paper distortion protocol
+
+The official evaluation conditions are `Clean`, `Rotation 75°`, `JPEG 25`,
+`Crop & Scale 0.75/0.75`, `Gaussian blur radius 8`, `Gaussian noise std 0.1`,
+`Brightness 6`. Paired verification samples must receive identical stochastic
+distortion parameters; the pairing gate rejects a cohort whose two sides declare
+different `distortion_config_sha256`/`distortion_seed`.
+
+### Backward compatibility
+
+Existing RID outputs are classified as follows:
+
+* Outputs produced with the plain circle-difference ring mask instead of the
+  official rounder ring: **invalid for official-parity claims** (a different
+  frequency region was scored).
+* Outputs whose detector averaged channels 0 and 3 into one number while
+  claiming official RingID: **invalid detector semantics**.
+* Outputs that reused one complete initial latent across prompts: **invalid for
+  formal multi-sample evaluation**.
+* Fixed-key-only outputs: they may support verification, but they are **not**
+  RingID identification results.
+* Outputs scored through the generic `DPMSolverMultistepInverseScheduler`
+  inversion without parity evidence: **legacy/approximate**.
+* The legacy fixed `RID_THRESHOLD` in `utils/utils.py` (nominal FPR `1e-3`) is a
+  **deployment legacy** operating point, not the paper's cohort-derived
+  TPR@1%FPR.
+* Outputs without key/pattern/mask/config hashes: **not independently
+  auditable**.
+* Results produced with a scaled spatial shift: **paper-described/ablation**,
+  never exact released-code parity.
+
+---
+
 ## HSQR (SFWMark) (`--wm_type HSQR`)
 
 Official reference: <https://github.com/thomas11809/SFWMark>, pinned comparison

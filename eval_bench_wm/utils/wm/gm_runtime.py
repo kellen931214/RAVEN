@@ -72,12 +72,14 @@ PAIR_DISTORTION_FIELDS = ("distortion_config_sha256", "distortion_seed")
 def load_pair_metadata(image_path: Path) -> typing.Optional[typing.Dict[str, typing.Any]]:
     """Locate the per-sample metadata sidecar for a cohort image.
 
-    Looked up as ``<dir>/../sample_metadata/<stem>.json`` (the layout written by
-    ``run_watermark.py``) and then ``<dir>/<stem>.json``.
+    Looked up next to the cohort directory and then at the run root, which is
+    where ``run_watermark.py`` actually writes it for the
+    ``<out_dir>/images/<cohort>/<stem>.png`` layout, and finally beside the image.
     """
     image_path = Path(image_path)
     candidates = (
         image_path.parent.parent / "sample_metadata" / f"{image_path.stem}.json",
+        image_path.parent.parent.parent / "sample_metadata" / f"{image_path.stem}.json",
         image_path.parent / "sample_metadata" / f"{image_path.stem}.json",
         image_path.parent / f"{image_path.stem}.json",
     )
@@ -333,15 +335,18 @@ def assert_resumable(
     name: str,
     existing: typing.Mapping[str, typing.Any],
     expected: typing.Mapping[str, typing.Any],
+    fields: typing.Sequence[str] = RESUME_FIELDS,
 ) -> None:
     """Fail closed unless an existing sample was produced by exactly this run.
 
     File existence alone is never sufficient (experiment-integrity skill §8).
+    ``fields`` lets a method declare its own state-identity fields (e.g. RingID
+    passes ``rid_bundle_config_sha256``); the comparison itself stays shared.
     """
     runner_common.assert_resumable(
         name,
         existing,
-        {field: expected[field] for field in RESUME_FIELDS if field in expected},
+        {field: expected[field] for field in fields if field in expected},
         method="GM",
     )
 
@@ -461,17 +466,20 @@ def official_roc(
     positive_scores: typing.Sequence[float],
     negative_scores: typing.Sequence[float],
     target_fpr: float,
+    score_definition: str = GM_SCORE_DEFINITION,
 ) -> typing.Dict[str, typing.Any]:
-    """Official ``Evaluator.eval_ensemble`` ROC bookkeeping.
+    """Official cohort ROC bookkeeping, shared by every higher-is-watermarked score.
 
-    Mirrors ``gaussmarker_det.py``: ``sklearn.metrics.roc_curve`` on the pooled
-    positive/negative ensemble probabilities, then the operating point at the
-    last index whose FPR is strictly below the target FPR.
+    Mirrors ``gaussmarker_det.py`` *and* RingID ``verify.py``, which perform the
+    identical computation: ``sklearn.metrics.roc_curve`` on the pooled
+    positive/negative scores, then the operating point at the last index whose
+    FPR is strictly below the target FPR (upstream ``tpr[np.where(fpr<.01)[0][-1]]``).
+    ``score_definition`` only labels the result; the arithmetic is the same.
     """
     return runner_common.official_roc(
         positive_scores,
         negative_scores,
         target_fpr,
-        score_definition=GM_SCORE_DEFINITION,
+        score_definition=score_definition,
         error_cls=GmBundleError,
     )

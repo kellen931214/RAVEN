@@ -10,6 +10,7 @@ This file records implementation bugs, validated non-bugs, ablations, and the ev
 | 2026-07-29 | HSQR (SFWMark) official alignment + standalone verification (Issue #5) | `HSQRProvider` stays the single authoritative HSQR implementation and gains an immutable `official_sfwmark_sd21` profile (base key seed 7433, explicit `--hsqr_key_index`, no global RNG), a persisted hash-bound SFW bundle, per-batch-item detector output, explicit `score = -L1 distance` semantics and an official-protocol inversion front-end. `run_watermark.py --wm_type HSQR` produces N indexed non-overwriting images with an independent complete base latent per sample; `run_verify_watermark.py --wm_type HSQR` verifies suspect images in a fresh process from the bundle alone. Legacy behaviour is preserved byte-for-byte under `legacy_raven`, which stays the parser default so the existing formal generators are unchanged. Two-sample GPU smoke on RTX 3090 separated watermarked (`-39.5`, `-42.8`) from clean (`-70.8`, `-71.3`) with ROC-AUC `1.0`; the run used the cached `RedbeardNZ` SD2.1-base mirror because `stabilityai/stable-diffusion-2-1-base` is not reachable, so it is labelled `legacy_or_ablation_mode`, not an official evaluation. Parity against the official code is now proven by executing the frozen official source, not transcribed: static fixtures (keys 0/1/1024/2047) and the whole inversion front-end are bitwise identical. The official weights remain unavailable, so published numbers are still not reproduced. | `eval_bench_wm/utils/wm/hsqr_provider.py`; `eval_bench_wm/utils/wm/sfw_bundle.py`; `eval_bench_wm/utils/wm/sfw_inversion.py`; `eval_bench_wm/utils/wm/sfw_runtime.py`; `eval_bench_wm/tests/test_hsqr_official_fixtures.py`; `eval_bench_wm/tests/test_hsqr_inversion_parity.py` |
 | 2026-07-29 | GM + T2S formal evaluation chain | GaussMarker and T2SMark are now runnable end-to-end through `run_raven_formal_eval.py`. Method dispatch is driven by the existing per-method provenance tables rather than literal `if method == "GS"` branches. GM detects from the cohort's persisted bundle (config read from the bundle manifest, never restated); T2S detects per sample from each row's portable state through a thin adapter over the same two standalone functions `run_verification.py` uses. Each method reports its own metric, threshold family and attack-success definition: GM `gm_raw_bit_accuracy` at a clean-calibrated empirical threshold (its official ensemble threshold does not exist for this bundle — no GNR, no classifier), T2S `t2s_score_true_key` under the stored `paired_key_comparison` rule, which is explicitly not TPR@1%FPR. No GPU smoke was run before the formal launch, by explicit user direction. | `raven_repro/scripts/extract_verification_scores.py`; `raven_repro/scripts/evaluate_verification.py`; `raven_repro/raven/eval_protocol.py`; `experiments/update_experiment_table.py` |
 | 2026-07-29 | GM + T2S `shared_tr_clean_v2` formal cohorts (Issue #9) | Formal 1001-row GM and T2S cohorts generated from fixed `main` `01ce7d7`, GPU 0 (RTX 3090, sm_86). All 1001 canonical clean images byte-identical before and after. The T2S runner's own final audit rejected the cohort on a `t2s_session_key_sha256` repeat, which is a birthday collision of a 16-bit key, not shared state; the audit gate was corrected and the cohort kept. T2S's in-runner summary/pairing/cross-method JSONs are absent (crash after the last row) and are supplied by the standalone cross-method audit instead. | `data/gm/diffusiondb_shared_tr/GM`; `data/t2s/diffusiondb_shared_tr/T2S`; `audit/shared_clean_tr_gs_gm_t2s.json`; `raven_repro/raven/pairing_provenance.py` |
+| 2026-07-29 | RingID official parity, multi-key identification and key bundles (Issue #3) | RingID now uses the official rounder-ring mask (it previously used the plain circle-difference mask), scores per channel with the official channel-wise **minimum** instead of one average over channels 0 and 3, returns one record per image instead of collapsing a batch, traverses the candidate keybook for `argmin` identification, samples an independent complete initial latent per sample, and persists a hash-verified key bundle that reloads in a fresh process. Official reference frozen at `45631a59aecd7d63ccdb640aaaf3e616fdb89fb9`. Released-code (`official_code_exact`, unscaled shift, `--time_shift_factor` a documented upstream no-op) and paper-described scaled shift are separate labelled profiles. CPU parity/artifact suite: 53 passed. No formal cohort generated. | `eval_bench_wm/utils/wm/ringid_provider.py`; `eval_bench_wm/utils/wm/rid_bundle.py`; `eval_bench_wm/utils/wm/rid_runtime.py`; `eval_bench_wm/tests/test_rid_official_parity.py`; `eval_bench_wm/tests/test_rid_bundle.py` |
 | 2026-07-28 | GM + T2S `shared_tr_clean_v2` (Issue #9, phase 1) | GaussMarker and T2SMark now consume the canonical Tree-Ring source row — same prompt, base latent, clean image and generation config — and generate only their own watermarked image. New authoritative provider entrypoints `GmProvider.get_wm_latents_from_base_latent` and the T2S `|z|`-multiset consumption gate prove the supplied latent was embedded into rather than replaced. Cross-method audit extended to TR/GS/GM/T2S. Two-row GPU smoke passed; the canonical clean images are byte-identical before and after. No formal 1000/1001 cohort generated. | `experiments/generate_gm_from_tr_shared_clean.py`; `experiments/generate_t2s_from_tr_shared_clean.py`; `experiments/shared_clean_tr.py`; `raven_repro/scripts/audit_shared_clean_cohorts.py`; `raven_repro/tests/test_shared_tr_clean_gm_t2s.py`; `docs/SHARED_TR_CLEAN_V2.md` |
 | 2026-07-28 | GaussMarker official parity, bundles and standalone verification | GM generation now samples a complete initial latent per sample from a deterministic seed with official legacy-RNG semantics, creates official ChaCha20 state, and persists an official-interchangeable `w1.pth`/`w2.pth`/`manifest.json` bundle. Standalone verification, threshold calibration and paper evaluation run from that bundle alone. Official reference frozen at `4ac9bfd4e152a56bd93c2a06a809ef6ff8e73155`. Bundle reuse, `paper_eval` cohort pairing and `run_manifest.json` resume are all fail-closed: a bundle must match the full detector configuration and can only lose officialness, never gain it; `official_paper_evaluation` requires a verified one-to-one pairing; a mismatched run manifest stops the run without modifying any file. | `eval_bench_wm/utils/wm/gm_provider.py`; `eval_bench_wm/utils/wm/gm_bundle.py`; `eval_bench_wm/run_verify_watermark.py`; `eval_bench_wm/tests/test_gm_official_parity.py` |
 | 2026-07-28 | T2S review follow-up (PR #8) | Restored upstream's full generation RNG lifecycle (`official_compatible`, default) and separated the RAVEN `raven_deterministic` mode without claiming upstream-exactness; `--t2s_fix_key` now fixes master key AND message per upstream `run.py`; `state_sha256` is mandatory; verification fails closed on mixed state/config; per-image rule relabelled `paired_key_comparison` (RAVEN extension) since upstream evaluates a cohort ROC. | `eval_bench_wm/utils/wm/t2s_provider.py`; `eval_bench_wm/run_verification.py`; `eval_bench_wm/tests/test_t2s_parity.py` |
@@ -804,6 +805,277 @@ gate rather than the pairing-hash gate.
 
 ### Validation
 - `raven_repro`: 427 passed (425 before + 2 new).
+## 2026-07-29 — RingID: official verification, multi-key identification and persisted key artifacts (Issue #3)
+
+### Problem
+The RingID (`RID`) provider claimed parity with the official ECCV 2024
+implementation but diverged from it in ways that change the detector, the
+watermark identity and the evaluation protocol:
+
+1. **Wrong mask.** `USE_ROUNDER_RING = True` in the official `utils.py` rebinds
+   `ring_mask` to the rounder-ring implementation at import time, so every
+   official mask — the watermark region mask *and* every single-radius ring
+   inside `make_Fourier_ringid_pattern` — is a rounder ring. RAVEN defined the
+   `RounderRingMask` class but never called it and used the plain
+   circle-difference mask instead (584 vs 556 selected coefficients per channel),
+   i.e. it injected into and scored a different frequency region.
+2. **Channel averaging.** `__get_l1_distance()` stored `channel_min` but ignored
+   it and took one masked mean over channels 0 and 3 together. The official
+   `get_distance(..., channel_min=1)` computes a masked complex L1 per channel
+   and returns the **minimum**.
+3. **No identification.** Only `Fourier_watermark_pattern_list[628]` was kept;
+   the keybook was never traversed, so RingID's defining multi-key
+   identification did not exist. Key 628 is the official `verify.py` *example*,
+   not the method.
+4. **Batch collapse.** `__get_l1_distance()` reduced the batch dimension into one
+   scalar, merging several suspect images into a single detector score.
+5. **One latent for the whole run.** The generic runner called
+   `get_wm_latents()` once before the prompt loop and reused that complete
+   initial latent for every image, and wrote a single overwritten
+   `watermarked_image.png`.
+6. **No official profile, no key artifact.** Generation defaulted to SDXL/DDIM/
+   float32; the key existed only as process-global RNG state, so nothing could
+   be verified or identified in a fresh process, and `--rid_seed 999999` was
+   presented as a RingID key.
+7. **Silently ignored / misrepresented flags.** `--ring_width` was parsed but
+   never passed (the function default silently won) and `--time_shift_factor`
+   was exposed as an effective knob although the released code has the
+   multiplication commented out.
+8. **Conflated thresholds.** The legacy fixed `RID_THRESHOLD` (nominal FPR
+   `1e-3`) was used as if it were the paper's cohort-derived operating point.
+9. **Dead buggy detector.** `__get_p_value()` overwrote `self.watermarking_mask`
+   with a zero mask as a side effect, permanently corrupting the provider for
+   any later call.
+
+### Root cause
+The provider was a partial transcription of the official scripts: the module
+level `ring_mask` rebinding was copied but the class-private `__ring_mask`
+static method was the one actually called; the keybook/`channel_min` code was
+copied as an unused free function (`get_distance`, defined without `self` and
+never invoked); and the runner-level lifecycle (per-prompt latent, per-sample
+output, persisted key) was never ported.
+
+### Affected files
+- `eval_bench_wm/utils/wm/ringid_provider.py` — authoritative implementation
+  (masks, keybook, `fix_gt`, spatial shift, injection, per-channel distances,
+  `identify_key`, inversion adapter, profiles, bundle binding, thresholds)
+- `eval_bench_wm/utils/wm/rid_bundle.py` — new key-artifact schema/persistence
+- `eval_bench_wm/utils/wm/rid_runtime.py` — new thin IO/scoring bookkeeping
+- `eval_bench_wm/run_watermark.py:run_rid_generation` — RingID generation flow
+- `eval_bench_wm/run_verify_watermark.py:rid_main` — verify / calibrate /
+  `paper_eval_verification` / `identify` / `paper_eval_identification`
+- `eval_bench_wm/utils/wm/gm_runtime.py` — `official_roc` and `assert_resumable`
+  parameterized so RingID reuses them instead of copying them
+- `eval_bench_wm/README.md`, `eval_bench_wm/tests/*rid*`
+
+### Affected outputs
+No RID cohort was regenerated and no formal 1000/1001 run was executed. Existing
+RID outputs are classified in `eval_bench_wm/README.md` ("Backward
+compatibility"): plain-circle-mask outputs and channel-averaged scores are
+invalid for official-parity claims; shared-latent multi-sample outputs are
+invalid for independent-sample evaluation; fixed-key outputs are not
+identification results; generic-inverse-scheduler outputs are legacy/approximate;
+legacy-threshold decisions are deployment legacy, not TPR@1%FPR.
+
+### Fix
+- **Masks.** One module-level `ring_mask()` implements the official
+  `USE_ROUNDER_RING` behaviour (lazily built and memoized, since the official
+  360-rotation vote costs ~8 s) and is used by the region mask *and* by
+  `make_Fourier_ringid_pattern`. `plain_ring_mask` is kept, explicitly named, for
+  the parity test that proves the two differ.
+- **Detector.** `official_channel_distances()` transcribes the official
+  per-channel masked complex L1; `channel_distances()` returns
+  `rid_channel_0_l1`, `rid_channel_3_l1`, `rid_channel_min_l1`,
+  `rid_score = -rid_channel_min_l1`, `score_direction=higher_is_watermarked`
+  and the raw positive distance — **one record per batch item**.
+- **Identification.** `identify_key()` traverses the declared candidate keybook
+  (full official 2048 by default, or an explicitly declared subset) and returns
+  `predicted_key_index/_id`, `best_distance`, `second_best_distance`,
+  `identification_margin`, `candidate_count`, `top_k_*`, `keybook_sha256` and —
+  only when a true key is known — `identification_correct`. Ties resolve to the
+  lowest candidate index (stable sort = upstream `np.argmin`).
+- **Per-sample latents.** `sample_clean_latent(seed)` draws the complete initial
+  latent from an explicit `torch.Generator` (`base_seed + sample_id`) instead of
+  resetting process-global RNG; `build_sample_latents()` returns the matched
+  clean/watermarked pair with `clean_latent_sha256 ==
+  pre_injection_latent_sha256`. Generation fails closed if any two samples share
+  a complete latent.
+- **Key RNG.** `iter_candidate_patterns()` reproduces the official RNG call
+  sequence exactly (seed → base-latent draw → one Gaussian draw per candidate),
+  including drawing and discarding the candidates it does not need, so a subset
+  build yields the official keys. The whole construction runs on the declared
+  key-RNG device; the canonical default is a portable CPU float32 draw and
+  `--rid_key_rng_device cuda --rid_key_rng_dtype float16` reproduces the official
+  runtime draw. `rng_algorithm/seed/device/dtype` are recorded in the manifest.
+- **Key artifact.** `<rid_bundle>/manifest.json + selected_pattern.pt +
+  watermark_mask.pt [+ threshold.json]`, with the full regeneration recipe,
+  `candidate_order_sha256`, `selected_pattern_sha256`, `mask_sha256` and the
+  frozen official commit. Never overwritten; edited manifests, tampered tensors,
+  foreign schemas, incompatible key or detector configurations and a
+  `--rid_key_index` that disagrees with the bundle all fail closed.
+- **Profiles.** `official_sd21` pins SD2.1-base / fp16 / DPM / 512 / 50 / 7.5 and
+  the official detection settings (empty prompt, guidance 1.0, 50 steps, VAE
+  posterior **mode**, scale 0.18215). Explicit CLI values are recorded in
+  `rid_profile_overrides` and downgrade the run to a labelled ablation.
+  `ring_width != 1` fails; `--time_shift_factor != 1.0` fails in
+  `official_code_exact` mode and is only effective in the separate
+  `paper_shift_ablation` profile. Upstream `--watermark_seed` is recorded in
+  `upstream_unused_args`. `--rid_seed` is accepted only with `--rid_profile
+  legacy` and is never remapped onto an official key.
+- **Inversion.** RingID uses the shared `official_forward_diffusion`
+  transcription (DPM scheduler for the timestep grid/`init_noise_sigma`/
+  `scale_model_input`/`alphas_cumprod`, manual DDIM update), not
+  `DPMSolverMultistepInverseScheduler`, plus official `transform_img`, VAE
+  posterior mode and empty-prompt embedding.
+- **Protocol separation.** `paper_eval_verification` (paired cohorts → ROC → AUC
+  and TPR at the requested FPR, threshold labelled experiment-specific) is
+  distinct from `verify` (deployment extension, provenance-bound threshold) and
+  from `identify`. Report labels are validated against a fixed list.
+- **Removed** the dead `__get_p_value()` mask-corrupting path and the unused
+  free-function `get_distance`; per-image failures are `status="error"`.
+- **Pair-metadata lookup.** `gm_runtime.load_pair_metadata` also looks in
+  `<run_root>/sample_metadata/`, which is where `run_watermark.py` actually
+  writes sidecars for the `<out_dir>/images/<cohort>/<stem>.png` layout. Without
+  it the paired-cohort gate rejected a correctly paired cohort produced by our
+  own generator (this affected GaussMarker's `paper_eval` too).
+
+### Reused code
+`utils/wm/ddim_inversion.py:official_forward_diffusion` (the official RingID and
+GaussMarker inversion loops are the same file upstream); `gm_bundle`'s canonical
+JSON/hashing/git-provenance helpers, re-exported by `rid_bundle` so a RAVEN
+artifact hash means the same thing for every method; `gm_runtime`'s
+`gpu_preflight`, `enumerate_images`, `resolve_pairing`,
+`assert_run_manifest_compatible`, `assert_resumable` and `official_roc` — the
+latter two were parameterized (`fields=`, `score_definition=`) rather than
+copied. `utils/pipe/pipe_utils` for model loading and
+`utils.imprint_utils.validate`'s existing `invert_images` hook.
+
+### Historical bug coverage
+Reviewed the 2026-07-17 Tree-Ring shared-latent entry and the 2026-07-28
+GaussMarker/T2S entries (same classes of bug: one latent reused for a whole run,
+overwritten single-image output, undocumented process-global key state,
+conflated paper/deployment thresholds). Searched for the old RID patterns:
+`__get_l1_distance`, `__get_p_value`, `Fourier_watermark_pattern_list[628]` and
+`RingIDProvider.get_distance` — none of them exists any more.
+`rg "wm_type == \"RID\"|WmProviders\[.*RID"` confirms the generic
+single-latent loop in `run_watermark.py` is no longer reachable for RID. The
+legacy `RID_THRESHOLD` / `check_if_detection_successful("RID", ...)` helpers in
+`utils/utils.py` remain for the older `run_verification.py`/experiment scripts
+and are documented as deployment legacy; the RingID path never uses them.
+
+### Regression prevention
+`eval_bench_wm/tests/rid_official_reference.py` is a literal, network-free
+transcription of the official `utils.py`/`verify.py`/`identify.py` at the frozen
+commit and is never imported by runtime code. The parity suite asserts, against
+that reference: rounder-ring vs plain-circle masks, the region/heterogeneous
+channel masks, official `itertools.product` candidate ordering, capacity
+`2^(14-3) = 2048`, key 628 element-by-element, the heterogeneous Gaussian channel
+under the frozen RNG fixture, `fix_gt` and the spatial shift, the injected
+Fourier tensor and real IFFT latent, per-channel and channel-min L1, the
+explicit "no channel averaging" regression, one score per batch item, argmin and
+top-k identification against the official traversal loop, deterministic tie
+behaviour, `ring_width != 1` and no-op-flag rejection, profile override
+downgrades, legacy-seed rejection, per-sample latent independence and
+order-independence. The artifact suite covers bundle round-trip, required
+manifest fields, overwrite refusal, edited-manifest/tampered-tensor/foreign
+schema/incompatible-config rejection, threshold binding, a **fresh-process**
+reload that re-identifies key 628 from the bundle alone, indexed non-overwriting
+multi-sample generation, resume reproduction, resume rejection on a changed
+seed, corrupt-image error records and cohort ROC bookkeeping.
+
+### Validation
+```text
+python -m pytest eval_bench_wm/tests/test_rid_official_parity.py -q   # 32 passed, 9 subtests
+python -m pytest eval_bench_wm/tests/test_rid_bundle.py -q            # 21 passed
+python -m pytest eval_bench_wm/tests -q                               # full CPU suite, see PR
+```
+GPU smoke (Issue #3 minimum only; outputs under
+`outputs/smoke/rid_issue3/`, not a formal cohort). GPU preflight healthy
+(RTX 3090, CUDA 12.4, torch 2.5.1).
+
+**Model blocker (open).** The official `official_sd21` profile could **not** be
+exercised end-to-end on GPU, because `stabilityai/stable-diffusion-2-1-base` is
+not obtainable in this environment. Verified on 2026-07-29:
+
+| Probe | Result |
+| :--- | :--- |
+| `GET /api/models/stabilityai/stable-diffusion-2-1-base`, anonymous | `401 Invalid username or password.` |
+| same, with the stored HF token | `401` |
+| `GET /stabilityai/stable-diffusion-2-1-base/resolve/main/model_index.json` | `401` |
+| `stabilityai/stable-diffusion-2-1` | `401` |
+| `stabilityai/stable-diffusion-xl-base-1.0`, `CompVis/stable-diffusion-v1-4` | `200` (so this is repo access, not the network) |
+| `HfApi.whoami()` with the stored token | `Invalid user token` |
+| filesystem search for a `models--stabilityai--stable-diffusion-2-1*` snapshot | none present |
+
+Re-verified on 2026-07-29 after a fresh `huggingface-cli login` (OAuth token,
+`whoami` → user `kellen931214`, valid until 2026-08-28). The credential is now
+good, but the repository itself is not reachable for this account:
+
+| Probe (authenticated, valid token) | Result |
+| :--- | :--- |
+| `GET /api/models/stabilityai/stable-diffusion-2-1-base` | `404 {"error":"Repository not found"}` |
+| `GET /api/models/stabilityai/stable-diffusion-2-1-base/revision/fp16` | `404 Repository not found` |
+| `snapshot_download(..., revision="fp16")` | `RepositoryNotFoundError` (404) |
+| `stabilityai/stable-diffusion-2-1`, `stabilityai/stable-diffusion-2-base`, `stabilityai/stable-diffusion-2` | `404` |
+| `stabilityai/stable-diffusion-xl-base-1.0`, `stabilityai/sd-turbo`, `CompVis/stable-diffusion-v1-4` | `200` |
+| `HfApi.list_models(author="stabilityai")` | 117 repos, **none** matching `stable-diffusion-2*` |
+| same probes, anonymous | `401 Invalid username or password.` |
+
+So the blocker is no longer a credential or licence-acceptance problem: the
+official `stabilityai/stable-diffusion-2-1*` repositories are absent from the Hub
+for this account (404 with a valid token, and delisted from the author's model
+listing). Nothing in this environment can supply an official snapshot; obtaining
+one requires the upstream repository to be restored, or an out-of-band copy whose
+provenance against the official weights can be verified.
+
+The smoke below therefore ran on the cached byte-copy mirror
+`RedbeardNZ/stable-diffusion-2-1-base` at the repository-default revision
+(snapshot `c6a5e9bab8d874d081de76fa270ae0aefa5410ff`). Both values were passed
+explicitly, so the profile machinery recorded them in `rid_profile_overrides`,
+set `rid_profile_is_official=false` and labelled every result
+`legacy_or_ablation_mode`. This evidence is **non-official** and is deliberately
+not relabelled: the mirror's byte-equality with the official weights cannot be
+verified without the official files. The Issue #3 acceptance item "GPU
+parity/smoke passes when GPU preflight is healthy" for the `official_sd21`
+profile remains **outstanding**; everything else below was exercised.
+
+| Check | Result |
+| :--- | :--- |
+| 2 images per key, 2 keys (628, 1000), DPM/fp16/512/50/7.5 | generated |
+| independent complete initial latents | 2 distinct clean and 2 distinct watermarked latent hashes per cohort |
+| constant key identity within a cohort | `3cdc758baed14965` (628), `58fd9c614c7fe34a` (1000) |
+| matched positive/negative mini-cohort (`paper_eval_verification`, 2+2 paired) | ROC-AUC `1.0`, TPR@target-FPR `1.0`, empirical FPR `0.0`, cohort threshold `-35.0687` |
+| identification, fresh process, bundle only, full 2048-candidate keybook | key 628 cohort 2/2 correct; key 1000 cohort 2/2 correct (from the key-628 bundle) |
+| keybook reproducibility across processes | `keybook_sha256 = 5451c0d105b200ca…` identical in both runs |
+| finite scores | all channel/min distances and scores finite; 0 error rows |
+
+No attack, FID, CLIP, PSNR/SSIM or benchmark run.
+
+### Watermark-specific status
+- source-data validity: no cohort generated; smoke outputs only
+- clean/watermarked pairing: matched per sample, `clean_latent_sha256 ==
+  pre_injection_latent_sha256`, both recorded per sample
+- base-latent uniqueness: enforced fail-closed across samples
+- watermark target/mask status: `selected_pattern_sha256` and `mask_sha256`
+  recorded per sample and in the bundle manifest
+- attack pairing: not exercised (out of scope for Issue #3)
+- detector score definition: `rid_neg_channel_min_complex_l1`,
+  `higher_is_watermarked`, `score >= threshold`
+- threshold calibration source: cohort ROC (`paper_eval_verification` /
+  `calibrate`) or an explicit `--rid_threshold`; no fixed constant
+- actual empirical FPR: reported next to the target FPR by `official_roc`
+- quality metrics / CLIP / FID: not computed
+- outputs requiring regeneration: any previous RID output claiming official
+  parity (see README "Backward compatibility")
+
+### Git provenance
+- Repository: RAVEN
+- Branch: `issue-3-ringid-official-parity`
+- Base `main` HEAD: `01ce7d7ed01f97070b71dc0dc17b08ee17ede34b`
+- Entry point: `eval_bench_wm/run_watermark.py:run_rid_generation`,
+  `eval_bench_wm/run_verify_watermark.py:rid_main`
+- Formal output eligibility: none — no formal cohort was produced
+
 
 ## 2026-07-28 — Shared-clean review follow-up: run-id coverage, source binding, artifact verification and a fail-closed run manifest
 
