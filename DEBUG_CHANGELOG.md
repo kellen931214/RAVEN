@@ -298,7 +298,7 @@ not obtainable in this environment. Verified on 2026-07-29:
 
 | Probe | Result |
 | :--- | :--- |
-| `GET /api/models/stabilityai/stable-diffusion-2-1-base`, anonymous | `401` |
+| `GET /api/models/stabilityai/stable-diffusion-2-1-base`, anonymous | `401 Invalid username or password.` |
 | same, with the stored HF token | `401` |
 | `GET /stabilityai/stable-diffusion-2-1-base/resolve/main/model_index.json` | `401` |
 | `stabilityai/stable-diffusion-2-1` | `401` |
@@ -306,10 +306,26 @@ not obtainable in this environment. Verified on 2026-07-29:
 | `HfApi.whoami()` with the stored token | `Invalid user token` |
 | filesystem search for a `models--stabilityai--stable-diffusion-2-1*` snapshot | none present |
 
-No official snapshot and no verifiable official cache exists on this machine, and
-the stored Hugging Face credential is invalid, so the gated repository cannot be
-accepted or fetched. Obtaining it requires a human to log in with a token whose
-account has accepted the model licence (`huggingface-cli login`).
+Re-verified on 2026-07-29 after a fresh `huggingface-cli login` (OAuth token,
+`whoami` → user `kellen931214`, valid until 2026-08-28). The credential is now
+good, but the repository itself is not reachable for this account:
+
+| Probe (authenticated, valid token) | Result |
+| :--- | :--- |
+| `GET /api/models/stabilityai/stable-diffusion-2-1-base` | `404 {"error":"Repository not found"}` |
+| `GET /api/models/stabilityai/stable-diffusion-2-1-base/revision/fp16` | `404 Repository not found` |
+| `snapshot_download(..., revision="fp16")` | `RepositoryNotFoundError` (404) |
+| `stabilityai/stable-diffusion-2-1`, `stabilityai/stable-diffusion-2-base`, `stabilityai/stable-diffusion-2` | `404` |
+| `stabilityai/stable-diffusion-xl-base-1.0`, `stabilityai/sd-turbo`, `CompVis/stable-diffusion-v1-4` | `200` |
+| `HfApi.list_models(author="stabilityai")` | 117 repos, **none** matching `stable-diffusion-2*` |
+| same probes, anonymous | `401 Invalid username or password.` |
+
+So the blocker is no longer a credential or licence-acceptance problem: the
+official `stabilityai/stable-diffusion-2-1*` repositories are absent from the Hub
+for this account (404 with a valid token, and delisted from the author's model
+listing). Nothing in this environment can supply an official snapshot; obtaining
+one requires the upstream repository to be restored, or an out-of-band copy whose
+provenance against the official weights can be verified.
 
 The smoke below therefore ran on the cached byte-copy mirror
 `RedbeardNZ/stable-diffusion-2-1-base` at the repository-default revision
