@@ -11,51 +11,20 @@ copy.
 from __future__ import annotations
 
 import json
-import platform
 import typing
 from pathlib import Path
 
-import numpy as np
 import torch
 from PIL import Image
 
-from . import gm_bundle
+from . import gm_bundle, runner_common
 from .gm_bundle import GmBundleError
 from .gm_provider import GM_SCORE_DEFINITION, TORCH_DTYPES, GmProvider
-
-
-IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tif", ".tiff")
-
-
-def gpu_preflight(device: torch.device) -> typing.Dict[str, typing.Any]:
-    """Fail closed on the Docker/NVML/CUDA failures described in AGENTS.md."""
-    info = {
-        "device": str(device),
-        "torch_version": torch.__version__,
-        "cuda_available": bool(torch.cuda.is_available()),
-        "device_count": int(torch.cuda.device_count()) if torch.cuda.is_available() else 0,
-        "platform": platform.platform(),
-    }
-    if device.type != "cuda":
-        return info
-    if not torch.cuda.is_available() or torch.cuda.device_count() == 0:
-        raise RuntimeError("GPU preflight failed: CUDA is not available inside this container")
-    probe = torch.ones(8, device=device)
-    if float((probe * 2).sum().item()) != 16.0:
-        raise RuntimeError("GPU preflight failed: basic CUDA kernel execution is wrong")
-    info["device_name"] = torch.cuda.get_device_name(device)
-    return info
-
-
-def enumerate_images(path: typing.Union[str, Path]) -> typing.List[Path]:
-    """One image or a deterministically sorted directory of images."""
-    path = Path(path)
-    if path.is_file():
-        return [path]
-    if not path.is_dir():
-        raise FileNotFoundError(f"suspect path does not exist: {path}")
-    images = [p for p in path.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_SUFFIXES]
-    return sorted(images, key=lambda p: p.name)
+from .runner_common import (  # noqa: F401 - re-exported for existing GM callers
+    IMAGE_SUFFIXES,
+    enumerate_images,
+    gpu_preflight,
+)
 
 
 def build_pipe_provider(args, device: torch.device):
@@ -349,18 +318,7 @@ def assert_run_manifest_compatible(
     yet and the caller may create one. An incompatible manifest raises and the
     output directory is left untouched.
     """
-    manifest_path = Path(manifest_path)
-    if not manifest_path.exists():
-        return None
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    existing = manifest.get("run_config_sha256")
-    if existing != run_config_sha256:
-        raise RuntimeError(
-            f"GM run manifest {manifest_path} was written by a different configuration "
-            f"(existing run_config_sha256 {existing!r}, current {run_config_sha256!r}); "
-            "nothing was modified. Use a fresh --out_dir."
-        )
-    return manifest
+    return runner_common.assert_run_manifest_compatible(manifest_path, run_config_sha256, method="GM")
 
 
 RESUME_FIELDS = (
@@ -380,14 +338,12 @@ def assert_resumable(
 
     File existence alone is never sufficient (experiment-integrity skill §8).
     """
-    for field in RESUME_FIELDS:
-        if field not in expected:
-            continue
-        if existing.get(field) != expected[field]:
-            raise RuntimeError(
-                f"GM sample {name} cannot be resumed: {field} differs "
-                f"(existing {existing.get(field)!r}, current {expected[field]!r}); use a fresh --out_dir"
-            )
+    runner_common.assert_resumable(
+        name,
+        existing,
+        {field: expected[field] for field in RESUME_FIELDS if field in expected},
+        method="GM",
+    )
 
 
 def run_provenance(args, provider: GmProvider, pipe_provider) -> typing.Dict[str, typing.Any]:
@@ -512,43 +468,10 @@ def official_roc(
     positive/negative ensemble probabilities, then the operating point at the
     last index whose FPR is strictly below the target FPR.
     """
-    try:
-        from sklearn import metrics
-    except ImportError as exc:  # pragma: no cover - dependency gate
-        raise ImportError("GM cohort evaluation requires scikit-learn") from exc
-
-    if not positive_scores or not negative_scores:
-        raise GmBundleError("GM ROC evaluation needs a non-empty positive and negative cohort")
-
-    labels = [1] * len(positive_scores) + [0] * len(negative_scores)
-    preds = list(positive_scores) + list(negative_scores)
-    if not np.isfinite(preds).all():
-        raise GmBundleError("GM ROC evaluation received a non-finite score")
-
-    fpr, tpr, thresholds = metrics.roc_curve(labels, preds, pos_label=1)
-    auc = float(metrics.auc(fpr, tpr))
-    acc = float(np.max(1 - (fpr + (1 - tpr)) / 2))
-    below = np.where(fpr < target_fpr)[0]
-    if below.size == 0:
-        raise GmBundleError(
-            f"no ROC operating point with FPR < {target_fpr}; cohort is too small or too noisy"
-        )
-    index = int(below[-1])
-    threshold = float(thresholds[index])
-    decisions_neg = [score >= threshold for score in negative_scores]
-    decisions_pos = [score >= threshold for score in positive_scores]
-    return {
-        "roc_auc": auc,
-        "best_accuracy": acc,
-        "target_fpr": float(target_fpr),
-        "threshold": threshold,
-        "tpr_at_target_fpr": float(tpr[index]),
-        "roc_fpr_at_threshold": float(fpr[index]),
-        "empirical_fpr": float(np.mean(decisions_neg)),
-        "empirical_tpr": float(np.mean(decisions_pos)),
-        "positive_count": len(positive_scores),
-        "negative_count": len(negative_scores),
-        "comparison_operator": ">=",
-        "score_direction": "higher_is_watermarked",
-        "score_definition": GM_SCORE_DEFINITION,
-    }
+    return runner_common.official_roc(
+        positive_scores,
+        negative_scores,
+        target_fpr,
+        score_definition=GM_SCORE_DEFINITION,
+        error_cls=GmBundleError,
+    )

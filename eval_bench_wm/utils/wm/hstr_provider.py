@@ -7,9 +7,8 @@ import numpy as np
 import torch
 import torchvision
 
-from . import hstr_bundle
+from . import sfw_bundle, sfw_inversion
 from .wm_provider import WmProvider
-from utils.canonical import canonical_json_sha256, tensor_sha256
 from utils.image_utils import torch_to_PIL
 from utils import utils
 
@@ -105,31 +104,35 @@ class HSTRProvider(WmProvider):
             self._validate_official_profile()
 
         self.masks, self.watermark_region_mask_hstr = self.__get_watermarking_mask()
-        self.bundle: hstr_bundle.HstrBundle | None = None
+        self.bundle: sfw_bundle.SfwBundle | None = None
         self.state_source = "in_memory"
         full_keybook = None
         if hstr_bundle_dir and not hstr_create_bundle:
-            self.bundle = hstr_bundle.HstrBundle.load(hstr_bundle_dir)
-            self.gt_patch = self.bundle.selected_pattern.to(self.device)
-            self.bundle.assert_compatible(self.provider_config())
+            self.bundle = sfw_bundle.SfwBundle.load(hstr_bundle_dir)
+            self.gt_patch = self.bundle.pattern.to(self.device)
+            self.bundle.assert_compatible(
+                self.provider_config(),
+                required_fields=sfw_bundle.HSTR_BUNDLE_COMPAT_FIELDS,
+            )
             self.state_source = "bundle"
         else:
             self.gt_patch = self.__get_watermarking_pattern()
             if hstr_save_full_keybook:
                 full_keybook = torch.stack(self.__get_watermarking_pattern_list(), dim=0)
             if hstr_bundle_dir:
-                self.bundle = hstr_bundle.HstrBundle.create(
+                if hstr_overwrite_bundle:
+                    raise ValueError("HSTR shared SFW bundles are immutable; use a fresh --hstr_bundle_dir")
+                self.bundle = sfw_bundle.SfwBundle.create(
                     hstr_bundle_dir,
-                    provider_config=self.provider_config(),
-                    selected_pattern=self.gt_patch,
-                    full_keybook=full_keybook,
-                    overwrite=hstr_overwrite_bundle,
+                    pattern=self.gt_patch,
+                    config=self.provider_config(),
+                    keybook=full_keybook,
                 )
-                self.gt_patch = self.bundle.selected_pattern.to(self.device)
+                self.gt_patch = self.bundle.pattern.to(self.device)
                 self.state_source = "bundle_created"
 
-        self.selected_pattern_sha256 = tensor_sha256(self.gt_patch)
-        self.watermark_mask_sha256 = tensor_sha256(self.watermark_region_mask_hstr)
+        self.selected_pattern_sha256 = sfw_bundle.sha256_tensor(self.gt_patch)
+        self.watermark_mask_sha256 = sfw_bundle.sha256_tensor(self.watermark_region_mask_hstr)
 
     @staticmethod
     def _legacy_key_index(fix_gt: int) -> int:
@@ -175,32 +178,44 @@ class HSTRProvider(WmProvider):
         return "HSTR"
 
     def provider_config(self) -> dict[str, typing.Any]:
-        return hstr_bundle.build_provider_config(
-            profile_name=self.profile,
-            model_id=self.model_id,
-            model_revision=self.model_revision,
-            scheduler_type=self.scheduler_type,
-            resolution=self.resolution,
-            latent_shape=list(self.latent_shape),
-            center_slice=[self.start, self.end],
-            radius=RADIUS,
-            radius_cutoff=RADIUS_CUTOFF,
-            watermark_channels=TREE_WATERMARK_CHANNEL,
-            heterogeneous_channels=HETER_WATERMARK_CHANNEL,
-            wm_capacity=self.wm_capacity,
-            base_key_seed=self.base_key_seed,
-            selected_key_index=self.key_index,
-            selected_key_seed=self.selected_key_seed,
-            rng_algorithm=(
+        return {
+            "schema": sfw_bundle.SFW_BUNDLE_SCHEMA,
+            "method": "HSTR",
+            "profile_name": self.profile,
+            "model_id": self.model_id,
+            "model_revision": self.model_revision,
+            "scheduler_type": self.scheduler_type,
+            "torch_dtype": str(self.dtype).replace("torch.", ""),
+            "resolution": int(self.resolution),
+            "latent_shape": [int(x) for x in self.latent_shape],
+            "center_slice": [int(self.start), int(self.end)],
+            "radius": int(RADIUS),
+            "radius_cutoff": int(RADIUS_CUTOFF),
+            "watermark_channels": [int(x) for x in TREE_WATERMARK_CHANNEL],
+            "heterogeneous_channels": [int(x) for x in HETER_WATERMARK_CHANNEL],
+            "wm_capacity": int(self.wm_capacity),
+            "base_key_seed": int(self.base_key_seed),
+            "selected_key_index": int(self.key_index),
+            "selected_key_seed": int(self.selected_key_seed),
+            "rng_algorithm": (
                 "torch.Generator(device).manual_seed(key_seed)+torch.randn_like_diffusers_prepare_latents"
                 if self.profile == OFFICIAL_HSTR_PROFILE else "legacy_explicit_reconstruction_of_previous_key_index"
             ),
-            rng_device=str(self.rng_device),
-            runtime_dtype=str(self.dtype),
-        )
+            "rng_device": str(self.rng_device),
+            "hermitian_enforcement_version": "sfwmark_7866612_utils_enforce_hermitian_symmetry",
+            "injection_configuration": {
+                "center": True,
+                "cut_real": False,
+                "score_mode": "center_channel_min_complex_l1",
+            },
+            "inversion_prompt_sha256": sfw_bundle.sha256_text(self.inversion_prompt),
+            "inversion_guidance_scale": float(self.inversion_guidance),
+            "inversion_steps": int(self.inversion_steps),
+            "vae_sample": False,
+        }
 
     def provider_config_sha256(self) -> str:
-        return canonical_json_sha256(self.provider_config())
+        return sfw_bundle.canonical_sha256(self.provider_config())
 
     def binding_config(self) -> dict[str, typing.Any]:
         payload = self.provider_config()
@@ -210,7 +225,7 @@ class HSTRProvider(WmProvider):
             "watermark_mask_sha256": self.watermark_mask_sha256,
         })
         if self.bundle is not None and self.bundle.manifest is not None:
-            payload["bundle_sha256"] = hstr_bundle.sha256_file(self.bundle.manifest_path)
+            payload["bundle_sha256"] = sfw_bundle.sha256_file(self.bundle.manifest_path)
         return payload
 
     def sample_base_latent(self, sample_seed: int | None = None) -> torch.Tensor:
@@ -466,51 +481,23 @@ class HSTRProvider(WmProvider):
             guidance_scale=guidance_scale,
         )
 
-    def _official_image_tensor(self, image_pil):
-        from PIL import Image
-
-        images = [image_pil] if isinstance(image_pil, Image.Image) else list(image_pil)
-        transform = torchvision.transforms.Compose([
-            torchvision.transforms.Resize((self.resolution, self.resolution)),
-            torchvision.transforms.ToTensor(),
-        ])
-        tensor = torch.stack([2.0 * transform(image.convert("RGB")) - 1.0 for image in images])
-        return tensor
-
     @torch.no_grad()
     def invert_pil_image(self, image_pil, pipe_provider_target, image_sha256: str | None = None) -> dict[str, typing.Any]:
-        """Frozen SFWMark detection inversion: VAE mode + DDIM inverse + guidance 0."""
-        from diffusers import DDIMInverseScheduler
-        from utils.canonical import tensor_sha256 as _tensor_sha256
-
-        # Load through the existing provider so model provenance and scheduler setup stay centralized.
-        pipe_provider_target._PipeProvider__load_pipe()
-        pipe = pipe_provider_target.pipe
-        current_scheduler = pipe.scheduler
-        try:
-            pipe.scheduler = DDIMInverseScheduler.from_config(pipe.scheduler.config)
-            image_tensor = self._official_image_tensor(image_pil).to(pipe.unet.dtype).to(pipe.device)
-            z0_torch = pipe.vae.encode(image_tensor).latent_dist.mode() * pipe.vae.config.scaling_factor
-            prompt = [""] * z0_torch.shape[0]
-            zT_torch = pipe(
-                prompt=prompt,
-                latents=z0_torch,
-                guidance_scale=self.inversion_guidance,
-                num_inference_steps=self.inversion_steps,
-                output_type="latent",
-            ).images
-        finally:
-            pipe.scheduler = current_scheduler
-        return {
-            "z0_torch": z0_torch.detach(),
-            "zT_torch": zT_torch.detach(),
-            "inversion_seed": None,
-            "inversion_steps": int(self.inversion_steps),
-            "inversion_prompt_sha256": hstr_bundle.sha256_text(self.inversion_prompt),
-            "inversion_guidance_scale": float(self.inversion_guidance),
-            "recovered_latent_sha256": _tensor_sha256(zT_torch.detach()),
-            "image_sha256": image_sha256,
-        }
+        """Shared frozen SFWMark detection inversion: VAE mode + DDIM inverse + guidance 0."""
+        inversion = sfw_inversion.invert_pil_image(
+            image_pil,
+            pipe_provider_target=pipe_provider_target,
+            resolution=self.resolution,
+            inversion_prompt=self.inversion_prompt,
+            guidance_scale=self.inversion_guidance,
+            num_inference_steps=self.inversion_steps,
+        )
+        inversion["inversion_seed"] = None
+        inversion["inversion_prompt_sha256"] = sfw_bundle.sha256_text(self.inversion_prompt)
+        inversion["inversion_guidance_scale"] = float(self.inversion_guidance)
+        inversion["recovered_latent_sha256"] = sfw_bundle.sha256_tensor(inversion["zT_torch"].detach())
+        inversion["image_sha256"] = image_sha256
+        return inversion
 
     def detect_from_latent(self, latents: torch.Tensor) -> dict[str, typing.Any]:
         if not torch.isfinite(latents.detach().to(torch.float32)).all():
@@ -546,7 +533,42 @@ class HSTRProvider(WmProvider):
                 "score_direction": HSTR_SCORE_DIRECTION,
                 "comparison_operator": ">=",
             }
-        return self.bundle.load_threshold(self.bundle.binding_config(), explicit_threshold=self.hstr_threshold)
+        if self.hstr_threshold is not None:
+            return {
+                "threshold_available": True,
+                "threshold": float(self.hstr_threshold),
+                "distance_threshold": -float(self.hstr_threshold),
+                "threshold_source": "user_supplied",
+                "score_direction": HSTR_SCORE_DIRECTION,
+                "comparison_operator": ">=",
+                "target_fpr": None,
+                "empirical_fpr": None,
+                "empirical_tpr": None,
+                "roc_auc": None,
+            }
+        if not self.bundle.has_threshold():
+            return {
+                "threshold_available": False,
+                "threshold": None,
+                "distance_threshold": None,
+                "threshold_source": None,
+                "score_direction": HSTR_SCORE_DIRECTION,
+                "comparison_operator": ">=",
+            }
+        artifact = self.bundle.load_threshold()
+        sfw_bundle.assert_threshold_compatible(artifact, self.binding_config())
+        return {
+            "threshold_available": True,
+            "threshold": float(artifact["threshold"]),
+            "distance_threshold": artifact.get("distance_threshold"),
+            "threshold_source": artifact.get("threshold_source"),
+            "score_direction": artifact.get("score_direction"),
+            "comparison_operator": artifact.get("comparison_operator"),
+            "target_fpr": artifact.get("target_fpr"),
+            "empirical_fpr": artifact.get("empirical_fpr"),
+            "empirical_tpr": artifact.get("empirical_tpr"),
+            "roc_auc": artifact.get("roc_auc"),
+        }
 
     @staticmethod
     def fft(input_tensor):
