@@ -292,14 +292,35 @@ GPU smoke (Issue #3 minimum only; outputs under
 `outputs/smoke/rid_issue3/`, not a formal cohort). GPU preflight healthy
 (RTX 3090, CUDA 12.4, torch 2.5.1).
 
-**Model caveat.** `stabilityai/stable-diffusion-2-1-base` returns HTTP 401 in
-this environment (the Hugging Face repo is not accessible to this account), so
-the smoke ran on the cached byte-copy mirror `RedbeardNZ/stable-diffusion-2-1-base`
-with the repository-default revision. Both values were passed explicitly, so the
-profile machinery recorded them in `rid_profile_overrides`, set
-`rid_profile_is_official=false` and labelled every result
-`legacy_or_ablation_mode`. The `official_sd21` profile itself could therefore
-**not** be exercised end-to-end on GPU; everything else below was.
+**Model blocker (open).** The official `official_sd21` profile could **not** be
+exercised end-to-end on GPU, because `stabilityai/stable-diffusion-2-1-base` is
+not obtainable in this environment. Verified on 2026-07-29:
+
+| Probe | Result |
+| :--- | :--- |
+| `GET /api/models/stabilityai/stable-diffusion-2-1-base`, anonymous | `401` |
+| same, with the stored HF token | `401` |
+| `GET /stabilityai/stable-diffusion-2-1-base/resolve/main/model_index.json` | `401` |
+| `stabilityai/stable-diffusion-2-1` | `401` |
+| `stabilityai/stable-diffusion-xl-base-1.0`, `CompVis/stable-diffusion-v1-4` | `200` (so this is repo access, not the network) |
+| `HfApi.whoami()` with the stored token | `Invalid user token` |
+| filesystem search for a `models--stabilityai--stable-diffusion-2-1*` snapshot | none present |
+
+No official snapshot and no verifiable official cache exists on this machine, and
+the stored Hugging Face credential is invalid, so the gated repository cannot be
+accepted or fetched. Obtaining it requires a human to log in with a token whose
+account has accepted the model licence (`huggingface-cli login`).
+
+The smoke below therefore ran on the cached byte-copy mirror
+`RedbeardNZ/stable-diffusion-2-1-base` at the repository-default revision
+(snapshot `c6a5e9bab8d874d081de76fa270ae0aefa5410ff`). Both values were passed
+explicitly, so the profile machinery recorded them in `rid_profile_overrides`,
+set `rid_profile_is_official=false` and labelled every result
+`legacy_or_ablation_mode`. This evidence is **non-official** and is deliberately
+not relabelled: the mirror's byte-equality with the official weights cannot be
+verified without the official files. The Issue #3 acceptance item "GPU
+parity/smoke passes when GPU preflight is healthy" for the `official_sd21`
+profile remains **outstanding**; everything else below was exercised.
 
 | Check | Result |
 | :--- | :--- |
