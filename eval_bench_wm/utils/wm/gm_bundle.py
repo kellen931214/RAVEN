@@ -21,17 +21,27 @@ Both files are therefore directly loadable by the official scripts.
 
 from __future__ import annotations
 
-import datetime
-import hashlib
 import json
 import math
-import os
-import subprocess
 import typing
 from pathlib import Path
 
 import numpy as np
 import torch
+
+from . import artifact_core
+from .artifact_core import (  # noqa: F401 - re-exported for existing GM callers
+    git_provenance,
+    optional_file_sha256,
+    read_jsonl,
+    repo_root,
+    sha256_array,
+    sha256_bytes,
+    sha256_file,
+    sha256_tensor,
+    sha256_text,
+    utc_now,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -137,134 +147,20 @@ class GmBundleError(RuntimeError):
 # ---------------------------------------------------------------------------
 
 def _canonicalize(value: typing.Any) -> typing.Any:
-    """Normalize a value into a deterministic JSON-serializable form.
-
-    Rejects NaN/Inf, normalizes paths to POSIX strings, sorts mapping keys and
-    keeps int/bool distinct from float. The very same function is used before
-    writing metadata, after reloading it, during resume validation and during
-    threshold-compatibility checks so that
-    ``hash before serialization == hash after serialization and reload``.
-    """
-    if value is None or isinstance(value, (str, bool, int)):
-        return value
-    if isinstance(value, float):
-        if math.isnan(value) or math.isinf(value):
-            raise GmBundleError(f"non-finite float rejected by canonical hashing: {value!r}")
-        return value
-    if isinstance(value, (np.bool_,)):
-        return bool(value)
-    if isinstance(value, (np.integer,)):
-        return int(value)
-    if isinstance(value, (np.floating,)):
-        return _canonicalize(float(value))
-    if isinstance(value, Path):
-        return value.as_posix()
-    if isinstance(value, bytes):
-        raise GmBundleError("raw bytes must never enter canonical metadata (possible secret leak)")
-    if isinstance(value, dict):
-        return {str(key): _canonicalize(value[key]) for key in sorted(value, key=str)}
-    if isinstance(value, (list, tuple)):
-        return [_canonicalize(item) for item in value]
-    if isinstance(value, torch.Size):
-        return [int(item) for item in value]
-    raise GmBundleError(f"unsupported type in canonical metadata: {type(value)!r}")
+    """GM-flavoured :func:`artifact_core.canonicalize` (raises ``GmBundleError``)."""
+    return artifact_core.canonicalize(value, GmBundleError)
 
 
 def canonical_json(payload: typing.Mapping[str, typing.Any]) -> str:
     """Deterministic JSON text for hashing and on-disk manifests."""
-    return json.dumps(
-        _canonicalize(payload),
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=True,
-        allow_nan=False,
-    )
+    return artifact_core.canonical_json(payload, GmBundleError)
 
 
 def canonical_sha256(payload: typing.Mapping[str, typing.Any]) -> str:
-    return hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()
-
-
-def sha256_bytes(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
-
-
-def sha256_text(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
-
-
-def sha256_file(path: typing.Union[str, Path]) -> str:
-    digest = hashlib.sha256()
-    with open(path, "rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def sha256_array(array: np.ndarray) -> str:
-    """Hash a numpy array together with its dtype and shape."""
-    array = np.ascontiguousarray(array)
-    header = f"numpy|{array.dtype.str}|{tuple(int(d) for d in array.shape)}|".encode("utf-8")
-    return hashlib.sha256(header + array.tobytes()).hexdigest()
-
-
-def sha256_tensor(tensor: torch.Tensor) -> str:
-    """Hash a torch tensor together with its dtype and shape (device agnostic)."""
-    tensor = tensor.detach().cpu().contiguous()
-    if tensor.is_complex():
-        real = sha256_tensor(tensor.real.contiguous())
-        imag = sha256_tensor(tensor.imag.contiguous())
-        return hashlib.sha256(f"complex|{real}|{imag}".encode("utf-8")).hexdigest()
-    header = f"torch|{tensor.dtype}|{tuple(tensor.shape)}|".encode("utf-8")
-    return hashlib.sha256(header + tensor.numpy().tobytes()).hexdigest()
+    return artifact_core.canonical_sha256(payload, GmBundleError)
 
 
 def sha256_image_file(path: typing.Union[str, Path]) -> str:
-    return sha256_file(path)
-
-
-def utc_now() -> str:
-    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
-# ---------------------------------------------------------------------------
-# Git provenance
-# ---------------------------------------------------------------------------
-
-def repo_root() -> Path:
-    return Path(__file__).resolve().parents[3]
-
-
-def git_provenance(root: typing.Optional[Path] = None) -> typing.Dict[str, typing.Any]:
-    root = Path(root) if root is not None else repo_root()
-
-    def _run(*args: str) -> typing.Optional[str]:
-        try:
-            out = subprocess.run(
-                ["git", "-C", str(root), *args],
-                capture_output=True,
-                text=True,
-                check=True,
-                timeout=30,
-            )
-        except (subprocess.SubprocessError, OSError):
-            return None
-        return out.stdout.strip()
-
-    status = _run("status", "--porcelain")
-    return {
-        "git_branch": _run("rev-parse", "--abbrev-ref", "HEAD"),
-        "git_commit": _run("rev-parse", "HEAD"),
-        "git_dirty": None if status is None else bool(status),
-    }
-
-
-def optional_file_sha256(path: typing.Optional[typing.Union[str, Path]]) -> typing.Optional[str]:
-    if path is None:
-        return None
-    path = Path(path)
-    if not path.exists():
-        return None
     return sha256_file(path)
 
 
@@ -680,38 +576,12 @@ def build_threshold_artifact(
 
 def cohort_sha256(image_paths: typing.Sequence[typing.Union[str, Path]]) -> str:
     """Order-independent-per-name hash of a cohort of image files."""
-    entries = []
-    for path in image_paths:
-        path = Path(path)
-        entries.append({"name": path.name, "sha256": sha256_file(path)})
-    entries.sort(key=lambda item: (item["name"], item["sha256"]))
-    return canonical_sha256({"cohort": entries})
+    return artifact_core.cohort_sha256(image_paths, GmBundleError)
 
 
 def write_jsonl(path: typing.Union[str, Path], rows: typing.Iterable[typing.Mapping[str, typing.Any]]) -> None:
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as handle:
-        for row in rows:
-            handle.write(canonical_json(row) + "\n")
+    artifact_core.write_jsonl(path, rows, GmBundleError)
 
 
 def append_jsonl(path: typing.Union[str, Path], row: typing.Mapping[str, typing.Any]) -> None:
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "a", encoding="utf-8") as handle:
-        handle.write(canonical_json(row) + "\n")
-        handle.flush()
-        os.fsync(handle.fileno())
-
-
-def read_jsonl(path: typing.Union[str, Path]) -> typing.List[typing.Dict[str, typing.Any]]:
-    path = Path(path)
-    if not path.exists():
-        return []
-    rows = []
-    for line in path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if line:
-            rows.append(json.loads(line))
-    return rows
+    artifact_core.append_jsonl(path, row, GmBundleError)

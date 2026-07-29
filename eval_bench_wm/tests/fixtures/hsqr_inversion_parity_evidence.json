@@ -1,0 +1,445 @@
+{
+  "claim": "implementation parity of utils/wm/sfw_inversion against the frozen official ddim_invert on identical weights",
+  "comparisons": [
+    {
+      "artifact": "preprocessed_input_tensor",
+      "bitwise_identical": true,
+      "elements_compared": 786432,
+      "max_abs_diff": 0.0,
+      "max_rel_diff": 0.0,
+      "mean_abs_diff": 0.0,
+      "official": {
+        "dtype": "torch.float32",
+        "mean": -0.09140485525131226,
+        "sha256": "3118da32b7fa9fb721a9dd5a84963404ff8c0c1194989a72486f6dbb606c5ec7",
+        "shape": [
+          3,
+          512,
+          512
+        ],
+        "std": 0.6580044627189636
+      },
+      "raven": {
+        "dtype": "torch.float32",
+        "mean": -0.09140485525131226,
+        "sha256": "3118da32b7fa9fb721a9dd5a84963404ff8c0c1194989a72486f6dbb606c5ec7",
+        "shape": [
+          3,
+          512,
+          512
+        ],
+        "std": 0.6580044627189636
+      },
+      "shape_match": true
+    },
+    {
+      "artifact": "vae_latent",
+      "bitwise_identical": true,
+      "elements_compared": 16384,
+      "max_abs_diff": 0.0,
+      "max_rel_diff": 0.0,
+      "mean_abs_diff": 0.0,
+      "official": {
+        "dtype": "torch.float32",
+        "mean": 0.0549604631960392,
+        "sha256": "a11b0d011d80a876231d39bbd4244bc2aae39a6b6e3444f94ee595ab9bc0d45c",
+        "shape": [
+          1,
+          4,
+          64,
+          64
+        ],
+        "std": 0.8118749856948853
+      },
+      "raven": {
+        "dtype": "torch.float32",
+        "mean": 0.0549604631960392,
+        "sha256": "a11b0d011d80a876231d39bbd4244bc2aae39a6b6e3444f94ee595ab9bc0d45c",
+        "shape": [
+          1,
+          4,
+          64,
+          64
+        ],
+        "std": 0.8118749856948853
+      },
+      "shape_match": true
+    },
+    {
+      "artifact": "final_recovered_latent",
+      "bitwise_identical": true,
+      "elements_compared": 16384,
+      "max_abs_diff": 0.0,
+      "max_rel_diff": 0.0,
+      "mean_abs_diff": 0.0,
+      "official": {
+        "dtype": "torch.float32",
+        "mean": 0.004570602905005217,
+        "sha256": "fe84d5592a615e24f9c5baee1d1c701d1bf37030b7ef2f3dfa419c7fa6745354",
+        "shape": [
+          1,
+          4,
+          64,
+          64
+        ],
+        "std": 1.1045712232589722
+      },
+      "raven": {
+        "dtype": "torch.float32",
+        "mean": 0.004570602905005217,
+        "sha256": "fe84d5592a615e24f9c5baee1d1c701d1bf37030b7ef2f3dfa419c7fa6745354",
+        "shape": [
+          1,
+          4,
+          64,
+          64
+        ],
+        "std": 1.1045712232589722
+      },
+      "shape_match": true
+    }
+  ],
+  "generated_utc": "2026-07-29T13:26:34Z",
+  "generator": "eval_bench_wm/tools/hsqr_inversion_parity.py",
+  "gpu_preflight": {
+    "cuda_available": true,
+    "device": "cuda",
+    "device_count": 1,
+    "device_name": "NVIDIA RTX 6000 Ada Generation",
+    "platform": "Linux-5.15.0-186-generic-x86_64-with-glibc2.35",
+    "torch_version": "2.5.1+cu124"
+  },
+  "hsqr_detection": {
+    "l1_abs_diff": 0.0,
+    "official_l1_distance": 39.810848236083984,
+    "official_score": -39.810848236083984,
+    "raven_l1_distance": 39.810848236083984,
+    "raven_score": -39.810848236083984,
+    "score_abs_diff": 0.0,
+    "score_definition": "negative_mean_complex_l1_distance"
+  },
+  "intermediate_latents": [
+    {
+      "artifact": "intermediate_latent_step_0",
+      "bitwise_identical": true,
+      "elements_compared": 16384,
+      "max_abs_diff": 0.0,
+      "max_rel_diff": 0.0,
+      "mean_abs_diff": 0.0,
+      "official": {
+        "dtype": "torch.float32",
+        "mean": 0.0549604631960392,
+        "sha256": "a11b0d011d80a876231d39bbd4244bc2aae39a6b6e3444f94ee595ab9bc0d45c",
+        "shape": [
+          1,
+          4,
+          64,
+          64
+        ],
+        "std": 0.8118749856948853
+      },
+      "official_timestep": 1.0,
+      "raven": {
+        "dtype": "torch.float32",
+        "mean": 0.0549604631960392,
+        "sha256": "a11b0d011d80a876231d39bbd4244bc2aae39a6b6e3444f94ee595ab9bc0d45c",
+        "shape": [
+          1,
+          4,
+          64,
+          64
+        ],
+        "std": 0.8118749856948853
+      },
+      "raven_timestep": 1.0,
+      "shape_match": true,
+      "unet_step": 0
+    },
+    {
+      "artifact": "intermediate_latent_step_1",
+      "bitwise_identical": true,
+      "elements_compared": 16384,
+      "max_abs_diff": 0.0,
+      "max_rel_diff": 0.0,
+      "mean_abs_diff": 0.0,
+      "official": {
+        "dtype": "torch.float32",
+        "mean": 0.054920993745326996,
+        "sha256": "0aa19fe07566d1c2f29b84376c9199dfd72e4493ffb0eb976833b3991e5c8996",
+        "shape": [
+          1,
+          4,
+          64,
+          64
+        ],
+        "std": 0.812969982624054
+      },
+      "official_timestep": 21.0,
+      "raven": {
+        "dtype": "torch.float32",
+        "mean": 0.054920993745326996,
+        "sha256": "0aa19fe07566d1c2f29b84376c9199dfd72e4493ffb0eb976833b3991e5c8996",
+        "shape": [
+          1,
+          4,
+          64,
+          64
+        ],
+        "std": 0.812969982624054
+      },
+      "raven_timestep": 21.0,
+      "shape_match": true,
+      "unet_step": 1
+    },
+    {
+      "artifact": "intermediate_latent_step_24",
+      "bitwise_identical": true,
+      "elements_compared": 16384,
+      "max_abs_diff": 0.0,
+      "max_rel_diff": 0.0,
+      "mean_abs_diff": 0.0,
+      "official": {
+        "dtype": "torch.float32",
+        "mean": 0.03123275563120842,
+        "sha256": "ebe64137623795e615909d39551cc8eef4225857c457a89f6d8515cc4ed6933e",
+        "shape": [
+          1,
+          4,
+          64,
+          64
+        ],
+        "std": 1.0480238199234009
+      },
+      "official_timestep": 481.0,
+      "raven": {
+        "dtype": "torch.float32",
+        "mean": 0.03123275563120842,
+        "sha256": "ebe64137623795e615909d39551cc8eef4225857c457a89f6d8515cc4ed6933e",
+        "shape": [
+          1,
+          4,
+          64,
+          64
+        ],
+        "std": 1.0480238199234009
+      },
+      "raven_timestep": 481.0,
+      "shape_match": true,
+      "unet_step": 24
+    },
+    {
+      "artifact": "intermediate_latent_step_48",
+      "bitwise_identical": true,
+      "elements_compared": 16384,
+      "max_abs_diff": 0.0,
+      "max_rel_diff": 0.0,
+      "mean_abs_diff": 0.0,
+      "official": {
+        "dtype": "torch.float32",
+        "mean": 0.005833645351231098,
+        "sha256": "fc9551dd6a12098c48dabec001c4f536b0a8188b2de0bcc88f386373ff13552d",
+        "shape": [
+          1,
+          4,
+          64,
+          64
+        ],
+        "std": 1.1068836450576782
+      },
+      "official_timestep": 961.0,
+      "raven": {
+        "dtype": "torch.float32",
+        "mean": 0.005833645351231098,
+        "sha256": "fc9551dd6a12098c48dabec001c4f536b0a8188b2de0bcc88f386373ff13552d",
+        "shape": [
+          1,
+          4,
+          64,
+          64
+        ],
+        "std": 1.1068836450576782
+      },
+      "raven_timestep": 961.0,
+      "shape_match": true,
+      "unet_step": 48
+    },
+    {
+      "artifact": "intermediate_latent_step_49",
+      "bitwise_identical": true,
+      "elements_compared": 16384,
+      "max_abs_diff": 0.0,
+      "max_rel_diff": 0.0,
+      "mean_abs_diff": 0.0,
+      "official": {
+        "dtype": "torch.float32",
+        "mean": 0.0051877740770578384,
+        "sha256": "5f8474b2eb5472c3d626c70aff2c30199f4afd771cad9a5be4a1a56ba03bc633",
+        "shape": [
+          1,
+          4,
+          64,
+          64
+        ],
+        "std": 1.1057835817337036
+      },
+      "official_timestep": 981.0,
+      "raven": {
+        "dtype": "torch.float32",
+        "mean": 0.0051877740770578384,
+        "sha256": "5f8474b2eb5472c3d626c70aff2c30199f4afd771cad9a5be4a1a56ba03bc633",
+        "shape": [
+          1,
+          4,
+          64,
+          64
+        ],
+        "std": 1.1057835817337036
+      },
+      "raven_timestep": 981.0,
+      "shape_match": true,
+      "unet_step": 49
+    }
+  ],
+  "model": {
+    "dtype": "float32",
+    "inversion_guidance": 0.0,
+    "inversion_prompt": "",
+    "inversion_steps": 50,
+    "model_id": "RedbeardNZ/stable-diffusion-2-1-base",
+    "official_model_id": "stabilityai/stable-diffusion-2-1-base",
+    "official_model_used": false,
+    "resolution": 512,
+    "scheduler": "DDIM"
+  },
+  "not_claimed": "numerical reproduction of the published SFWMark results, which needs the official stabilityai/stable-diffusion-2-1-base weights",
+  "official_stubs_touched": [],
+  "provenance": {
+    "official_commit": "78666128b44614a0cc471993649e3132d5dddfcb",
+    "official_detect_sha256": "fac82635c48843fbbbb172dd918dadb13d1fc8694dbf23f8b30d310c2a70ea0c",
+    "official_generate_sha256": "bf8b79543d6ddfc4b904a5026c82bd0f32d91bedf2b6a46c0e4e8d51fc40243e",
+    "official_repo": "https://github.com/thomas11809/SFWMark",
+    "official_utils_sha256": "d3deb279006a143e2e082a1bf1195c5cc4846722bf01a702c58efbb834f6dea8"
+  },
+  "schema": "hsqr_inversion_parity_v1",
+  "source_watermarked_latent": {
+    "dtype": "torch.float32",
+    "mean": -0.002140946686267853,
+    "sha256": "f159f30d9e393b62a529d362edf5e5f1c156bc0ca7cbca02fc7e8a1f7d7d9f62",
+    "shape": [
+      1,
+      4,
+      64,
+      64
+    ],
+    "std": 1.0077465772628784
+  },
+  "timesteps": {
+    "count_official": 50,
+    "count_raven": 50,
+    "match": true,
+    "official": [
+      1.0,
+      21.0,
+      41.0,
+      61.0,
+      81.0,
+      101.0,
+      121.0,
+      141.0,
+      161.0,
+      181.0,
+      201.0,
+      221.0,
+      241.0,
+      261.0,
+      281.0,
+      301.0,
+      321.0,
+      341.0,
+      361.0,
+      381.0,
+      401.0,
+      421.0,
+      441.0,
+      461.0,
+      481.0,
+      501.0,
+      521.0,
+      541.0,
+      561.0,
+      581.0,
+      601.0,
+      621.0,
+      641.0,
+      661.0,
+      681.0,
+      701.0,
+      721.0,
+      741.0,
+      761.0,
+      781.0,
+      801.0,
+      821.0,
+      841.0,
+      861.0,
+      881.0,
+      901.0,
+      921.0,
+      941.0,
+      961.0,
+      981.0
+    ],
+    "raven": [
+      1.0,
+      21.0,
+      41.0,
+      61.0,
+      81.0,
+      101.0,
+      121.0,
+      141.0,
+      161.0,
+      181.0,
+      201.0,
+      221.0,
+      241.0,
+      261.0,
+      281.0,
+      301.0,
+      321.0,
+      341.0,
+      361.0,
+      381.0,
+      401.0,
+      421.0,
+      441.0,
+      461.0,
+      481.0,
+      501.0,
+      521.0,
+      541.0,
+      561.0,
+      581.0,
+      601.0,
+      621.0,
+      641.0,
+      661.0,
+      681.0,
+      701.0,
+      721.0,
+      741.0,
+      761.0,
+      781.0,
+      801.0,
+      821.0,
+      841.0,
+      861.0,
+      881.0,
+      901.0,
+      921.0,
+      941.0,
+      961.0,
+      981.0
+    ]
+  }
+}

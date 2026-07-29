@@ -310,6 +310,235 @@ def run_gm_generation(args, argv):
     return rows
 
 
+def run_hsqr_generation(args, argv):
+    """Official-compatible HSQR (SFWMark) generation.
+
+    One command produces ``--num`` non-overwriting watermarked images. Every
+    sample independently samples its *complete* base latent from a deterministic
+    per-sample seed and the HSQR pattern is injected into a clone of that
+    latent, so two samples never share a complete initial latent. The watermark
+    identity (key index, seed, payload, pattern) is persisted in a reusable
+    bundle that a fresh process can verify against.
+
+    All algorithms live in ``utils/wm/hsqr_provider.py``; this function only does
+    seeding bookkeeping, IO and provenance.
+    """
+    from utils.wm import sfw_bundle, sfw_runtime
+    from utils.wm.hsqr_provider import OFFICIAL_PROFILE_NAME
+    from utils.wm.hsqr_provider import apply_arg_defaults as hsqr_apply_profile
+
+    argv = list(argv or [])
+    # Standalone HSQR reproduction runner: adopt the immutable official profile
+    # unless the user asked for another one. The formal cohort generators
+    # (experiments/generate_watermarked_images.py, run_removal.py) keep the
+    # parser default (legacy_raven) and are unaffected.
+    if not any(token == "--hsqr_profile" or token.startswith("--hsqr_profile=") for token in argv):
+        args.hsqr_profile = OFFICIAL_PROFILE_NAME
+    profile_info = hsqr_apply_profile(args, argv)
+    print(f"[HSQR] profile: {profile_info}", flush=True)
+
+    out_dir = Path(args.out_dir)
+    images_dir = out_dir / "images" / "watermarked"
+    clean_images_dir = out_dir / "images" / "no_watermark"
+    prompts_dir = out_dir / "prompts"
+    metadata_dir = out_dir / "sample_metadata"
+    results_path = out_dir / "results.jsonl"
+    manifest_path = out_dir / "run_manifest.json"
+    if not args.hsqr_bundle_dir:
+        args.hsqr_bundle_dir = (out_dir / "hsqr_bundle").as_posix()
+    bundle_dir = Path(args.hsqr_bundle_dir)
+
+    gpu_info = sfw_runtime.gpu_preflight(DEVICE)
+    print(f"[HSQR] device preflight: {gpu_info}", flush=True)
+
+    # A run that resumes into an existing output directory must not create
+    # anything before its manifest has been validated; the bundle that produced
+    # the existing samples must exist and is then loaded read-only.
+    resuming = manifest_path.exists()
+    if resuming and not sfw_bundle.SfwBundle(bundle_dir).complete():
+        raise RuntimeError(
+            f"{manifest_path} already exists, so this run resumes an existing cohort and must "
+            f"reuse the bundle that produced it, but {bundle_dir} is not a complete bundle. "
+            "Nothing was modified."
+        )
+
+    pipe_provider_target = sfw_runtime.build_pipe_provider(args, DEVICE)
+    latent_shape = pipe_provider_target.get_latent_shape()
+
+    if resuming:
+        wm_provider = sfw_runtime.load_provider_from_bundle(args, latent_shape, DEVICE)
+    else:
+        wm_provider = sfw_runtime.build_provider(args, latent_shape, DEVICE)
+
+    target_prompts = get_text_prompts(num_prompts=args.num, dataset_id=args.dataset_id)
+
+    key_mapping = None
+    if wm_provider.key_policy == "per_sample":
+        key_mapping = [wm_provider.sample_key_index(sample_id) for sample_id in range(args.num)]
+
+    if not resuming:
+        wm_provider.create_bundle(
+            bundle_dir,
+            save_keybook=args.hsqr_save_keybook,
+            key_mapping=key_mapping,
+        )
+    print(
+        f"[HSQR] bundle {wm_provider.bundle.dir} "
+        f"(key_index={wm_provider.selected_key_index}, "
+        f"payload={wm_provider.payload_text(wm_provider.selected_key_index)}, "
+        f"config {wm_provider.bundle.manifest['bundle_config_sha256'][:16]})",
+        flush=True,
+    )
+
+    provenance = sfw_runtime.run_provenance(args, wm_provider, pipe_provider_target)
+    run_config = dict(provenance)
+    run_config.update({"base_seed": int(args.seed), "num_samples": int(args.num),
+                       "dataset_id": args.dataset_id, "key_policy": wm_provider.key_policy,
+                       "paired": bool(args.hsqr_paired)})
+    # ``created_utc`` is volatile, ``pattern_source`` records whether *this* process
+    # derived or reloaded the pattern, and ``num_samples`` only says how far the
+    # cohort was extended. None of them is part of a *sample's* configuration
+    # identity, which is what the resume gate compares; each sample is still bound
+    # to its own seed, prompt, key/pattern hash, bundle and model configuration.
+    volatile_fields = ("created_utc", "pattern_source", "num_samples")
+    run_config_sha256 = sfw_bundle.canonical_sha256(
+        {k: v for k, v in run_config.items() if k not in volatile_fields}
+    )
+
+    manifest = sfw_runtime.assert_run_manifest_compatible(
+        manifest_path, run_config_sha256, method="HSQR"
+    )
+    if manifest is None:
+        manifest = dict(run_config)
+        manifest["run_config_sha256"] = run_config_sha256
+        manifest["entrypoint"] = "eval_bench_wm/run_watermark.py:run_hsqr_generation"
+        manifest["entrypoint_sha256"] = sha256_path(Path(__file__))
+        manifest["report_label"] = (
+            "official_profile_raw_scores" if wm_provider.profile_is_official
+            else "legacy_or_ablation_mode"
+        )
+        out_dir.mkdir(parents=True, exist_ok=True)
+        manifest_path.write_text(sfw_bundle.canonical_json(manifest) + "\n", encoding="utf-8")
+
+    directories = [images_dir, prompts_dir, metadata_dir]
+    if args.hsqr_paired:
+        directories.append(clean_images_dir)
+    for directory in directories:
+        directory.mkdir(parents=True, exist_ok=True)
+
+    rows = []
+    for sample_id, target_prompt in tqdm(
+        list(enumerate(target_prompts)), total=len(target_prompts), desc="HSQR generation"
+    ):
+        sample_seed = int(args.seed) + int(sample_id)
+        name = f"{sample_id:06d}"
+        image_path = images_dir / f"{name}.png"
+        clean_image_path = clean_images_dir / f"{name}.png"
+        prompt_path = prompts_dir / f"{name}.txt"
+        metadata_path = metadata_dir / f"{name}.json"
+        prompt_sha256 = sfw_bundle.sha256_text(target_prompt)
+
+        key_index = key_mapping[sample_id] if key_mapping else wm_provider.selected_key_index
+        pattern = (
+            wm_provider.keybook()[key_index] if key_mapping else wm_provider.gt_patch
+        )
+
+        if metadata_path.exists() or image_path.exists():
+            # Resume: never overwrite and never silently mix incompatible runs.
+            if not (metadata_path.exists() and image_path.exists()):
+                raise RuntimeError(
+                    f"HSQR sample {name} is half-written ({image_path.exists()=}, "
+                    f"{metadata_path.exists()=}); use a fresh --out_dir"
+                )
+            existing = json.loads(metadata_path.read_text(encoding="utf-8"))
+            sfw_runtime.assert_resumable(
+                name,
+                existing,
+                {
+                    "sample_seed": sample_seed,
+                    "prompt_sha256": prompt_sha256,
+                    "run_config_sha256": run_config_sha256,
+                    "hsqr_bundle_config_sha256": wm_provider.bundle.manifest["bundle_config_sha256"],
+                    "selected_pattern_sha256": wm_provider.pattern_sha256(pattern),
+                },
+                method="HSQR",
+            )
+            if existing.get("image_sha256") != sha256_path(image_path):
+                raise RuntimeError(
+                    f"HSQR sample {name} image hash changed on disk; refusing to resume"
+                )
+            rows.append(existing)
+            continue
+
+        sample = wm_provider.build_sample_latents(sample_seed, pattern=pattern)
+        generated = pipe_provider_target.generate(
+            prompts=target_prompt,
+            latents=sample["watermarked_latent"],
+            num_inference_steps=args.num_inference_steps_target,
+            guidance_scale=args.guidance_scale_target,
+        )
+        generated["images_PIL"][0].save(image_path)
+        prompt_path.write_text(target_prompt, encoding="utf-8")
+
+        clean_sha = None
+        if args.hsqr_paired:
+            clean_generated = pipe_provider_target.generate(
+                prompts=target_prompt,
+                latents=sample["clean_latent"],
+                num_inference_steps=args.num_inference_steps_target,
+                guidance_scale=args.guidance_scale_target,
+            )
+            clean_generated["images_PIL"][0].save(clean_image_path)
+            clean_sha = sha256_path(clean_image_path)
+
+        row = {
+            "sample_id": sample_id,
+            "sample_name": name,
+            "sample_seed": sample_seed,
+            "prompt": target_prompt,
+            "prompt_sha256": prompt_sha256,
+            "image_path": image_path.as_posix(),
+            "image_sha256": sha256_path(image_path),
+            "clean_image_path": clean_image_path.as_posix() if args.hsqr_paired else None,
+            "clean_image_sha256": clean_sha,
+            "base_latent_sha256": sample["base_latent_sha256"],
+            "clean_base_latent_sha256": sample["clean_base_latent_sha256"],
+            "watermark_pre_injection_base_latent_sha256":
+                sample["watermark_pre_injection_base_latent_sha256"],
+            "watermarked_latent_sha256": sample["watermarked_latent_sha256"],
+            "selected_key_index": key_index,
+            "selected_key_seed": wm_provider.key_seed(key_index),
+            "payload_text": wm_provider.payload_text(key_index),
+            "selected_pattern_sha256": wm_provider.pattern_sha256(pattern),
+            "hsqr_bundle_config_sha256": wm_provider.bundle.manifest["bundle_config_sha256"],
+            "run_config_sha256": run_config_sha256,
+        }
+        # The pairing invariant is asserted, not assumed.
+        if row["clean_base_latent_sha256"] != row["watermark_pre_injection_base_latent_sha256"]:
+            raise RuntimeError(
+                f"HSQR sample {name}: clean and watermark pre-injection base latents differ"
+            )
+        row.update({k: v for k, v in provenance.items() if k != "created_utc"})
+        row["created_utc"] = sfw_bundle.utc_now()
+        metadata_path.write_text(sfw_bundle.canonical_json(row) + "\n", encoding="utf-8")
+        sfw_bundle.append_jsonl(results_path, row)
+        rows.append(row)
+
+    latent_hashes = {row["base_latent_sha256"] for row in rows}
+    if len(rows) > 1 and len(latent_hashes) != len(rows):
+        raise RuntimeError(
+            "HSQR generation produced repeated complete base latents across samples; "
+            "this invalidates the run for independent-sample evaluation"
+        )
+    print(
+        f"[HSQR] generated {len(rows)} sample(s) into {out_dir}; "
+        f"{len(latent_hashes)} distinct complete base latents; "
+        f"key policy {wm_provider.key_policy}",
+        flush=True,
+    )
+    return rows
+
+
 def value_log_label(wm_type):
     if wm_type == "PRC":
         return "PRC value"
@@ -337,6 +566,12 @@ def main(argv=None):
     # latent per sample and indexed, never-overwritten outputs.
     if args.wm_type == "GM":
         return run_gm_generation(args, argv)
+
+    # HSQR has the same single-command flow: a persistent SFWMark bundle, a
+    # deterministic per-sample seed, an independently sampled complete base
+    # latent per sample and indexed, never-overwritten outputs.
+    if args.wm_type == "HSQR":
+        return run_hsqr_generation(args, argv)
 
     wm_provider_cls = WmProviders[args.wm_type].value
     if args.wm_type == "GS" and int(args.num) != 1:
