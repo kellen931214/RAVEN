@@ -103,12 +103,14 @@ PAIR_DISTORTION_FIELDS = ("distortion_config_sha256", "distortion_seed")
 def load_pair_metadata(image_path: Path) -> typing.Optional[typing.Dict[str, typing.Any]]:
     """Locate the per-sample metadata sidecar for a cohort image.
 
-    Looked up as ``<dir>/../sample_metadata/<stem>.json`` (the layout written by
-    ``run_watermark.py``) and then ``<dir>/<stem>.json``.
+    Looked up next to the cohort directory and then at the run root, which is
+    where ``run_watermark.py`` actually writes it for the
+    ``<out_dir>/images/<cohort>/<stem>.png`` layout, and finally beside the image.
     """
     image_path = Path(image_path)
     candidates = (
         image_path.parent.parent / "sample_metadata" / f"{image_path.stem}.json",
+        image_path.parent.parent.parent / "sample_metadata" / f"{image_path.stem}.json",
         image_path.parent / "sample_metadata" / f"{image_path.stem}.json",
         image_path.parent / f"{image_path.stem}.json",
     )

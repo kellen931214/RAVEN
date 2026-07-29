@@ -153,6 +153,11 @@ legacy-threshold decisions are deployment legacy, not TPR@1%FPR.
   from `identify`. Report labels are validated against a fixed list.
 - **Removed** the dead `__get_p_value()` mask-corrupting path and the unused
   free-function `get_distance`; per-image failures are `status="error"`.
+- **Pair-metadata lookup.** `gm_runtime.load_pair_metadata` also looks in
+  `<run_root>/sample_metadata/`, which is where `run_watermark.py` actually
+  writes sidecars for the `<out_dir>/images/<cohort>/<stem>.png` layout. Without
+  it the paired-cohort gate rejected a correctly paired cohort produced by our
+  own generator (this affected GaussMarker's `paper_eval` too).
 
 ### Reused code
 `utils/wm/ddim_inversion.py:official_forward_diffusion` (the official RingID and
@@ -204,10 +209,30 @@ python -m pytest eval_bench_wm/tests/test_rid_official_parity.py -q   # 32 passe
 python -m pytest eval_bench_wm/tests/test_rid_bundle.py -q            # 21 passed
 python -m pytest eval_bench_wm/tests -q                               # full CPU suite, see PR
 ```
-GPU smoke (Issue #3 minimum only): SD2.1-base fp16 + DPM, two independently
-sampled images for one key, matched clean pair, fresh-process bundle reload,
-single-key verification and multi-key identification of images generated from
-two different keys. No attack, FID, CLIP, PSNR/SSIM or benchmark run.
+GPU smoke (Issue #3 minimum only; outputs under
+`outputs/smoke/rid_issue3/`, not a formal cohort). GPU preflight healthy
+(RTX 3090, CUDA 12.4, torch 2.5.1).
+
+**Model caveat.** `stabilityai/stable-diffusion-2-1-base` returns HTTP 401 in
+this environment (the Hugging Face repo is not accessible to this account), so
+the smoke ran on the cached byte-copy mirror `RedbeardNZ/stable-diffusion-2-1-base`
+with the repository-default revision. Both values were passed explicitly, so the
+profile machinery recorded them in `rid_profile_overrides`, set
+`rid_profile_is_official=false` and labelled every result
+`legacy_or_ablation_mode`. The `official_sd21` profile itself could therefore
+**not** be exercised end-to-end on GPU; everything else below was.
+
+| Check | Result |
+| :--- | :--- |
+| 2 images per key, 2 keys (628, 1000), DPM/fp16/512/50/7.5 | generated |
+| independent complete initial latents | 2 distinct clean and 2 distinct watermarked latent hashes per cohort |
+| constant key identity within a cohort | `3cdc758baed14965` (628), `58fd9c614c7fe34a` (1000) |
+| matched positive/negative mini-cohort (`paper_eval_verification`, 2+2 paired) | ROC-AUC `1.0`, TPR@target-FPR `1.0`, empirical FPR `0.0`, cohort threshold `-35.0687` |
+| identification, fresh process, bundle only, full 2048-candidate keybook | key 628 cohort 2/2 correct; key 1000 cohort 2/2 correct (from the key-628 bundle) |
+| keybook reproducibility across processes | `keybook_sha256 = 5451c0d105b200ca…` identical in both runs |
+| finite scores | all channel/min distances and scores finite; 0 error rows |
+
+No attack, FID, CLIP, PSNR/SSIM or benchmark run.
 
 ### Watermark-specific status
 - source-data validity: no cohort generated; smoke outputs only
