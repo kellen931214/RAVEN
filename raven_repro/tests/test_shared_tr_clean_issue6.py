@@ -258,3 +258,13 @@ def test_regenerated_method_specific_clean_image_is_rejected(tmp_path, method):
     rows[0]["pairing_sha256"] = build_pairing_sha256(rows[0])
     with pytest.raises(ValueError, match="clean_path|clean_sha256"):
         audit_shared_clean_cohorts(tr_rows, {method: rows}, verify_files=False, tr_metadata_path=tr_meta)
+
+
+def test_issue6_runner_specs_expose_protocol_modes():
+    from generate_hsqr_from_tr_shared_clean import SPEC as hsqr_spec
+    from generate_hstr_from_tr_shared_clean import SPEC as hstr_spec
+    from generate_rid_from_tr_shared_clean import SPEC as rid_spec
+
+    assert rid_spec.protocol_mode == RID_SHARED_TR_CLEAN_MODE
+    assert hstr_spec.protocol_mode == HSTR_SHARED_TR_CLEAN_MODE
+    assert hsqr_spec.protocol_mode == HSQR_SHARED_TR_CLEAN_MODE

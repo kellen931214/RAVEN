@@ -4,11 +4,13 @@
 from __future__ import annotations
 
 from shared_tr_clean_fourier import MethodSpec, main_for_spec
+from utils.wm.hsqr_provider import HSQR_SHARED_TR_CLEAN_MODE
 
 SPEC = MethodSpec(
         method='HSQR',
         wm_name='HSQR',
         protocol='hsqr_shared_tr_clean_v2',
+        protocol_mode=HSQR_SHARED_TR_CLEAN_MODE,
         provider_module='hsqr_provider',
         provider_class='HSQRProvider',
         provider_entrypoint_field='hsqr_provider_entrypoint_sha256',

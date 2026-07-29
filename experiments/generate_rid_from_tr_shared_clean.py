@@ -4,11 +4,13 @@
 from __future__ import annotations
 
 from shared_tr_clean_fourier import MethodSpec, main_for_spec
+from utils.wm.ringid_provider import RID_SHARED_TR_CLEAN_MODE
 
 SPEC = MethodSpec(
         method='RID',
         wm_name='RingID',
         protocol='ringid_shared_tr_clean_v2',
+        protocol_mode=RID_SHARED_TR_CLEAN_MODE,
         provider_module='ringid_provider',
         provider_class='RingIDProvider',
         provider_entrypoint_field='rid_provider_entrypoint_sha256',

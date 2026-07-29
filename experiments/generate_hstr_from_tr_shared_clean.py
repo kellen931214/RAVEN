@@ -4,11 +4,13 @@
 from __future__ import annotations
 
 from shared_tr_clean_fourier import MethodSpec, main_for_spec
+from utils.wm.hstr_provider import HSTR_SHARED_TR_CLEAN_MODE
 
 SPEC = MethodSpec(
         method='HSTR',
         wm_name='HSTR',
         protocol='hstr_shared_tr_clean_v2',
+        protocol_mode=HSTR_SHARED_TR_CLEAN_MODE,
         provider_module='hstr_provider',
         provider_class='HSTRProvider',
         provider_entrypoint_field='hstr_provider_entrypoint_sha256',

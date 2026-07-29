@@ -3484,3 +3484,11 @@ retained V1 code cannot silently rot now that no V1 data exists.
 - Branch: `agent/cleanup-quality-decomposition`
 - Entry point: `experiments/generate_gs_from_tr_shared_clean.py`
 - Formal output eligibility: V1 results withdrawn; V2 cohort generation in progress.
+
+## 2026-07-29 — Issue #6 PR #16 pre-merge smoke gate update
+
+The requested two-row RID/HSTR/HSQR `shared_tr_clean_v2` GPU smoke was prepared against the existing canonical TR source at `/workspace/RAVEN/data/tr/diffusiondb/metadata.csv` with run_ids 0 and 1 and canonical clean artifacts at `/workspace/RAVEN/data/clean/diffusiondb/000000.png` and `/workspace/RAVEN/data/clean/diffusiondb/000001.png`. No clean artifact was copied, regenerated, renamed, re-encoded, overwritten or modified.
+
+Pre-smoke validation found the three thin RID/HSTR/HSQR runner entrypoints failed at import because their `MethodSpec` declarations omitted `protocol_mode`. Added the missing provider protocol-mode constants and a focused CPU regression test that imports all three runner specs. Focused validation passed: `python -m py_compile experiments/generate_rid_from_tr_shared_clean.py experiments/generate_hstr_from_tr_shared_clean.py experiments/generate_hsqr_from_tr_shared_clean.py raven_repro/tests/test_shared_tr_clean_issue6.py` and `python -m pytest -q raven_repro/tests/test_shared_tr_clean_issue6.py` (`11 passed, 14 warnings`).
+
+GPU preflight passed for `nvidia-smi`, but no idle supported GPU was available. GPUs 0, 1 and 3 had active Python compute processes; GPUs 2, 4, 5, 7 and 8 were not idle by memory/utilization; GPU 6 was idle but is Blackwell and remains disallowed with the current unsupported PyTorch build. Therefore the required two-row GPU smoke was not run, no method watermarked smoke images were generated, no cross-method smoke audit was produced, and no CPU fallback was used. No formal cohort, attack, FID, CLIP, PSNR, SSIM or quality evaluation was run.
