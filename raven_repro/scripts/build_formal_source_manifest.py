@@ -40,6 +40,16 @@ CORE_FILES = (
     "experiments/generate_watermarked_images.py",
     "experiments/generate_gs_from_tr_shared_clean.py",
     "eval_bench_wm/utils/wm/gs_provider.py",
+    # GM and T2S detection runs out of these modules, so a formal GM/T2S run
+    # must pin them exactly as it pins the GS provider. gm_bundle carries the
+    # bundle compatibility gate and t2s_inversion the state-bound inversion
+    # profile, so neither is an implementation detail of its provider.
+    "experiments/generate_gm_from_tr_shared_clean.py",
+    "experiments/generate_t2s_from_tr_shared_clean.py",
+    "eval_bench_wm/utils/wm/gm_provider.py",
+    "eval_bench_wm/utils/wm/gm_bundle.py",
+    "eval_bench_wm/utils/wm/t2s_provider.py",
+    "eval_bench_wm/utils/wm/t2s_inversion.py",
 )
 
 

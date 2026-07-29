@@ -27,6 +27,17 @@ PROVENANCE_FIELDS = [
     "gs_message_sha256", "gs_key_sha256", "gs_nonce_sha256",
     "gs_secret_bundle_sha256", "gs_sampling_seed", "gs_sampling_uniform_sha256",
     "gs_official_tau_onebit", "gs_official_tau_bits",
+    # GaussMarker: cohort-wide bundle identity the detector reproduced.
+    "gm_protocol_mode", "gm_bundle_dir", "gm_bundle_config_sha256",
+    "gm_w1_file_sha256", "gm_w2_file_sha256", "gm_state_source",
+    "gm_profile_is_official", "gm_report_label", "gm_score_definition",
+    "gm_threshold_source", "gm_comparison_operator", "gm_gnr_used",
+    "gm_classifier_used",
+    # T2SMark: the per-sample portable state this row was scored against.
+    "t2s_protocol_mode", "t2s_rng_mode", "t2s_inversion_mode",
+    "t2s_num_inversion_steps", "t2s_watermark_id", "t2s_state_path",
+    "t2s_state_sha256", "t2s_provider_config_sha256", "t2s_decision_rule",
+    "t2s_score_direction",
 ]
 PATH_FIELDS = [item for stage in STAGES for item in (f"{stage}_path", f"{stage}_sha256")]
 SCORE_FIELDS = [
@@ -36,12 +47,35 @@ SCORE_FIELDS = [
     )
 ]
 GS_FIELDS = [f"{stage}_decoded_bits_sha256" for stage in STAGES]
-FIELDNAMES = PROVENANCE_FIELDS + PATH_FIELDS + SCORE_FIELDS + GS_FIELDS + ["error"]
+# GM emits both of its raw domain scores per stage: the spatial-domain bit
+# accuracy (the primary metric, since this bundle carries no GNR/classifier and
+# therefore no ensemble score) and the frequency-domain ring L1.
+GM_FIELDS = [
+    f"{stage}_{suffix}"
+    for stage in STAGES
+    for suffix in ("gm_raw_bit_accuracy", "gm_raw_ring_l1", "gm_restored_bit_accuracy",
+                   "gm_classifier_probability")
+]
+# T2S needs both key scores per stage: the paired_key_comparison decision is
+# score_true_key > score_control_key, so the control score is not a constant and
+# must be recorded per sample and per stage.
+T2S_FIELDS = [
+    f"{stage}_{suffix}"
+    for stage in STAGES
+    for suffix in ("t2s_score_true_key", "t2s_score_control_key", "t2s_score_margin",
+                   "t2s_detection_success", "t2s_key_accuracy", "t2s_message_accuracy")
+]
+FIELDNAMES = (
+    PROVENANCE_FIELDS + PATH_FIELDS + SCORE_FIELDS + GS_FIELDS + GM_FIELDS
+    + T2S_FIELDS + ["error"]
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--method", required=True, choices=["GS", "TR", "RID", "HSTR", "HSQR"])
+    parser.add_argument(
+        "--method", required=True, choices=["GS", "TR", "GM", "T2S", "RID", "HSTR", "HSQR"]
+    )
     parser.add_argument("--metadata", type=Path, required=True, help="Strict pairing manifest CSV")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--resume", action="store_true", help="Append after validated completed rows in an existing output")
@@ -105,6 +139,172 @@ def gs_sampling_provenance(row: dict[str, str], identifier: str) -> dict[str, st
     return resolved
 
 
+def gm_bundle_manifest(row: dict[str, str], identifier: str) -> tuple[Path, dict]:
+    """Load the cohort's GM bundle manifest and bind it to this row's digests.
+
+    The detector configuration is read from the bundle rather than restated
+    here, so a detector can never be constructed with copy factors, ring
+    parameters or an inversion profile that differ from the ones the cohort was
+    embedded with. ``GmProvider`` re-checks the same manifest through
+    ``GmBundle.assert_compatible``; this is the outer binding that ties the
+    bundle to the digests recorded in the source metadata.
+    """
+    bundle_dir = Path(str(row.get("gm_bundle_dir", ""))).resolve()
+    manifest_path = bundle_dir / "manifest.json"
+    if not manifest_path.is_file():
+        raise RuntimeError(f"run_id={identifier}: GM bundle manifest not found: {manifest_path}")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    for manifest_field, row_field in (
+        ("bundle_config_sha256", "gm_bundle_config_sha256"),
+        ("w1_file_sha256", "gm_w1_file_sha256"),
+        ("w2_file_sha256", "gm_w2_file_sha256"),
+        ("m_sha256", "gm_m_sha256"),
+        ("watermark_sha256", "gm_watermark_sha256"),
+        ("w2_tensor_sha256", "gm_target_sha256"),
+    ):
+        expected = str(row.get(row_field, ""))
+        actual = str(manifest.get(manifest_field, ""))
+        if not expected or expected != actual:
+            raise RuntimeError(
+                f"run_id={identifier}: GM bundle/source {row_field} mismatch: "
+                f"source={expected!r} bundle={actual!r}"
+            )
+    for digest_field, file_name in (
+        ("w1_file_sha256", "w1.pth"),
+        ("w2_file_sha256", "w2.pth"),
+    ):
+        artifact = bundle_dir / file_name
+        if not artifact.is_file() or sha256(artifact) != str(manifest[digest_field]):
+            raise RuntimeError(f"run_id={identifier}: GM bundle artifact drift: {artifact}")
+    return bundle_dir, manifest
+
+
+def gm_provider_kwargs(row: dict[str, str], identifier: str) -> dict:
+    """Constructor kwargs derived from the bundle the cohort was embedded with."""
+    bundle_dir, manifest = gm_bundle_manifest(row, identifier)
+    if manifest.get("gnr_sha256") is not None or manifest.get("classifier_sha256") is not None:
+        # This bundle would produce the official ensemble score; supporting it
+        # means loading those checkpoints, which this cohort does not have.
+        raise RuntimeError(
+            f"run_id={identifier}: GM bundle declares GNR/classifier artifacts; "
+            "ensemble-score detection is not wired up for this cohort"
+        )
+    return {
+        "gm_profile": str(manifest["profile"]),
+        "gm_bundle_dir": str(bundle_dir),
+        "gm_create_bundle": False,
+        "gm_allow_in_memory_state": False,
+        "gm_torch_dtype": str(manifest["torch_dtype"]),
+        "gm_channel_copy": int(manifest["channel_copy"]),
+        "gm_w_copy": int(manifest["w_copy"]),
+        "gm_h_copy": int(manifest["h_copy"]),
+        "gm_watermark_bits_seed": manifest.get("watermark_bits_seed"),
+        "gm_use_gnr": False,
+        "gm_gnr_path": None,
+        "gm_use_classifier": False,
+        "gm_classifier_path": None,
+        "modelid_target": str(manifest["model_id"]),
+        "model_revision": str(manifest["model_revision"]),
+        "scheduler_target": str(manifest["scheduler"]),
+        "resolution": int(manifest["resolution"]),
+        "w_seed": int(manifest["w_seed"]),
+        "w_channel": int(manifest["w_channel"]),
+        "w_pattern": str(manifest["w_pattern"]),
+        "w_mask_shape": str(manifest["w_mask_shape"]),
+        "w_radius": int(manifest["w_radius"]),
+        "w_measurement": str(manifest["w_measurement"]),
+        "w_injection": str(manifest["w_injection"]),
+    }
+
+
+class T2SStateDetector:
+    """Per-row detector bound to one T2SMark portable state.
+
+    T2S detection is state-bound rather than cohort-uniform: every row carries
+    its own session key and message, so there is no single provider instance
+    that can score the cohort. This adapter exposes the provider interface
+    ``evaluate_image`` expects while delegating to the two authoritative
+    standalone implementations — ``t2s_inversion.invert_image`` and
+    ``T2SProvider.accuracies_for_state`` — which are the same functions
+    ``eval_bench_wm/run_verification.py`` uses. No detector maths lives here.
+
+    Constructing a real ``T2SProvider`` would be wrong as well as unnecessary:
+    its ``__init__`` draws master-key/message RNG for generation, which a
+    detector must never do.
+    """
+
+    def __init__(self, state, provider_module, inversion_module):
+        self.state = state
+        self._provider_module = provider_module
+        self._invert_image = inversion_module.invert_image
+
+    def get_wm_type(self) -> str:
+        return "T2S"
+
+    def invert_images(self, images, pipe_provider_target=None, num_inference_steps=None, **_):
+        if pipe_provider_target is None:
+            raise ValueError("T2S inversion requires pipe_provider_target")
+        if isinstance(images, list):
+            if len(images) != 1:
+                raise ValueError("T2S inversion supports a single image per call")
+            images = images[0]
+        # The state's own recorded profile wins: this cohort was embedded under
+        # t2s_official / 10 steps, and scoring it under the benchmark DDIM
+        # profile would be a different detector.
+        zT = self._invert_image(
+            pipe_provider_target,
+            images,
+            inversion_mode=self.state.inversion_mode,
+            num_inversion_steps=self.state.num_inversion_steps,
+            benchmark_num_inference_steps=self.state.num_inference_steps,
+        )
+        return {"zT_torch": zT}
+
+    def get_accuracies(self, reversed_latents):
+        return self._provider_module.T2SProvider.accuracies_for_state(
+            self.state, reversed_latents
+        )
+
+
+def t2s_state_for_row(row: dict[str, str], identifier: str):
+    """Load and bind this row's portable T2S state (fail closed on any drift)."""
+    from utils.wm.t2s_provider import T2SWatermarkState
+
+    state_path = Path(str(row.get("t2s_state_path", ""))).resolve()
+    if not state_path.is_file():
+        raise RuntimeError(f"run_id={identifier}: T2S state file not found: {state_path}")
+    # ``load`` already fails closed when the embedded digest does not survive the
+    # round trip; this additionally binds it to the digest the cohort recorded.
+    state = T2SWatermarkState.load(state_path)
+    recorded = str(row.get("t2s_state_sha256", ""))
+    if not recorded or recorded != state.state_sha256():
+        raise RuntimeError(
+            f"run_id={identifier}: T2S state SHA mismatch: "
+            f"source={recorded!r} state={state.state_sha256()!r}"
+        )
+    recorded_id = str(row.get("t2s_watermark_id", ""))
+    if not recorded_id or recorded_id != state.watermark_id:
+        raise RuntimeError(
+            f"run_id={identifier}: T2S watermark_id mismatch: "
+            f"source={recorded_id!r} state={state.watermark_id!r}"
+        )
+    for field, row_field in (
+        ("rng_mode", "t2s_rng_mode"),
+        ("inversion_mode", "t2s_inversion_mode"),
+        ("provider_config_sha256", "t2s_provider_config_sha256"),
+    ):
+        expected = str(row.get(row_field, ""))
+        actual = str(getattr(state, field))
+        if not expected or expected != actual:
+            raise RuntimeError(
+                f"run_id={identifier}: T2S {row_field} mismatch: "
+                f"source={expected!r} state={actual!r}"
+            )
+    if int(row["t2s_num_inversion_steps"]) != int(state.num_inversion_steps):
+        raise RuntimeError(f"run_id={identifier}: T2S num_inversion_steps mismatch")
+    return state
+
+
 def provider_kwargs(method: str, row: dict[str, str]) -> dict:
     if method == "GS":
         secret_index = integer(row, ("gs_secret_index", "offset"), 0)
@@ -150,6 +350,9 @@ def provider_class(method: str):
     if method == "GS":
         from utils.wm.gs_provider import GsProvider
         return GsProvider
+    if method == "GM":
+        from utils.wm.gm_provider import GmProvider
+        return GmProvider
     if method == "RID":
         from utils.wm.ringid_provider import RingIDProvider
         return RingIDProvider
@@ -167,6 +370,17 @@ def raw_score(method: str, result: dict) -> float:
         return float(result["p_values"][0])
     if method in {"RID", "HSTR", "HSQR"}:
         return float(result["l1_dist"][0])
+    if method == "GM":
+        # This cohort's bundle carries no GNR and no classifier, so the official
+        # ensemble score does not exist and gm_provider correctly refuses to
+        # fabricate one. The raw spatial-domain bit accuracy is GM's own primary
+        # score; the frequency-domain ring L1 is recorded alongside it.
+        value = result.get("gm_raw_bit_accuracy")
+        if value is None:
+            raise RuntimeError("GM detector returned no gm_raw_bit_accuracy")
+        return float(value)
+    if method == "T2S":
+        return float(result["t2s_score_true_key"])
     return float(result["bit_accuracies"][0])
 
 
@@ -175,7 +389,21 @@ def canonical_score(method: str, raw: float, result: dict) -> float:
         diagnostics = result.get("p_value_diagnostics") or []
         log_p = float(diagnostics[0].get("log_p", float("nan"))) if diagnostics else float("nan")
         return -log_p / math.log(10.0) if math.isfinite(log_p) else -math.log10(max(raw, sys.float_info.min))
+    # GM bit accuracy and T2S score_true_key are both higher-is-watermarked
+    # already, so the canonical score is the raw score, exactly as for GS.
     return -raw if method in {"RID", "HSTR", "HSQR"} else raw
+
+
+SCORE_DIRECTION_TEXT = {
+    "TR": "lower raw p-value means watermark; canonical=-log10(p)",
+    "GS": "higher bit accuracy means watermark",
+    "GM": "higher gm_raw_bit_accuracy means watermark",
+    "T2S": "higher t2s score_true_key means watermark",
+}
+
+
+def score_direction_text(method: str) -> str:
+    return SCORE_DIRECTION_TEXT.get(method, "lower raw L1 means watermark; canonical=-L1")
 
 
 def sha256(path: Path) -> str:
@@ -278,12 +506,40 @@ def main() -> int:
 
     provider = None
     target_hash = ""
-    if method != "GS":
+    # GS and T2S bind their detector to per-sample state, so their provider is
+    # rebuilt inside the row loop. Every other method has one cohort-wide
+    # detector built once here. GM is cohort-wide too, but its constructor
+    # kwargs come from the bundle recorded in the rows, so it is built from the
+    # first row rather than from uniform_kwargs alone.
+    per_sample_provider_methods = {"GS", "T2S"}
+    if method == "GM":
+        first_row = manifest_rows[0]
+        first_id = first(first_row, "run_id", "sample_id", "id", "index") or "0"
+        provider = provider_class(method)(
+            latent_shape=latent_shape,
+            dtype=pipe.get_dtype(),
+            device=device,
+            **gm_provider_kwargs(first_row, str(first_id)),
+        )
+        if provider.bundle is None or provider.state_source != "bundle":
+            raise RuntimeError(
+                "GM verification requires an existing persisted bundle; "
+                f"state_source={provider.state_source!r}"
+            )
+        target = getattr(provider, "gt_patch", None)
+        target_hash = tensor_sha256(target.real.contiguous()) if target is not None else ""
+    elif method not in per_sample_provider_methods:
         provider = provider_class(method)(
             latent_shape=latent_shape, dtype=pipe.get_dtype(), device=device, **uniform_kwargs
         )
         target = getattr(provider, "gt_patch", None)
         target_hash = tensor_sha256(target) if target is not None else ""
+    t2s_modules = None
+    if method == "T2S":
+        import utils.wm.t2s_provider as t2s_provider_module
+        import utils.wm.t2s_inversion as t2s_inversion_module
+
+        t2s_modules = (t2s_provider_module, t2s_inversion_module)
     processed, errors = 0, 0
     completed: set[str] = set()
     output_mode, write_header = "x", True
@@ -329,8 +585,7 @@ def main() -> int:
                 "vae_id": row.get("vae_id") or "checkpoint-default", "vae_scaling_factor": vae_scaling,
                 "scheduler": args.scheduler, "inverse_scheduler": inverse_scheduler, "steps": args.steps,
                 "resolution": args.resolution, "detector_dtype": str(pipe.get_dtype()),
-                "score_direction": "lower raw p-value means watermark; canonical=-log10(p)" if method == "TR" else
-                    ("lower raw L1 means watermark; canonical=-L1" if method != "GS" else "higher bit accuracy means watermark"),
+                "score_direction": score_direction_text(method),
                 "generation_seed": row.get("generation_seed", ""), "attack_seed": row.get("attack_seed", ""),
                 "legacy_threshold": row.get("legacy_threshold") or legacy["threshold"], "target_fpr": args.target_fpr,
                 "provider_config_hash": uniform_hash,
@@ -394,6 +649,54 @@ def main() -> int:
                         "source_watermark_mask_sha256": source_mask_hash,
                         "detector_watermark_mask_sha256": detector_mask_hash,
                     })
+                if method == "GM":
+                    # Re-bind every row to the same bundle the detector holds, so
+                    # a mixed-bundle manifest cannot slip past the uniform
+                    # provider-config check.
+                    gm_bundle_manifest(row, str(identifier))
+                    source_target_hash = str(row.get("watermark_target_sha256", ""))
+                    detector_target_hash = tensor_sha256(provider.gt_patch.real.contiguous())
+                    source_mask_hash = str(row.get("watermark_mask_sha256", ""))
+                    detector_mask_hash = tensor_sha256(provider.watermarking_mask)
+                    if not source_target_hash or source_target_hash != detector_target_hash:
+                        raise RuntimeError(
+                            f"run_id={identifier}: GM detector/source target SHA mismatch"
+                        )
+                    if not source_mask_hash or source_mask_hash != detector_mask_hash:
+                        raise RuntimeError(
+                            f"run_id={identifier}: GM detector/source mask SHA mismatch"
+                        )
+                    record.update({
+                        "source_watermark_target_sha256": source_target_hash,
+                        "detector_watermark_target_sha256": detector_target_hash,
+                        "source_watermark_mask_sha256": source_mask_hash,
+                        "detector_watermark_mask_sha256": detector_mask_hash,
+                        "gm_protocol_mode": row.get("gm_protocol_mode", ""),
+                        "gm_bundle_dir": row.get("gm_bundle_dir", ""),
+                        "gm_bundle_config_sha256": row.get("gm_bundle_config_sha256", ""),
+                        "gm_w1_file_sha256": row.get("gm_w1_file_sha256", ""),
+                        "gm_w2_file_sha256": row.get("gm_w2_file_sha256", ""),
+                        "gm_state_source": provider.state_source,
+                        "gm_profile_is_official": provider.profile_is_official,
+                    })
+                if method == "T2S":
+                    state = t2s_state_for_row(row, str(identifier))
+                    provider = T2SStateDetector(state, *t2s_modules)
+                    record.update({
+                        "t2s_protocol_mode": row.get("t2s_protocol_mode", ""),
+                        "t2s_rng_mode": row.get("t2s_rng_mode", ""),
+                        "t2s_inversion_mode": row.get("t2s_inversion_mode", ""),
+                        "t2s_num_inversion_steps": row.get("t2s_num_inversion_steps", ""),
+                        "t2s_watermark_id": state.watermark_id,
+                        "t2s_state_path": row.get("t2s_state_path", ""),
+                        "t2s_state_sha256": state.state_sha256(),
+                        "t2s_provider_config_sha256": state.provider_config_sha256,
+                        # T2S has no cohort-wide target tensor: the target is the
+                        # session key/message inside each row's own state, whose
+                        # digest is the per-sample target hash.
+                        "source_watermark_target_sha256": row.get("watermark_target_sha256", ""),
+                        "detector_watermark_target_sha256": state.state_sha256(),
+                    })
                 record["provider_parameters"] = json.dumps(uniform_kwargs, sort_keys=True)
                 record["watermark_seed"] = next((kwargs[key] for key in ("w_seed", "rid_seed", "hstr_seed", "hsqr_seed") if key in kwargs), "")
                 record["fix_gt"], record["offset"] = kwargs.get("fix_gt", ""), kwargs.get("offset", "")
@@ -414,12 +717,64 @@ def main() -> int:
                     record[f"{stage}_canonical_score"] = canonical_score(method, raw, result)
                     if method == "TR":
                         add_tr_diagnostics(record, stage, result)
+                    if method == "GM":
+                        for field in (
+                            "gm_raw_bit_accuracy", "gm_raw_ring_l1",
+                            "gm_restored_bit_accuracy", "gm_classifier_probability",
+                        ):
+                            value = result.get(field)
+                            record[f"{stage}_{field}"] = "" if value is None else value
+                    if method == "T2S":
+                        for field in (
+                            "t2s_score_true_key", "t2s_score_control_key",
+                            "t2s_score_margin", "t2s_key_accuracy",
+                        ):
+                            value = result.get(field)
+                            record[f"{stage}_{field}"] = "" if value is None else value
+                        message_accuracy = result.get("message_accuracy")
+                        record[f"{stage}_t2s_message_accuracy"] = (
+                            "" if message_accuracy is None else message_accuracy
+                        )
+                        record[f"{stage}_t2s_detection_success"] = bool(
+                            result["detection_success"]
+                        )
                 if method == "GS":
                     for stage in STAGES:
                         decoded = stage_results[stage]["message_bits_str_list"][0]
                         record[f"{stage}_decoded_bits_sha256"] = hashlib.sha256(
                             decoded.encode("ascii")
                         ).hexdigest()
+                if method == "GM":
+                    # Detector self-description, taken from the detector itself
+                    # rather than restated, and required to be identical across
+                    # the three stages of one row.
+                    for field in (
+                        "gm_report_label", "gm_score_definition",
+                        "gm_threshold_source", "gm_comparison_operator",
+                    ):
+                        values = {str(stage_results[stage][field]) for stage in STAGES}
+                        if len(values) != 1:
+                            raise RuntimeError(
+                                f"run_id={identifier}: GM {field} differs between stages: "
+                                f"{sorted(values)}"
+                            )
+                        record[field] = next(iter(values))
+                    record["gm_gnr_used"] = bool(stage_results["watermarked"]["gm_used_gnr"])
+                    record["gm_classifier_used"] = bool(
+                        stage_results["watermarked"]["gm_used_classifier"]
+                    )
+                if method == "T2S":
+                    for field, column in (
+                        ("decision_rule", "t2s_decision_rule"),
+                        ("score_direction", "t2s_score_direction"),
+                    ):
+                        values = {str(stage_results[stage][field]) for stage in STAGES}
+                        if len(values) != 1:
+                            raise RuntimeError(
+                                f"run_id={identifier}: T2S {field} differs between stages: "
+                                f"{sorted(values)}"
+                            )
+                        record[column] = next(iter(values))
                 del stage_results
             except Exception as exc:
                 errors += 1

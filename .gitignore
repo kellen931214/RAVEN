@@ -33,6 +33,11 @@ Thumbs.db
 *.swp
 *.swo
 
+# Agent scratch space. formal evaluation calls require_clean_git_worktree with
+# --untracked-files=all, so a stray agent worktree here would otherwise block
+# every formal run.
+.claude/
+
 # Generated experiment artifacts
 outputs/
 logs/

@@ -1,0 +1,201 @@
+{
+  "base_latent": {
+    "dtype": "float32",
+    "recipe": "torch.randn(4, 4, 64, 64, dtype=torch.float32, generator=torch.Generator('cpu').manual_seed(20250729))",
+    "seed": 20250729,
+    "sha256": "a129f7aa4fa49f66f7cef3e50bbc6ef75325a6cc93f00ceb79df30d1413571c8",
+    "shape": [
+      4,
+      4,
+      64,
+      64
+    ]
+  },
+  "derivation": "executed the frozen official src/utils.py; not transcribed",
+  "generated_utc": "2026-07-29T13:19:04Z",
+  "generator": "eval_bench_wm/tools/generate_hsqr_official_fixtures.py",
+  "keys": {
+    "0": {
+      "clean_l1_distances": [
+        71.96414947509766,
+        70.00691986083984,
+        70.2446517944336,
+        72.61878204345703
+      ],
+      "clean_scores": [
+        -71.96414947509766,
+        -70.00691986083984,
+        -70.2446517944336,
+        -72.61878204345703
+      ],
+      "key_index": 0,
+      "key_seed": 7433,
+      "pattern_bits_b64": "AAM/MAAAAM/MAAP/P8M/8P/P8M/8MDMMMwMMDMMMwMMDPMMwMMDPMMwMMDMAMwMMDMAMwMP/PAM/8P/PAM/8AAMzMAAAAMzMAA//8P/////8P////8P8MzM/8P8MzMAA/A8zwAA/A8zwMDDDAwMMDDDAwMwM8PPwDwM8PPwDA/PAz/AA/PAz/A//8DA/w//8DA/wAAP8/P/AAP8/P/P/MwDwMP/MwDwMMDPMzPDMDPMzPDMDPA8M/MDPA8M/MDPzwzwMDPzwzwP/P8D88P/P8D88AAPAM/PAAPAM/PA=",
+      "pattern_ones": 844,
+      "pattern_sha256": "4fb8b70ec30dd568ca829cc623a4755860658e2a53a82070d0707df33d678d07",
+      "pattern_shape": [
+        1,
+        42,
+        42
+      ],
+      "payload": "HSQR7433",
+      "watermarked_l1_distances": [
+        36.67438507080078,
+        37.29815673828125,
+        35.875858306884766,
+        36.38302230834961
+      ],
+      "watermarked_latent_sha256": "bb3d0eae112a0165627984503f20110ef1a77ed7c175b177a0fca66b404c8d7d",
+      "watermarked_scores": [
+        -36.67438507080078,
+        -37.29815673828125,
+        -35.875858306884766,
+        -36.38302230834961
+      ]
+    },
+    "1": {
+      "clean_l1_distances": [
+        72.19927978515625,
+        70.07231140136719,
+        72.31468200683594,
+        71.45096588134766
+      ],
+      "clean_scores": [
+        -72.19927978515625,
+        -70.07231140136719,
+        -72.31468200683594,
+        -71.45096588134766
+      ],
+      "key_index": 1,
+      "key_seed": 7434,
+      "pattern_bits_b64": "AAMP8AAAAMP8AAP/MA8/8P/MA8/8MDPzMwMMDPzMwMMDMM8wMMDMM8wMMDMAMwMMDMAMwMP/Mz8/8P/Mz8/8AAMzMAAAAMzMAA///MP/////MP///PPzPAw/PPzPAwPD8zDMPPD8zDMPMzDPMADMzDPMADzMzDPA8zMzDPA8AzAA/MMAzAA/MM//8PzAA//8PzAAAAP/Mw/AAP/Mw/P/PMAPzP/PMAPzMDPPwzMMDPPwzMMDM8M8AMDM8M8AMDPAwA8MDPAwA8P/PD/DMP/PD/DMAAPD8APAAPD8APA=",
+      "pattern_ones": 820,
+      "pattern_sha256": "a57eb68242291614e510b8d99172df9338045a2dda06e3ac212d756f50888ce7",
+      "pattern_shape": [
+        1,
+        42,
+        42
+      ],
+      "payload": "HSQR7434",
+      "watermarked_l1_distances": [
+        36.67438507080078,
+        37.298160552978516,
+        35.875858306884766,
+        36.38302230834961
+      ],
+      "watermarked_latent_sha256": "e501b4eb06773fa95931324ab84568b1a24568b730b17a6f70775587e1948c3f",
+      "watermarked_scores": [
+        -36.67438507080078,
+        -37.298160552978516,
+        -35.875858306884766,
+        -36.38302230834961
+      ]
+    },
+    "1024": {
+      "clean_l1_distances": [
+        70.64827728271484,
+        69.74527740478516,
+        72.0137939453125,
+        71.45124053955078
+      ],
+      "clean_scores": [
+        -70.64827728271484,
+        -69.74527740478516,
+        -72.0137939453125,
+        -71.45124053955078
+      ],
+      "key_index": 1024,
+      "key_seed": 8457,
+      "pattern_bits_b64": "AAMM8AAAAMM8AAP/M/M/8P/M/M/8MDPwMwMMDPwMwMMDMM8wMMDMM8wMMDMMMwMMDMMMwMP/MMM/8P/MMM/8AAMzMAAAAMzMAA///AP/////AP///PPD/Aw/PPD/AwM/wPzMPM/wPzMP8PPDzAD8PPDzADMz8MwA8Mz8MwA8DADP8MMDADP8MM//8w/AA//8w/AAAAPwzw/AAPwzw/P/P//PzP/P//PzMDPP/8MMDPP/8MMDMwzPAMDMwzPAMDPzwA8MDPzwA8P/P8M88P/P8M88AAPzDAPAAPzDAPA=",
+      "pattern_ones": 860,
+      "pattern_sha256": "404842532c72f6b55c554ca77378fdfbdddc0ae78fa130d6f8c70a93e5b71fbb",
+      "pattern_shape": [
+        1,
+        42,
+        42
+      ],
+      "payload": "HSQR8457",
+      "watermarked_l1_distances": [
+        36.67438507080078,
+        37.29815673828125,
+        35.875858306884766,
+        36.38302230834961
+      ],
+      "watermarked_latent_sha256": "74f6611afc1d05800ca05e5dd9d49c788bd092e58164ef0ba871e8aaf94cb3c0",
+      "watermarked_scores": [
+        -36.67438507080078,
+        -37.29815673828125,
+        -35.875858306884766,
+        -36.38302230834961
+      ]
+    },
+    "2047": {
+      "clean_l1_distances": [
+        71.92987823486328,
+        70.71588897705078,
+        72.12628936767578,
+        72.0965576171875
+      ],
+      "clean_scores": [
+        -71.92987823486328,
+        -70.71588897705078,
+        -72.12628936767578,
+        -72.0965576171875
+      ],
+      "key_index": 2047,
+      "key_seed": 9480,
+      "pattern_bits_b64": "AAMMMAAAAMMMAAP/M8M/8P/M8M/8MDPP8wMMDPP8wMMDMM8wMMDMM8wMMDMA8wMMDMA8wMP/Mz8/8P/Mz8/8AAMzMAAAAMzMAA///8P/////8P///PPM/Aw/PPM/Aw88zwPMP88zwPMPwMAw8ADwMAw8AD/MwzAA8/MwzAA8zzPMDMMzzPMDMM//8APAA//8APAAAAP8ww/AAP8ww/P/PPMPzP/PPMPzMDPw8/8MDPw8/8MDMMMMwMDMMMMwMDPPPD8MDPPPD8P/P8A/8P/P8A/8AAPDz8PAAPDz8PA=",
+      "pattern_ones": 860,
+      "pattern_sha256": "a37f0bed123aa1ea44773f146a576dc5f37206cefc176e43f68f7feb37b5e0ce",
+      "pattern_shape": [
+        1,
+        42,
+        42
+      ],
+      "payload": "HSQR9480",
+      "watermarked_l1_distances": [
+        36.67438507080078,
+        37.29815673828125,
+        35.875858306884766,
+        36.38302230834961
+      ],
+      "watermarked_latent_sha256": "96a3d61b168fd94bd21071b5812ef21724e4e2c159ac43de4fa54030740b1e89",
+      "watermarked_scores": [
+        -36.67438507080078,
+        -37.29815673828125,
+        -35.875858306884766,
+        -36.38302230834961
+      ]
+    }
+  },
+  "official_constants": {
+    "base_key_seed": 7433,
+    "border": 0,
+    "box_size": 2,
+    "center_end": 54,
+    "center_start": 10,
+    "delta": 0,
+    "error_correction": "H",
+    "latent_hw": 64,
+    "qr_version": 1,
+    "score_definition": "negative_mean_complex_l1_distance",
+    "target_magnitude": 45.0,
+    "watermark_channel": [
+      3
+    ],
+    "wm_capacity": 2048
+  },
+  "provenance": {
+    "official_commit": "78666128b44614a0cc471993649e3132d5dddfcb",
+    "official_detect_sha256": "fac82635c48843fbbbb172dd918dadb13d1fc8694dbf23f8b30d310c2a70ea0c",
+    "official_generate_sha256": "bf8b79543d6ddfc4b904a5026c82bd0f32d91bedf2b6a46c0e4e8d51fc40243e",
+    "official_repo": "https://github.com/thomas11809/SFWMark",
+    "official_utils_sha256": "d3deb279006a143e2e082a1bf1195c5cc4846722bf01a702c58efbb834f6dea8"
+  },
+  "schema": "hsqr_official_fixtures_v1",
+  "tolerances": {
+    "distance_abs": 0.0,
+    "qr_pattern": "exact (bitwise)",
+    "watermarked_latent_max_abs": 0.0
+  }
+}

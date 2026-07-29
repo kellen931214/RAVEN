@@ -378,7 +378,7 @@ def method_from_path(run_root: Path) -> str | None:
     parts = [part.lower() for part in Path(run_root).resolve().parts]
     if "outputs" in parts:
         index = parts.index("outputs")
-        if index + 1 < len(parts) and parts[index + 1] in {"tr", "gs"}:
+        if index + 1 < len(parts) and parts[index + 1] in {"tr", "gs", "gm", "t2s"}:
             return parts[index + 1].upper()
     return None
 
@@ -797,6 +797,8 @@ ATTACK_SUCCESS_KEYS = (
     "attack_success_rate",
     "attack_success_rate_at_recalibrated_threshold",
     "attack_success_rate_at_official_onebit_threshold",
+    "attack_success_rate_at_clean_calibrated_threshold",
+    "attack_success_rate_at_paired_key_comparison",
 )
 
 
@@ -819,9 +821,202 @@ def authoritative_attack_success(
     return None
 
 
+def method_metric_block(sources: Sources, required: tuple[str, ...]) -> tuple[dict, str] | None:
+    """Locate a method's own metric block, identified by its required keys."""
+    for key in ("verification", "formal_aggregate", "aggregate"):
+        payload = sources.get(key)
+        block = dig(payload, "metric")
+        if isinstance(block, dict) and all(name in block for name in required):
+            return block, sources.rel(key)
+        if isinstance(payload, dict) and all(name in payload for name in required):
+            return payload, sources.rel(key)
+    return None
+
+
+GM_REQUIRED_METRIC_KEYS = (
+    "detector_metric",
+    "macro_bit_accuracy_before",
+    "macro_bit_accuracy_attacked",
+    "clean_calibrated_threshold",
+    "before_detection_rate_at_clean_calibrated_threshold",
+    "attacked_detection_rate_at_clean_calibrated_threshold",
+    "official_ensemble_threshold_available",
+)
+
+
+def extract_gm_detector_metrics(sources: Sources) -> DetectorMetrics:
+    """GaussMarker: raw spatial-domain bit accuracy, clean-calibrated threshold.
+
+    GM's own metric name is ``gm_raw_bit_accuracy`` and its own threshold family
+    here is ``empirical_clean_1pct_fpr``, because this cohort's bundle carries
+    no GNR and no classifier and therefore has no official ensemble threshold.
+    Neither the GS ``official_beta_tail_tau_onebit`` family nor the TR TPR family
+    is reused, and a bundle that *does* have the ensemble artifacts fails closed
+    here rather than being reported under this family.
+    """
+    found = method_metric_block(sources, GM_REQUIRED_METRIC_KEYS)
+    if found is None:
+        return DetectorMetrics()
+    metric, source = found
+
+    if metric.get("detector_metric") != "gm_raw_bit_accuracy":
+        raise UpdaterError(
+            f"unknown GM detector schema in {source}: "
+            f"detector_metric={metric.get('detector_metric')!r}"
+        )
+    if metric.get("official_ensemble_threshold_available") is not False:
+        raise UpdaterError(
+            f"GM run in {source} declares an official ensemble threshold; that is a "
+            "different threshold family and needs its own extractor"
+        )
+    operator = metric.get("threshold_comparison_operator")
+    if operator not in (">", ">="):
+        raise UpdaterError(f"unsupported GM threshold comparison operator {operator!r} in {source}")
+    direction = metric.get("score_direction")
+    if direction not in VALID_SCORE_DIRECTIONS:
+        raise UpdaterError(f"unsupported GM score direction {direction!r} in {source}")
+
+    result = DetectorMetrics(
+        detector_metric="gm_raw_bit_accuracy",
+        score_direction=direction,
+        threshold_type=metric.get("threshold_type"),
+        threshold=check_finite(
+            metric.get("clean_calibrated_threshold"), "clean_calibrated_threshold", source
+        ),
+        before_score=check_finite(
+            metric.get("macro_bit_accuracy_before"), "macro_bit_accuracy_before", source
+        ),
+        after_score=check_finite(
+            metric.get("macro_bit_accuracy_attacked"), "macro_bit_accuracy_attacked", source
+        ),
+        before_detection_rate=check_finite(
+            metric.get("before_detection_rate_at_clean_calibrated_threshold"),
+            "before_detection_rate_at_clean_calibrated_threshold",
+            source,
+        ),
+        after_detection_rate=check_finite(
+            metric.get("attacked_detection_rate_at_clean_calibrated_threshold"),
+            "attacked_detection_rate_at_clean_calibrated_threshold",
+            source,
+        ),
+        roc_auc=check_finite(metric.get("attacked_roc_auc"), "attacked_roc_auc", source),
+    )
+    # The threshold really was calibrated from this run's clean-negative cohort,
+    # so its measured FPR is a genuine empirical clean FPR.
+    clean_n = dig(metric, "stages", "clean", "N")
+    if isinstance(clean_n, int) and clean_n > 0:
+        result.empirical_clean_fpr = check_finite(
+            metric.get("clean_calibrated_actual_empirical_fpr"),
+            "clean_calibrated_actual_empirical_fpr",
+            source,
+        )
+    result.attack_success = authoritative_attack_success(sources)
+    if result.attack_success is not None and result.after_detection_rate is not None:
+        expected = 1.0 - float(result.after_detection_rate)
+        if abs(float(result.attack_success) - expected) > 1e-9:
+            raise UpdaterError(
+                f"GM attack success in {source} is {result.attack_success!r}, which is not "
+                f"1 - attacked detection rate at the same threshold ({expected!r})"
+            )
+    return result
+
+
+T2S_REQUIRED_METRIC_KEYS = (
+    "detector_metric",
+    "threshold_type",
+    "mean_score_true_key_before",
+    "mean_score_true_key_attacked",
+    "before_detection_rate_at_paired_key_comparison",
+    "attacked_detection_rate_at_paired_key_comparison",
+    "empirical_clean_fpr_at_paired_key_comparison",
+)
+
+
+def extract_t2s_detector_metrics(sources: Sources) -> DetectorMetrics:
+    """T2SMark: score_true_key under its own stored paired_key_comparison rule.
+
+    The comparand is each sample's own control-key score, so Threshold stays
+    empty rather than carrying an invented scalar, and Threshold Type names the
+    real family. The detection rates are the stored rule's rates — explicitly
+    not TPR at a calibrated 1% FPR, which the run records separately as a
+    secondary family and which this extractor deliberately does not read into
+    the detection-rate cells.
+    """
+    found = method_metric_block(sources, T2S_REQUIRED_METRIC_KEYS)
+    if found is None:
+        return DetectorMetrics()
+    metric, source = found
+
+    if metric.get("detector_metric") != "t2s_score_true_key":
+        raise UpdaterError(
+            f"unknown T2S detector schema in {source}: "
+            f"detector_metric={metric.get('detector_metric')!r}"
+        )
+    if metric.get("threshold_type") != "paired_key_comparison_control_key":
+        raise UpdaterError(
+            f"unknown T2S threshold family in {source}: {metric.get('threshold_type')!r}"
+        )
+    if metric.get("threshold_comparison_operator") != ">":
+        raise UpdaterError(
+            "unsupported T2S threshold comparison operator "
+            f"{metric.get('threshold_comparison_operator')!r} in {source}"
+        )
+    direction = metric.get("score_direction")
+    if direction not in VALID_SCORE_DIRECTIONS:
+        raise UpdaterError(f"unsupported T2S score direction {direction!r} in {source}")
+    if metric.get("threshold") is not None:
+        raise UpdaterError(
+            f"T2S run in {source} reports a scalar threshold; the paired_key_comparison "
+            "rule compares against each sample's own control-key score"
+        )
+
+    result = DetectorMetrics(
+        detector_metric="t2s_score_true_key",
+        score_direction=direction,
+        threshold_type=metric.get("threshold_type"),
+        # Left as None on purpose: per-sample comparand, no cohort scalar.
+        threshold=None,
+        before_score=check_finite(
+            metric.get("mean_score_true_key_before"), "mean_score_true_key_before", source
+        ),
+        after_score=check_finite(
+            metric.get("mean_score_true_key_attacked"), "mean_score_true_key_attacked", source
+        ),
+        before_detection_rate=check_finite(
+            metric.get("before_detection_rate_at_paired_key_comparison"),
+            "before_detection_rate_at_paired_key_comparison",
+            source,
+        ),
+        after_detection_rate=check_finite(
+            metric.get("attacked_detection_rate_at_paired_key_comparison"),
+            "attacked_detection_rate_at_paired_key_comparison",
+            source,
+        ),
+        # The clean cohort was scored under the very same per-image rule, so its
+        # detection rate is a measured false-positive rate for that rule.
+        empirical_clean_fpr=check_finite(
+            metric.get("empirical_clean_fpr_at_paired_key_comparison"),
+            "empirical_clean_fpr_at_paired_key_comparison",
+            source,
+        ),
+        roc_auc=check_finite(metric.get("attacked_roc_auc"), "attacked_roc_auc", source),
+    )
+    result.attack_success = authoritative_attack_success(sources)
+    if result.attack_success is not None and result.after_detection_rate is not None:
+        expected = 1.0 - float(result.after_detection_rate)
+        if abs(float(result.attack_success) - expected) > 1e-9:
+            raise UpdaterError(
+                f"T2S attack success in {source} is {result.attack_success!r}, which is not "
+                f"1 - attacked paired_key_comparison detection rate ({expected!r})"
+            )
+    return result
+
+
 DETECTOR_EXTRACTORS: dict[str, Any] = {
     "GS": extract_gs_detector_metrics,
     "TR": extract_tr_detector_metrics,
+    "GM": extract_gm_detector_metrics,
+    "T2S": extract_t2s_detector_metrics,
 }
 
 
