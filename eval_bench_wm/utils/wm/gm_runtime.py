@@ -375,17 +375,20 @@ def assert_resumable(
     name: str,
     existing: typing.Mapping[str, typing.Any],
     expected: typing.Mapping[str, typing.Any],
+    fields: typing.Sequence[str] = RESUME_FIELDS,
 ) -> None:
     """Fail closed unless an existing sample was produced by exactly this run.
 
     File existence alone is never sufficient (experiment-integrity skill §8).
+    ``fields`` lets a method declare its own state-identity fields (e.g. RingID
+    passes ``rid_bundle_config_sha256``); the comparison itself stays shared.
     """
-    for field in RESUME_FIELDS:
+    for field in fields:
         if field not in expected:
             continue
         if existing.get(field) != expected[field]:
             raise RuntimeError(
-                f"GM sample {name} cannot be resumed: {field} differs "
+                f"sample {name} cannot be resumed: {field} differs "
                 f"(existing {existing.get(field)!r}, current {expected[field]!r}); use a fresh --out_dir"
             )
 
@@ -505,12 +508,15 @@ def official_roc(
     positive_scores: typing.Sequence[float],
     negative_scores: typing.Sequence[float],
     target_fpr: float,
+    score_definition: str = GM_SCORE_DEFINITION,
 ) -> typing.Dict[str, typing.Any]:
-    """Official ``Evaluator.eval_ensemble`` ROC bookkeeping.
+    """Official cohort ROC bookkeeping, shared by every higher-is-watermarked score.
 
-    Mirrors ``gaussmarker_det.py``: ``sklearn.metrics.roc_curve`` on the pooled
-    positive/negative ensemble probabilities, then the operating point at the
-    last index whose FPR is strictly below the target FPR.
+    Mirrors ``gaussmarker_det.py`` *and* RingID ``verify.py``, which perform the
+    identical computation: ``sklearn.metrics.roc_curve`` on the pooled
+    positive/negative scores, then the operating point at the last index whose
+    FPR is strictly below the target FPR (upstream ``tpr[np.where(fpr<.01)[0][-1]]``).
+    ``score_definition`` only labels the result; the arithmetic is the same.
     """
     try:
         from sklearn import metrics
@@ -550,5 +556,5 @@ def official_roc(
         "negative_count": len(negative_scores),
         "comparison_operator": ">=",
         "score_direction": "higher_is_watermarked",
-        "score_definition": GM_SCORE_DEFINITION,
+        "score_definition": score_definition,
     }

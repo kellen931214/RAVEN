@@ -310,6 +310,205 @@ def run_gm_generation(args, argv):
     return rows
 
 
+def run_rid_generation(args, argv):
+    """Official-compatible RingID generation.
+
+    One command produces ``--num`` watermarked images (and, by default, their
+    matched non-watermarked pair) for ONE explicit key. The key identity is
+    fixed for the whole run while every sample independently samples its
+    *complete* initial latent from a deterministic per-sample seed, exactly as
+    official ``verify.py`` / ``identify.py`` do (``set_random_seed(this_seed)``
+    then a fresh ``pipe.get_random_latents()`` per prompt).
+
+    All algorithms live in ``utils/wm/ringid_provider.py``; this function only
+    does seeding bookkeeping, IO and provenance.
+    """
+    from utils.wm import rid_bundle, rid_runtime
+    from utils.wm.ringid_provider import apply_arg_defaults as rid_apply_profile
+
+    profile_info = rid_apply_profile(args, argv)
+    print(f"[RID] profile: {profile_info}", flush=True)
+
+    out_dir = Path(args.out_dir)
+    images_dir = out_dir / "images" / "watermarked"
+    clean_dir = out_dir / "images" / "no_watermark"
+    prompts_dir = out_dir / "prompts"
+    metadata_dir = out_dir / "sample_metadata"
+    results_path = out_dir / "results.jsonl"
+    manifest_path = out_dir / "run_manifest.json"
+
+    gpu_info = rid_runtime.gpu_preflight(DEVICE)
+    print(f"[RID] device preflight: {gpu_info}", flush=True)
+
+    # A resuming run must reuse the bundle that produced the existing cohort;
+    # nothing may be created before the manifest has been validated.
+    resuming = manifest_path.exists()
+    if resuming:
+        bundle_dir = getattr(args, "rid_bundle_dir", None)
+        if bundle_dir is None or not rid_bundle.RidBundle(Path(bundle_dir)).complete():
+            raise RuntimeError(
+                f"{manifest_path} already exists, so this run resumes an existing cohort and must "
+                f"reuse the bundle that produced it, but --rid_bundle_dir ({bundle_dir}) is not a "
+                "complete bundle. Nothing was modified."
+            )
+
+    pipe_provider_target = rid_runtime.build_pipe_provider(args, DEVICE)
+    wm_provider = rid_runtime.build_provider(
+        args,
+        latent_shape=pipe_provider_target.get_latent_shape(),
+        device=DEVICE,
+        create_bundle=not resuming,
+    )
+    if wm_provider.bundle is None:
+        raise RuntimeError(
+            "RingID generation requires --rid_bundle_dir so the key artifact persists and the "
+            "images can be verified or identified later in a fresh process"
+        )
+    print(
+        f"[RID] bundle {wm_provider.bundle.dir} ({wm_provider.state_source}), key "
+        f"{wm_provider.selected_key_id}, pattern "
+        f"{wm_provider.bundle.manifest['selected_pattern_sha256'][:16]}",
+        flush=True,
+    )
+
+    target_prompts = get_text_prompts(num_prompts=args.num, dataset_id=args.dataset_id)
+    provenance = rid_runtime.run_provenance(args, wm_provider, pipe_provider_target)
+    run_config = dict(provenance)
+    run_config.update({"base_seed": int(args.seed), "num_samples": int(args.num),
+                       "dataset_id": args.dataset_id,
+                       "save_clean_pair": bool(args.rid_save_clean)})
+
+    # Volatile/extent-only fields are not part of a *sample's* configuration
+    # identity, which is what the resume gate compares.
+    volatile_fields = ("created_utc", "rid_state_source", "num_samples", "platform")
+    run_config_sha256 = rid_bundle.canonical_sha256(
+        {k: v for k, v in run_config.items() if k not in volatile_fields}
+    )
+
+    manifest = rid_runtime.assert_run_manifest_compatible(manifest_path, run_config_sha256)
+    if manifest is None:
+        manifest = dict(run_config)
+        manifest["run_config_sha256"] = run_config_sha256
+        manifest["entrypoint"] = "eval_bench_wm/run_watermark.py:run_rid_generation"
+        manifest["report_label"] = (
+            "official_profile_raw_scores" if wm_provider.profile_is_official
+            else ("paper_described_shift_ablation"
+                  if wm_provider.shift_semantics == "paper_described_shift"
+                  else "legacy_or_ablation_mode")
+        )
+        out_dir.mkdir(parents=True, exist_ok=True)
+        manifest_path.write_text(rid_bundle.canonical_json(manifest) + "\n", encoding="utf-8")
+
+    directories = [images_dir, prompts_dir, metadata_dir]
+    if args.rid_save_clean:
+        directories.append(clean_dir)
+    for directory in directories:
+        directory.mkdir(parents=True, exist_ok=True)
+
+    rows = []
+    for sample_id, target_prompt in tqdm(
+        list(enumerate(target_prompts)), total=len(target_prompts), desc="RID generation"
+    ):
+        # Official semantics: this_seed = general_seed + prompt_index.
+        sample_seed = int(args.seed) + int(sample_id)
+        name = f"{sample_id:06d}"
+        image_path = images_dir / f"{name}.png"
+        clean_path = clean_dir / f"{name}.png"
+        prompt_path = prompts_dir / f"{name}.txt"
+        metadata_path = metadata_dir / f"{name}.json"
+        prompt_sha256 = hashlib.sha256(target_prompt.encode("utf-8")).hexdigest()
+
+        if metadata_path.exists() or image_path.exists():
+            if not (metadata_path.exists() and image_path.exists()):
+                raise RuntimeError(
+                    f"RID sample {name} is half-written ({image_path.exists()=}, "
+                    f"{metadata_path.exists()=}); use a fresh --out_dir"
+                )
+            existing = json.loads(metadata_path.read_text(encoding="utf-8"))
+            rid_runtime.assert_resumable(
+                name,
+                existing,
+                {
+                    "sample_seed": sample_seed,
+                    "prompt_sha256": prompt_sha256,
+                    "run_config_sha256": run_config_sha256,
+                    "rid_bundle_config_sha256": wm_provider.bundle.manifest["bundle_config_sha256"],
+                    "selected_pattern_sha256": wm_provider.bundle.manifest["selected_pattern_sha256"],
+                },
+            )
+            if existing.get("image_sha256") != rid_bundle.sha256_file(image_path):
+                raise RuntimeError(
+                    f"RID sample {name} image hash changed on disk; refusing to resume"
+                )
+            rows.append(existing)
+            continue
+
+        sample = wm_provider.build_sample_latents(sample_seed)
+        generated = wm_provider.generate(
+            pipe_provider_target=pipe_provider_target,
+            prompts=target_prompt,
+            latents=sample["watermarked_latent"],
+            num_inference_steps=args.num_inference_steps_target,
+            guidance_scale=args.guidance_scale_target,
+        )
+        generated["images_PIL"][0].save(image_path)
+        prompt_path.write_text(target_prompt, encoding="utf-8")
+
+        clean_sha = None
+        if args.rid_save_clean:
+            clean_generated = wm_provider.generate(
+                pipe_provider_target=pipe_provider_target,
+                prompts=target_prompt,
+                latents=sample["clean_latent"],
+                num_inference_steps=args.num_inference_steps_target,
+                guidance_scale=args.guidance_scale_target,
+            )
+            clean_generated["images_PIL"][0].save(clean_path)
+            clean_sha = rid_bundle.sha256_file(clean_path)
+
+        row = {
+            "sample_id": sample_id,
+            "sample_name": name,
+            "sample_seed": sample_seed,
+            "prompt": target_prompt,
+            "prompt_sha256": prompt_sha256,
+            "image_path": image_path.as_posix(),
+            "image_sha256": rid_bundle.sha256_file(image_path),
+            "clean_image_path": None if clean_sha is None else clean_path.as_posix(),
+            "clean_image_sha256": clean_sha,
+            # The clean and the watermark pre-injection latent are the same
+            # tensor by construction; both hashes are recorded so the pairing is
+            # auditable without trusting filenames or row order.
+            "clean_base_latent_sha256": sample["clean_latent_sha256"],
+            "pre_injection_latent_sha256": sample["pre_injection_latent_sha256"],
+            "post_injection_latent_sha256": sample["post_injection_latent_sha256"],
+            "selected_pattern_sha256": sample["selected_pattern_sha256"],
+            "mask_sha256": sample["mask_sha256"],
+            "rid_bundle_config_sha256": wm_provider.bundle.manifest["bundle_config_sha256"],
+            "run_config_sha256": run_config_sha256,
+        }
+        row.update({k: v for k, v in provenance.items() if k != "created_utc"})
+        row["created_utc"] = rid_bundle.utc_now()
+        metadata_path.write_text(rid_bundle.canonical_json(row) + "\n", encoding="utf-8")
+        rid_bundle.append_jsonl(results_path, row)
+        rows.append(row)
+
+    latent_hashes = {row["post_injection_latent_sha256"] for row in rows}
+    clean_hashes = {row["clean_base_latent_sha256"] for row in rows}
+    if len(rows) > 1 and (len(latent_hashes) != len(rows) or len(clean_hashes) != len(rows)):
+        raise RuntimeError(
+            "RID generation produced repeated complete initial latents across samples; "
+            "this invalidates the run for independent-sample evaluation"
+        )
+    print(
+        f"[RID] generated {len(rows)} sample(s) into {out_dir}; "
+        f"{len(latent_hashes)} distinct complete initial latents; key identity "
+        f"{wm_provider.bundle.manifest['selected_pattern_sha256'][:16]} (constant)",
+        flush=True,
+    )
+    return rows
+
+
 def value_log_label(wm_type):
     if wm_type == "PRC":
         return "PRC value"
@@ -337,6 +536,13 @@ def main(argv=None):
     # latent per sample and indexed, never-overwritten outputs.
     if args.wm_type == "GM":
         return run_gm_generation(args, argv)
+
+    # RingID has the same single-command flow: a persistent key bundle, a
+    # deterministic per-sample seed, an independently sampled complete initial
+    # latent per sample, the matched non-watermarked pair and indexed,
+    # never-overwritten outputs.
+    if args.wm_type == "RID":
+        return run_rid_generation(args, argv)
 
     wm_provider_cls = WmProviders[args.wm_type].value
     if args.wm_type == "GS" and int(args.num) != 1:
