@@ -191,9 +191,9 @@ that is not the complement of the detection rate rendered in the same row.
 ### Git provenance
 - Repository: RAVEN
 - Branch: main
-- Commit: see below
+- Commit: 1cf2747e67e645bec8e0afb6025cbdd6ea14caaa
 - Remote branch: origin/main
-- Push status: see below
+- Push status: pushed; remote refs/heads/main verified at the same SHA
 - Entry point: `experiments/run_raven_formal_eval.py`
 - Formal output eligibility: eligible; six GM/T2S runs launched from this commit
 
