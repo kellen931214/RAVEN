@@ -56,7 +56,7 @@ All forgery execution scripts are located under the `eval_bench_wm/` directory.
 | Script | Purpose |
 | :--- | :--- |
 | `run_watermark.py` | Generate and evaluate watermarked images. |
-| `run_verify_watermark.py` | Standalone GaussMarker verification, threshold calibration and paper evaluation from a saved bundle. |
+| `run_verify_watermark.py` | Standalone GM/HSTR verification, threshold calibration and paper evaluation from a saved bundle. |
 | `run_no_watermark.py` | Generate clean, non-watermarked images. |
 | `run_removal.py` | Run watermark removal attacks and evaluate detection performance. |
 | `run_reprompting.py` | Run reprompting-based forgery evaluation. |
@@ -116,6 +116,76 @@ python run_imprint_forgery.py --wm_type GS --cover_image_path images/stalin.jpg
 Note that some watermarking methods (e.g., GM, SHALLOW, MaXsive) are tested for 4-channel latent diffusion models only. We therefore recommend evaluating them on SDXL or SD2.1. We have not yet extended these methods to 16-channel latent models.
 
 ---
+
+
+## HSTR / SFWMark (`--wm_type HSTR`)
+
+The official HSTR path is aligned to the frozen SFWMark source:
+
+```text
+https://github.com/thomas11809/SFWMark
+commit 78666128b44614a0cc471993649e3132d5dddfcb
+```
+
+Use `--hstr_profile official_sfwmark_sd21` for the official SD2.1 profile:
+`stabilityai/stable-diffusion-2-1-base`, DDIM, float32, 512x512, 50 steps,
+guidance 7.5, key seed base 7433, center slice `10:54`, radius 14 with cutoff 3,
+and score `hstr_score=-min(channel_0_l1,channel_3_l1)`. HSTR algorithm code
+stays in `utils/wm/hstr_provider.py`; `utils/wm/sfw_bundle.py` handles bundle
+serialization and `utils/wm/sfw_runtime.py` handles IO, provenance and ROC.
+HSQR is not changed by this path.
+
+Official generation writes one persistent key bundle and indexed paired outputs:
+
+```bash
+python run_watermark.py \
+    --wm_type HSTR --hstr_profile official_sfwmark_sd21 \
+    --hstr_key_index 0 --num 10 --seed 0 \
+    --out_dir out/hstr_generation
+```
+
+The default bundle path is `out/hstr_generation/hstr_bundle/` and contains
+`manifest.json`, `selected_pattern.pt`, optional `pattern_list-2048.pt` when
+`--hstr_save_full_keybook` is used, and `threshold.json` only after calibration.
+Images are saved as `images/watermarked/000000.png` and
+`images/no_watermark/000000.png`; each sample records its own base seed and
+pre/post-injection latent hashes in `sample_metadata/000000.json`.
+
+Standalone verification is a fresh-process deployment extension. It loads only
+the bundle and suspect image(s), emits raw per-image scores, and emits a binary
+decision only when a compatible calibrated threshold exists or `--hstr_threshold`
+is explicitly supplied:
+
+```bash
+python run_verify_watermark.py \
+    --wm_type HSTR --mode deployment_verify \
+    --hstr_bundle_dir out/hstr_generation/hstr_bundle \
+    --suspect_path out/hstr_generation/images/watermarked \
+    --out_dir out/hstr_verify
+```
+
+Paper-style cohort evaluation and calibration use the same detector path,
+`sklearn.metrics.roc_curve`, and the official strict operating point `FPR < 0.01`:
+
+```bash
+python run_verify_watermark.py \
+    --wm_type HSTR --mode paper_eval \
+    --hstr_bundle_dir out/hstr_generation/hstr_bundle \
+    --positive_path out/hstr_generation/images/watermarked \
+    --negative_path out/hstr_generation/images/no_watermark \
+    --out_dir out/hstr_paper_eval
+
+python run_verify_watermark.py \
+    --wm_type HSTR --mode calibrate --overwrite_threshold \
+    --hstr_bundle_dir out/hstr_generation/hstr_bundle \
+    --positive_path out/hstr_generation/images/watermarked \
+    --negative_path out/hstr_generation/images/no_watermark \
+    --out_dir out/hstr_calibration
+```
+
+Do not report HSTR as TR/GS metrics. HSTR reports its own score direction
+(`higher_is_watermarked`) and threshold family (`empirical_clean_1pct_fpr` when
+calibrated from clean negatives).
 
 ## GaussMarker (`--wm_type GM`)
 

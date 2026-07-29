@@ -64,7 +64,7 @@ OFFICIAL_SFWMARK_COMMIT = "78666128b44614a0cc471993649e3132d5dddfcb"
 SFW_BUNDLE_SCHEMA = "sfw_bundle_v1"
 SFW_THRESHOLD_SCHEMA = "sfw_threshold_v1"
 
-SUPPORTED_METHODS = ("HSQR",)
+SUPPORTED_METHODS = ("HSQR", "HSTR")
 
 MANIFEST_FILENAME = "manifest.json"
 SELECTED_PATTERN_FILENAME = "selected_pattern.pt"
@@ -115,6 +115,29 @@ REQUIRED_BUNDLE_COMPAT_FIELDS = (
     "inversion_steps",
     "vae_sample",
     "vae_scaling_factor",
+)
+
+HSTR_BUNDLE_COMPAT_FIELDS = (
+    "method",
+    "profile_name",
+    "model_id",
+    "model_revision",
+    "scheduler_type",
+    "torch_dtype",
+    "resolution",
+    "latent_shape",
+    "center_slice",
+    "radius",
+    "radius_cutoff",
+    "watermark_channels",
+    "heterogeneous_channels",
+    "wm_capacity",
+    "base_key_seed",
+    "selected_key_index",
+    "selected_key_seed",
+    "rng_algorithm",
+    "rng_device",
+    "hermitian_enforcement_version",
 )
 
 #: Manifest fields a threshold artifact is bound to. A threshold whose recorded
@@ -186,34 +209,58 @@ def append_jsonl(path, row) -> None:
 # ---------------------------------------------------------------------------
 
 def validate_pattern(pattern: torch.Tensor, channels: int) -> None:
-    """A selected HSQR pattern is a boolean ``(c_wm, qr, qr)`` tensor."""
+    """Validate a selected SFWMark pattern tensor.
+
+    HSQR persists a boolean ``(c_wm, qr, qr)`` QR pattern. HSTR persists the
+    selected Fourier target as a complex ``(1, 4, 64, 64)`` tensor, so the shared
+    bundle validates by tensor semantics instead of coercing HSTR into HSQR's
+    QR schema.
+    """
     if not isinstance(pattern, torch.Tensor):
-        raise SfwBundleError("HSQR pattern must be a torch.Tensor")
-    if pattern.dtype != torch.bool:
+        raise SfwBundleError("SFW pattern must be a torch.Tensor")
+    if pattern.dtype == torch.bool:
+        if pattern.ndim != 3:
+            raise SfwBundleError(
+                f"HSQR pattern must have shape (c_wm, qr, qr), got {tuple(pattern.shape)}"
+            )
+        if pattern.shape[0] != channels:
+            raise SfwBundleError(
+                f"HSQR pattern has {pattern.shape[0]} channel(s), configuration declares {channels}"
+            )
+        if pattern.shape[-1] != pattern.shape[-2]:
+            raise SfwBundleError(f"HSQR pattern must be square, got {tuple(pattern.shape)}")
+        return
+    if not torch.is_complex(pattern):
         raise SfwBundleError(
-            f"HSQR pattern must keep official boolean semantics, got dtype {pattern.dtype}"
+            f"HSTR pattern must keep official complex Fourier semantics, got dtype {pattern.dtype}"
         )
-    if pattern.ndim != 3:
+    if pattern.ndim != 4:
         raise SfwBundleError(
-            f"HSQR pattern must have shape (c_wm, qr, qr), got {tuple(pattern.shape)}"
+            f"HSTR pattern must have shape (batch, channels, h, w), got {tuple(pattern.shape)}"
         )
-    if pattern.shape[0] != channels:
+    if pattern.shape[1] < channels:
         raise SfwBundleError(
-            f"HSQR pattern has {pattern.shape[0]} channel(s), configuration declares {channels}"
+            f"HSTR pattern has {pattern.shape[1]} channel(s), configuration declares {channels}"
         )
     if pattern.shape[-1] != pattern.shape[-2]:
-        raise SfwBundleError(f"HSQR pattern must be square, got {tuple(pattern.shape)}")
+        raise SfwBundleError(f"HSTR pattern must be square, got {tuple(pattern.shape)}")
 
 
 def validate_keybook(keybook: torch.Tensor, capacity: int, channels: int) -> None:
     if not isinstance(keybook, torch.Tensor):
         raise SfwBundleError("HSQR keybook must be a torch.Tensor")
-    if keybook.dtype != torch.bool:
-        raise SfwBundleError(f"HSQR keybook must be boolean, got dtype {keybook.dtype}")
-    if keybook.ndim != 4 or keybook.shape[0] != capacity:
-        raise SfwBundleError(
-            f"HSQR keybook must have shape ({capacity}, c_wm, qr, qr), got {tuple(keybook.shape)}"
-        )
+    if keybook.dtype == torch.bool:
+        if keybook.ndim != 4 or keybook.shape[0] != capacity:
+            raise SfwBundleError(
+                f"HSQR keybook must have shape ({capacity}, c_wm, qr, qr), got {tuple(keybook.shape)}"
+            )
+    elif torch.is_complex(keybook):
+        if keybook.ndim != 5 or keybook.shape[0] != capacity:
+            raise SfwBundleError(
+                f"HSTR keybook must have shape ({capacity}, batch, channels, h, w), got {tuple(keybook.shape)}"
+            )
+    else:
+        raise SfwBundleError(f"SFW keybook has unsupported dtype {keybook.dtype}")
     validate_pattern(keybook[0], channels)
 
 

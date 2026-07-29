@@ -78,6 +78,11 @@ from utils.wm.gm_bundle import GmBundle, GmBundleError
 from utils.wm.gm_provider import GM_SCORE_DEFINITION
 from utils.wm.gm_provider import apply_arg_defaults as gm_apply_profile
 from utils.wm.gm_provider import parser as gm_parser
+from utils.wm import sfw_bundle, sfw_runtime
+from utils.wm.sfw_bundle import SfwBundle, SfwBundleError
+from utils.wm.hstr_provider import HSTR_SCORE_DEFINITION
+from utils.wm.hstr_provider import apply_arg_defaults as hstr_apply_profile
+from utils.wm.hstr_provider import parser as hstr_parser
 
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -108,12 +113,12 @@ CSV_COLUMNS = [
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="GaussMarker standalone verification / calibration / paper evaluation",
-        parents=[gm_parser],
+        description="Watermark standalone verification / calibration / paper evaluation",
+        parents=[gm_parser, hstr_parser],
     )
-    parser.add_argument("--wm_type", type=str, default="GM", choices=["GM"])
+    parser.add_argument("--wm_type", type=str, default="GM", choices=["GM", "HSTR"])
     parser.add_argument("--mode", type=str, default="verify",
-                        choices=["verify", "calibrate", "paper_eval"])
+                        choices=["verify", "deployment_verify", "calibrate", "paper_eval"])
     parser.add_argument("--suspect_path", type=str, default=None,
                         help="One image file or a directory of images (verify mode).")
     parser.add_argument("--positive_path", type=str, default=None,
@@ -122,6 +127,7 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Non-watermarked cohort (calibrate / paper_eval).")
     parser.add_argument("--out_dir", type=str, default="out/gm_verification")
     parser.add_argument("--overwrite_threshold", action="store_true", default=False)
+    parser.add_argument("--hstr_target_fpr", type=float, default=0.01)
     parser.add_argument("--pair_manifest", type=str, default=None,
                         help="JSON file declaring the positive/negative pairing explicitly: "
                              '{"protocol": ..., "pairs": [{"positive": ..., "negative": ...}, ...]}.')
@@ -226,6 +232,10 @@ def main(argv=None) -> int:
 
 def main_gm(argv) -> int:
     args = build_parser().parse_args(argv)
+    if args.mode == "deployment_verify":
+        args.mode = "verify"
+    if args.wm_type == "HSTR":
+        return _main_hstr(args, argv)
 
     profile_info = gm_apply_profile(args, argv)
     print(f"[GM] profile: {profile_info}", flush=True)
@@ -282,6 +292,214 @@ def main_gm(argv) -> int:
 
     print(gm_bundle.canonical_json(summary), flush=True)
     return 0
+
+
+def _apply_hstr_bundle_defaults(args, argv):
+    explicit = {item for item in argv if item.startswith("--")}
+    if not args.hstr_bundle_dir:
+        raise SystemExit("error: --hstr_bundle_dir is required; HSTR verification loads state from a bundle")
+    manifest = json.loads((Path(args.hstr_bundle_dir) / sfw_bundle.MANIFEST_FILENAME).read_text(encoding="utf-8"))
+    fields = {
+        "hstr_profile": "profile_name",
+        "hstr_key_index": "selected_key_index",
+        "modelid_target": "model_id",
+        "model_revision": "model_revision",
+        "scheduler_target": "scheduler_type",
+        "resolution": "resolution",
+    }
+    for arg_name, manifest_name in fields.items():
+        if f"--{arg_name}" not in explicit and manifest.get(manifest_name) is not None:
+            setattr(args, arg_name, manifest[manifest_name])
+    if "--num_inference_steps_target" not in explicit:
+        args.num_inference_steps_target = 50
+    if "--guidance_scale_target" not in explicit:
+        args.guidance_scale_target = 7.5
+    return hstr_apply_profile(args, argv)
+
+
+def _resolve_inputs_hstr(args) -> typing.Dict[str, typing.Any]:
+    if args.mode == "verify":
+        images = sfw_runtime.enumerate_images(
+            _require(args.suspect_path, "--suspect_path is required in verify mode")
+        )
+        if not images:
+            raise SystemExit(f"error: no supported images found under {args.suspect_path}")
+        return {"suspects": images}
+    positives = sfw_runtime.enumerate_images(
+        _require(args.positive_path, f"--positive_path is required in {args.mode} mode")
+    )
+    negatives = sfw_runtime.enumerate_images(
+        _require(args.negative_path, f"--negative_path is required in {args.mode} mode")
+    )
+    if not positives or not negatives:
+        raise SystemExit("error: both cohorts must contain at least one image")
+    pairing = sfw_runtime.resolve_pairing(positives, negatives, args.pair_manifest)
+    if args.mode == "paper_eval" and not pairing["paired"] and not args.allow_unmatched_cohorts:
+        raise SystemExit(
+            "error: the official HSTR paper protocol requires a verified one-to-one paired cohort "
+            f"({pairing['reason']}). Supply --pair_manifest or per-sample metadata, or pass "
+            "--allow_unmatched_cohorts to run a non-official ablation."
+        )
+    if not pairing["paired"]:
+        print(f"[HSTR] cohorts are NOT verifiably paired: {pairing['reason']}", flush=True)
+    return {"positives": positives, "negatives": negatives, "pairing": pairing}
+
+
+def _score_hstr_cohort(provider, pipe_provider, image_paths, threshold_info, role: str):
+    rows = []
+    for index, image_path in enumerate(image_paths):
+        row = sfw_runtime.hstr_score_image(provider, pipe_provider, image_path, threshold_info, image_index=index)
+        row["cohort_role"] = role
+        rows.append(row)
+    return rows
+
+
+def _main_hstr(args, argv) -> int:
+    profile_info = _apply_hstr_bundle_defaults(args, argv)
+    print(f"[HSTR] profile: {profile_info}", flush=True)
+    bundle_dir = Path(args.hstr_bundle_dir)
+    bundle_before = SfwBundle.load(bundle_dir).artifact_mtimes()
+    inputs = _resolve_inputs_hstr(args)
+
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    gpu_info = sfw_runtime.gpu_preflight(DEVICE)
+    print(f"[HSTR] device preflight: {gpu_info}", flush=True)
+    pipe_provider = sfw_runtime.build_pipe_provider(args, DEVICE)
+    provider = sfw_runtime.build_provider(
+        args,
+        latent_shape=(1, 4, int(args.resolution) // 8, int(args.resolution) // 8),
+        device=DEVICE,
+        create_bundle=False,
+    )
+    if provider.bundle is None:
+        raise SfwBundleError("HSTR verification must load state from an existing bundle")
+
+    provenance = sfw_runtime.run_provenance(args, provider, pipe_provider)
+    provenance["entrypoint"] = "eval_bench_wm/run_verify_watermark.py"
+    provenance["mode"] = args.mode
+
+    if args.mode == "verify":
+        summary = _run_verify_hstr(args, provider, pipe_provider, out_dir, provenance, inputs)
+    else:
+        summary = _run_cohort_hstr(args, provider, pipe_provider, out_dir, provenance, inputs)
+
+    bundle_after = SfwBundle.load(bundle_dir).artifact_mtimes()
+    if args.mode == "calibrate":
+        changed = {k for k in set(bundle_before) | set(bundle_after) if bundle_before.get(k) != bundle_after.get(k)}
+        unexpected = changed - {sfw_bundle.THRESHOLD_FILENAME}
+        if unexpected:
+            raise SfwBundleError(f"calibration modified bundle artifacts it must not touch: {sorted(unexpected)}")
+    elif bundle_before != bundle_after:
+        raise SfwBundleError("the HSTR bundle was modified during verification; this must never happen")
+    print(sfw_bundle.canonical_json(summary), flush=True)
+    return 0
+
+
+def _run_verify_hstr(args, provider, pipe_provider, out_dir: Path, provenance, inputs) -> dict:
+    threshold_info = provider.resolve_threshold()
+    if threshold_info["threshold_available"]:
+        report_label = "calibrated_deployment_verification"
+    else:
+        report_label = "official_profile_raw_scores" if provider.profile == "official_sfwmark_sd21" else "legacy_or_ablation_mode"
+        print("[HSTR] no compatible threshold artifact and no --hstr_threshold: emitting raw detector scores only.", flush=True)
+    rows = _score_hstr_cohort(provider, pipe_provider, inputs["suspects"], threshold_info, role="suspect")
+    for row in rows:
+        row["report_label"] = report_label
+        row["evaluation_mode"] = "deployment_verification_extension"
+        row.update({k: v for k, v in provenance.items() if k != "created_utc"})
+    sfw_bundle.write_jsonl(out_dir / "results.jsonl", rows)
+    sfw_runtime.write_csv(out_dir / "results.csv", rows)
+    ok_rows = [row for row in rows if row["status"] == "ok"]
+    decided = [row for row in ok_rows if row["detection_success"] is not None]
+    summary = dict(provenance)
+    summary.update({
+        "evaluation_mode": "deployment_verification_extension",
+        "report_label": report_label,
+        "image_count": len(rows),
+        "ok_count": len(ok_rows),
+        "error_count": len(rows) - len(ok_rows),
+        "score_definition": HSTR_SCORE_DEFINITION,
+        "score_direction": threshold_info.get("score_direction"),
+        "comparison_operator": threshold_info.get("comparison_operator"),
+        "threshold": threshold_info.get("threshold"),
+        "threshold_source": threshold_info.get("threshold_source"),
+        "threshold_target_fpr": threshold_info.get("target_fpr"),
+        "threshold_empirical_fpr": threshold_info.get("empirical_fpr"),
+        "detected_count": sum(1 for row in decided if row["detection_success"]),
+        "decided_count": len(decided),
+        "note": "Deployment verification extension: raw per-image HSTR scores are always emitted; binary decisions require a compatible calibrated threshold or --hstr_threshold.",
+    })
+    (out_dir / "summary.json").write_text(sfw_bundle.canonical_json(summary) + "\n", encoding="utf-8")
+    return summary
+
+
+def _run_cohort_hstr(args, provider, pipe_provider, out_dir: Path, provenance, inputs) -> dict:
+    raw_threshold_info = {
+        "threshold": None,
+        "threshold_source": "cohort_pending",
+        "score_direction": "higher_is_watermarked",
+        "comparison_operator": ">=",
+    }
+    rows = _score_hstr_cohort(provider, pipe_provider, inputs["positives"], raw_threshold_info, role="positive")
+    rows += _score_hstr_cohort(provider, pipe_provider, inputs["negatives"], raw_threshold_info, role="negative")
+    failed = [row for row in rows if row["status"] != "ok"]
+    if failed:
+        sfw_bundle.write_jsonl(out_dir / "results.jsonl", rows)
+        raise SfwBundleError(f"{len(failed)} HSTR cohort image(s) failed to score; first error: {failed[0]['error']}")
+    positive_scores = [row["score"] for row in rows if row["cohort_role"] == "positive"]
+    negative_scores = [row["score"] for row in rows if row["cohort_role"] == "negative"]
+    roc = sfw_runtime.hstr_official_roc(positive_scores, negative_scores, args.hstr_target_fpr)
+    pairing = inputs["pairing"]
+    report_label = "official_paper_evaluation" if args.mode == "paper_eval" and provider.profile == "official_sfwmark_sd21" and pairing["paired"] else "calibrated_deployment_verification"
+    evaluation_mode = "official_paper_evaluation" if args.mode == "paper_eval" else "threshold_calibration"
+    for row in rows:
+        row["threshold"] = roc["threshold"]
+        row["threshold_source"] = "cohort_roc"
+        row["report_label"] = report_label
+        row["evaluation_mode"] = evaluation_mode
+        row["detection_success"] = provider.decide(row["score"], roc["threshold"])
+        row.update({k: v for k, v in provenance.items() if k != "created_utc"})
+    sfw_bundle.write_jsonl(out_dir / "results.jsonl", rows)
+    sfw_runtime.write_csv(out_dir / "results.csv", rows)
+    summary = dict(provenance)
+    summary.update(roc)
+    summary.update({
+        "evaluation_mode": evaluation_mode,
+        "report_label": report_label,
+        "paired_cohorts": pairing["paired"],
+        "pairing_reason": pairing["reason"],
+        "pairing_sha256": pairing["pairing_sha256"],
+        "pairing_protocol": pairing["protocol"],
+        "pair_manifest": pairing["pair_manifest"],
+        "pair_count": len(pairing["pairs"]),
+        "positive_cohort_sha256": sfw_bundle.canonical_sha256({"images": [sfw_bundle.sha256_file(p) for p in inputs["positives"]]}),
+        "negative_cohort_sha256": sfw_bundle.canonical_sha256({"images": [sfw_bundle.sha256_file(p) for p in inputs["negatives"]]}),
+        "note": "The threshold is derived from THIS positive/negative cohort with sklearn.metrics.roc_curve and FPR < target_fpr. It is experiment-specific, not a universal detector threshold.",
+    })
+    if args.mode == "calibrate":
+        artifact = sfw_bundle.build_threshold_artifact(
+            threshold=roc["threshold"],
+            binding=provider.binding_config(),
+            score_definition=HSTR_SCORE_DEFINITION,
+            threshold_source="cohort_calibration",
+            report_label="calibrated_deployment_verification",
+            method="HSTR",
+            target_fpr=roc["target_fpr"],
+            empirical_fpr=roc["empirical_fpr"],
+            tpr_at_target_fpr=roc["tpr_at_target_fpr"],
+            roc_auc=roc["roc_auc"],
+            positive_count=roc["positive_count"],
+            negative_count=roc["negative_count"],
+            positive_cohort_sha256=summary["positive_cohort_sha256"],
+            negative_cohort_sha256=summary["negative_cohort_sha256"],
+        )
+        path = provider.bundle.save_threshold(artifact, overwrite=args.overwrite_threshold)
+        summary["threshold_artifact"] = path.as_posix()
+        print(f"[HSTR] wrote calibrated threshold to {path}", flush=True)
+    (out_dir / "summary.json").write_text(sfw_bundle.canonical_json(summary) + "\n", encoding="utf-8")
+    return summary
 
 
 def _run_verify(args, provider, pipe_provider, out_dir: Path, provenance, inputs) -> dict:
