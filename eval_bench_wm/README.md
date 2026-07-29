@@ -355,6 +355,214 @@ calibration commit. Verification rejects an incompatible threshold artifact.
 
 ---
 
+## HSQR (SFWMark) (`--wm_type HSQR`)
+
+Official reference: <https://github.com/thomas11809/SFWMark>, pinned comparison
+commit `78666128b44614a0cc471993649e3132d5dddfcb`
+(`src/generate.py`, `src/detect.py`, `src/utils.py`).
+
+The single authoritative HSQR implementation is
+`utils/wm/hsqr_provider.py`. Runners only enumerate files, save/load artifacts
+and call provider methods; the artifact schema lives in `utils/wm/sfw_bundle.py`,
+the official detection front-end in `utils/wm/sfw_inversion.py` and the shared
+runner plumbing in `utils/wm/sfw_runtime.py` / `utils/wm/runner_common.py`.
+
+### Profiles
+
+| Profile | Base key seed | Key selection | Model / scheduler | Official? |
+| --- | --- | --- | --- | --- |
+| `official_sfwmark_sd21` | **7433** (key `i` -> `7433 + i`) | explicit `--hsqr_key_index` | `stabilityai/stable-diffusion-2-1-base`, DDIM, float32, 512px, 50 steps, CFG 7.5 | yes |
+| `legacy_raven` (parser default) | 999999 | `fix_gt` index into a process-global-RNG mapping | whatever the caller passes | **no** |
+
+`legacy_raven` is the parser default so the pre-existing formal generators
+(`experiments/generate_watermarked_images.py`, `run_removal.py`) keep producing
+byte-identical cohorts. `run_watermark.py --wm_type HSQR` and
+`run_verify_watermark.py --wm_type HSQR` are standalone runners: the former
+selects `official_sfwmark_sd21` unless `--hsqr_profile` is given explicitly.
+
+Any value set explicitly on the command line overrides the profile, is recorded
+in `hsqr_profile_overrides`, and makes the run an **ablation**, never an official
+run. The official profile fails closed on an incompatible latent shape, center
+slice, capacity, base key seed or key-selection mode.
+
+Frozen official facts enforced and tested: QR version 1, box size 2, border 0,
+error correction `H` (42x42), payload `HSQR{key_seed % 10000}`, latent channel
+`[3]`, center slice `10:54` (44x44), two 42x21 halves driving the sign of the
+real / imaginary RFFT coefficients, `delta=0`, detector target `±45` as a complex
+42x21 tensor, capacity `2^(14-3) = 2048`.
+
+### Score direction and threshold semantics
+
+```text
+hsqr_l1_distance  raw mean complex L1 distance  (LOWER  = more watermarked)
+hsqr_score        = -hsqr_l1_distance           (HIGHER = more watermarked)
+decision          score >= threshold            (equivalently distance <= distance_threshold)
+```
+
+Both values are emitted on every record, and threshold artifacts store the score
+threshold *and* the equivalent `distance_threshold` so a positive distance can
+never be compared against a negative score threshold. The official SFWMark
+release does **not** define a universal deployment threshold for arbitrary
+suspect images:
+
+* `paper_eval` reproduces the official cohort protocol (ROC on `score`,
+  operating point at the last FPR strictly below `--target_fpr`) and records
+  target FPR, **actual empirical FPR**, TPR, ROC-AUC and cohort counts.
+* `deployment_verify` is a RAVEN deployment extension. Without a compatible
+  bundled or supplied threshold it emits raw distances and scores and reports the
+  binary decision as **undecided** — never as "not embedded".
+* The legacy operating point (`-65.86233520507812`, nominal FPR `1e-3`) requires
+  `--hsqr_allow_legacy_threshold`, is labelled `legacy_threshold` and is **not**
+  a TPR@1%FPR result.
+
+### Bundle layout
+
+```text
+<out_dir>/hsqr_bundle/
+├── manifest.json          # schema, profile, geometry, key identity, hashes, git provenance
+├── selected_pattern.pt    # boolean (c_wm, 42, 42) — sufficient for one-key verification
+├── keybook.pt             # optional (2048, c_wm, 42, 42) — --hsqr_save_keybook
+├── key_mapping.json       # optional per-sample key mapping (--hsqr_key_policy per_sample)
+└── threshold.json         # only after `calibrate`
+```
+
+The manifest records `schema`, `method`, `official_reference_commit`,
+`profile_name`, `profile_overrides`, `profile_is_official`, `model_id`,
+`model_revision`, `scheduler_type`, `torch_dtype`, `resolution`, `latent_shape`,
+`center_slice`, `watermark_channels`, `qr_version`, `box_size`, `border`,
+`error_correction`, `delta`, `wm_capacity`, `base_key_seed`,
+`selected_key_index`, `selected_key_seed`, `payload_text`,
+`selected_pattern_sha256`, the optional keybook/mapping files with their hashes,
+the inversion configuration, `bundle_config_sha256` and the creating git
+branch/commit.
+
+Loading a bundle uses the **persisted** pattern; it is never regenerated.
+Incompatible profile, model, geometry, QR configuration, channel, delta, key
+identity or hash fails closed, extra undeclared artifacts are rejected, and
+creating a bundle over existing artifacts fails instead of overwriting.
+
+### Commands
+
+```bash
+# 1) Direct generation: N indexed, non-overwriting watermarked images.
+#    Each sample draws an independent complete base latent from seed+sample_id
+#    and injects the pattern into a clone of it. --hsqr_paired also writes the
+#    matched clean image from the same pre-injection latent.
+python eval_bench_wm/run_watermark.py \
+  --wm_type HSQR \
+  --hsqr_profile official_sfwmark_sd21 \
+  --hsqr_key_index 0 \
+  --num 10 --seed 42 \
+  --out_dir out/hsqr_generation
+
+# 2) Standalone verification in a fresh process.
+#    Needs only the bundle and the suspect image(s) — no prompt, no original
+#    image, no live generation process, no keybook regeneration.
+python eval_bench_wm/run_verify_watermark.py \
+  --wm_type HSQR \
+  --mode deployment_verify \
+  --hsqr_bundle_dir out/hsqr_generation/hsqr_bundle \
+  --suspect_path image.png_or_directory \
+  --out_dir out/hsqr_verification
+
+# 3) Paper-style calibration / evaluation over positive and negative cohorts.
+python eval_bench_wm/run_verify_watermark.py \
+  --wm_type HSQR \
+  --mode paper_eval \
+  --hsqr_bundle_dir out/hsqr_generation/hsqr_bundle \
+  --positive_path out/hsqr_generation/images/watermarked \
+  --negative_path out/hsqr_generation/images/no_watermark \
+  --target_fpr 0.01 \
+  --out_dir out/hsqr_calibration
+
+# 4) Reuse that threshold for a binary decision (or --mode calibrate to store it
+#    inside the bundle as threshold.json).
+python eval_bench_wm/run_verify_watermark.py \
+  --wm_type HSQR --mode deployment_verify \
+  --hsqr_bundle_dir out/hsqr_generation/hsqr_bundle \
+  --threshold_artifact out/hsqr_calibration/threshold.json \
+  --suspect_path suspects/ --out_dir out/hsqr_decisions
+```
+
+### Output layout
+
+```text
+<out_dir>/
+├── images/watermarked/000000.png ...
+├── images/no_watermark/000000.png ...   # --hsqr_paired
+├── prompts/000000.txt
+├── sample_metadata/000000.json
+├── hsqr_bundle/
+├── results.jsonl
+└── run_manifest.json
+```
+
+Every sample record carries `sample_id`, prompt and `prompt_sha256`,
+`sample_seed`, `base_latent_sha256`, `clean_base_latent_sha256`,
+`watermark_pre_injection_base_latent_sha256`, `watermarked_latent_sha256`, the
+key index / seed / payload / pattern hash, image paths and hashes, the
+model/scheduler/dtype/steps/guidance/resolution, `hsqr_bundle_config_sha256`,
+`run_config_sha256`, the entrypoint and its SHA, and the git branch/commit.
+The clean-vs-pre-injection pairing invariant is asserted per sample, and a run
+whose samples repeat a complete base latent is rejected.
+
+Resume is hash-gated: an existing `run_manifest.json` must match the current
+`run_config_sha256`, and each existing sample must match its seed, prompt hash,
+run config, bundle config, pattern hash and on-disk image hash. Anything else
+stops the run with the output directory untouched.
+
+### Batch and directory scoring
+
+`HSQRProvider.l1_distances` / `detect_from_latent` return one value per batch
+item in input order. The pre-Issue-#5 detector indexed the target at batch item
+`0`, so a batch or a directory of suspects could silently report the first
+image's result for every image; this is now covered by a regression test.
+`HSQRProvider.identify()` is a separate API for the paper identification
+experiment and does not change single-key verification.
+
+Every scored image reports `status`/`error`; NaN or Inf in the recovered latent,
+a shape mismatch, an inversion failure or a bundle/threshold mismatch is an
+**error**, never a negative detection. Duplicate suspect paths are rejected and
+directories are walked in deterministic name order.
+
+### Inversion parity status
+
+`utils/wm/sfw_inversion.py` transcribes the documented official `detect.py`
+front-end — fixed `Resize((512, 512))`, `ToTensor`, `[-1, 1]`, VAE posterior
+**mode**, VAE scaling factor,
+`DDIMInverseScheduler.from_config(<current scheduler>.config)`, empty prompt,
+guidance 0, 50 steps — and is deliberately *not* the generic
+`PipeProvider.invert_images` path (different resize, `guidance_scale=1.0`, full
+pipeline preprocessing) nor the GaussMarker loop (which never calls
+`scheduler.step`).
+
+It is used by `validate()` only for **official-profile** providers, so existing
+legacy HSQR cohorts keep the exact inversion path they were produced and scored
+with. `SFW_INVERSION_PARITY_STATUS` is
+`documented_protocol_transcription_not_fixture_verified` and is recorded on every
+record: **no element-wise fixture from the official repository has been compared
+yet**, so no HSQR result may be labelled exact official inversion parity.
+
+The static parity fixtures in `tests/hsqr_official_reference.py` (keybook,
+payload, QR pattern, injection, center FFT, complex L1, score sign) are derived
+from the frozen written specification and the `qrcode` package, not from tensors
+downloaded from the official repository.
+
+### Backward compatibility
+
+* Pre-Issue-#5 HSQR outputs have no persisted pattern/key identity, no
+  independent per-sample base latent and no immutable configuration. They are
+  **legacy / not independently auditable** and must be excluded from formal
+  claims unless their provenance can be proven separately. Nothing is deleted.
+* They must not be resumed under the new bundle/profile schema; the resume gates
+  reject them because they carry no `run_config_sha256`.
+* Detection rates computed with the legacy `-65.86233520507812` threshold remain
+  **legacy** results at nominal FPR `1e-3` and are not TPR@1%FPR.
+* `HSQRProvider.get_accuracies()` now returns one distance per batch item
+  instead of a single-element list; batch-size-1 callers are unaffected.
+
+---
+
 ## T2S (T2SMark)
 
 Upstream reference: <https://github.com/0xD009/T2SMark>, pinned comparison commit

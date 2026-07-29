@@ -6,6 +6,7 @@ This file records implementation bugs, validated non-bugs, ablations, and the ev
 
 | Date | Area | Status | Evidence |
 | --- | --- | --- | --- |
+| 2026-07-29 | HSQR (SFWMark) official alignment + standalone verification (Issue #5) | `HSQRProvider` stays the single authoritative HSQR implementation and gains an immutable `official_sfwmark_sd21` profile (base key seed 7433, explicit `--hsqr_key_index`, no global RNG), a persisted hash-bound SFW bundle, per-batch-item detector output, explicit `score = -L1 distance` semantics and an official-protocol inversion front-end. `run_watermark.py --wm_type HSQR` produces N indexed non-overwriting images with an independent complete base latent per sample; `run_verify_watermark.py --wm_type HSQR` verifies suspect images in a fresh process from the bundle alone. Legacy behaviour is preserved byte-for-byte under `legacy_raven`, which stays the parser default so the existing formal generators are unchanged. Two-sample GPU smoke on RTX 3090 separated watermarked (`-39.5`, `-42.8`) from clean (`-70.8`, `-71.3`) with ROC-AUC `1.0`; the run used the cached `RedbeardNZ` SD2.1-base mirror because `stabilityai/stable-diffusion-2-1-base` is not reachable, so it is labelled `legacy_or_ablation_mode`, not an official evaluation. Inversion parity is a documented-protocol transcription, **not** fixture-verified against the official repository. | `eval_bench_wm/utils/wm/hsqr_provider.py`; `eval_bench_wm/utils/wm/sfw_bundle.py`; `eval_bench_wm/utils/wm/sfw_inversion.py`; `eval_bench_wm/utils/wm/sfw_runtime.py`; `eval_bench_wm/tests/test_hsqr_official_parity.py` |
 | 2026-07-29 | GM + T2S formal evaluation chain | GaussMarker and T2SMark are now runnable end-to-end through `run_raven_formal_eval.py`. Method dispatch is driven by the existing per-method provenance tables rather than literal `if method == "GS"` branches. GM detects from the cohort's persisted bundle (config read from the bundle manifest, never restated); T2S detects per sample from each row's portable state through a thin adapter over the same two standalone functions `run_verification.py` uses. Each method reports its own metric, threshold family and attack-success definition: GM `gm_raw_bit_accuracy` at a clean-calibrated empirical threshold (its official ensemble threshold does not exist for this bundle — no GNR, no classifier), T2S `t2s_score_true_key` under the stored `paired_key_comparison` rule, which is explicitly not TPR@1%FPR. No GPU smoke was run before the formal launch, by explicit user direction. | `raven_repro/scripts/extract_verification_scores.py`; `raven_repro/scripts/evaluate_verification.py`; `raven_repro/raven/eval_protocol.py`; `experiments/update_experiment_table.py` |
 | 2026-07-29 | GM + T2S `shared_tr_clean_v2` formal cohorts (Issue #9) | Formal 1001-row GM and T2S cohorts generated from fixed `main` `01ce7d7`, GPU 0 (RTX 3090, sm_86). All 1001 canonical clean images byte-identical before and after. The T2S runner's own final audit rejected the cohort on a `t2s_session_key_sha256` repeat, which is a birthday collision of a 16-bit key, not shared state; the audit gate was corrected and the cohort kept. T2S's in-runner summary/pairing/cross-method JSONs are absent (crash after the last row) and are supplied by the standalone cross-method audit instead. | `data/gm/diffusiondb_shared_tr/GM`; `data/t2s/diffusiondb_shared_tr/T2S`; `audit/shared_clean_tr_gs_gm_t2s.json`; `raven_repro/raven/pairing_provenance.py` |
 | 2026-07-28 | GM + T2S `shared_tr_clean_v2` (Issue #9, phase 1) | GaussMarker and T2SMark now consume the canonical Tree-Ring source row — same prompt, base latent, clean image and generation config — and generate only their own watermarked image. New authoritative provider entrypoints `GmProvider.get_wm_latents_from_base_latent` and the T2S `|z|`-multiset consumption gate prove the supplied latent was embedded into rather than replaced. Cross-method audit extended to TR/GS/GM/T2S. Two-row GPU smoke passed; the canonical clean images are byte-identical before and after. No formal 1000/1001 cohort generated. | `experiments/generate_gm_from_tr_shared_clean.py`; `experiments/generate_t2s_from_tr_shared_clean.py`; `experiments/shared_clean_tr.py`; `raven_repro/scripts/audit_shared_clean_cohorts.py`; `raven_repro/tests/test_shared_tr_clean_gm_t2s.py`; `docs/SHARED_TR_CLEAN_V2.md` |
@@ -25,6 +26,246 @@ This file records implementation bugs, validated non-bugs, ablations, and the ev
 
 
 
+
+## 2026-07-29 — HSQR (SFWMark) official alignment and standalone verification (Issue #5)
+
+### Problem
+The `eval_bench_wm` HSQR implementation was structurally similar to official
+SFWMark but not auditably equivalent, and it could not verify a suspect image in
+a fresh process:
+
+1. the key space used base seed `999999`, not the official `7433`, so the QR
+   keybook was a different keybook;
+2. `fix_gt` was overloaded as an index into a length-8192 mapping drawn from the
+   *process-global* NumPy RNG, so a field named "fixed ground truth" silently
+   chose a random key that was never persisted;
+3. the watermark identity existed only in memory — no artifact a fresh process
+   could load and validate;
+4. `run_watermark.py` called `get_wm_latents()` once before the prompt loop, so
+   every sample of a multi-image run shared one *complete* initial latent;
+5. every sample was written to the fixed path `watermarked_image.png`, so a
+   multi-image run left exactly one image;
+6. no immutable official SD2.1 profile existed and the fixed 64x64 / `10:54`
+   geometry was applied to whatever latent shape the pipeline produced;
+7. the generic RAVEN inversion had never been shown equivalent to official
+   `detect.py` detection;
+8. `HSQRProvider.__get_l1_distance()` indexed the detector target at batch item
+   `0`, so a batch or a directory of suspects could report the first image's
+   score for every image;
+9. the provider returned a positive `l1_dist` while the generic threshold path
+   negated it implicitly, and the only available threshold was a legacy
+   nominal-FPR=`1e-3` operating point that could be mistaken for TPR@1%FPR;
+10. no standalone artifact-plus-suspect-image entrypoint existed for HSQR;
+11. no focused HSQR test suite existed at all.
+
+### Root cause
+Watermark identity, latent sampling and output naming were all implicit. The
+single `gt_patch` was derived at construction time from hidden global RNG state,
+never serialized, and the runner treated one watermarked latent as if it were a
+key rather than a complete sample. The detector's target slice hard-coded the
+batch index, and score direction lived in the caller instead of the provider.
+
+### Affected files
+- `eval_bench_wm/utils/wm/hsqr_provider.py`: profiles, key space, key selection,
+  `sample_base_latent`/`inject`/`build_sample_latents`, per-item `l1_distances`,
+  `detect_from_latent`, `identify`, `resolve_threshold`/`decide`, bundle binding,
+  `invert_pil_image`, geometry gates, `QRCodeGenerator` version gate
+- `eval_bench_wm/utils/wm/sfw_bundle.py` (new): SFWMark bundle/threshold schema
+- `eval_bench_wm/utils/wm/sfw_inversion.py` (new): official `detect.py` front-end
+- `eval_bench_wm/utils/wm/sfw_runtime.py` (new): HSQR runner plumbing
+- `eval_bench_wm/utils/wm/artifact_core.py` (new): canonical hashing/IO extracted
+  from `gm_bundle.py`
+- `eval_bench_wm/utils/wm/runner_common.py` (new): GPU preflight, directory walk,
+  duplicate/resume gates and ROC extracted from `gm_runtime.py`
+- `eval_bench_wm/utils/wm/gm_bundle.py`, `eval_bench_wm/utils/wm/gm_runtime.py`:
+  now delegate to the extracted modules (behaviour unchanged)
+- `eval_bench_wm/run_watermark.py:run_hsqr_generation`
+- `eval_bench_wm/run_verify_watermark.py:main`/`main_hsqr`/`_run_hsqr_verify`/
+  `_run_hsqr_cohort`
+- `eval_bench_wm/tests/hsqr_official_reference.py`,
+  `tests/test_hsqr_official_parity.py`, `tests/test_hsqr_bundle.py`,
+  `tests/test_hsqr_verification.py` (new)
+- `eval_bench_wm/README.md`
+
+### Affected outputs
+No HSQR outputs are committed in this repository, so nothing was deleted, moved
+or rewritten. Any pre-existing HSQR outputs held outside the repository are
+classified **legacy / not independently auditable**: they carry no persisted
+pattern/key identity, no independent per-sample base-latent provenance and no
+immutable configuration hash. They must be excluded from formal claims and
+cannot be resumed under the new schema (the resume gate rejects them because they
+have no `run_config_sha256`). Detection rates computed with the legacy
+`-65.86233520507812` threshold remain legacy results at nominal FPR `1e-3` and
+are not TPR@1%FPR. Regeneration is required for any HSQR result that is to be
+reported as officially aligned.
+
+### Fix
+* **Profiles.** `official_sfwmark_sd21` pins SD2.1-base + DDIM + float32 + 512px
+  + 50 steps + CFG 7.5, latent `(B,4,64,64)`, center slice `10:54`, QR v1 / box 2
+  / border 0 / EC `H`, `delta=0`, capacity 2048 and base key seed **7433** (key
+  `i` -> seed `7433+i`, payload `HSQR{seed % 10000}`). Any explicit CLI value is
+  recorded in `hsqr_profile_overrides` and demotes the run to an ablation.
+  `legacy_raven` is the parser default and applies nothing, so
+  `experiments/generate_watermarked_images.py` and `run_removal.py` are
+  untouched; the standalone `run_watermark.py` HSQR path opts into the official
+  profile unless `--hsqr_profile` is given.
+* **Key identity.** `--hsqr_key_index` (range-checked against `[0, 2048)`)
+  replaces the `fix_gt` overload on the official path; the legacy global-RNG
+  mapping survives only as `--hsqr_key_selection legacy_fix_gt` and is forbidden
+  under the official profile. `--hsqr_key_policy per_sample` derives keys
+  deterministically from the base key seed and the sample id and persists the
+  mapping.
+* **Artifacts.** A versioned `sfw_bundle_v1` bundle persists the selected pattern
+  (and optionally the full 2048 keybook and per-sample mapping) hash-bound to the
+  profile, model, geometry, QR configuration, key identity and inversion
+  configuration. Loading uses the persisted tensor and never regenerates it.
+* **Generation.** `run_hsqr_generation` samples an independent complete base
+  latent per sample from `seed + sample_id` with a local generator, injects into
+  a clone, writes indexed non-overwriting outputs plus prompts, per-sample
+  metadata, `results.jsonl` and `run_manifest.json`, and optionally the matched
+  clean image from the same pre-injection latent.
+* **Detector.** `l1_distances`/`detect_from_latent` return one record per batch
+  item in input order; `identify()` is a separate multi-key API.
+* **Scores.** The provider owns `hsqr_score = -hsqr_l1_distance`
+  (`higher_is_watermarked`, `score >= threshold`); threshold artifacts also store
+  the equivalent `distance_threshold`. `paper_eval` reproduces the official ROC
+  protocol; `deployment_verify` fails closed on the binary decision when no
+  compatible threshold exists while still emitting raw scores; the legacy
+  threshold needs `--hsqr_allow_legacy_threshold` and stays labelled.
+* **Verification.** `run_verify_watermark.py --wm_type HSQR` scores suspect
+  images in a fresh process from the bundle alone — no prompt, no original image,
+  no live generation process, no keybook regeneration.
+
+### Reused code
+* Canonical hashing/IO and the GPU preflight/ROC/resume helpers were **extracted**
+  from `gm_bundle.py` / `gm_runtime.py` into `artifact_core.py` /
+  `runner_common.py` rather than copied; GaussMarker now imports them, so there is
+  one implementation of each.
+* The existing `HSQRProvider` remains the only HSQR algorithm. No
+  `hsqr_v2_provider.py` / `official_hsqr.py` was added.
+* The existing `run_verify_watermark.py` runner was extended by `--wm_type`
+  dispatch instead of adding an HSQR-only duplicate; the GM parser, GM entry
+  points and GM behaviour are unchanged.
+* `sfw_bundle.py` / `sfw_inversion.py` / `sfw_runtime.py` are deliberately
+  method-tagged SFWMark modules so HSTR (Issue #4) extends them instead of adding
+  a second artifact format or inversion path.
+* `utils/utils.describe_legacy_detection_threshold` is reused for the labelled
+  legacy threshold.
+
+### Historical bug coverage
+Reviewed the GaussMarker (2026-07-28), T2S (2026-07-28) and Tree-Ring paired
+generation (2026-07-17) entries, which record the same three failure classes:
+one shared complete latent across samples, watermark state that is never
+persisted, and thresholds whose provenance is lost. All three are closed for
+HSQR here. Searched for the reachable copies of each pattern:
+`rg "get_wm_latents\(\)" eval_bench_wm` (the remaining generic call site keeps
+the documented legacy behaviour for the other providers), `rg "fix_gt"`,
+`rg "watermarked_image.png"`, `rg "qr_slice"`. The legacy HSQR path is retained,
+explicitly labelled, unreachable from the official profile and excluded from
+official labelling.
+
+### Regression prevention
+97 new focused tests across three files, plus a frozen official reference module:
+* frozen payloads and pattern SHA-256 for key indices 0, 1, 1024 and 2047, plus
+  element-wise boolean equality against an independent transcription;
+* element-wise injection and complex-L1 parity, and "injection touches only the
+  center region of channel 3";
+* `score == -distance`, the `>=` operator, and "no threshold means undecided,
+  never a negative detection";
+* batch regression: later batch elements affect their own output;
+* bundle save/load round trip, canonical hash equality after reload, and
+  rejection of tampered pattern/keybook/mapping/manifest, undeclared extra
+  artifacts, foreign thresholds, non-finite thresholds and missing binding blocks;
+* rejection of incompatible model/scheduler/delta/geometry/inversion config and
+  of a pipeline that does not match the bundle (checked *before* model loading);
+* NaN/Inf, shape mismatch and inversion failure recorded as `status="error"`;
+* deterministic directory ordering and duplicate suspect rejection;
+* run-manifest and per-sample resume rejection;
+* CLI tests for all three documented commands, and a test that the GM verifier
+  surface is unchanged.
+
+### Validation
+CPU, focused:
+```
+cd eval_bench_wm
+python -m pytest tests/test_hsqr_official_parity.py tests/test_hsqr_bundle.py \
+    tests/test_hsqr_verification.py -q      # 97 passed, 15 subtests
+python -m pytest tests/ -q                  # 233 passed, 25 subtests
+```
+The full `eval_bench_wm/tests` suite was run because `gm_bundle.py`,
+`gm_runtime.py` and `run_verify_watermark.py` were modified by the shared-code
+extraction; it is the suite that covers them.
+
+Legacy-equivalence check (old provider from `HEAD` vs new, `hsqr_seed=999999`,
+`fix_gt` 0/1/5): identical `gt_patch`, identical watermarked latent
+(`torch.equal`) and identical `l1_dist`.
+
+GPU, RTX 3090 (`nvidia-smi` OK, `torch.cuda.is_available()` True, 9 devices;
+`CUDA_VISIBLE_DEVICES=6`, an idle 97 GB device). `stabilityai/stable-diffusion-2-1-base`
+returns HTTP 404 from the Hub in this environment, so the smoke used the cached
+`RedbeardNZ/stable-diffusion-2-1-base` mirror as an explicit override; every run
+below is therefore labelled `legacy_or_ablation_mode`, **not** an official
+evaluation.
+```
+python run_watermark.py --wm_type HSQR --hsqr_profile official_sfwmark_sd21 \
+  --modelid_target RedbeardNZ/stable-diffusion-2-1-base \
+  --hsqr_key_index 0 --hsqr_paired --num 2 --seed 42 --out_dir <scratch>/hsqr_gen
+python run_verify_watermark.py --wm_type HSQR --mode deployment_verify ...
+python run_verify_watermark.py --wm_type HSQR --mode paper_eval --target_fpr 0.01 ...
+```
+Results: two distinct complete base latents; per sample
+`clean_base_latent_sha256 == watermark_pre_injection_base_latent_sha256`;
+selected pattern SHA `4fb8b70e…` identical at source and detector;
+positives `-39.499` / `-42.756`, negatives `-70.847` / `-71.333`; ROC-AUC `1.0`,
+threshold `-42.7559`, target FPR `0.01`, empirical FPR `0.0`, TPR `1.0`, 2+2
+samples. Re-verifying with `--threshold_artifact` in a fresh process reported
+`embedded=True` for both watermarked and `embedded=False` for both clean images.
+All values finite; no image overwritten.
+
+Negative tests (all failed closed as required): tampered `selected_pattern.pt`;
+threshold artifact bound to a different key index; a pipeline that does not match
+the bundle (rejected before model loading); `--hsqr_key_index` disagreeing with
+the bundle; a run manifest written by a different seed/configuration (output
+directory left untouched — image hashes verified unchanged). Re-running an
+identical configuration resumed without regenerating or overwriting anything.
+
+### Git provenance
+- Repository: `kellen931214/RAVEN`
+- Branch: `agent/issue-5-hsqr-official-standalone-verification`
+- Commit: recorded in the follow-up commit on this branch
+- Remote branch: `origin/agent/issue-5-hsqr-official-standalone-verification`
+- Push status: pushed
+- Entry point: `eval_bench_wm/run_watermark.py:run_hsqr_generation`,
+  `eval_bench_wm/run_verify_watermark.py:main_hsqr`
+- Formal output eligibility: **not eligible**. The GPU smoke is a two-sample
+  ablation on a mirror model, and the inversion is a documented-protocol
+  transcription that has not been compared element-wise against an official
+  fixture (`SFW_INVERSION_PARITY_STATUS =
+  documented_protocol_transcription_not_fixture_verified`).
+
+### Watermark-specific record
+- Source-data validity: no HSQR source cohort was generated or modified; the
+  smoke cohort lives in the session scratch directory.
+- Clean/watermarked pairing: asserted per sample
+  (`clean_base_latent_sha256 == watermark_pre_injection_base_latent_sha256`),
+  and enforced in code, not inferred from filenames or row order.
+- Base-latent uniqueness: enforced — a run whose samples repeat a complete base
+  latent is rejected.
+- Watermark target and mask status: selected pattern persisted and hash-bound;
+  keybook and per-sample mapping optional and hash-bound.
+- Attack pairing: not applicable — no attack was run.
+- Detector score definition: `hsqr_negative_mean_complex_l1_distance`
+  (`score = -mean(|target_complex - center_fft_window|)`), higher is watermarked.
+- Threshold calibration source: the smoke `paper_eval` cohort (2 positives, 2
+  negatives) only; no deployment threshold is shipped.
+- Actual empirical FPR: `0.0` at target FPR `0.01` on 2 negatives — a
+  finite-sample value from a smoke cohort, not a paper result.
+- Quality metric reference / CLIP input / FID staging: not applicable; no quality
+  metric was computed.
+- Outputs requiring regeneration: every pre-Issue-#5 HSQR output that is to be
+  reported as officially aligned.
+
+---
 
 ## 2026-07-29 — GM and T2S wired into the formal RAVEN evaluation chain
 
