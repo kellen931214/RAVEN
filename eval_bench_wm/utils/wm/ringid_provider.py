@@ -106,6 +106,7 @@ KEY_RNG_DTYPES = {"float32": torch.float32, "float16": torch.float16}
 #: ``utils.set_random_seed`` of the reference commit, recorded by name in the
 #: bundle so the RNG lifecycle is auditable.
 RNG_ALGORITHM = "official_ringid_set_random_seed_torch_manual_seed"
+RID_SHARED_TR_CLEAN_MODE = "official_math_shared_tr_clean"
 
 #: Official ``verify.py`` uses candidate 628 as its single verification example.
 DEFAULT_KEY_INDEX = 628
@@ -994,6 +995,13 @@ class RingIDProvider(WmProvider):
             binding["bundle_config_sha256"] = self.bundle.manifest.get("bundle_config_sha256")
         return binding
 
+    def provider_config(self) -> typing.Dict[str, typing.Any]:
+        """Return the provenance-bound RingID configuration for shared-clean runs."""
+        return self.binding_config()
+
+    def provider_config_sha256(self) -> str:
+        return rid_bundle.canonical_sha256(self.provider_config())
+
     @property
     def selected_key_id(self) -> str:
         return f"rid-key-{self.key_index:06d}"
@@ -1110,6 +1118,54 @@ class RingIDProvider(WmProvider):
             "zT_fft_wchannel_PIL": torch_to_PIL(wm_fft[:, ch:ch + 1]),
             "zT_fft_wchannel": torch_to_PIL(wm_fft[:, ch:ch + 1]),
         }
+
+    def get_wm_latents_from_base_latent(self, base_latent: torch.Tensor) -> typing.Dict[str, typing.Any]:
+        """Inject RingID into a caller-supplied canonical TR base latent.
+
+        This is the only RingID entrypoint a ``shared_tr_clean_v2`` runner may
+        use. It never samples a replacement latent and never consults a hidden
+        process-global RNG. The supplied tensor must be the canonical CPU-float32
+        TR latent after transfer to this provider's device.
+        """
+        if base_latent is None:
+            raise RidBundleError("RID shared-clean injection requires a supplied base_latent")
+        if tuple(base_latent.shape) != tuple(self.latent_shape):
+            raise RidBundleError(
+                f"RID shared-clean latent shape mismatch: got {tuple(base_latent.shape)}, "
+                f"expected {tuple(self.latent_shape)}"
+            )
+        if base_latent.dtype != torch.float32:
+            raise RidBundleError(
+                f"RID shared-clean requires the canonical float32 base latent, got {base_latent.dtype}"
+            )
+        if not torch.isfinite(base_latent.detach()).all():
+            raise RidBundleError("RID shared-clean base latent contains NaN or Inf")
+        try:
+            from raven.pairing_provenance import tensor_sha256 as shared_clean_tensor_sha256
+        except Exception as exc:
+            raise RidBundleError("RID shared-clean hashing requires raven.pairing_provenance") from exc
+        pre_sha = shared_clean_tensor_sha256(base_latent.detach())
+        out = self.get_wm_latents(latents_clean=base_latent)
+        if out["zT_torch"].dtype != base_latent.dtype:
+            out["zT_torch"] = out["zT_torch"].to(dtype=base_latent.dtype)
+            out["zT_PIL"] = torch_to_PIL(out["zT_torch"])
+            out["zT"] = out["zT_PIL"]
+        out["zT_clean_torch"] = base_latent
+        post_sha = shared_clean_tensor_sha256(out["zT_torch"])
+        if post_sha == pre_sha:
+            raise RidBundleError("RID shared-clean injection made no latent change")
+        out.update(
+            {
+                "shared_clean_mode": RID_SHARED_TR_CLEAN_MODE,
+                "rid_pre_injection_latent_sha256": pre_sha,
+                "rid_post_injection_latent_sha256": post_sha,
+                "rid_selected_pattern_sha256": rid_bundle.sha256_tensor(self.gt_patch),
+                "rid_mask_sha256": rid_bundle.sha256_tensor(self.watermarking_mask),
+                "selected_key_index": int(self.key_index),
+                "selected_pattern_sha256": rid_bundle.sha256_tensor(self.gt_patch),
+            }
+        )
+        return out
 
     # ------------------------------------------------------------------
     # Inversion (official parity adapter)

@@ -58,6 +58,31 @@ does not use the official profile it is labelled `legacy` and
 **T2SMark** — `t2smark_shared_tr_clean_v2`, mode
 `official_encoder_shared_tr_clean`.
 
+**RingID** — `ringid_shared_tr_clean_v2`, mode
+`official_math_shared_tr_clean`.
+
+Shared-clean RingID uses the authoritative `RingIDProvider` selected key bundle
+and Fourier replacement math, but the Gaussian source is the canonical TR
+float32 base latent and generation uses the canonical TR DDIM configuration. It
+is not labelled as official end-to-end RingID generation parity.
+
+**HSTR** — `hstr_shared_tr_clean_v2`, mode
+`official_math_shared_tr_clean`.
+
+Shared-clean HSTR uses the authoritative `HSTRProvider` SFWMark center Fourier
+pattern injection from a persisted SFW bundle. The clean image and pre-injection
+latent remain the TR artifacts; only `watermarked.png` is generated under the
+HSTR method root.
+
+**HSQR** — `hsqr_shared_tr_clean_v2`, mode
+`official_math_shared_tr_clean`.
+
+Shared-clean HSQR uses the authoritative `HSQRProvider` QR pattern and center
+RFFT sign injection from a persisted SFW bundle. It is a RAVEN formal
+shared-clean profile, not a regenerated HSQR clean cohort and not exact official
+sampling parity.
+
+
 The T2S encoder is unchanged: the same key pattern derivation, the same
 master/session key and message lifecycle in upstream's draw order, the same
 repeated-bit codeword, the same tail/central magnitude split, and the default
@@ -269,3 +294,52 @@ refuses to skip on any mismatch.
 CUDA, NVML, driver or container-runtime failure is a hard stop for the smoke and
 for formal generation. There is no CPU fallback: a CPU run is not a GPU smoke and
 must never be reported as one.
+
+
+### Additional Issue #6 shared-clean runners
+
+```bash
+python3 experiments/generate_rid_from_tr_shared_clean.py \
+  --tr-metadata data/tr/diffusiondb/metadata.csv \
+  --rid-bundle-dir artifacts/rid_shared_tr_clean_bundle \
+  --output-dir data/rid/diffusiondb_shared_tr/RID \
+  --rid-create-bundle true \
+  --resume
+
+python3 experiments/generate_hstr_from_tr_shared_clean.py \
+  --tr-metadata data/tr/diffusiondb/metadata.csv \
+  --hstr-bundle-dir artifacts/hstr_shared_tr_clean_bundle \
+  --output-dir data/hstr/diffusiondb_shared_tr/HSTR \
+  --hstr-create-bundle true \
+  --resume
+
+python3 experiments/generate_hsqr_from_tr_shared_clean.py \
+  --tr-metadata data/tr/diffusiondb/metadata.csv \
+  --hsqr-bundle-dir artifacts/hsqr_shared_tr_clean_bundle \
+  --output-dir data/hsqr/diffusiondb_shared_tr/HSQR \
+  --hsqr-create-bundle true \
+  --resume
+```
+
+All five non-TR method runners write method-specific watermarked artifacts only.
+They must never generate, copy, rename, re-encode, or overwrite a clean image.
+Legacy cohorts are not relabelled as `formal_shared_tr_clean`; a cohort earns
+that classification only after `raven_repro/scripts/audit_shared_clean_cohorts.py`
+validates it against the canonical TR metadata by `run_id`.
+
+### Issue #6 pre-merge GPU smoke (2026-07-29)
+
+The pre-merge two-row RID/HSTR/HSQR smoke used canonical TR metadata from `/workspace/RAVEN/data/tr/diffusiondb/metadata.csv` and run_ids `0 1`. Outputs were written under `outputs/smoke/issue6_shared_tr_clean_gpu_20260729T1930Z/` in the Issue #6 worktree only. The runner selected physical GPU 2 by UUID (`GPU-1289e71c-7313-be4c-7cf2-68c895107672`), an idle RTX 3090 (`sm_86`), with `CUDA_DEVICE_ORDER=PCI_BUS_ID`; no CPU fallback occurred.
+
+HSTR uses a separate provider profile, `official_math_shared_tr_clean`, for this protocol. It preserves the official SFWMark HSTR key math and geometry but accepts the canonical Tree-Ring generation configuration. This is not the same as `official_sfwmark_sd21` and must not be reported as end-to-end official HSTR reproduction.
+
+Smoke metadata:
+
+```text
+RID:  outputs/smoke/issue6_shared_tr_clean_gpu_20260729T1930Z/RID/metadata.csv
+HSTR: outputs/smoke/issue6_shared_tr_clean_gpu_20260729T1930Z/HSTR_v2/metadata.csv
+HSQR: outputs/smoke/issue6_shared_tr_clean_gpu_20260729T1930Z/HSQR_v2/metadata.csv
+Audit: outputs/smoke/issue6_shared_tr_clean_gpu_20260729T1930Z/cross_method_audit_rid_hstr_hsqr.json
+```
+
+The audit passed for all three methods (`2` rows each), verified files, matched by `run_id`, and confirmed the shared TR source metadata SHA `b359a5104f93d54580914f152f074a72f7aae59e8ab6ef4a6a05ab91662aa66c`. Canonical clean files remained unchanged before and after generation.

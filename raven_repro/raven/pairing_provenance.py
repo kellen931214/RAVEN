@@ -31,11 +31,17 @@ GS_UNIFORM_DERIVATION = "normal_cdf_of_tr_float32_base_latent"
 # silently relabelled as another method's.
 GM_SHARED_TR_CLEAN_PROTOCOL = "gaussmarker_shared_tr_clean_v2"
 T2S_SHARED_TR_CLEAN_PROTOCOL = "t2smark_shared_tr_clean_v2"
+RID_SHARED_TR_CLEAN_PROTOCOL = "ringid_shared_tr_clean_v2"
+HSTR_SHARED_TR_CLEAN_PROTOCOL = "hstr_shared_tr_clean_v2"
+HSQR_SHARED_TR_CLEAN_PROTOCOL = "hsqr_shared_tr_clean_v2"
 # gm_provider.GM_SHARED_TR_CLEAN_MODE / t2s_provider.T2S_SHARED_TR_CLEAN_MODE —
 # duplicated here because raven/ must not import eval_bench_wm. The runners and
 # test_shared_tr_clean_gm_t2s assert they match.
 GM_SHARED_TR_CLEAN_MODE = "official_math_shared_tr_clean"
 T2S_SHARED_TR_CLEAN_MODE = "official_encoder_shared_tr_clean"
+RID_SHARED_TR_CLEAN_MODE = "official_math_shared_tr_clean"
+HSTR_SHARED_TR_CLEAN_MODE = "official_math_shared_tr_clean"
+HSQR_SHARED_TR_CLEAN_MODE = "official_math_shared_tr_clean"
 GM_UNIFORM_DERIVATION = "normal_cdf_of_tr_float32_base_latent"
 
 PAIRING_PROTOCOL = TR_PAIRING_PROTOCOL
@@ -48,11 +54,14 @@ ALLOWED_PAIRING_PROTOCOLS = {
     "GS": (GS_PAIRING_PROTOCOL, GS_SHARED_TR_CLEAN_PROTOCOL),
     "GM": (GM_SHARED_TR_CLEAN_PROTOCOL,),
     "T2S": (T2S_SHARED_TR_CLEAN_PROTOCOL,),
+    "RID": (RID_SHARED_TR_CLEAN_PROTOCOL,),
+    "HSTR": (HSTR_SHARED_TR_CLEAN_PROTOCOL,),
+    "HSQR": (HSQR_SHARED_TR_CLEAN_PROTOCOL,),
 }
 
 # Methods whose watermark target is one cohort-wide artifact (Tree-Ring style
 # ring pattern) versus methods that derive a fresh target per sample.
-SINGLE_TARGET_METHODS = frozenset({"TR", "GM"})
+SINGLE_TARGET_METHODS = frozenset({"TR", "GM", "RID", "HSTR", "HSQR"})
 PER_SAMPLE_TARGET_METHODS = frozenset({"GS", "T2S"})
 
 # V1 GS provenance. Field order is preserved byte-for-byte from the original
@@ -114,6 +123,7 @@ SHARED_CLEAN_COMMON_FIELDS = (
     "tr_base_latent_sha256",
     "tr_clean_path",
     "tr_clean_sha256",
+    "watermarked_sha256",
 )
 
 # GaussMarker shared-clean provenance: bundle identity (ChaCha20 state, ring
@@ -158,6 +168,25 @@ T2S_CORE_FIELDS = (
 )
 T2S_REQUIRED_FIELDS = T2S_CORE_FIELDS + SHARED_CLEAN_COMMON_FIELDS
 
+# RID/HSTR/HSQR all perform method-specific Fourier-domain injection into the
+# caller-supplied canonical TR latent. The bundle records the selected pattern
+# and mask; the pre/post latent hashes prove the provider consumed that tensor.
+FOURIER_SHARED_CORE_TEMPLATE = (
+    "{prefix}_protocol_mode",
+    "{prefix}_state_source",
+    "{prefix}_bundle_dir",
+    "{prefix}_bundle_config_sha256",
+    "{prefix}_selected_pattern_sha256",
+    "{prefix}_mask_sha256",
+    "{prefix}_key_index",
+    "{prefix}_pre_injection_latent_sha256",
+    "{prefix}_post_injection_latent_sha256",
+    "{prefix}_provider_entrypoint_sha256",
+)
+RID_REQUIRED_FIELDS = tuple(field.format(prefix="rid") for field in FOURIER_SHARED_CORE_TEMPLATE) + SHARED_CLEAN_COMMON_FIELDS
+HSTR_REQUIRED_FIELDS = tuple(field.format(prefix="hstr") for field in FOURIER_SHARED_CORE_TEMPLATE) + SHARED_CLEAN_COMMON_FIELDS
+HSQR_REQUIRED_FIELDS = tuple(field.format(prefix="hsqr") for field in FOURIER_SHARED_CORE_TEMPLATE) + SHARED_CLEAN_COMMON_FIELDS
+
 # Path fields are locations, not identities (same rule as GS V2): required
 # metadata, excluded from the pairing hash, but everything they point at is
 # still bound through its SHA-256.
@@ -167,23 +196,38 @@ SHARED_CLEAN_PATH_FIELDS = frozenset(
         "tr_clean_path",
         "gm_bundle_dir",
         "t2s_state_path",
+        "rid_bundle_dir",
+        "hstr_bundle_dir",
+        "hsqr_bundle_dir",
     }
 )
 GM_PAIRING_FIELDS = tuple(f for f in GM_REQUIRED_FIELDS if f not in SHARED_CLEAN_PATH_FIELDS)
 T2S_PAIRING_FIELDS = tuple(f for f in T2S_REQUIRED_FIELDS if f not in SHARED_CLEAN_PATH_FIELDS)
+RID_PAIRING_FIELDS = tuple(f for f in RID_REQUIRED_FIELDS if f not in SHARED_CLEAN_PATH_FIELDS)
+HSTR_PAIRING_FIELDS = tuple(f for f in HSTR_REQUIRED_FIELDS if f not in SHARED_CLEAN_PATH_FIELDS)
+HSQR_PAIRING_FIELDS = tuple(f for f in HSQR_REQUIRED_FIELDS if f not in SHARED_CLEAN_PATH_FIELDS)
 
 METHOD_REQUIRED_FIELDS = {
     "GM": GM_REQUIRED_FIELDS,
     "T2S": T2S_REQUIRED_FIELDS,
+    "RID": RID_REQUIRED_FIELDS,
+    "HSTR": HSTR_REQUIRED_FIELDS,
+    "HSQR": HSQR_REQUIRED_FIELDS,
 }
 METHOD_PAIRING_FIELDS = {
     "GM": GM_PAIRING_FIELDS,
     "T2S": T2S_PAIRING_FIELDS,
+    "RID": RID_PAIRING_FIELDS,
+    "HSTR": HSTR_PAIRING_FIELDS,
+    "HSQR": HSQR_PAIRING_FIELDS,
 }
 # Per-method constants that must hold for every row of a shared-clean cohort.
 METHOD_PROTOCOL_MODES = {
     "GM": ("gm_protocol_mode", GM_SHARED_TR_CLEAN_MODE),
     "T2S": ("t2s_protocol_mode", T2S_SHARED_TR_CLEAN_MODE),
+    "RID": ("rid_protocol_mode", RID_SHARED_TR_CLEAN_MODE),
+    "HSTR": ("hstr_protocol_mode", HSTR_SHARED_TR_CLEAN_MODE),
+    "HSQR": ("hsqr_protocol_mode", HSQR_SHARED_TR_CLEAN_MODE),
 }
 # Fields that identify one cohort-wide watermark state; exactly one value each.
 METHOD_COHORT_CONSTANT_FIELDS = {
@@ -197,6 +241,9 @@ METHOD_COHORT_CONSTANT_FIELDS = {
         "gm_mask_sha256",
     ),
     "T2S": ("t2s_provider_config_sha256",),
+    "RID": ("rid_bundle_config_sha256", "rid_selected_pattern_sha256", "rid_mask_sha256"),
+    "HSTR": ("hstr_bundle_config_sha256", "hstr_selected_pattern_sha256", "hstr_mask_sha256"),
+    "HSQR": ("hsqr_bundle_config_sha256", "hsqr_selected_pattern_sha256", "hsqr_mask_sha256"),
 }
 # Fields that must be distinct for every row; a repeat means two samples share
 # state that is supposed to be per-sample.
@@ -204,6 +251,9 @@ METHOD_PER_SAMPLE_UNIQUE_FIELDS = {
     "GM": ("gm_pre_injection_latent_sha256", "gm_post_injection_latent_sha256",
            "gm_sampling_uniform_sha256"),
     "T2S": ("t2s_watermark_id", "t2s_state_sha256", "t2s_abs_magnitude_sha256"),
+    "RID": ("rid_post_injection_latent_sha256",),
+    "HSTR": ("hstr_post_injection_latent_sha256",),
+    "HSQR": ("hsqr_post_injection_latent_sha256",),
 }
 # Per-sample fields drawn from a space small enough that repeats are expected
 # rather than evidence of shared state. The T2S session key is `--t2s_key_length`
@@ -358,6 +408,12 @@ def pairing_method(row: Mapping[str, Any]) -> str:
         return "GM"
     if protocol == T2S_SHARED_TR_CLEAN_PROTOCOL:
         return "T2S"
+    if protocol == RID_SHARED_TR_CLEAN_PROTOCOL:
+        return "RID"
+    if protocol == HSTR_SHARED_TR_CLEAN_PROTOCOL:
+        return "HSTR"
+    if protocol == HSQR_SHARED_TR_CLEAN_PROTOCOL:
+        return "HSQR"
     return ""
 
 
@@ -552,6 +608,16 @@ def audit_pairing_rows(
                 raise ValueError(
                     f"t2s_base_latent_sha256 is not the shared latent SHA run_id={run_id}"
                 )
+            if method in {"RID", "HSTR", "HSQR"}:
+                prefix = method.lower()
+                if str(row[f"{prefix}_pre_injection_latent_sha256"]) != str(row["base_latent_sha256"]):
+                    raise ValueError(
+                        f"{prefix}_pre_injection_latent_sha256 is not the shared latent SHA run_id={run_id}"
+                    )
+                if str(row[f"{prefix}_post_injection_latent_sha256"]) != str(row["watermarked_latent_sha256"]):
+                    raise ValueError(
+                        f"{prefix}_post_injection_latent_sha256 disagrees with watermarked_latent_sha256 run_id={run_id}"
+                    )
             _assert_shared_clean_identity(row, run_id, require_pre_injection=True)
             for field in METHOD_COHORT_CONSTANT_FIELDS[method]:
                 method_constant_fields.setdefault(field, set()).add(str(row[field]))
@@ -735,6 +801,9 @@ SHARED_CLEAN_METHOD_PROTOCOLS = {
     "GS": GS_SHARED_TR_CLEAN_PROTOCOL,
     "GM": GM_SHARED_TR_CLEAN_PROTOCOL,
     "T2S": T2S_SHARED_TR_CLEAN_PROTOCOL,
+    "RID": RID_SHARED_TR_CLEAN_PROTOCOL,
+    "HSTR": HSTR_SHARED_TR_CLEAN_PROTOCOL,
+    "HSQR": HSQR_SHARED_TR_CLEAN_PROTOCOL,
 }
 
 
@@ -756,6 +825,78 @@ def _index_tr_source(tr_rows: Iterable[Mapping[str, Any]]) -> dict[str, Mapping[
     if not tr_by_id:
         raise ValueError("shared-clean audit requires a non-empty TR source cohort")
     return tr_by_id
+
+
+SHARED_FOURIER_METHOD_CONFIG = {
+    "RID": {
+        "protocol": RID_SHARED_TR_CLEAN_PROTOCOL,
+        "mode_field": "rid_protocol_mode",
+        "mode": RID_SHARED_TR_CLEAN_MODE,
+        "bundle_dir_field": "rid_bundle_dir",
+        "bundle_config_field": "rid_bundle_config_sha256",
+        "pattern_field": "rid_selected_pattern_sha256",
+        "mask_field": "rid_mask_sha256",
+    },
+    "HSTR": {
+        "protocol": HSTR_SHARED_TR_CLEAN_PROTOCOL,
+        "mode_field": "hstr_protocol_mode",
+        "mode": HSTR_SHARED_TR_CLEAN_MODE,
+        "bundle_dir_field": "hstr_bundle_dir",
+        "bundle_config_field": "hstr_bundle_config_sha256",
+        "pattern_field": "hstr_selected_pattern_sha256",
+        "mask_field": "hstr_mask_sha256",
+    },
+    "HSQR": {
+        "protocol": HSQR_SHARED_TR_CLEAN_PROTOCOL,
+        "mode_field": "hsqr_protocol_mode",
+        "mode": HSQR_SHARED_TR_CLEAN_MODE,
+        "bundle_dir_field": "hsqr_bundle_dir",
+        "bundle_config_field": "hsqr_bundle_config_sha256",
+        "pattern_field": "hsqr_selected_pattern_sha256",
+        "mask_field": "hsqr_mask_sha256",
+    },
+}
+
+
+def _verify_bundle_manifest_fields(row: Mapping[str, Any], run_id: str, *, method: str) -> dict[str, str]:
+    config = SHARED_FOURIER_METHOD_CONFIG[method]
+    bundle_dir = Path(str(_required(row, config["bundle_dir_field"], run_id)))
+    manifest_path = bundle_dir / "manifest.json"
+    if not manifest_path.is_file():
+        raise FileNotFoundError(f"{method} bundle manifest missing for run_id={run_id}: {manifest_path}")
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{method} bundle manifest is not valid JSON run_id={run_id}: {exc}") from None
+    checks = {
+        config["bundle_config_field"]: "bundle_config_sha256",
+        config["pattern_field"]: "selected_pattern_sha256",
+    }
+    if "mask_sha256" in manifest:
+        checks[config["mask_field"]] = "mask_sha256"
+    artifacts = {config["bundle_dir_field"]: str(bundle_dir)}
+    for row_field, manifest_field in checks.items():
+        expected = str(_required(row, row_field, run_id))
+        actual = str(manifest.get(manifest_field) or "")
+        if expected != actual:
+            raise ValueError(
+                f"{method} bundle manifest drift run_id={run_id} field={row_field}: "
+                f"row={expected} manifest={actual}"
+            )
+        artifacts[row_field] = actual
+    return artifacts
+
+
+def _verify_rid_bundle_artifacts(row: Mapping[str, Any], run_id: str) -> dict[str, str]:
+    return _verify_bundle_manifest_fields(row, run_id, method="RID")
+
+
+def _verify_hstr_bundle_artifacts(row: Mapping[str, Any], run_id: str) -> dict[str, str]:
+    return _verify_bundle_manifest_fields(row, run_id, method="HSTR")
+
+
+def _verify_hsqr_bundle_artifacts(row: Mapping[str, Any], run_id: str) -> dict[str, str]:
+    return _verify_bundle_manifest_fields(row, run_id, method="HSQR")
 
 
 def _verify_gm_bundle_artifacts(row: Mapping[str, Any], run_id: str) -> dict[str, str]:
@@ -858,6 +999,9 @@ def _verify_t2s_state_artifact(row: Mapping[str, Any], run_id: str) -> dict[str,
 METHOD_ARTIFACT_VERIFIERS = {
     "GM": _verify_gm_bundle_artifacts,
     "T2S": _verify_t2s_state_artifact,
+    "RID": _verify_rid_bundle_artifacts,
+    "HSTR": _verify_hstr_bundle_artifacts,
+    "HSQR": _verify_hsqr_bundle_artifacts,
 }
 
 
