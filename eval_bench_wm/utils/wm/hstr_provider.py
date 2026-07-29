@@ -23,6 +23,7 @@ OFFICIAL_STEPS = 50
 OFFICIAL_GUIDANCE_SCALE = 7.5
 HSTR_SCORE_DEFINITION = "hstr_score=-min(channel_0_l1,channel_3_l1)"
 HSTR_SCORE_DIRECTION = "higher_is_watermarked"
+HSTR_SHARED_TR_CLEAN_MODE = "official_math_shared_tr_clean"
 
 parser = argparse.ArgumentParser(add_help=False)
 parser.add_argument("--hstr_seed", default=None, type=int)
@@ -284,6 +285,37 @@ class HSTRProvider(WmProvider):
             "selected_key_seed": self.selected_key_seed,
             "selected_pattern_sha256": self.selected_pattern_sha256,
         }
+
+    def get_wm_latents_from_base_latent(self, base_latent: torch.Tensor) -> dict[str, typing.Any]:
+        """Inject HSTR into a caller-supplied canonical TR base latent."""
+        if base_latent is None:
+            raise sfw_bundle.SfwBundleError("HSTR shared-clean injection requires a supplied base_latent")
+        if tuple(base_latent.shape) != tuple(self.latent_shape):
+            raise sfw_bundle.SfwBundleError(
+                f"HSTR shared-clean latent shape mismatch: got {tuple(base_latent.shape)}, "
+                f"expected {tuple(self.latent_shape)}"
+            )
+        if base_latent.dtype != torch.float32:
+            raise sfw_bundle.SfwBundleError(
+                f"HSTR shared-clean requires the canonical float32 base latent, got {base_latent.dtype}"
+            )
+        if not torch.isfinite(base_latent.detach()).all():
+            raise sfw_bundle.SfwBundleError("HSTR shared-clean base latent contains NaN or Inf")
+        pre_sha = sfw_bundle.sha256_tensor(base_latent.detach())
+        out = self.get_wm_latents(latents_clean=base_latent)
+        post_sha = sfw_bundle.sha256_tensor(out["zT_torch"])
+        if post_sha == pre_sha:
+            raise sfw_bundle.SfwBundleError("HSTR shared-clean injection made no latent change")
+        out.update(
+            {
+                "shared_clean_mode": HSTR_SHARED_TR_CLEAN_MODE,
+                "hstr_pre_injection_latent_sha256": pre_sha,
+                "hstr_post_injection_latent_sha256": post_sha,
+                "hstr_selected_pattern_sha256": self.selected_pattern_sha256,
+                "hstr_mask_sha256": self.watermark_mask_sha256,
+            }
+        )
+        return out
 
     def _pattern_for_batch(self, batch_size: int) -> torch.Tensor:
         pattern = self.gt_patch.to(self.device)

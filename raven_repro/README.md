@@ -182,3 +182,14 @@ Historical scripts remain solely as reproducibility evidence.
 - If model loading fails, verify the pinned RedbeardNZ revision in the local Hugging Face cache.
 - If attention shape errors occur after upgrading Diffusers, first run `pytest tests/test_attention_shapes.py`, then inspect `raven/attention.py`.
 - If outputs drift too much, lower `--strength` or use `--view_guided_attention true --color_transfer true`.
+
+## Shared TR Clean V2
+
+`shared_tr_clean_v2` is a formal RAVEN comparison profile, separate from each
+method's official reproduction profile. GM, T2S, RID, HSTR, and HSQR runners
+under `experiments/generate_*_from_tr_shared_clean.py` consume canonical
+Tree-Ring metadata and clean artifacts, inject only the method-specific
+watermark through the authoritative provider, and write only method-specific
+`watermarked.png` outputs. A cohort is `formal_shared_tr_clean` only after the
+cross-method audit validates it by `run_id` against `data/tr/diffusiondb/metadata.csv`.
+See `docs/SHARED_TR_CLEAN_V2.md` for commands and schema details.

@@ -27,6 +27,83 @@ This file records implementation bugs, validated non-bugs, ablations, and the ev
 | 2026-07-14 | NFPA-style Tree-Ring complex L1 evaluation | Completed for DiffusionDB only. MS-COCO was not run after scope was corrected. | `outputs/raven_nfpa_tr_eval/diffusiondb/20260714T161952Z/aggregate_results.json` |
 
 
+
+## 2026-07-29 — Issue #6 shared Tree-Ring clean protocol for RID/HSTR/HSQR
+
+### Problem
+GM and T2S already had `shared_tr_clean_v2` runners, but the formal shared-clean
+workflow did not yet cover RingID, HSTR, and HSQR. The cross-method audit also
+only accepted GS/GM/T2S, so a later cohort could not prove all declared methods
+used the same TR prompt, base latent, clean image, and generation configuration.
+
+### Root cause
+The authoritative provider implementations from Issues #3/#4/#5 existed on
+`main`, but they lacked explicit supplied-base-latent shared-clean entrypoints
+and the experiment/audit layer had no RID/HSTR/HSQR protocol schemas.
+
+### Affected files
+- `eval_bench_wm/utils/wm/ringid_provider.py:get_wm_latents_from_base_latent`
+- `eval_bench_wm/utils/wm/hstr_provider.py:get_wm_latents_from_base_latent`
+- `eval_bench_wm/utils/wm/hsqr_provider.py:get_wm_latents_from_base_latent`
+- `experiments/shared_tr_clean_fourier.py`
+- `experiments/generate_rid_from_tr_shared_clean.py`
+- `experiments/generate_hstr_from_tr_shared_clean.py`
+- `experiments/generate_hsqr_from_tr_shared_clean.py`
+- `raven_repro/raven/pairing_provenance.py`
+- `raven_repro/scripts/audit_shared_clean_cohorts.py`
+
+### Affected outputs
+No formal cohort, attack output, FID, CLIP, PSNR, SSIM, or quality metric was
+run or modified. Existing legacy, formal, attack, and quality artifacts were
+left untouched. New shared-clean metadata hashes bind output image SHA for new
+V2 method rows; older cohorts remain historical and must be re-audited before
+being classified as `formal_shared_tr_clean`.
+
+### Fix
+Added strict provider APIs that accept a caller-supplied canonical float32 TR
+base latent and fail closed on missing, wrong-shaped, wrong-dtyped, or non-finite
+latents. Added RID/HSTR/HSQR runners that load TR rows, reconstruct and verify
+the base latent, verify prompt/clean/config identities, call only the provider
+injection API, write only method-specific `watermarked.png`, snapshot/re-hash
+clean artifacts, and validate resume manifests before skipping. Extended the
+shared provenance/audit implementation to support TR, GS, GM, T2S, RID, HSTR,
+and HSQR by `run_id` with per-method and aggregate counts.
+
+### Reused code
+Reused `experiments/shared_clean_tr.py` for canonical row loading, latent
+reconstruction, clean-image guards, manifest/resume gates and metadata writes;
+reused existing provider bundle schemas (`RidBundle`, `SfwBundle`) and
+`raven.pairing_provenance` canonical hashing/audit functions.
+
+### Historical bug coverage
+Reviewed the 2026-07-28/2026-07-29 GM/T2S shared-clean entries and the RingID,
+HSTR, and HSQR official-provider entries. Searched for shared-clean, base-latent,
+resume, provider, and audit code paths before editing. The new experiment layer
+contains no watermark algorithm implementation.
+
+### Regression prevention
+Focused CPU tests cover canonical latent reconstruction, wrong seed rejection,
+RID/HSTR/HSQR cross-method audit acceptance and drift rejection, relocatable
+pairing hashes that still bind artifact identity, rejection of method-specific
+regenerated clean images, and provider supplied-latent/no-replacement gates.
+Resume gates reuse the existing fail-closed row and manifest checks.
+
+### Validation
+- `free -h`: 251 GiB total, 120 GiB available before provider-level CPU probes.
+- `python -m py_compile experiments/shared_clean_tr.py experiments/shared_tr_clean_fourier.py experiments/generate_gm_from_tr_shared_clean.py experiments/generate_t2s_from_tr_shared_clean.py experiments/generate_rid_from_tr_shared_clean.py experiments/generate_hstr_from_tr_shared_clean.py experiments/generate_hsqr_from_tr_shared_clean.py raven_repro/raven/pairing_provenance.py eval_bench_wm/utils/wm/ringid_provider.py eval_bench_wm/utils/wm/hstr_provider.py eval_bench_wm/utils/wm/hsqr_provider.py` passed.
+- CPU provider probe: HSQR/HSTR/RID all reported supplied pre-injection latent SHA equality and post-injection latent SHA inequality.
+- `python -m pytest -q raven_repro/tests/test_shared_tr_clean_issue6.py raven_repro/tests/test_shared_tr_clean_gm_t2s.py::test_audit_script_runs_end_to_end` passed (`11 passed`).
+- GPU preflight: `nvidia-smi` succeeded; CPU memory check showed 113 GiB available; a PyTorch CUDA allocation/kernel probe on a compatible non-Blackwell visible device succeeded (`cuda_available=True`, `device_count=1`, `capability=8.6`, `probe_sum=64.0`). Two-row shared-clean smoke generation was not started because `data/tr/diffusiondb/metadata.csv` and local canonical TR artifacts are absent in this worktree; no dataset/model download or synthetic replacement cohort was used.
+
+### Git provenance
+- Repository: RAVEN
+- Branch: issue-6-shared-clean
+- Commit: pending at time of entry
+- Remote branch: origin/issue-6-shared-clean
+- Push status: pending at time of entry
+- Entry point: `experiments/generate_rid_from_tr_shared_clean.py`, `experiments/generate_hstr_from_tr_shared_clean.py`, `experiments/generate_hsqr_from_tr_shared_clean.py`
+- Formal output eligibility: code/test implementation only so far; no formal cohort or quality/attack evaluation run.
+
 ## 2026-07-29 — HSTR adopts shared SFWMark infrastructure and official-source fixtures
 
 ### Problem

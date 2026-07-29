@@ -69,6 +69,7 @@ LEGACY_BASE_KEY_SEED = 999999
 HSQR_SCORE_DEFINITION = "hsqr_negative_mean_complex_l1_distance"
 HSQR_SCORE_DIRECTION = "higher_is_watermarked"
 HSQR_COMPARISON_OPERATOR = ">="
+HSQR_SHARED_TR_CLEAN_MODE = "official_math_shared_tr_clean"
 
 #: The QR boolean pattern is mapped to these complex magnitudes by the official
 #: detector target.
@@ -591,6 +592,38 @@ class HSQRProvider(WmProvider):
             "zT_fft_wchannel_PIL": latents_w_fft_wchannel_PIL,
             "zT_fft_wchannel": latents_w_fft_wchannel_PIL,
         }
+
+    def get_wm_latents_from_base_latent(self, base_latent: torch.Tensor) -> typing.Dict[str, typing.Any]:
+        """Inject HSQR into a caller-supplied canonical TR base latent."""
+        if base_latent is None:
+            raise SfwBundleError("HSQR shared-clean injection requires a supplied base_latent")
+        if tuple(base_latent.shape) != tuple(self.latent_shape):
+            raise SfwBundleError(
+                f"HSQR shared-clean latent shape mismatch: got {tuple(base_latent.shape)}, "
+                f"expected {tuple(self.latent_shape)}"
+            )
+        if base_latent.dtype != torch.float32:
+            raise SfwBundleError(
+                f"HSQR shared-clean requires the canonical float32 base latent, got {base_latent.dtype}"
+            )
+        if not torch.isfinite(base_latent.detach()).all():
+            raise SfwBundleError("HSQR shared-clean base latent contains NaN or Inf")
+        pre_sha = sfw_bundle.sha256_tensor(base_latent.detach())
+        out = self.get_wm_latents(latents_clean=base_latent)
+        post_sha = sfw_bundle.sha256_tensor(out["zT_torch"])
+        if post_sha == pre_sha:
+            raise SfwBundleError("HSQR shared-clean injection made no latent change")
+        out.update(
+            {
+                "shared_clean_mode": HSQR_SHARED_TR_CLEAN_MODE,
+                "hsqr_pre_injection_latent_sha256": pre_sha,
+                "hsqr_post_injection_latent_sha256": post_sha,
+                "hsqr_selected_pattern_sha256": self.pattern_sha256(),
+                "hsqr_payload_sha256": sfw_bundle.sha256_text(self.payload_text(self.selected_key_index)),
+                "hsqr_key_identity_sha256": sfw_bundle.canonical_sha256(self.key_identity()),
+            }
+        )
+        return out
 
     # ------------------------------------------------------------------
     # Detector

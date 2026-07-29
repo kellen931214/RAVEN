@@ -46,6 +46,10 @@ CORE_FILES = (
     # profile, so neither is an implementation detail of its provider.
     "experiments/generate_gm_from_tr_shared_clean.py",
     "experiments/generate_t2s_from_tr_shared_clean.py",
+    "experiments/shared_tr_clean_fourier.py",
+    "experiments/generate_rid_from_tr_shared_clean.py",
+    "experiments/generate_hstr_from_tr_shared_clean.py",
+    "experiments/generate_hsqr_from_tr_shared_clean.py",
     "eval_bench_wm/utils/wm/gm_provider.py",
     "eval_bench_wm/utils/wm/gm_bundle.py",
     "eval_bench_wm/utils/wm/t2s_provider.py",

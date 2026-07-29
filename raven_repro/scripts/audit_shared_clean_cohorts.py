@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Audit TR / GS / GM / T2S ``shared_tr_clean_v2`` cohorts against one TR source.
+"""Audit TR / GS / GM / T2S / RID / HSTR / HSQR ``shared_tr_clean_v2`` cohorts against one TR source.
 
 Every method cohort is first audited on its own terms (``audit_pairing_rows``:
 required provenance, duplicate detection, pairing-hash round trip, on-disk file
@@ -42,7 +42,14 @@ from raven.pairing_provenance import (  # noqa: E402
     sha256_path,
 )
 
-METHOD_ARGS = {"GS": "gs_metadata", "GM": "gm_metadata", "T2S": "t2s_metadata"}
+METHOD_ARGS = {
+    "GS": "gs_metadata",
+    "GM": "gm_metadata",
+    "T2S": "t2s_metadata",
+    "RID": "rid_metadata",
+    "HSTR": "hstr_metadata",
+    "HSQR": "hsqr_metadata",
+}
 
 
 def load_rows(path: Path) -> List[Dict[str, str]]:
@@ -59,6 +66,9 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--gs-metadata", type=Path, default=None)
     parser.add_argument("--gm-metadata", type=Path, default=None)
     parser.add_argument("--t2s-metadata", type=Path, default=None)
+    parser.add_argument("--rid-metadata", type=Path, default=None)
+    parser.add_argument("--hstr-metadata", type=Path, default=None)
+    parser.add_argument("--hsqr-metadata", type=Path, default=None)
     parser.add_argument(
         "--verify-files",
         action="store_true",
@@ -126,8 +136,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if not cohorts:
         raise SystemExit(
-            "nothing to audit: pass at least one of --gs-metadata / --gm-metadata / "
-            "--t2s-metadata"
+            "nothing to audit: pass at least one method metadata argument"
         )
 
     if args.expected_run_ids is not None and args.expect_full_tr_cohort:
