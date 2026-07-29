@@ -232,7 +232,7 @@ identical configuration resumed without regenerating or overwriting anything.
 ### Git provenance
 - Repository: `kellen931214/RAVEN`
 - Branch: `agent/issue-5-hsqr-official-standalone-verification`
-- Commit: recorded in the follow-up commit on this branch
+- Commit: `3c53c49582ecd54ece9a785c546c6e6ae3e57b56`
 - Remote branch: `origin/agent/issue-5-hsqr-official-standalone-verification`
 - Push status: pushed
 - Entry point: `eval_bench_wm/run_watermark.py:run_hsqr_generation`,
