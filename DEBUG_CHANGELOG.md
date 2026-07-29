@@ -6,6 +6,7 @@ This file records implementation bugs, validated non-bugs, ablations, and the ev
 
 | Date | Area | Status | Evidence |
 | --- | --- | --- | --- |
+| 2026-07-29 | GM + T2S `shared_tr_clean_v2` formal cohorts (Issue #9) | Formal 1001-row GM and T2S cohorts generated from fixed `main` `01ce7d7`, GPU 0 (RTX 3090, sm_86). All 1001 canonical clean images byte-identical before and after. The T2S runner's own final audit rejected the cohort on a `t2s_session_key_sha256` repeat, which is a birthday collision of a 16-bit key, not shared state; the audit gate was corrected and the cohort kept. T2S's in-runner summary/pairing/cross-method JSONs are absent (crash after the last row) and are supplied by the standalone cross-method audit instead. | `data/gm/diffusiondb_shared_tr/GM`; `data/t2s/diffusiondb_shared_tr/T2S`; `audit/shared_clean_tr_gs_gm_t2s.json`; `raven_repro/raven/pairing_provenance.py` |
 | 2026-07-28 | GM + T2S `shared_tr_clean_v2` (Issue #9, phase 1) | GaussMarker and T2SMark now consume the canonical Tree-Ring source row — same prompt, base latent, clean image and generation config — and generate only their own watermarked image. New authoritative provider entrypoints `GmProvider.get_wm_latents_from_base_latent` and the T2S `|z|`-multiset consumption gate prove the supplied latent was embedded into rather than replaced. Cross-method audit extended to TR/GS/GM/T2S. Two-row GPU smoke passed; the canonical clean images are byte-identical before and after. No formal 1000/1001 cohort generated. | `experiments/generate_gm_from_tr_shared_clean.py`; `experiments/generate_t2s_from_tr_shared_clean.py`; `experiments/shared_clean_tr.py`; `raven_repro/scripts/audit_shared_clean_cohorts.py`; `raven_repro/tests/test_shared_tr_clean_gm_t2s.py`; `docs/SHARED_TR_CLEAN_V2.md` |
 | 2026-07-28 | GaussMarker official parity, bundles and standalone verification | GM generation now samples a complete initial latent per sample from a deterministic seed with official legacy-RNG semantics, creates official ChaCha20 state, and persists an official-interchangeable `w1.pth`/`w2.pth`/`manifest.json` bundle. Standalone verification, threshold calibration and paper evaluation run from that bundle alone. Official reference frozen at `4ac9bfd4e152a56bd93c2a06a809ef6ff8e73155`. Bundle reuse, `paper_eval` cohort pairing and `run_manifest.json` resume are all fail-closed: a bundle must match the full detector configuration and can only lose officialness, never gain it; `official_paper_evaluation` requires a verified one-to-one pairing; a mismatched run manifest stops the run without modifying any file. | `eval_bench_wm/utils/wm/gm_provider.py`; `eval_bench_wm/utils/wm/gm_bundle.py`; `eval_bench_wm/run_verify_watermark.py`; `eval_bench_wm/tests/test_gm_official_parity.py` |
 | 2026-07-28 | T2S review follow-up (PR #8) | Restored upstream's full generation RNG lifecycle (`official_compatible`, default) and separated the RAVEN `raven_deterministic` mode without claiming upstream-exactness; `--t2s_fix_key` now fixes master key AND message per upstream `run.py`; `state_sha256` is mandatory; verification fails closed on mixed state/config; per-image rule relabelled `paired_key_comparison` (RAVEN extension) since upstream evaluates a cohort ROC. | `eval_bench_wm/utils/wm/t2s_provider.py`; `eval_bench_wm/run_verification.py`; `eval_bench_wm/tests/test_t2s_parity.py` |
@@ -23,6 +24,85 @@ This file records implementation bugs, validated non-bugs, ablations, and the ev
 
 
 
+
+## 2026-07-29 — T2S session-key uniqueness gate rejected a correct 1001-row cohort
+
+### Problem
+Formal `shared_tr_clean_v2` T2S generation from `main` at
+`01ce7d7ed01f97070b71dc0dc17b08ee17ede34b` generated all 1001 rows, images and
+state artifacts, then died in its own final audit:
+
+```text
+ValueError: duplicate t2s_session_key_sha256 run_id=57:
+1b0a5c141179a3508e145ce2239f1a6153a274e33b505e5dee452e375cb97fb7
+```
+
+### Root cause
+Not a generation bug. `audit_pairing_rows` listed `t2s_session_key_sha256` in
+`METHOD_PER_SAMPLE_UNIQUE_FIELDS["T2S"]` and required it to be globally distinct.
+The T2S session key is `--t2s_key_length` bits — 16 by default, matching upstream
+`run.py` — drawn per sample as `torch.randint(0, 2, (16,))`. With a 65536-value
+space, a 1001-sample cohort has `C(1001,2) / 2**16 ≈ 7.6` expected colliding
+pairs; the run observed 9 (Poisson λ≈7.6, P(X≥9)≈0.35). Global uniqueness is not
+something the draw can guarantee, so the gate asserted an impossible condition.
+It had only ever been exercised by the two-row GPU smoke, where a collision has
+probability 1/65536.
+
+Detection reads each sample's own portable state, so two samples sharing a
+16-bit session key is two independent draws landing on the same value, not shared
+state. Every field that genuinely is per-sample stayed unique across all 1001
+rows: `t2s_watermark_id`, `t2s_state_sha256`, `t2s_abs_magnitude_sha256`,
+`t2s_message_sha256`, `watermarked_sha256`, `base_latent_sha256`,
+`watermarked_latent_sha256` — 1001 distinct values each.
+
+### Affected files
+- `raven_repro/raven/pairing_provenance.py`: `t2s_session_key_sha256` removed
+  from `METHOD_PER_SAMPLE_UNIQUE_FIELDS`; new `METHOD_COLLISION_COUNTED_FIELDS`
+  and the `collision_counted_field_stats` summary block.
+- `raven_repro/tests/test_shared_tr_clean_gm_t2s.py`, `docs/SHARED_TR_CLEAN_V2.md`.
+
+### Affected outputs
+No canonical clean artifact was touched: all 1001 clean images re-hashed
+byte-identical (SHA-256, size and mtime_ns) against a snapshot taken before
+generation. The GM cohort was unaffected and passed its own audit in full. The
+T2S cohort's 1001 rows, images, state artifacts and `run_manifest.json` are
+valid and were kept; because the crash happened after the last row, the runner
+never wrote T2S's `summary.json`, `pairing_audit.json`,
+`cross_method_shared_clean_audit.json` or `clean_source_integrity.json`, and its
+`results.json` records `status=error`. Those attestations were supplied by the
+standalone `audit_shared_clean_cohorts.py` run instead of by a resume, because
+gate 3 binds `git_commit` into `run_config_sha256` and this fix moves `main`
+HEAD — resuming would have required weakening a fail-closed gate. **No image was
+regenerated and no row was rewritten.**
+
+### Fix
+`METHOD_COLLISION_COUNTED_FIELDS` marks per-sample fields whose value space is
+small enough that repeats are expected. For each, the audit records
+`distinct_values`, `colliding_pairs` and `max_repeat` in the summary rather than
+failing, so a degenerate draw (every row identical) is still visible while a
+birthday collision is not treated as corruption. `pairing_sha256` still binds
+the session key, so the value cannot be edited after the fact.
+
+### Reused code
+The existing `METHOD_PER_SAMPLE_UNIQUE_FIELDS` loop, `_required`, and the summary
+assembly in `audit_pairing_rows`. No new hashing or canonicalization.
+
+### Historical bug coverage
+Checked the GS analogue: `gs_sampling_seed` and `gs_secret_index` uniqueness are
+kept, because those are cohort-assigned per-sample identifiers rather than short
+random draws, and the 2026-07-27 GS V2 cohort passes unchanged. GM has no
+equivalent short-key field.
+
+### Regression prevention
+Two tests: a T2S cohort with a repeated session key passes and reports
+`{"distinct_values": 1, "colliding_pairs": 1, "max_repeat": 2}`; and a repeat of
+`t2s_watermark_id`, `t2s_state_sha256` or `t2s_abs_magnitude_sha256` still fails
+closed, so dropping the session key did not weaken the fields that matter. Both
+rebuild `pairing_sha256` after mutating the row, so they exercise the intended
+gate rather than the pairing-hash gate.
+
+### Validation
+- `raven_repro`: 427 passed (425 before + 2 new).
 
 ## 2026-07-28 — Shared-clean review follow-up: run-id coverage, source binding, artifact verification and a fail-closed run manifest
 
