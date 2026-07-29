@@ -41,6 +41,7 @@ from raven.eval_protocol import (  # noqa: E402
     formal_attack_config_hash,
     formal_quality_summary,
     formal_runtime_provenance,
+    fourier_l1_attack_success_summary,
     gm_attack_success_summary,
     gs_attack_success_summary,
     t2s_attack_success_summary,
@@ -1057,6 +1058,9 @@ def aggregate_stage(args: argparse.Namespace, config: dict[str, Any]) -> int:
         "GS": gs_attack_success_summary,
         "GM": gm_attack_success_summary,
         "T2S": t2s_attack_success_summary,
+        "RID": fourier_l1_attack_success_summary,
+        "HSTR": fourier_l1_attack_success_summary,
+        "HSQR": fourier_l1_attack_success_summary,
     }
     method_summary: dict[str, Any] = {}
     reducer = method_summary_reducers.get(args.method)
@@ -1269,6 +1273,43 @@ def validate_stage(args: argparse.Namespace, config: dict[str, Any]) -> int:
             for key in finite_keys:
                 if not math.isfinite(float(protocol[key])):
                     raise RuntimeError(f"non-finite TR aggregate {protocol_name}.{key}")
+    else:
+        score_path = args.output_root / "verification" / "scores.csv"
+        with score_path.open(newline="", encoding="utf-8-sig") as handle:
+            score_rows = list(csv.DictReader(handle))
+        expected_order = [str(row["run_id"]) for row in snapshot_rows]
+        score_order = [str(row.get("run_id", "")) for row in score_rows]
+        if score_order != expected_order:
+            raise RuntimeError("verification score rows are not one-per-input in input order")
+        if any(row.get("error") for row in score_rows):
+            raise RuntimeError("verification score output contains error rows")
+        if {row.get("provider_config_hash") for row in score_rows} != providers:
+            raise RuntimeError(f"{args.method} verification provider config mismatch")
+        for score in score_rows:
+            run_id = str(score["run_id"])
+            record = next(row for row in records if str(row["run_id"]) == run_id)
+            if score.get("source_watermark_target_sha256") != record.get("watermark_target_sha256"):
+                raise RuntimeError(f"run_id={run_id}: score/source target hash mismatch")
+            if score.get("source_watermark_mask_sha256") != record.get("watermark_mask_sha256"):
+                raise RuntimeError(f"run_id={run_id}: score/source mask hash mismatch")
+            if score.get("detector_watermark_target_sha256") != record.get("watermark_target_sha256"):
+                raise RuntimeError(f"run_id={run_id}: detector/source target hash mismatch")
+            if score.get("detector_watermark_mask_sha256") != record.get("watermark_mask_sha256"):
+                raise RuntimeError(f"run_id={run_id}: detector/source mask hash mismatch")
+            for stage in ("clean", "watermarked", "attacked"):
+                value = float(score[f"{stage}_canonical_score"])
+                if not math.isfinite(value):
+                    raise RuntimeError(f"run_id={run_id}: non-finite {stage} canonical score")
+        metric = detector_payload.get("metric", {})
+        for key in (
+            "clean_calibrated_threshold",
+            "clean_calibrated_actual_empirical_fpr",
+            "before_detection_rate_at_clean_calibrated_threshold",
+            "attacked_detection_rate_at_clean_calibrated_threshold",
+            "attacked_roc_auc",
+        ):
+            if key in metric and not math.isfinite(float(metric[key])):
+                raise RuntimeError(f"non-finite {args.method} detector metric {key}")
     aggregate = args.output_root / "formal_aggregate.json"
     if not aggregate.is_file():
         raise FileNotFoundError(aggregate)

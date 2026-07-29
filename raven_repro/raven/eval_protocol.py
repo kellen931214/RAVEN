@@ -44,12 +44,18 @@ METHOD_DATA_ROOTS: dict[str, Path] = {
     # and are never duplicated per method.
     "GM": DATA_ROOT / "gm",
     "T2S": DATA_ROOT / "t2s",
+    "RID": DATA_ROOT / "rid",
+    "HSTR": DATA_ROOT / "hstr",
+    "HSQR": DATA_ROOT / "hsqr",
 }
 METHOD_OUTPUT_ROOTS: dict[str, Path] = {
     "TR": OUTPUTS_ROOT / "tr",
     "GS": OUTPUTS_ROOT / "gs",
     "GM": OUTPUTS_ROOT / "gm",
     "T2S": OUTPUTS_ROOT / "t2s",
+    "RID": OUTPUTS_ROOT / "rid",
+    "HSTR": OUTPUTS_ROOT / "hstr",
+    "HSQR": OUTPUTS_ROOT / "hsqr",
 }
 
 # Methods whose formal protocol includes the attacked-clean recalibration branch.
@@ -240,9 +246,27 @@ TR_PROVIDER_FIELDS = (
 
 PROVIDER_FIELDS_BY_METHOD = {
     "TR": TR_PROVIDER_FIELDS,
-    "RID": ("rid_seed", "fix_gt", "time_shift", "time_shift_factor"),
-    "HSTR": ("hstr_seed", "fix_gt"),
-    "HSQR": ("hsqr_seed", "fix_gt", "delta"),
+    "RID": (
+        "rid_protocol_mode",
+        "rid_bundle_config_sha256",
+        "rid_selected_pattern_sha256",
+        "rid_mask_sha256",
+        "rid_key_index",
+    ),
+    "HSTR": (
+        "hstr_protocol_mode",
+        "hstr_bundle_config_sha256",
+        "hstr_selected_pattern_sha256",
+        "hstr_mask_sha256",
+        "hstr_key_index",
+    ),
+    "HSQR": (
+        "hsqr_protocol_mode",
+        "hsqr_bundle_config_sha256",
+        "hsqr_selected_pattern_sha256",
+        "hsqr_mask_sha256",
+        "hsqr_key_index",
+    ),
     "GS": (
         "gs_protocol_mode",
         "message_width_in_bytes",
@@ -285,10 +309,13 @@ PROVIDER_FIELDS_BY_METHOD = {
 # digest or protocol identity there is no defensible default: silently falling
 # back to "" would let a cohort with missing provenance produce a stable-looking
 # provider_config_hash. Methods absent from this mapping keep the historical
-# default-filling behaviour so existing TR/GS/RID cohort hashes are unchanged.
+# default-filling behaviour so existing TR/GS cohort hashes are unchanged.
 PROVIDER_REQUIRED_NONEMPTY_FIELDS: dict[str, frozenset[str]] = {
     "GM": frozenset(PROVIDER_FIELDS_BY_METHOD["GM"]),
     "T2S": frozenset(PROVIDER_FIELDS_BY_METHOD["T2S"]),
+    "RID": frozenset(PROVIDER_FIELDS_BY_METHOD["RID"]),
+    "HSTR": frozenset(PROVIDER_FIELDS_BY_METHOD["HSTR"]),
+    "HSQR": frozenset(PROVIDER_FIELDS_BY_METHOD["HSQR"]),
 }
 
 PROVIDER_DEFAULTS = {
@@ -302,9 +329,27 @@ PROVIDER_DEFAULTS = {
         "w_injection": "complex",
         "w_pattern_const": 0.0,
     },
-    "RID": {"rid_seed": 999999, "fix_gt": 1, "time_shift": 1, "time_shift_factor": 1},
-    "HSTR": {"hstr_seed": 999999, "fix_gt": 1},
-    "HSQR": {"hsqr_seed": 999999, "fix_gt": 1, "delta": 0},
+    "RID": {
+        "rid_protocol_mode": "",
+        "rid_bundle_config_sha256": "",
+        "rid_selected_pattern_sha256": "",
+        "rid_mask_sha256": "",
+        "rid_key_index": 0,
+    },
+    "HSTR": {
+        "hstr_protocol_mode": "",
+        "hstr_bundle_config_sha256": "",
+        "hstr_selected_pattern_sha256": "",
+        "hstr_mask_sha256": "",
+        "hstr_key_index": 0,
+    },
+    "HSQR": {
+        "hsqr_protocol_mode": "",
+        "hsqr_bundle_config_sha256": "",
+        "hsqr_selected_pattern_sha256": "",
+        "hsqr_mask_sha256": "",
+        "hsqr_key_index": 0,
+    },
     "GS": {
         # Default is official_compatible; legacy must be requested explicitly.
         # Only a fallback/type hint here — formal GS rows always carry
@@ -1092,6 +1137,58 @@ def t2s_attack_success_summary(detector_payload: Mapping[str, Any]) -> dict[str,
         ),
         "attack_success_threshold_type": "paired_key_comparison_control_key",
         "attack_success_threshold": None,
+        "attack_success_threshold_comparison_operator": operator,
+        "attack_success_detected_rate": attacked_rate,
+    }
+
+
+FOURIER_ATTACK_SUCCESS_FIELD = "attack_success_rate_at_clean_calibrated_threshold"
+
+
+def fourier_l1_attack_success_summary(detector_payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Attack success for RID/HSTR/HSQR canonical score families.
+
+    The detector payload names the method-specific canonical score, which is
+    ``-raw_l1`` and therefore higher-is-watermarked. The clean-calibrated
+    threshold is in canonical-score space; raw L1 thresholds are never mixed into
+    this family.
+    """
+    metric = _detector_metric(detector_payload)
+    method = str(detector_payload.get("method") or "").upper()
+    expected_metrics = {
+        "RID": "rid_neg_channel_min_complex_l1",
+        "HSTR": "hstr_score",
+        "HSQR": "hsqr_score",
+    }
+    if method not in expected_metrics:
+        raise RuntimeError(f"unsupported Fourier L1 method for attack success: {method!r}")
+    if str(metric.get("detector_metric")) != expected_metrics[method]:
+        raise RuntimeError(
+            f"unexpected {method} detector metric: {metric.get('detector_metric')!r}"
+        )
+    if str(metric.get("threshold_score_space")) != "canonical_score":
+        raise RuntimeError(f"{method} threshold is not explicitly in canonical_score space")
+    if str(metric.get("score_direction")) != "higher_is_watermarked":
+        raise RuntimeError(f"{method} canonical score direction is not higher_is_watermarked")
+    operator = metric.get("threshold_comparison_operator")
+    if operator not in (">", ">="):
+        raise RuntimeError(f"unsupported {method} threshold operator: {operator!r}")
+    attacked_rate = _finite_rate(
+        metric["attacked_detection_rate_at_clean_calibrated_threshold"],
+        "attacked_detection_rate_at_clean_calibrated_threshold",
+    )
+    threshold = float(metric["clean_calibrated_threshold"])
+    if not math.isfinite(threshold):
+        raise RuntimeError(f"non-finite {method} clean_calibrated_threshold")
+    return {
+        FOURIER_ATTACK_SUCCESS_FIELD: 1.0 - attacked_rate,
+        "attack_success_definition": (
+            "1 - attacked detection rate at the clean-calibrated empirical "
+            f"threshold on {expected_metrics[method]} (canonical score = -raw L1)"
+        ),
+        "attack_success_threshold_type": "empirical_clean_1pct_fpr",
+        "attack_success_threshold_score_space": "canonical_score",
+        "attack_success_threshold": threshold,
         "attack_success_threshold_comparison_operator": operator,
         "attack_success_detected_rate": attacked_rate,
     }

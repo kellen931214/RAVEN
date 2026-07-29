@@ -6,9 +6,12 @@ that makes that true: one canonical Tree-Ring source row per `run_id` supplies
 the prompt, the base latent, the clean image and the generation configuration to
 every other method, and each method produces **only** its own watermarked image.
 
-Phase 1 (Issue #9) covers **GaussMarker (GM)** and **T2SMark (T2S)**, alongside
-the already-merged **Gaussian Shading (GS)** cohort. RingID, HSTR and HSQR remain
-open under Issue #6.
+Phase 1 (Issue #9) covered **GaussMarker (GM)** and **T2SMark (T2S)**, alongside
+the already-merged **Gaussian Shading (GS)** cohort. Issue #6 / PR #16 adds
+**RingID (RID)**, **HSTR**, and **HSQR** shared-clean generation/provenance. This
+branch registers those RID/HSTR/HSQR cohorts with the existing formal RAVEN
+removal-attack and evaluation pipeline; it does not merge PR #16 and does not
+run a formal cohort.
 
 ---
 
@@ -343,3 +346,39 @@ Audit: outputs/smoke/issue6_shared_tr_clean_gpu_20260729T1930Z/cross_method_audi
 ```
 
 The audit passed for all three methods (`2` rows each), verified files, matched by `run_id`, and confirmed the shared TR source metadata SHA `b359a5104f93d54580914f152f074a72f7aae59e8ab6ef4a6a05ab91662aa66c`. Canonical clean files remained unchanged before and after generation.
+
+## 8. Formal RAVEN attack/evaluation compatibility
+
+`shared_tr_clean_v2` RID, HSTR and HSQR cohorts enter the formal evaluator through
+the same architecture as TR, GS, GM and T2S:
+
+- canonical method roots: `data/rid`, `data/hstr`, `data/hsqr` and matching `outputs/<method>` roots;
+- snapshot batches from the method `metadata.csv`, with `run_id` uniqueness and the full pairing audit enabled;
+- the existing RAVEN attack implementation and `attack_cache/<attack_config_hash>/<run_id>/watermarked/record.json` layout;
+- no method-specific attack algorithm, no regenerated clean image, and no method-specific attacked-clean branch;
+- verification manifests built from immutable snapshots plus attack records, preserving method provenance fields in input order;
+- quality, FID and CLIP stages over the verified attacked-watermarked records;
+- aggregate, validate and experiment-table update stages from structured JSON/CSV only.
+
+RID/HSTR/HSQR verification is bundle-bound. The detector must load the persisted
+`RidBundle` / `SfwBundle` named by the row and re-check the row's bundle config,
+selected pattern and mask hashes before scoring. Verification must not regenerate
+keys, patterns, QR targets, clean images or watermarked images.
+
+Detector score semantics are method-specific:
+
+| Method | Raw detector statistic | Canonical score | Direction | Threshold family |
+| --- | --- | --- | --- | --- |
+| RID | `rid_channel_min_l1` | `rid_neg_channel_min_complex_l1 = -raw_l1` | `higher_is_watermarked` | `empirical_clean_1pct_fpr` in canonical-score space |
+| HSTR | `hstr_channel_min_l1` | `hstr_score = -min(channel_0_l1, channel_3_l1)` | `higher_is_watermarked` | `empirical_clean_1pct_fpr` in canonical-score space |
+| HSQR | `hsqr_l1_distance` | `hsqr_score = -raw_l1` | `higher_is_watermarked` | `empirical_clean_1pct_fpr` in canonical-score space |
+
+Raw L1 thresholds and canonical-score thresholds are not interchangeable. The
+formal table extractor fails closed unless the detector payload explicitly names
+`threshold_score_space = canonical_score`, `score_direction = higher_is_watermarked`,
+and `raw_score_direction = lower_is_watermarked`.
+
+Validation added on this branch is CPU-only and fixture-based. Remaining work
+before publication is the repository GPU gate plus real two-row smoke and full
+formal attack/verify/quality/FID/CLIP validation on fixed, clean, pushed code.
+>>>>>>> b98fd49 (Register shared-clean Fourier methods for formal eval)

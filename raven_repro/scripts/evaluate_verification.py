@@ -143,6 +143,126 @@ def semantic_report(method: str, rows: list[dict[str, str]], target_fpr: float, 
     return metric
 
 
+
+FOURIER_METHOD_CONFIG = {
+    "RID": {
+        "raw_metric": "rid_channel_min_l1",
+        "canonical_metric": "rid_neg_channel_min_complex_l1",
+        "score_definition": "rid_neg_channel_min_complex_l1",
+    },
+    "HSTR": {
+        "raw_metric": "hstr_channel_min_l1",
+        "canonical_metric": "hstr_score",
+        "score_definition": "hstr_score=-min(channel_0_l1,channel_3_l1)",
+    },
+    "HSQR": {
+        "raw_metric": "hsqr_l1_distance",
+        "canonical_metric": "hsqr_score",
+        "score_definition": "hsqr_negative_mean_complex_l1_distance",
+    },
+}
+
+
+def fourier_report(method: str, rows: list[dict[str, str]], target_fpr: float, threshold_override: float | None) -> tuple[dict, list[dict]]:
+    """RID/HSTR/HSQR detector family: raw L1 plus canonical higher-is-WM score."""
+    config = FOURIER_METHOD_CONFIG[method]
+    prefix = method.lower()
+    raw = {
+        stage: [finite_float(row, f"{stage}_raw_score") for row in rows]
+        for stage in ("clean", "watermarked", "attacked")
+    }
+    canonical = {
+        stage: [finite_float(row, f"{stage}_canonical_score") for row in rows]
+        for stage in raw
+    }
+    for stage in raw:
+        for index, row in enumerate(rows):
+            method_raw = row.get(f"{stage}_{prefix}_raw_l1")
+            method_score = row.get(f"{stage}_{prefix}_canonical_score")
+            if method_raw not in (None, "") and float(method_raw) != raw[stage][index]:
+                raise ValueError(f"run_id={row.get('run_id')}: {method} raw L1 column drift at {stage}")
+            if method_score not in (None, "") and float(method_score) != canonical[stage][index]:
+                raise ValueError(f"run_id={row.get('run_id')}: {method} canonical score column drift at {stage}")
+            if canonical[stage][index] != -raw[stage][index]:
+                raise ValueError(f"run_id={row.get('run_id')}: {method} canonical score is not -raw L1")
+    summary = summarize_detection(
+        canonical["clean"], canonical["watermarked"], canonical["attacked"], target_fpr
+    )
+    threshold = summary.calibration.threshold
+    rates = {
+        stage: sum(value >= threshold for value in values) / len(values)
+        for stage, values in canonical.items()
+    }
+    legacy_threshold = None
+    recorded_thresholds = {finite_float(row, "legacy_threshold") for row in rows}
+    if threshold_override is not None:
+        legacy_threshold = float(threshold_override)
+    elif len(recorded_thresholds) == 1:
+        legacy_threshold = next(iter(recorded_thresholds))
+    legacy_rates = None
+    if legacy_threshold is not None:
+        legacy_rates = {
+            stage: sum(legacy_detected(method, value, legacy_threshold) for value in values) / len(values)
+            for stage, values in raw.items()
+        }
+    audited = []
+    for index, row in enumerate(rows):
+        item = {
+            "run_id": row.get("run_id") or str(index),
+            f"{prefix}_bundle_config_sha256": row.get(f"{prefix}_bundle_config_sha256", ""),
+            f"{prefix}_selected_pattern_sha256": row.get(f"{prefix}_selected_pattern_sha256", ""),
+            f"{prefix}_mask_sha256": row.get(f"{prefix}_mask_sha256", ""),
+        }
+        for stage in raw:
+            item[f"{stage}_raw_l1"] = raw[stage][index]
+            item[f"{stage}_canonical_score"] = canonical[stage][index]
+        audited.append(item)
+    metric = {
+        "N": len(rows),
+        "detector_metric": config["canonical_metric"],
+        "raw_detector_metric": config["raw_metric"],
+        "score_direction": "higher_is_watermarked",
+        "raw_score_direction": "lower_is_watermarked",
+        "score_definition": config["score_definition"],
+        "threshold_type": "empirical_clean_1pct_fpr",
+        "threshold_score_space": "canonical_score",
+        "threshold_comparison_operator": ">=",
+        "clean_calibrated_threshold": threshold,
+        "clean_calibrated_actual_empirical_fpr": summary.calibration.actual_fpr,
+        "clean_calibrated_false_positive_count": summary.calibration.false_positives,
+        "target_fpr": target_fpr,
+        "stages": {
+            stage: {
+                "N": len(values),
+                "mean_raw_l1": sum(raw[stage]) / len(raw[stage]),
+                "mean_canonical_score": sum(canonical[stage]) / len(canonical[stage]),
+                "canonical_detection_rate_at_clean_calibrated_threshold": rates[stage],
+                "raw_l1_distribution": distribution(raw[stage]),
+                "canonical_score_distribution": distribution(canonical[stage]),
+            }
+            for stage, values in canonical.items()
+        },
+        "mean_canonical_score_before": sum(canonical["watermarked"]) / len(canonical["watermarked"]),
+        "mean_canonical_score_attacked": sum(canonical["attacked"]) / len(canonical["attacked"]),
+        "mean_raw_l1_before": sum(raw["watermarked"]) / len(raw["watermarked"]),
+        "mean_raw_l1_attacked": sum(raw["attacked"]) / len(raw["attacked"]),
+        "before_detection_rate_at_clean_calibrated_threshold": rates["watermarked"],
+        "attacked_detection_rate_at_clean_calibrated_threshold": rates["attacked"],
+        "clean_detection_rate_at_clean_calibrated_threshold": rates["clean"],
+        "attack_success_rate_at_clean_calibrated_threshold": 1.0 - rates["attacked"],
+        "attack_success_definition": (
+            "1 - attacked detection rate at the clean-calibrated empirical "
+            f"threshold on {config['canonical_metric']}"
+        ),
+        "before_roc_auc": summary.watermarked_auc,
+        "attacked_roc_auc": summary.attacked_auc,
+        "statistically_valid_for_target_fpr": len(rows) >= math.ceil(1.0 / target_fpr),
+        "legacy_threshold_raw_l1": legacy_threshold,
+        "legacy_threshold_comparison_operator": "raw_l1_detected_when_-raw_l1 > threshold",
+        "legacy_fixed_threshold_rates": legacy_rates,
+    }
+    return metric, audited
+
 def gs_report(
     rows: list[dict[str, str]], expected_bits: int, target_fpr: float = 0.01
 ) -> tuple[dict, list[dict]]:
@@ -473,8 +593,10 @@ def main() -> int:
     if any((row.get("method") or "").upper() != args.method for row in rows):
         raise ValueError("Records contain a different method")
 
-    if args.method in SEMANTIC_METHODS:
+    if args.method == "TR":
         metric, detailed = semantic_report(args.method, rows, args.target_fpr, args.legacy_threshold), []
+    elif args.method in {"RID", "HSTR", "HSQR"}:
+        metric, detailed = fourier_report(args.method, rows, args.target_fpr, args.legacy_threshold)
     elif args.method == "GM":
         metric, detailed = gm_report(rows, args.target_fpr)
     elif args.method == "T2S":

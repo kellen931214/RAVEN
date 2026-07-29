@@ -65,3 +65,24 @@ The earlier `formal_deterministic` five-magnitude/four-quadrant schedule is now 
 `balanced_deterministic_schedule`. Existing outputs are retained as historical ablations and are not
 relabeled or modified, but that schedule must not be described as paper-exact
 random sampling.
+
+## Shared-Clean Method Registration (2026-07-29)
+
+The formal runner now registers RID, HSTR and HSQR `shared_tr_clean_v2` cohorts
+beside TR, GS, GM and T2S. They use the existing snapshot -> attack-watermarked
+-> verify -> quality -> FID -> CLIP -> aggregate -> validate stages and the same
+attack cache. They do not run attacked-clean recalibration; attacked-clean remains
+TR-only.
+
+RID/HSTR/HSQR detector verification is bound to persisted bundles and source
+metadata. The verification manifest carries method provenance from the snapshot
+and attack record, and validation requires exactly one successful score row per
+input row in input order. Missing or duplicate `run_id`, source metadata drift,
+clean/watermarked/attacked SHA drift, provider/bundle/target/mask mismatch,
+generation-config drift and attack-cache provenance drift are fatal.
+
+Score reporting uses canonical score space for these methods: RID
+`rid_neg_channel_min_complex_l1`, HSTR `hstr_score`, and HSQR `hsqr_score`; all
+are `higher_is_watermarked` because canonical score is `-raw_l1`. Thresholds are
+recorded as `empirical_clean_1pct_fpr` only in canonical-score space, with raw L1
+direction recorded separately as `lower_is_watermarked`.

@@ -184,6 +184,26 @@ def _provider_for_spec(spec: MethodSpec, Provider, args, *, device, latent_shape
     raise ValueError(spec.method)
 
 
+def _fourier_mask_sha256(spec: MethodSpec, provider: Any, manifest: Mapping[str, Any]) -> str:
+    recorded = manifest.get("mask_sha256")
+    if recorded:
+        return str(recorded)
+    for attr in ("watermark_mask_sha256", "rid_mask_sha256"):
+        value = getattr(provider, attr, None)
+        if value:
+            return str(value)
+    if spec.method == "HSQR":
+        return canonical_json_sha256({
+            "method": "HSQR",
+            "mask_identity": "center_slice_protocol",
+            "center_slice": [int(provider.start), int(provider.end)],
+            "watermark_channels": [int(ch) for ch in provider.watermark_channels],
+            "latent_shape": [int(dim) for dim in provider.latent_shape],
+            "version": 1,
+        })
+    return ""
+
+
 def _bundle_state(spec: MethodSpec, provider: Any, args: argparse.Namespace) -> Dict[str, Any]:
     bundle_dir = str(Path(getattr(args, spec.bundle_arg)).resolve())
     manifest = provider.bundle.public_manifest() if getattr(provider, "bundle", None) is not None else {}
@@ -196,12 +216,7 @@ def _bundle_state(spec: MethodSpec, provider: Any, args: argparse.Namespace) -> 
             or getattr(provider, "selected_pattern_sha256", None)
             or (provider.pattern_sha256() if hasattr(provider, "pattern_sha256") else "")
         ),
-        f"{spec.method.lower()}_mask_sha256": str(
-            manifest.get("mask_sha256")
-            or getattr(provider, "watermark_mask_sha256", None)
-            or getattr(provider, "rid_mask_sha256", None)
-            or (provider.mask_sha256() if hasattr(provider, "mask_sha256") else "")
-        ),
+        f"{spec.method.lower()}_mask_sha256": _fourier_mask_sha256(spec, provider, manifest),
         f"{spec.method.lower()}_key_index": int(
             getattr(provider, "key_index", getattr(provider, "selected_key_index", 0))
         ),
