@@ -34,6 +34,7 @@ from utils.utils import set_random_seed, seed_everything
 from utils.prompt_utils import get_text_prompts
 
 import dataclasses
+import gc
 import hashlib
 import json
 import os
@@ -310,6 +311,177 @@ def run_gm_generation(args, argv):
     return rows
 
 
+def run_hstr_generation(args, argv):
+    """Official-compatible HSTR/SFWMark generation.
+
+    The HSTR algorithm remains in ``utils/wm/hstr_provider.py``. This runner
+    only handles profile defaults, bundle persistence, indexed paired outputs,
+    per-sample seeds, and non-overwriting resume checks.
+    """
+    from utils.wm import hstr_bundle, hstr_runtime
+    from utils.wm.hstr_provider import apply_arg_defaults as hstr_apply_profile
+
+    profile_info = hstr_apply_profile(args, argv)
+    print(f"[HSTR] profile: {profile_info}", flush=True)
+    hstr_runtime.require_official_generation_profile(args)
+
+    out_dir = Path(args.out_dir)
+    if not getattr(args, "hstr_bundle_dir", None):
+        args.hstr_bundle_dir = (out_dir / "hstr_bundle").as_posix()
+    images_wm_dir = out_dir / "images" / "watermarked"
+    images_clean_dir = out_dir / "images" / "no_watermark"
+    prompts_dir = out_dir / "prompts"
+    metadata_dir = out_dir / "sample_metadata"
+    results_path = out_dir / "results.jsonl"
+    manifest_path = out_dir / "run_manifest.json"
+
+    gpu_info = hstr_runtime.gpu_preflight(DEVICE)
+    print(f"[HSTR] device preflight: {gpu_info}", flush=True)
+
+    latent_shape = (1, 4, int(args.resolution) // 8, int(args.resolution) // 8)
+    resuming = manifest_path.exists()
+    if resuming and not hstr_bundle.HstrBundle(args.hstr_bundle_dir).complete():
+        raise RuntimeError(
+            f"{manifest_path} already exists, so this run must reuse a complete HSTR bundle at "
+            f"--hstr_bundle_dir={args.hstr_bundle_dir}; nothing was modified."
+        )
+
+    dry_bundle_dir = args.hstr_bundle_dir
+    if not resuming:
+        args.hstr_bundle_dir = None
+    dry_provider = hstr_runtime.build_provider(
+        args,
+        latent_shape=latent_shape,
+        device=DEVICE,
+        create_bundle=False,
+    )
+    args.hstr_bundle_dir = dry_bundle_dir
+    run_config = {
+        "official_reference_repo": hstr_bundle.OFFICIAL_SFWMARK_REPO,
+        "official_reference_commit": hstr_bundle.OFFICIAL_SFWMARK_COMMIT,
+        "entrypoint": "eval_bench_wm/run_watermark.py:run_hstr_generation",
+        "hstr_profile": dry_provider.profile,
+        "provider_config_sha256": dry_provider.provider_config_sha256(),
+        "base_sample_seed": int(args.seed),
+        "num_samples": int(args.num),
+        "dataset_id": args.dataset_id,
+        "model_id": args.modelid_target,
+        "model_revision": getattr(args, "model_revision", None),
+        "scheduler": args.scheduler_target,
+        "resolution": int(args.resolution),
+        "num_inference_steps": int(args.num_inference_steps_target),
+        "guidance_scale": float(args.guidance_scale_target),
+        "paired_clean_watermarked_outputs": True,
+    }
+    run_config_sha256 = hstr_bundle.canonical_sha256({k: v for k, v in run_config.items() if k != "num_samples"})
+    manifest = hstr_runtime.assert_run_manifest_compatible(manifest_path, run_config_sha256)
+
+    provider = hstr_runtime.build_provider(
+        args,
+        latent_shape=latent_shape,
+        device=DEVICE,
+        create_bundle=not resuming,
+    )
+    if provider.bundle is None:
+        raise RuntimeError("HSTR generation requires a persisted --hstr_bundle_dir")
+
+    pipe_provider_target = hstr_runtime.build_pipe_provider(args, DEVICE)
+    provenance = hstr_runtime.run_provenance(args, provider, pipe_provider_target)
+    if manifest is None:
+        manifest = dict(run_config)
+        manifest.update({k: v for k, v in provenance.items() if k != "created_utc"})
+        manifest["run_config_sha256"] = run_config_sha256
+        manifest["report_label"] = "official_profile_raw_scores"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        manifest_path.write_text(hstr_bundle.canonical_json(manifest) + "\n", encoding="utf-8")
+
+    for directory in (images_wm_dir, images_clean_dir, prompts_dir, metadata_dir):
+        directory.mkdir(parents=True, exist_ok=True)
+
+    target_prompts = get_text_prompts(num_prompts=args.num, dataset_id=args.dataset_id)
+    rows = []
+    for sample_id, target_prompt in tqdm(list(enumerate(target_prompts)), total=len(target_prompts), desc="HSTR generation"):
+        sample_seed = int(args.seed) + int(sample_id)
+        name = f"{sample_id:06d}"
+        image_wm_path = images_wm_dir / f"{name}.png"
+        image_clean_path = images_clean_dir / f"{name}.png"
+        prompt_path = prompts_dir / f"{name}.txt"
+        metadata_path = metadata_dir / f"{name}.json"
+        prompt_sha256 = hstr_bundle.sha256_text(target_prompt)
+
+        if metadata_path.exists() or image_wm_path.exists() or image_clean_path.exists():
+            if not (metadata_path.exists() and image_wm_path.exists() and image_clean_path.exists()):
+                raise RuntimeError(f"HSTR sample {name} is half-written; use a fresh --out_dir")
+            existing = json.loads(metadata_path.read_text(encoding="utf-8"))
+            hstr_runtime.assert_resumable(name, existing, {
+                "sample_seed": sample_seed,
+                "prompt_sha256": prompt_sha256,
+                "run_config_sha256": run_config_sha256,
+                "hstr_bundle_config_sha256": provider.bundle.manifest["provider_config_sha256"],
+            })
+            if existing.get("watermarked_image_sha256") != hstr_bundle.sha256_file(image_wm_path):
+                raise RuntimeError(f"HSTR sample {name} watermarked image hash changed on disk")
+            if existing.get("clean_image_sha256") != hstr_bundle.sha256_file(image_clean_path):
+                raise RuntimeError(f"HSTR sample {name} clean image hash changed on disk")
+            rows.append(existing)
+            continue
+
+        clean_latent = provider.sample_base_latent(sample_seed)
+        wm_sample = provider.get_wm_latents(latents_clean=clean_latent)
+        wm_latent = wm_sample["zT_torch"]
+        generated = provider.generate(
+            pipe_provider_target=pipe_provider_target,
+            prompts=[target_prompt, target_prompt],
+            latents=torch.cat([clean_latent, wm_latent], dim=0),
+            num_inference_steps=args.num_inference_steps_target,
+            guidance_scale=args.guidance_scale_target,
+        )
+        clean_image, wm_image = generated["images_PIL"][0], generated["images_PIL"][1]
+        clean_image.save(image_clean_path)
+        wm_image.save(image_wm_path)
+        prompt_path.write_text(target_prompt, encoding="utf-8")
+
+        row = {
+            "sample_id": sample_id,
+            "sample_name": name,
+            "sample_seed": sample_seed,
+            "prompt": target_prompt,
+            "prompt_sha256": prompt_sha256,
+            "clean_image_path": image_clean_path.as_posix(),
+            "clean_image_sha256": hstr_bundle.sha256_file(image_clean_path),
+            "watermarked_image_path": image_wm_path.as_posix(),
+            "watermarked_image_sha256": hstr_bundle.sha256_file(image_wm_path),
+            "pre_injection_latent_sha256": hstr_bundle.tensor_sha256(clean_latent),
+            "post_injection_latent_sha256": hstr_bundle.tensor_sha256(wm_latent),
+            "hstr_bundle_config_sha256": provider.bundle.manifest["provider_config_sha256"],
+            "hstr_bundle_sha256": hstr_bundle.sha256_file(provider.bundle.manifest_path),
+            "selected_key_index": provider.key_index,
+            "selected_key_seed": provider.selected_key_seed,
+            "selected_pattern_sha256": provider.selected_pattern_sha256,
+            "run_config_sha256": run_config_sha256,
+            "protocol": "hstr_official_sfwmark_paired_direct_generation",
+        }
+        row.update({k: v for k, v in provenance.items() if k != "created_utc"})
+        row["created_utc"] = hstr_bundle.utc_now()
+        metadata_path.write_text(hstr_bundle.canonical_json(row) + "\n", encoding="utf-8")
+        hstr_bundle.append_jsonl(results_path, row)
+        rows.append(row)
+        del clean_latent, wm_latent, wm_sample, generated
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    latent_hashes = {row["post_injection_latent_sha256"] for row in rows}
+    if len(rows) > 1 and len(latent_hashes) != len(rows):
+        raise RuntimeError("HSTR generation produced repeated complete watermarked latents across samples")
+    print(
+        f"[HSTR] generated {len(rows)} paired clean/watermarked sample(s) into {out_dir}; "
+        f"{len(latent_hashes)} distinct watermarked latents; bundle {provider.bundle.dir}",
+        flush=True,
+    )
+    return rows
+
+
 def value_log_label(wm_type):
     if wm_type == "PRC":
         return "PRC value"
@@ -337,6 +509,8 @@ def main(argv=None):
     # latent per sample and indexed, never-overwritten outputs.
     if args.wm_type == "GM":
         return run_gm_generation(args, argv)
+    if args.wm_type == "HSTR" and getattr(args, "hstr_profile", None) == "official_sfwmark_sd21":
+        return run_hstr_generation(args, argv)
 
     wm_provider_cls = WmProviders[args.wm_type].value
     if args.wm_type == "GS" and int(args.num) != 1:

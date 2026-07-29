@@ -6,6 +6,7 @@ This file records implementation bugs, validated non-bugs, ablations, and the ev
 
 | Date | Area | Status | Evidence |
 | --- | --- | --- | --- |
+| 2026-07-29 | HSTR/SFWMark official generation and standalone verification (Issue #4) | HSTR now has an official SFWMark SD2.1 profile pinned to `78666128b44614a0cc471993649e3132d5dddfcb`. Generation uses a persisted hash-bound HSTR bundle, explicit key index/seed provenance, independent per-sample latents and indexed paired clean/watermarked outputs. `run_verify_watermark.py` now supports HSTR fresh-process deployment verification plus cohort calibration and paper-style ROC (`FPR < target_fpr`) without relabelling HSTR as TR/GS. CPU coverage is focused and network-free; no formal cohort, attack, FID, CLIP, PSNR or SSIM was run. | `eval_bench_wm/utils/wm/hstr_provider.py`; `eval_bench_wm/utils/wm/hstr_bundle.py`; `eval_bench_wm/utils/wm/hstr_runtime.py`; `eval_bench_wm/run_watermark.py`; `eval_bench_wm/run_verify_watermark.py`; `eval_bench_wm/tests/test_hstr_official_parity.py`; `eval_bench_wm/README.md` |
 | 2026-07-29 | GM + T2S formal evaluation chain | GaussMarker and T2SMark are now runnable end-to-end through `run_raven_formal_eval.py`. Method dispatch is driven by the existing per-method provenance tables rather than literal `if method == "GS"` branches. GM detects from the cohort's persisted bundle (config read from the bundle manifest, never restated); T2S detects per sample from each row's portable state through a thin adapter over the same two standalone functions `run_verification.py` uses. Each method reports its own metric, threshold family and attack-success definition: GM `gm_raw_bit_accuracy` at a clean-calibrated empirical threshold (its official ensemble threshold does not exist for this bundle — no GNR, no classifier), T2S `t2s_score_true_key` under the stored `paired_key_comparison` rule, which is explicitly not TPR@1%FPR. No GPU smoke was run before the formal launch, by explicit user direction. | `raven_repro/scripts/extract_verification_scores.py`; `raven_repro/scripts/evaluate_verification.py`; `raven_repro/raven/eval_protocol.py`; `experiments/update_experiment_table.py` |
 | 2026-07-29 | GM + T2S `shared_tr_clean_v2` formal cohorts (Issue #9) | Formal 1001-row GM and T2S cohorts generated from fixed `main` `01ce7d7`, GPU 0 (RTX 3090, sm_86). All 1001 canonical clean images byte-identical before and after. The T2S runner's own final audit rejected the cohort on a `t2s_session_key_sha256` repeat, which is a birthday collision of a 16-bit key, not shared state; the audit gate was corrected and the cohort kept. T2S's in-runner summary/pairing/cross-method JSONs are absent (crash after the last row) and are supplied by the standalone cross-method audit instead. | `data/gm/diffusiondb_shared_tr/GM`; `data/t2s/diffusiondb_shared_tr/T2S`; `audit/shared_clean_tr_gs_gm_t2s.json`; `raven_repro/raven/pairing_provenance.py` |
 | 2026-07-28 | GM + T2S `shared_tr_clean_v2` (Issue #9, phase 1) | GaussMarker and T2SMark now consume the canonical Tree-Ring source row — same prompt, base latent, clean image and generation config — and generate only their own watermarked image. New authoritative provider entrypoints `GmProvider.get_wm_latents_from_base_latent` and the T2S `|z|`-multiset consumption gate prove the supplied latent was embedded into rather than replaced. Cross-method audit extended to TR/GS/GM/T2S. Two-row GPU smoke passed; the canonical clean images are byte-identical before and after. No formal 1000/1001 cohort generated. | `experiments/generate_gm_from_tr_shared_clean.py`; `experiments/generate_t2s_from_tr_shared_clean.py`; `experiments/shared_clean_tr.py`; `raven_repro/scripts/audit_shared_clean_cohorts.py`; `raven_repro/tests/test_shared_tr_clean_gm_t2s.py`; `docs/SHARED_TR_CLEAN_V2.md` |
@@ -24,6 +25,67 @@ This file records implementation bugs, validated non-bugs, ablations, and the ev
 | 2026-07-14 | NFPA-style Tree-Ring complex L1 evaluation | Completed for DiffusionDB only. MS-COCO was not run after scope was corrected. | `outputs/raven_nfpa_tr_eval/diffusiondb/20260714T161952Z/aggregate_results.json` |
 
 
+## 2026-07-29 — HSTR/SFWMark official generation and standalone verification (Issue #4)
+
+### Problem
+The HSTR runner path was not suitable for an auditable SFWMark comparison. It
+sampled and selected watermark state through the legacy RAVEN path, reused a
+single complete latent in generic generation, overwrote outputs in legacy layouts,
+and had no persisted key bundle or standalone fresh-process verifier. HSTR scores
+could therefore not be tied to an official key, detector configuration or clean
+negative calibration artifact.
+
+### Official source
+The implementation was checked against the frozen official repository
+`https://github.com/thomas11809/SFWMark` at commit
+`78666128b44614a0cc471993649e3132d5dddfcb`. The pinned semantics used here are:
+SD2.1 base, DDIM, float32, 512x512, 50 denoising/inversion steps, guidance 7.5
+for generation, empty-prompt DDIM inversion with guidance 0, key seed base 7433,
+center slice `10:54`, radius 14, radius cutoff 3, heterogeneous channel 0,
+Tree-Ring channel 3, and detector score `-min(channel_0_l1,channel_3_l1)`.
+
+### Fix
+- `HSTRProvider` remains the only HSTR algorithm implementation. It now exposes
+  an `official_sfwmark_sd21` profile, explicit `--hstr_key_index`, official
+  key-seed mapping `7433 + key_index`, provider-owned SFWMark inversion, per-image
+  channel-min complex-L1 scoring and fixed-threshold decisions.
+- `hstr_bundle.py` persists `manifest.json` and `selected_pattern.pt` with
+  canonical hashes, optional full `pattern_list-2048.pt`, and compatible
+  `threshold.json` artifacts. Verification never creates or mutates key state.
+- `run_watermark.py` has an official HSTR branch that writes paired indexed
+  `images/no_watermark/000000.png` and `images/watermarked/000000.png`, prompt
+  files, per-sample metadata and `results.jsonl`. Every sample uses its own
+  deterministic base latent seed and records pre/post latent hashes.
+- `run_verify_watermark.py` now dispatches `--wm_type HSTR` for raw deployment
+  verification, `calibrate`, and `paper_eval`. Cohort modes score positives and
+  negatives through the same provider path and select the threshold with
+  `sklearn.metrics.roc_curve` at the strict official operating point
+  `FPR < target_fpr`.
+
+### Detector and threshold definition
+HSTR reports `hstr_score=-min(channel_0_l1,channel_3_l1)` with
+`higher_is_watermarked` and comparison `>=`. A single-image deployment decision
+is emitted only from a compatible calibrated `threshold.json` or explicit
+`--hstr_threshold`; otherwise raw per-image scores are emitted with no binary
+claim. Paper evaluation requires verifiable clean/watermarked pairing unless the
+user explicitly marks the run as unmatched ablation. HSTR is not coerced into a
+Tree-Ring, Gaussian Shading or GaussMarker metric schema.
+
+### Validation
+Focused CPU tests are network-free and do not load diffusion models:
+`python -m pytest -q tests/test_hstr_official_parity.py` passed (`9 passed`).
+They cover frozen key-index/seed mapping, selected pattern parity, independent
+latents, batch per-image score shape/sign, bundle round-trip and fail-closed
+compatibility, threshold binding, corrupt-image containment, paired sidecar
+resolution and official profile defaults. The full eval-benchmark CPU suite also
+passed after the final HSTR runtime fix: `python -m pytest -q tests` reported
+`145 passed, 10 subtests passed`. GPU preflight passed (`nvidia-smi` and a
+PyTorch CUDA allocation/kernel probe), but the one-sample official smoke was
+blocked before model loading completed because Hugging Face returned 404 /
+`RepositoryNotFoundError` for the official model id
+`stabilityai/stable-diffusion-2-1-base`; no mirror was substituted. No formal
+1000/1001 cohort was generated, no Issue #6 shared-clean work was performed, and
+no attack, FID, CLIP, PSNR or SSIM evaluation was run.
 
 
 ## 2026-07-29 — GM and T2S wired into the formal RAVEN evaluation chain
