@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+from collections import Counter
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
@@ -202,8 +203,19 @@ METHOD_COHORT_CONSTANT_FIELDS = {
 METHOD_PER_SAMPLE_UNIQUE_FIELDS = {
     "GM": ("gm_pre_injection_latent_sha256", "gm_post_injection_latent_sha256",
            "gm_sampling_uniform_sha256"),
-    "T2S": ("t2s_watermark_id", "t2s_state_sha256", "t2s_abs_magnitude_sha256",
-            "t2s_session_key_sha256"),
+    "T2S": ("t2s_watermark_id", "t2s_state_sha256", "t2s_abs_magnitude_sha256"),
+}
+# Per-sample fields drawn from a space small enough that repeats are expected
+# rather than evidence of shared state. The T2S session key is `--t2s_key_length`
+# bits (16 by default, matching upstream `run.py`), so a cohort of n samples has
+# roughly n*(n-1)/2 / 2**16 colliding pairs by the birthday bound: ~7.6 at
+# n=1001. Requiring global uniqueness there asserts something the draw cannot
+# guarantee. Detection reads each sample's own portable state, so two samples
+# sharing a session key is not shared state — it is two independent draws that
+# landed on the same 16-bit value. The collision count is recorded instead, so a
+# genuinely degenerate key draw (every row identical) is still visible.
+METHOD_COLLISION_COUNTED_FIELDS = {
+    "T2S": ("t2s_session_key_sha256",),
 }
 
 
@@ -441,6 +453,7 @@ def audit_pairing_rows(
     gs_sampling_hashes: set[str] = set()
     method_constant_fields: dict[str, set[str]] = {}
     method_unique_fields: dict[str, set[str]] = {}
+    method_collision_counted_fields: dict[str, Counter[str]] = {}
     count = 0
 
     for row in rows:
@@ -529,6 +542,9 @@ def audit_pairing_rows(
                         f"duplicate {field} run_id={run_id}: {value}"
                     )
                 seen.add(value)
+            for field in METHOD_COLLISION_COUNTED_FIELDS.get(method, ()):
+                counts = method_collision_counted_fields.setdefault(field, Counter())
+                counts[str(_required(row, field, run_id))] += 1
             shared_source_hashes.add(str(row["shared_clean_source_metadata_sha256"]))
         if run_id in seen_run_ids:
             raise ValueError(f"duplicate run_id in pairing provenance: {run_id}")
@@ -666,6 +682,16 @@ def audit_pairing_rows(
             "per_sample_unique_field_counts": {
                 field: len(values)
                 for field, values in sorted(method_unique_fields.items())
+            },
+            "collision_counted_field_stats": {
+                field: {
+                    "distinct_values": len(counts),
+                    "colliding_pairs": sum(
+                        n * (n - 1) // 2 for n in counts.values()
+                    ),
+                    "max_repeat": max(counts.values()),
+                }
+                for field, counts in sorted(method_collision_counted_fields.items())
             },
         })
     return result

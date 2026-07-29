@@ -197,6 +197,22 @@ The audit matches by `run_id` only, and checks four independent things:
    portable state JSON (present, self-signature valid, `state_sha256` equal to
    the row's).
 
+Per-sample state fields (`gm_pre_injection_latent_sha256`,
+`gm_post_injection_latent_sha256`, `gm_sampling_uniform_sha256`,
+`t2s_watermark_id`, `t2s_state_sha256`, `t2s_abs_magnitude_sha256`) must be
+distinct on every row: a repeat means two samples shared state that is supposed
+to be per-sample.
+
+`t2s_session_key_sha256` is deliberately **not** in that set. The T2S session key
+is `--t2s_key_length` bits — 16 by default, matching upstream `run.py` — so a
+cohort of n samples has about `n*(n-1)/2 / 2**16` colliding pairs by the birthday
+bound: ~7.6 expected at n=1001, and the formal cohort observed 9. That is two
+independent draws landing on the same 16-bit value, not shared state; detection
+reads each sample's own portable state, which stays unique. The audit records
+`collision_counted_field_stats` (`distinct_values`, `colliding_pairs`,
+`max_repeat`) instead, so a genuinely degenerate key draw is still visible. The
+key remains bound by `pairing_sha256`.
+
 Where two methods cover the same `run_id` they must agree on the clean artifacts
 and must have produced different watermarked images.
 

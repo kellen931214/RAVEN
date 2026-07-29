@@ -894,6 +894,44 @@ def test_pairing_audit_rejects_a_shared_gm_bundle_row_with_a_repeated_latent(
         audit_pairing_rows(rows, expected_count=2, verify_files=False)
 
 
+def test_pairing_audit_counts_t2s_session_key_collisions_without_failing(
+    cohort, tmp_path, stub_pipeline
+):
+    """A repeated 16-bit session key is a birthday collision, not shared state.
+
+    ``--t2s_key_length`` is 16 bits by default (upstream ``run.py``), so a cohort
+    of n samples has about n*(n-1)/2 / 2**16 colliding pairs — ~7.6 at n=1001.
+    Asserting global uniqueness there fails a correct cohort, so the audit
+    records the collisions instead.
+    """
+    run_t2s(tmp_path, cohort)
+    rows = read_rows(tmp_path / "t2s" / "metadata.csv")
+    rows[1]["t2s_session_key_sha256"] = rows[0]["t2s_session_key_sha256"]
+    # The session key is bound by the pairing hash, so a collided cohort carries
+    # a pairing hash computed over the repeated key, not a stale one.
+    rows[1]["pairing_sha256"] = build_pairing_sha256(rows[1])
+
+    audit = audit_pairing_rows(rows, expected_count=2, verify_files=False)
+
+    assert audit["passed"] is True
+    stats = audit["collision_counted_field_stats"]["t2s_session_key_sha256"]
+    assert stats == {"distinct_values": 1, "colliding_pairs": 1, "max_repeat": 2}
+
+
+def test_pairing_audit_still_rejects_duplicate_t2s_per_sample_state(
+    cohort, tmp_path, stub_pipeline
+):
+    """Dropping the session key must not weaken the fields that are per-sample."""
+    run_t2s(tmp_path, cohort)
+    rows = read_rows(tmp_path / "t2s" / "metadata.csv")
+    for field in ("t2s_watermark_id", "t2s_state_sha256", "t2s_abs_magnitude_sha256"):
+        drifted = [dict(row) for row in rows]
+        drifted[1][field] = drifted[0][field]
+        drifted[1]["pairing_sha256"] = build_pairing_sha256(drifted[1])
+        with pytest.raises(ValueError, match=f"duplicate {field}"):
+            audit_pairing_rows(drifted, expected_count=2, verify_files=False)
+
+
 def test_audit_script_runs_end_to_end(cohort, tmp_path, stub_pipeline):
     import subprocess
 
