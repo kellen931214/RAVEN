@@ -41,7 +41,9 @@ from raven.eval_protocol import (  # noqa: E402
     formal_attack_config_hash,
     formal_quality_summary,
     formal_runtime_provenance,
+    gm_attack_success_summary,
     gs_attack_success_summary,
+    t2s_attack_success_summary,
     load_and_validate_source_manifest,
     load_formal_attack_config,
     normalize_formal_attack_config,
@@ -57,10 +59,20 @@ from raven.eval_protocol import (  # noqa: E402
 from raven.metrics import pair_quality_metrics  # noqa: E402
 from raven.quality import fid_protocol_descriptor  # noqa: E402
 from raven.pairing_provenance import (  # noqa: E402
+    ALLOWED_PAIRING_PROTOCOLS,
     PAIRING_REQUIRED_FIELDS,
+    PER_SAMPLE_TARGET_METHODS,
+    SINGLE_TARGET_METHODS,
     audit_pairing_rows,
-    gs_fields_for_rows,
+    method_provenance_fields,
 )
+
+# Methods whose cohort carries the full paired base-latent provenance and is
+# therefore auditable by audit_pairing_rows. TR and GS were the original two;
+# the shared_tr_clean_v2 cohorts (GM, T2S) record the same pairing fields and
+# are audited identically. Anything else keeps the historical behaviour of
+# skipping the pairing audit rather than failing on absent fields.
+PAIRING_AUDITED_METHODS = frozenset(ALLOWED_PAIRING_PROTOCOLS)
 
 
 STAGES = (
@@ -487,7 +499,7 @@ def snapshot_stage(args: argparse.Namespace, config: dict[str, Any]) -> int:
         )
         for row in source_rows
     ]
-    if args.method in {"TR", "GS"}:
+    if args.method in PAIRING_AUDITED_METHODS:
         audit_pairing_rows(
             normalized, expected_count=len(normalized), verify_files=True
         )
@@ -509,12 +521,12 @@ def snapshot_stage(args: argparse.Namespace, config: dict[str, Any]) -> int:
             "watermarked_sha256",
             "provider_config_hash",
         ]
-        if args.method in {"TR", "GS"}:
+        if args.method in PAIRING_AUDITED_METHODS:
             drift_fields.extend(PAIRING_REQUIRED_FIELDS)
-        if args.method == "GS":
-            # V1 and V2 GS cohorts carry different provenance field sets; use the
-            # one this cohort's recorded protocol actually defines.
-            drift_fields.extend(gs_fields_for_rows([new]))
+        # Method-specific provenance. GS V1 and V2 cohorts carry different field
+        # sets, so the tuple comes from this cohort's own recorded protocol;
+        # GM and T2S each have exactly one.
+        drift_fields.extend(method_provenance_fields(args.method, [new]))
         for field in dict.fromkeys(drift_fields):
             if str(old.get(field, "")) != str(new.get(field, "")):
                 raise RuntimeError(f"snapshotted source drift run_id={run_id}: {field}")
@@ -626,11 +638,10 @@ def expected_resume_fields(
         "provider_config_hash": str(row.get("provider_config_hash", "")),
         "watermark_target_sha256": str(row.get("watermark_target_sha256", "")),
         "watermark_mask_sha256": str(row.get("watermark_mask_sha256", "")),
-        **(
-            {field: row.get(field, "") for field in gs_fields_for_rows([row])}
-            if config["method"] == "GS"
-            else {}
-        ),
+        **{
+            field: row.get(field, "")
+            for field in method_provenance_fields(config["method"], [row])
+        },
         **config["attack_runtime"],
     }
 
@@ -1039,9 +1050,18 @@ def aggregate_stage(args: argparse.Namespace, config: dict[str, Any]) -> int:
         expected_count=args.expected_count,
         expected_run_ids={str(row["run_id"]) for row in records},
     )
+    # Each method publishes attack success under its own definition and
+    # threshold family; there is no shared fallback, so a method without a
+    # reducer records no attack-success field rather than borrowing another's.
+    method_summary_reducers = {
+        "GS": gs_attack_success_summary,
+        "GM": gm_attack_success_summary,
+        "T2S": t2s_attack_success_summary,
+    }
     method_summary: dict[str, Any] = {}
-    if args.method == "GS":
-        method_summary = gs_attack_success_summary(detector_payload)
+    reducer = method_summary_reducers.get(args.method)
+    if reducer is not None:
+        method_summary = reducer(detector_payload)
     aggregate = {
         **config,
         "status": (
@@ -1079,7 +1099,7 @@ def validate_stage(args: argparse.Namespace, config: dict[str, Any]) -> int:
         audit_pairing_rows(
             snapshot_rows, expected_count=args.expected_count, verify_files=True
         )
-        if args.method in {"TR", "GS"}
+        if args.method in PAIRING_AUDITED_METHODS
         else None
     )
     records = require_complete_records(args, config, "watermarked")
@@ -1094,11 +1114,17 @@ def validate_stage(args: argparse.Namespace, config: dict[str, Any]) -> int:
     target_hashes = {str(row.get("target_watermark_hash", "")) for row in records}
     if "" in target_hashes:
         raise RuntimeError("missing target watermark hash")
-    if args.method == "TR" and len(target_hashes) != 1:
-        raise RuntimeError(f"mixed Tree-Ring target watermark hashes: {sorted(target_hashes)}")
-    if args.method == "GS" and len(target_hashes) != args.expected_count:
+    # Whether the watermark target is one cohort-wide artifact (TR ring pattern,
+    # GM bundle) or freshly derived per sample (GS secret, T2S session state) is
+    # a property of the method, declared once in pairing_provenance.
+    if args.method in SINGLE_TARGET_METHODS and len(target_hashes) != 1:
         raise RuntimeError(
-            f"GS requires one target per run: unique={len(target_hashes)} "
+            f"{args.method} requires one cohort-wide target watermark hash: "
+            f"{sorted(target_hashes)}"
+        )
+    if args.method in PER_SAMPLE_TARGET_METHODS and len(target_hashes) != args.expected_count:
+        raise RuntimeError(
+            f"{args.method} requires one target per run: unique={len(target_hashes)} "
             f"expected={args.expected_count}"
         )
     alias_pairs = (
@@ -1297,7 +1323,9 @@ def validate_stage(args: argparse.Namespace, config: dict[str, Any]) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset", required=True)
-    parser.add_argument("--method", required=True, choices=["GS", "TR", "RID", "HSTR", "HSQR"])
+    parser.add_argument(
+        "--method", required=True, choices=["GS", "TR", "GM", "T2S", "RID", "HSTR", "HSQR"]
+    )
     parser.add_argument("--source-metadata", type=Path, required=True)
     parser.add_argument("--source-manifest", type=Path, required=True)
     parser.add_argument(

@@ -13,7 +13,7 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from raven.pairing_provenance import gs_fields_for_rows  # noqa: E402
+from raven.pairing_provenance import method_provenance_fields  # noqa: E402
 from raven.eval_protocol import (  # noqa: E402
     FORMAL_ATTACK_CONFIG,
     load_formal_attack_config,
@@ -29,7 +29,9 @@ from raven.eval_protocol import (  # noqa: E402
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset", required=True)
-    parser.add_argument("--method", required=True, choices=["GS", "TR", "RID", "HSTR", "HSQR"])
+    parser.add_argument(
+        "--method", required=True, choices=["GS", "TR", "GM", "T2S", "RID", "HSTR", "HSQR"]
+    )
     parser.add_argument("--metadata", type=Path, required=True, help="Snapshot index JSONL")
     parser.add_argument("--attack-records", type=Path, required=True, help="Formal attack record JSONL")
     parser.add_argument("--snapshot-manifest", type=Path, required=True, help="Snapshot index JSONL")
@@ -129,8 +131,8 @@ def main() -> int:
             "snapshot_sha256", "source_manifest_sha256", "clean_sha256",
             "watermarked_sha256", "provider_config_hash",
         ]
-        if args.method == "GS":
-            provenance_fields.extend(gs_fields_for_rows([source]))
+        method_fields = method_provenance_fields(args.method, [source])
+        provenance_fields.extend(method_fields)
         for field in provenance_fields:
             if str(source.get(field)) != str(attack.get(field)):
                 raise RuntimeError(f"run_id={run_id}: {field} mismatch")
@@ -200,15 +202,18 @@ def main() -> int:
             "watermark_mask_sha256": attack.get("watermark_mask_sha256", ""),
             "generation_config_sha256": attack.get("generation_config_sha256", ""),
             "watermark_config_sha256": attack.get("watermark_config_sha256", ""),
+            # The cohort's own pairing protocol decides which method-specific
+            # provenance fields exist (GS V1 has gs_sampling_seed, V2 does not),
+            # so the detector needs the protocol identity, not a guess. GM and
+            # T2S carry their bundle / portable-state identity the same way.
+            # Methods with no method-specific provenance keep their existing
+            # manifest columns untouched.
             **(
                 {
-                    # The cohort's own pairing protocol decides which GS provenance
-                    # fields exist (V1 has gs_sampling_seed, V2 does not), so the
-                    # detector needs the protocol identity, not a guess.
                     "protocol": str(source.get("protocol", "")),
-                    **{field: attack.get(field, "") for field in gs_fields_for_rows([source])},
+                    **{field: attack.get(field, "") for field in method_fields},
                 }
-                if args.method == "GS"
+                if method_fields
                 else {}
             ),
             **provider,

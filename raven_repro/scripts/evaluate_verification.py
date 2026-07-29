@@ -20,7 +20,9 @@ QUANTILES = (0.0, 0.01, 0.05, 0.25, 0.5, 0.75, 0.95, 0.99, 1.0)
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--method", required=True, choices=["GS", "TR", "RID", "HSTR", "HSQR"])
+    parser.add_argument(
+        "--method", required=True, choices=["GS", "TR", "GM", "T2S", "RID", "HSTR", "HSQR"]
+    )
     parser.add_argument("--records", type=Path, required=True)
     parser.add_argument("--target-fpr", type=float, default=0.01)
     parser.add_argument("--legacy-threshold", type=float, default=None)
@@ -222,6 +224,240 @@ def gs_report(
     }, audited
 
 
+def optional_float(row: dict[str, str], column: str) -> float | None:
+    """Parse a column that the detector may legitimately have left unavailable."""
+    value = row.get(column)
+    if value is None or not value.strip():
+        return None
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise ValueError(f"run_id={row.get('run_id')}: non-finite {column}: {value}")
+    return parsed
+
+
+def optional_mean(rows: list[dict[str, str]], column: str) -> float | None:
+    values = [optional_float(row, column) for row in rows]
+    if any(value is None for value in values):
+        return None
+    return sum(values) / len(values)
+
+
+def gm_report(rows: list[dict[str, str]], target_fpr: float) -> tuple[dict, list[dict]]:
+    """GaussMarker's own detector family.
+
+    The primary score is ``gm_raw_bit_accuracy`` — the official spatial-domain
+    ChaCha20-decrypt bit accuracy — because this cohort's bundle carries neither
+    the GNR restorer nor the ring classifier, so GaussMarker's official ensemble
+    score does not exist for it and ``gm_provider`` correctly declines to
+    fabricate one. That absence is recorded explicitly rather than papered over.
+
+    With no official threshold available, the threshold family used here is an
+    empirical one calibrated from this run's own clean-negative cohort. It is
+    named ``empirical_clean_1pct_fpr`` and reported with its measured FPR; it is
+    NOT GaussMarker's official decision rule and must never be presented as one.
+    The frequency-domain ring L1 is reported alongside as a secondary raw score.
+    """
+    raw = {
+        stage: [finite_float(row, f"{stage}_gm_raw_bit_accuracy") for row in rows]
+        for stage in ("clean", "watermarked", "attacked")
+    }
+    ring_l1 = {
+        stage: [finite_float(row, f"{stage}_gm_raw_ring_l1") for row in rows]
+        for stage in raw
+    }
+    summary = summarize_detection(
+        raw["clean"], raw["watermarked"], raw["attacked"], target_fpr
+    )
+    threshold = summary.calibration.threshold
+    detection_rates = {
+        stage: sum(value >= threshold for value in values) / len(values)
+        for stage, values in raw.items()
+    }
+    restored = {stage: optional_mean(rows, f"{stage}_gm_restored_bit_accuracy") for stage in raw}
+    classifier = {
+        stage: optional_mean(rows, f"{stage}_gm_classifier_probability") for stage in raw
+    }
+    gnr_used = {str(row.get("gm_gnr_used", "")).lower() for row in rows}
+    classifier_used = {str(row.get("gm_classifier_used", "")).lower() for row in rows}
+    if gnr_used != {"false"} or classifier_used != {"false"}:
+        raise ValueError(
+            "GM rows disagree about GNR/classifier availability; the ensemble "
+            f"score family would apply: gnr={sorted(gnr_used)} "
+            f"classifier={sorted(classifier_used)}"
+        )
+    audited = [
+        {
+            "run_id": row.get("run_id") or str(index),
+            "gm_bundle_config_sha256": row.get("gm_bundle_config_sha256", ""),
+            **{
+                f"{stage}_{name}": finite_float(row, f"{stage}_gm_raw_{suffix}")
+                for stage in raw
+                for name, suffix in (("bit_accuracy", "bit_accuracy"), ("ring_l1", "ring_l1"))
+            },
+        }
+        for index, row in enumerate(rows)
+    ]
+    return {
+        "N": len(rows),
+        "detector_metric": "gm_raw_bit_accuracy",
+        "score_direction": "higher_is_watermarked",
+        "score_definition": consistent_value(rows, "gm_score_definition"),
+        "detector_report_label": consistent_value(rows, "gm_report_label"),
+        "secondary_detector_metric": "gm_raw_ring_l1",
+        "stages": {
+            stage: {
+                "N": len(values),
+                "macro_bit_accuracy": sum(values) / len(values),
+                "mean_ring_l1": sum(ring_l1[stage]) / len(ring_l1[stage]),
+                "distribution": distribution(values),
+                "ring_l1_distribution": distribution(ring_l1[stage]),
+                "mean_restored_bit_accuracy": restored[stage],
+                "mean_classifier_probability": classifier[stage],
+            }
+            for stage, values in raw.items()
+        },
+        "macro_bit_accuracy_before": sum(raw["watermarked"]) / len(raw["watermarked"]),
+        "macro_bit_accuracy_attacked": sum(raw["attacked"]) / len(raw["attacked"]),
+        "target_fpr": target_fpr,
+        "threshold_type": "empirical_clean_1pct_fpr",
+        "threshold_comparison_operator": ">=",
+        "clean_calibrated_threshold": threshold,
+        "clean_calibrated_actual_empirical_fpr": summary.calibration.actual_fpr,
+        "clean_calibrated_false_positive_count": summary.calibration.false_positives,
+        "before_detection_rate_at_clean_calibrated_threshold": detection_rates["watermarked"],
+        "attacked_detection_rate_at_clean_calibrated_threshold": detection_rates["attacked"],
+        "clean_detection_rate_at_clean_calibrated_threshold": detection_rates["clean"],
+        "attack_success_rate_at_clean_calibrated_threshold": 1.0 - detection_rates["attacked"],
+        "attack_success_definition": (
+            "1 - attacked detection rate at the clean-calibrated empirical "
+            "threshold on gm_raw_bit_accuracy"
+        ),
+        "before_roc_auc": summary.watermarked_auc,
+        "attacked_roc_auc": summary.attacked_auc,
+        "official_ensemble_threshold_available": False,
+        "official_ensemble_threshold_unavailable_reason": (
+            "the cohort's GM bundle carries no GNR restorer and no ring "
+            "classifier, so GaussMarker's official ensemble score and its "
+            "official decision threshold do not exist for this cohort"
+        ),
+        "statistically_valid_for_target_fpr": len(rows) >= math.ceil(1.0 / target_fpr),
+    }, audited
+
+
+def t2s_report(rows: list[dict[str, str]], target_fpr: float) -> tuple[dict, list[dict]]:
+    """T2SMark's own detector family.
+
+    The primary score is ``score_true_key`` (upstream ``norm1_w``), and T2S's own
+    stored decision rule is ``paired_key_comparison``:
+    ``score_true_key > score_control_key`` per image, where the control key is
+    upstream's ``fake_key = 1 - master_key``. The threshold is therefore
+    per-sample, not a cohort scalar, and no scalar is invented for it.
+
+    That rule is a RAVEN deployment extension — upstream evaluates a cohort ROC
+    and defines no per-image decision — and the provenance strings recorded by
+    the detector say so. It is not TPR@1%FPR. A clean-calibrated empirical
+    threshold on score_true_key is reported separately as a secondary family so
+    the two are never conflated.
+    """
+    stages = ("clean", "watermarked", "attacked")
+    true_key = {
+        stage: [finite_float(row, f"{stage}_t2s_score_true_key") for row in rows]
+        for stage in stages
+    }
+    control_key = {
+        stage: [finite_float(row, f"{stage}_t2s_score_control_key") for row in rows]
+        for stage in stages
+    }
+    paired_rates = {}
+    for stage in stages:
+        recorded = [
+            str(row.get(f"{stage}_t2s_detection_success", "")).lower() for row in rows
+        ]
+        if set(recorded) - {"true", "false"}:
+            raise ValueError(f"missing T2S detection decision for stage {stage}")
+        computed = [
+            first > second
+            for first, second in zip(true_key[stage], control_key[stage])
+        ]
+        if [str(value).lower() for value in computed] != recorded:
+            raise ValueError(
+                f"stage {stage}: stored T2S decision disagrees with "
+                "score_true_key > score_control_key"
+            )
+        paired_rates[stage] = sum(computed) / len(computed)
+    summary = summarize_detection(
+        true_key["clean"], true_key["watermarked"], true_key["attacked"], target_fpr
+    )
+    margins = {
+        stage: [
+            first - second for first, second in zip(true_key[stage], control_key[stage])
+        ]
+        for stage in stages
+    }
+    audited = [
+        {
+            "run_id": row.get("run_id") or str(index),
+            "t2s_watermark_id": row.get("t2s_watermark_id", ""),
+            "t2s_state_sha256": row.get("t2s_state_sha256", ""),
+            **{
+                f"{stage}_{name}": finite_float(row, f"{stage}_t2s_{name}")
+                for stage in stages
+                for name in ("score_true_key", "score_control_key", "score_margin")
+            },
+        }
+        for index, row in enumerate(rows)
+    ]
+    return {
+        "N": len(rows),
+        "detector_metric": "t2s_score_true_key",
+        "score_direction": "higher_is_watermarked",
+        "threshold_type": "paired_key_comparison_control_key",
+        "threshold_comparison_operator": ">",
+        # Deliberately null: the comparand is each sample's own control-key
+        # score, so there is no cohort-wide scalar threshold to report.
+        "threshold": None,
+        "decision_rule": consistent_value(rows, "t2s_decision_rule"),
+        "decision_rule_provenance": (
+            "RAVEN paired_key_comparison deployment extension; upstream T2SMark "
+            "evaluates a cohort ROC and defines no per-image decision rule"
+        ),
+        "not_claimed": "this is not TPR at a calibrated 1% FPR",
+        "stages": {
+            stage: {
+                "N": len(true_key[stage]),
+                "mean_score_true_key": sum(true_key[stage]) / len(true_key[stage]),
+                "mean_score_control_key": sum(control_key[stage]) / len(control_key[stage]),
+                "mean_score_margin": sum(margins[stage]) / len(margins[stage]),
+                "paired_key_comparison_detection_rate": paired_rates[stage],
+                "mean_key_accuracy": optional_mean(rows, f"{stage}_t2s_key_accuracy"),
+                "mean_message_accuracy": optional_mean(rows, f"{stage}_t2s_message_accuracy"),
+                "distribution": distribution(true_key[stage]),
+            }
+            for stage in stages
+        },
+        "mean_score_true_key_before": sum(true_key["watermarked"]) / len(true_key["watermarked"]),
+        "mean_score_true_key_attacked": sum(true_key["attacked"]) / len(true_key["attacked"]),
+        "before_detection_rate_at_paired_key_comparison": paired_rates["watermarked"],
+        "attacked_detection_rate_at_paired_key_comparison": paired_rates["attacked"],
+        "empirical_clean_fpr_at_paired_key_comparison": paired_rates["clean"],
+        "attack_success_rate_at_paired_key_comparison": 1.0 - paired_rates["attacked"],
+        "attack_success_definition": (
+            "1 - attacked detection rate under the stored T2S "
+            "paired_key_comparison rule (score_true_key > score_control_key)"
+        ),
+        "before_roc_auc": summary.watermarked_auc,
+        "attacked_roc_auc": summary.attacked_auc,
+        # Secondary, clearly separated from the stored per-image rule above.
+        "target_fpr": target_fpr,
+        "secondary_threshold_type": "empirical_clean_1pct_fpr",
+        "secondary_clean_calibrated_threshold": summary.calibration.threshold,
+        "secondary_clean_calibrated_actual_empirical_fpr": summary.calibration.actual_fpr,
+        "secondary_before_tpr": summary.watermarked_tpr,
+        "secondary_attacked_tpr": summary.attacked_tpr,
+        "statistically_valid_for_target_fpr": len(rows) >= math.ceil(1.0 / target_fpr),
+    }, audited
+
+
 def main() -> int:
     args = build_parser().parse_args()
     for output in (args.output_json, args.output_rows):
@@ -239,13 +475,20 @@ def main() -> int:
 
     if args.method in SEMANTIC_METHODS:
         metric, detailed = semantic_report(args.method, rows, args.target_fpr, args.legacy_threshold), []
+    elif args.method == "GM":
+        metric, detailed = gm_report(rows, args.target_fpr)
+    elif args.method == "T2S":
+        metric, detailed = t2s_report(rows, args.target_fpr)
     else:
         metric, detailed = gs_report(rows, args.expected_gs_bits, args.target_fpr)
     report = {
         "protocol_version": 2,
         "paper_comparable": (
             args.target_fpr == 0.01
-            and (args.method != "GS" or len(rows) >= math.ceil(1.0 / args.target_fpr))
+            and (
+                args.method not in {"GS", "GM", "T2S"}
+                or len(rows) >= math.ceil(1.0 / args.target_fpr)
+            )
         ),
         "method": args.method,
         "dataset": consistent_value(rows, "dataset"),

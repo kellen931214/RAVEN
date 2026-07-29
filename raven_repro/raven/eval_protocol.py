@@ -253,6 +253,42 @@ PROVIDER_FIELDS_BY_METHOD = {
         "gs_fpr",
         "gs_user_number",
     ),
+    # GaussMarker: the watermark state is one cohort-wide bundle, so the provider
+    # config is the bundle's identity. Every field here is a digest of an
+    # artifact the detector must reproduce exactly; none has a meaningful
+    # default, which is why they are all listed in
+    # PROVIDER_REQUIRED_NONEMPTY_FIELDS below.
+    "GM": (
+        "gm_protocol_mode",
+        "gm_bundle_config_sha256",
+        "gm_w1_file_sha256",
+        "gm_w2_file_sha256",
+        "gm_watermark_sha256",
+        "gm_m_sha256",
+        "gm_target_sha256",
+        "gm_mask_sha256",
+    ),
+    # T2SMark: the per-sample watermark lives in each row's own portable state
+    # artifact, so the cohort-uniform provider config is the encoder/detector
+    # profile those states were produced under. The per-sample state is bound
+    # separately through t2s_state_sha256.
+    "T2S": (
+        "t2s_protocol_mode",
+        "t2s_rng_mode",
+        "t2s_inversion_mode",
+        "t2s_num_inversion_steps",
+        "t2s_provider_config_sha256",
+    ),
+}
+
+# Provider fields that must be present and non-empty in the source row. For a
+# digest or protocol identity there is no defensible default: silently falling
+# back to "" would let a cohort with missing provenance produce a stable-looking
+# provider_config_hash. Methods absent from this mapping keep the historical
+# default-filling behaviour so existing TR/GS/RID cohort hashes are unchanged.
+PROVIDER_REQUIRED_NONEMPTY_FIELDS: dict[str, frozenset[str]] = {
+    "GM": frozenset(PROVIDER_FIELDS_BY_METHOD["GM"]),
+    "T2S": frozenset(PROVIDER_FIELDS_BY_METHOD["T2S"]),
 }
 
 PROVIDER_DEFAULTS = {
@@ -284,6 +320,26 @@ PROVIDER_DEFAULTS = {
         "gs_hw_copy": 8,
         "gs_fpr": 1e-6,
         "gs_user_number": 1000000,
+    },
+    # Type hints only. Every GM/T2S field is required non-empty, so these
+    # defaults are never substituted for a missing value — they exist so
+    # _normalized_scalar knows whether to coerce to str or int.
+    "GM": {
+        "gm_protocol_mode": "",
+        "gm_bundle_config_sha256": "",
+        "gm_w1_file_sha256": "",
+        "gm_w2_file_sha256": "",
+        "gm_watermark_sha256": "",
+        "gm_m_sha256": "",
+        "gm_target_sha256": "",
+        "gm_mask_sha256": "",
+    },
+    "T2S": {
+        "t2s_protocol_mode": "",
+        "t2s_rng_mode": "",
+        "t2s_inversion_mode": "",
+        "t2s_num_inversion_steps": 0,
+        "t2s_provider_config_sha256": "",
     },
 }
 
@@ -701,6 +757,16 @@ def provider_config(method: str, row: Mapping[str, Any]) -> dict[str, Any]:
         nested = json.loads(nested)
     source = nested if isinstance(nested, Mapping) else row
     defaults = PROVIDER_DEFAULTS[method]
+    required = PROVIDER_REQUIRED_NONEMPTY_FIELDS.get(method, frozenset())
+    missing = sorted(
+        field
+        for field in PROVIDER_FIELDS_BY_METHOD[method]
+        if field in required and str(source.get(field, "")).strip() == ""
+    )
+    if missing:
+        raise ValueError(
+            f"{method} provider config is missing required fields: {missing}"
+        )
     return {
         field: _normalized_scalar(source.get(field), defaults[field])
         for field in PROVIDER_FIELDS_BY_METHOD[method]
@@ -928,6 +994,104 @@ def gs_attack_success_summary(detector_payload: Mapping[str, Any]) -> dict[str, 
         ),
         "attack_success_threshold_type": "official_beta_tail_tau_onebit",
         "attack_success_threshold": threshold,
+        "attack_success_threshold_comparison_operator": operator,
+        "attack_success_detected_rate": attacked_rate,
+    }
+
+
+GM_ATTACK_SUCCESS_FIELD = "attack_success_rate_at_clean_calibrated_threshold"
+T2S_ATTACK_SUCCESS_FIELD = "attack_success_rate_at_paired_key_comparison"
+
+
+def _detector_metric(detector_payload: Mapping[str, Any]) -> Mapping[str, Any]:
+    metric = detector_payload.get("metric")
+    return metric if isinstance(metric, Mapping) else detector_payload
+
+
+def _finite_rate(value: Any, field: str) -> float:
+    number = float(value)
+    if not math.isfinite(number) or not 0.0 <= number <= 1.0:
+        raise RuntimeError(f"invalid rate for {field}: {value!r}")
+    return number
+
+
+def gm_attack_success_summary(detector_payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Attack success for GaussMarker, against its clean-calibrated threshold.
+
+    This cohort's GM bundle has no GNR restorer and no ring classifier, so
+    GaussMarker's official ensemble score and official threshold do not exist
+    for it. The detector family actually used is an empirical threshold
+    calibrated from this run's own clean-negative cohort on
+    ``gm_raw_bit_accuracy``, and that is what this reduces. It is a different
+    threshold family from both the GS official beta-tail threshold and the TR
+    clean-calibrated TPR, and must never be filled in from either.
+    """
+    metric = _detector_metric(detector_payload)
+    if str(metric.get("detector_metric")) != "gm_raw_bit_accuracy":
+        raise RuntimeError(
+            f"unexpected GM detector metric: {metric.get('detector_metric')!r}"
+        )
+    if metric.get("official_ensemble_threshold_available") is not False:
+        raise RuntimeError(
+            "GM aggregate expects the ensemble-threshold-unavailable family; "
+            "a bundle with GNR/classifier needs its own reducer"
+        )
+    operator = metric.get("threshold_comparison_operator")
+    if operator not in (">", ">="):
+        raise RuntimeError(f"unsupported GM threshold operator: {operator!r}")
+    attacked_rate = _finite_rate(
+        metric["attacked_detection_rate_at_clean_calibrated_threshold"],
+        "attacked_detection_rate_at_clean_calibrated_threshold",
+    )
+    threshold = float(metric["clean_calibrated_threshold"])
+    if not math.isfinite(threshold):
+        raise RuntimeError("non-finite GM clean_calibrated_threshold")
+    return {
+        GM_ATTACK_SUCCESS_FIELD: 1.0 - attacked_rate,
+        "attack_success_definition": (
+            "1 - attacked detection rate at the clean-calibrated empirical "
+            "threshold on gm_raw_bit_accuracy"
+        ),
+        "attack_success_threshold_type": "empirical_clean_1pct_fpr",
+        "attack_success_threshold": threshold,
+        "attack_success_threshold_comparison_operator": operator,
+        "attack_success_detected_rate": attacked_rate,
+    }
+
+
+def t2s_attack_success_summary(detector_payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Attack success for T2SMark, under its own stored per-image rule.
+
+    T2S's stored decision rule is ``paired_key_comparison``
+    (``score_true_key > score_control_key``), whose comparand is each sample's
+    own control-key score rather than a cohort scalar — so the threshold is
+    reported as null, not as a fabricated number. The rule is a RAVEN
+    deployment extension, not a calibrated TPR at a target FPR.
+    """
+    metric = _detector_metric(detector_payload)
+    if str(metric.get("detector_metric")) != "t2s_score_true_key":
+        raise RuntimeError(
+            f"unexpected T2S detector metric: {metric.get('detector_metric')!r}"
+        )
+    if str(metric.get("threshold_type")) != "paired_key_comparison_control_key":
+        raise RuntimeError(
+            f"unexpected T2S threshold family: {metric.get('threshold_type')!r}"
+        )
+    operator = metric.get("threshold_comparison_operator")
+    if operator != ">":
+        raise RuntimeError(f"unsupported T2S threshold operator: {operator!r}")
+    attacked_rate = _finite_rate(
+        metric["attacked_detection_rate_at_paired_key_comparison"],
+        "attacked_detection_rate_at_paired_key_comparison",
+    )
+    return {
+        T2S_ATTACK_SUCCESS_FIELD: 1.0 - attacked_rate,
+        "attack_success_definition": (
+            "1 - attacked detection rate under the stored T2S "
+            "paired_key_comparison rule (score_true_key > score_control_key)"
+        ),
+        "attack_success_threshold_type": "paired_key_comparison_control_key",
+        "attack_success_threshold": None,
         "attack_success_threshold_comparison_operator": operator,
         "attack_success_detected_rate": attacked_rate,
     }

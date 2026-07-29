@@ -6,6 +6,7 @@ This file records implementation bugs, validated non-bugs, ablations, and the ev
 
 | Date | Area | Status | Evidence |
 | --- | --- | --- | --- |
+| 2026-07-29 | GM + T2S formal evaluation chain | GaussMarker and T2SMark are now runnable end-to-end through `run_raven_formal_eval.py`. Method dispatch is driven by the existing per-method provenance tables rather than literal `if method == "GS"` branches. GM detects from the cohort's persisted bundle (config read from the bundle manifest, never restated); T2S detects per sample from each row's portable state through a thin adapter over the same two standalone functions `run_verification.py` uses. Each method reports its own metric, threshold family and attack-success definition: GM `gm_raw_bit_accuracy` at a clean-calibrated empirical threshold (its official ensemble threshold does not exist for this bundle — no GNR, no classifier), T2S `t2s_score_true_key` under the stored `paired_key_comparison` rule, which is explicitly not TPR@1%FPR. No GPU smoke was run before the formal launch, by explicit user direction. | `raven_repro/scripts/extract_verification_scores.py`; `raven_repro/scripts/evaluate_verification.py`; `raven_repro/raven/eval_protocol.py`; `experiments/update_experiment_table.py` |
 | 2026-07-29 | GM + T2S `shared_tr_clean_v2` formal cohorts (Issue #9) | Formal 1001-row GM and T2S cohorts generated from fixed `main` `01ce7d7`, GPU 0 (RTX 3090, sm_86). All 1001 canonical clean images byte-identical before and after. The T2S runner's own final audit rejected the cohort on a `t2s_session_key_sha256` repeat, which is a birthday collision of a 16-bit key, not shared state; the audit gate was corrected and the cohort kept. T2S's in-runner summary/pairing/cross-method JSONs are absent (crash after the last row) and are supplied by the standalone cross-method audit instead. | `data/gm/diffusiondb_shared_tr/GM`; `data/t2s/diffusiondb_shared_tr/T2S`; `audit/shared_clean_tr_gs_gm_t2s.json`; `raven_repro/raven/pairing_provenance.py` |
 | 2026-07-28 | GM + T2S `shared_tr_clean_v2` (Issue #9, phase 1) | GaussMarker and T2SMark now consume the canonical Tree-Ring source row — same prompt, base latent, clean image and generation config — and generate only their own watermarked image. New authoritative provider entrypoints `GmProvider.get_wm_latents_from_base_latent` and the T2S `|z|`-multiset consumption gate prove the supplied latent was embedded into rather than replaced. Cross-method audit extended to TR/GS/GM/T2S. Two-row GPU smoke passed; the canonical clean images are byte-identical before and after. No formal 1000/1001 cohort generated. | `experiments/generate_gm_from_tr_shared_clean.py`; `experiments/generate_t2s_from_tr_shared_clean.py`; `experiments/shared_clean_tr.py`; `raven_repro/scripts/audit_shared_clean_cohorts.py`; `raven_repro/tests/test_shared_tr_clean_gm_t2s.py`; `docs/SHARED_TR_CLEAN_V2.md` |
 | 2026-07-28 | GaussMarker official parity, bundles and standalone verification | GM generation now samples a complete initial latent per sample from a deterministic seed with official legacy-RNG semantics, creates official ChaCha20 state, and persists an official-interchangeable `w1.pth`/`w2.pth`/`manifest.json` bundle. Standalone verification, threshold calibration and paper evaluation run from that bundle alone. Official reference frozen at `4ac9bfd4e152a56bd93c2a06a809ef6ff8e73155`. Bundle reuse, `paper_eval` cohort pairing and `run_manifest.json` resume are all fail-closed: a bundle must match the full detector configuration and can only lose officialness, never gain it; `official_paper_evaluation` requires a verified one-to-one pairing; a mismatched run manifest stops the run without modifying any file. | `eval_bench_wm/utils/wm/gm_provider.py`; `eval_bench_wm/utils/wm/gm_bundle.py`; `eval_bench_wm/run_verify_watermark.py`; `eval_bench_wm/tests/test_gm_official_parity.py` |
@@ -24,6 +25,177 @@ This file records implementation bugs, validated non-bugs, ablations, and the ev
 
 
 
+
+## 2026-07-29 — GM and T2S wired into the formal RAVEN evaluation chain
+
+### Problem
+The `shared_tr_clean_v2` GM and T2S cohorts (1001 rows each, Issue #9) existed
+and passed `audit_pairing_rows`, but no formal RAVEN attack/evaluation could be
+run on them. Every stage of the formal chain fails closed on an unregistered
+method, so `--method GM` / `--method T2S` was rejected at argument parsing and,
+had that been bypassed, would have raised `unsupported watermark method` from
+`provider_config()`. The generation side knew about GM/T2S; the evaluation side
+did not.
+
+### Root cause
+Method support was spelled out as literal `if method == "GS"` branches and
+`choices=[...]` whitelists in seven places rather than being driven by the
+per-method tables that already existed in `raven/pairing_provenance.py` and
+`raven/eval_protocol.py`:
+
+1. `experiments/run_raven_formal_eval.py` — `--method` whitelist.
+2. `raven/eval_protocol.py` — no `PROVIDER_FIELDS_BY_METHOD` / `PROVIDER_DEFAULTS`
+   entry, so `provider_config()` raised.
+3. `raven_repro/scripts/build_verification_manifest.py` — whitelist and a
+   GS-only method-provenance branch.
+4. `raven_repro/scripts/extract_verification_scores.py` — whitelist, provider
+   dispatch, and score definitions.
+5. `raven_repro/scripts/evaluate_verification.py` — whitelist; GM/T2S fit
+   neither `SEMANTIC_METHODS` nor the GS official-threshold branch.
+6. `run_raven_formal_eval.aggregate_stage` / `validate_stage` — GS-only attack
+   success reducer, TR/GS-only pairing audit and target-hash rules.
+7. `experiments/update_experiment_table.py` — `DETECTOR_EXTRACTORS` held only
+   GS and TR, and correctly refused to guess.
+
+### Affected files
+- `raven_repro/raven/eval_protocol.py`: `PROVIDER_FIELDS_BY_METHOD`,
+  `PROVIDER_DEFAULTS`, new `PROVIDER_REQUIRED_NONEMPTY_FIELDS`,
+  `provider_config`, `gm_attack_success_summary`, `t2s_attack_success_summary`.
+- `raven_repro/raven/pairing_provenance.py`: `method_provenance_fields`.
+- `raven_repro/scripts/extract_verification_scores.py`: `gm_bundle_manifest`,
+  `gm_provider_kwargs`, `T2SStateDetector`, `t2s_state_for_row`,
+  `provider_class`, `raw_score`, `canonical_score`, `score_direction_text`.
+- `raven_repro/scripts/evaluate_verification.py`: `gm_report`, `t2s_report`,
+  `optional_float`, `optional_mean`.
+- `raven_repro/scripts/build_verification_manifest.py`: method-provenance carry.
+- `experiments/run_raven_formal_eval.py`: `PAIRING_AUDITED_METHODS`,
+  `snapshot_stage`, `expected_resume_fields`, `aggregate_stage`,
+  `validate_stage`, `build_parser`.
+- `experiments/update_experiment_table.py`: `extract_gm_detector_metrics`,
+  `extract_t2s_detector_metrics`, `method_metric_block`, `ATTACK_SUCCESS_KEYS`,
+  `method_from_path`.
+- `.gitignore`: `.claude/`.
+
+### Affected outputs
+None invalidated. No existing TR or GS run was touched, no cohort was
+regenerated and no generation code was modified. `outputs/gm/` and `outputs/t2s/`
+were empty before this change, so all six GM/T2S runs are new.
+
+### Fix
+Method-specific behaviour is now driven by the existing per-method tables
+instead of literal branches. `method_provenance_fields(method, rows)` resolves
+the method-specific provenance columns once (GS from the cohort's own recorded
+pairing protocol, since V1 and V2 differ; GM and T2S from
+`METHOD_REQUIRED_FIELDS`) and is used by the snapshot drift gate, the
+resume-expectation record and the verification manifest. `SINGLE_TARGET_METHODS`
+/ `PER_SAMPLE_TARGET_METHODS` now drive the validate-stage target-hash rule, so
+GM is checked for one cohort-wide target and T2S for one target per run.
+
+Detector wiring reuses the authoritative implementations rather than
+reimplementing detection:
+
+- **GM** is cohort-wide. Its constructor kwargs are read from the bundle
+  manifest recorded in the cohort rows, not restated, so a detector cannot be
+  built with copy factors or ring parameters that differ from the ones the
+  cohort was embedded with; `GmBundle.assert_compatible` re-checks the same
+  manifest, and `gm_bundle_manifest` binds the bundle digests to the source
+  metadata and re-hashes `w1.pth`/`w2.pth`.
+- **T2S** is state-bound: each row carries its own session key and message, so
+  there is no cohort-uniform provider. `T2SStateDetector` is a thin adapter over
+  the two standalone functions `run_verification.py` already uses —
+  `t2s_inversion.invert_image` and `T2SProvider.accuracies_for_state`. No
+  detector maths lives in the adapter, and a real `T2SProvider` is deliberately
+  not constructed because its `__init__` draws generation RNG.
+
+### Reused code
+`audit_pairing_rows`, `METHOD_REQUIRED_FIELDS`, `SINGLE_TARGET_METHODS`,
+`PER_SAMPLE_TARGET_METHODS`, `ALLOWED_PAIRING_PROTOCOLS`, `gs_fields_for_rows`,
+`summarize_detection`, `distribution`, `consistent_value`, `tensor_sha256`,
+`GmBundle.assert_compatible`, `T2SWatermarkState.load`,
+`T2SProvider.accuracies_for_state`, `t2s_inversion.invert_image`,
+`evaluate_image`'s existing provider-owned-inversion hook. No new hashing,
+canonicalization, inversion or detector implementation was added.
+
+### Historical bug coverage
+Reviewed the 2026-07-29 T2S session-key entry (the collision-counted field rule
+is untouched; detection reads each row's own state, which is exactly why the
+per-sample adapter is correct), the 2026-07-27 GS V2 detector entry (the
+"missing gs_sampling_seed" class of bug — a cohort-shape assumption baked into
+the detector — is the reason GM/T2S detector configuration is read from the
+bundle and the portable state rather than hard-coded), and the 2026-07-27 GS
+aggregate entry (which is why GM and T2S publish their own attack-success
+scalars into `formal_aggregate.json` rather than leaving the table to derive
+them). Searched for remaining `method == "GS"` branches in the formal chain;
+the ones left are genuinely GS-specific (secret provenance, decoded-bit digests,
+official beta-tail thresholds).
+
+### Detector definitions
+- **GM** — metric `gm_raw_bit_accuracy` (official spatial-domain ChaCha20-decrypt
+  bit accuracy), `higher_is_watermarked`, secondary raw score `gm_raw_ring_l1`.
+  This cohort's bundle has `gnr_sha256: null` and `classifier_sha256: null`, so
+  GaussMarker's official *ensemble* score and its official threshold do not
+  exist for it; `gm_provider` correctly declines to fabricate a decision, and
+  the report records `official_ensemble_threshold_available: false` with the
+  reason. The threshold family actually used is `empirical_clean_1pct_fpr`,
+  calibrated from this run's own clean-negative cohort, reported with its
+  measured FPR. A bundle that *does* carry GNR/classifier fails closed in both
+  the extractor and the aggregate reducer rather than being reported under this
+  family.
+- **T2S** — metric `t2s_score_true_key` (upstream `norm1_w`),
+  `higher_is_watermarked`. The stored decision rule is `paired_key_comparison`:
+  `score_true_key > score_control_key`, where the control key is upstream's
+  `fake_key = 1 - master_key`. The comparand is per-sample, so Threshold is
+  reported as null rather than as an invented scalar, and Threshold Type is
+  `paired_key_comparison_control_key`. This is a RAVEN deployment extension —
+  upstream evaluates a cohort ROC and defines no per-image rule — and is **not**
+  TPR@1%FPR; the report carries that disclaimer in `decision_rule_provenance`
+  and `not_claimed`. A clean-calibrated empirical threshold is reported
+  separately under `secondary_*` keys and is never read into the detection-rate
+  cells. `evaluate_verification` recomputes the decision from the two stored
+  scores and fails closed if it disagrees with the stored one.
+
+Neither method reuses the other's, GS's, or TR's metric name, threshold family,
+detection-rate definition or attack-success definition.
+
+### Regression prevention
+`PROVIDER_REQUIRED_NONEMPTY_FIELDS` makes every GM/T2S provider field required
+non-empty, so a cohort with missing provenance can no longer produce a
+stable-looking `provider_config_hash` from defaulted empty strings; TR/GS/RID
+cohort hashes are unchanged because those methods are not listed. The GM
+detector re-binds the bundle on every row, so a mixed-bundle manifest cannot
+pass the uniform-provider check. `t2s_state_for_row` binds state digest,
+watermark id, rng mode, inversion mode, provider-config digest and inversion
+step count to the source row. Both extractors reject an attack-success value
+that is not the complement of the detection rate rendered in the same row.
+
+### Validation
+- `raven_repro`: 412 passed, 1 failed. The failure is
+  `test_canonical_layout.py::test_data_and_outputs_tops_contain_only_canonical_entries`,
+  caused by a pre-existing untracked `outputs/smoke/rid_issue3` directory from
+  separate RingID work; it is unrelated to this change and reproduces on
+  unmodified `main`.
+- `test_aligned_color_formal_adapter.py` and `test_attention_shapes.py` fail at
+  collection on unmodified `main` as well; pre-existing, not introduced here.
+- Provider config resolves and is uniform across all 1001 rows of both cohorts.
+- `GmProvider` constructed from the recorded bundle on CPU: `state_source=bundle`,
+  `profile_is_official=False`, and its target and mask tensor digests match the
+  cohort's `watermark_target_sha256` / `watermark_mask_sha256` exactly.
+- `T2SWatermarkState` loads and binds for the cohort's first row
+  (`t2s_official`, 10 inversion steps).
+- **No GPU smoke test was run.** The user explicitly directed that the full
+  1001-sample runs be started without one. The detector path is therefore first
+  exercised at the verify stage of the real runs; the attack stage does not use
+  the detector, so a detector defect would cost a verify rerun rather than a
+  re-attack.
+
+### Git provenance
+- Repository: RAVEN
+- Branch: main
+- Commit: see below
+- Remote branch: origin/main
+- Push status: see below
+- Entry point: `experiments/run_raven_formal_eval.py`
+- Formal output eligibility: eligible; six GM/T2S runs launched from this commit
 
 ## 2026-07-29 — T2S session-key uniqueness gate rejected a correct 1001-row cohort
 
