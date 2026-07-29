@@ -455,6 +455,15 @@ class HSQRProvider(WmProvider):
     def pattern_sha256(self, pattern: typing.Optional[torch.Tensor] = None) -> str:
         return sfw_bundle.sha256_tensor(self.gt_patch if pattern is None else pattern)
 
+    def mask_sha256(self) -> str:
+        return sfw_bundle.canonical_sha256({
+            "mask_type": "hsqr_center_channel_qr_region",
+            "latent_shape": [int(x) for x in self.latent_shape],
+            "center_slice": [int(self.start), int(self.end)],
+            "watermark_channels": [int(x) for x in self.watermark_channels],
+            "pattern_shape": [int(x) for x in self.gt_patch.shape],
+        })
+
     def key_identity(self) -> typing.Dict[str, typing.Any]:
         """Everything needed to reproduce and audit the selected watermark key."""
         return {
@@ -608,9 +617,13 @@ class HSQRProvider(WmProvider):
             )
         if not torch.isfinite(base_latent.detach()).all():
             raise SfwBundleError("HSQR shared-clean base latent contains NaN or Inf")
-        pre_sha = sfw_bundle.sha256_tensor(base_latent.detach())
+        try:
+            from raven.pairing_provenance import tensor_sha256 as shared_clean_tensor_sha256
+        except Exception as exc:
+            raise SfwBundleError("HSQR shared-clean hashing requires raven.pairing_provenance") from exc
+        pre_sha = shared_clean_tensor_sha256(base_latent.detach())
         out = self.get_wm_latents(latents_clean=base_latent)
-        post_sha = sfw_bundle.sha256_tensor(out["zT_torch"])
+        post_sha = shared_clean_tensor_sha256(out["zT_torch"])
         if post_sha == pre_sha:
             raise SfwBundleError("HSQR shared-clean injection made no latent change")
         out.update(
@@ -619,6 +632,7 @@ class HSQRProvider(WmProvider):
                 "hsqr_pre_injection_latent_sha256": pre_sha,
                 "hsqr_post_injection_latent_sha256": post_sha,
                 "hsqr_selected_pattern_sha256": self.pattern_sha256(),
+                "hsqr_mask_sha256": self.mask_sha256(),
                 "hsqr_payload_sha256": sfw_bundle.sha256_text(self.payload_text(self.selected_key_index)),
                 "hsqr_key_identity_sha256": sfw_bundle.canonical_sha256(self.key_identity()),
             }

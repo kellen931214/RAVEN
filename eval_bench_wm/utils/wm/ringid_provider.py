@@ -995,6 +995,13 @@ class RingIDProvider(WmProvider):
             binding["bundle_config_sha256"] = self.bundle.manifest.get("bundle_config_sha256")
         return binding
 
+    def provider_config(self) -> typing.Dict[str, typing.Any]:
+        """Return the provenance-bound RingID configuration for shared-clean runs."""
+        return self.binding_config()
+
+    def provider_config_sha256(self) -> str:
+        return rid_bundle.canonical_sha256(self.provider_config())
+
     @property
     def selected_key_id(self) -> str:
         return f"rid-key-{self.key_index:06d}"
@@ -1133,9 +1140,18 @@ class RingIDProvider(WmProvider):
             )
         if not torch.isfinite(base_latent.detach()).all():
             raise RidBundleError("RID shared-clean base latent contains NaN or Inf")
-        pre_sha = rid_bundle.sha256_tensor(base_latent.detach())
+        try:
+            from raven.pairing_provenance import tensor_sha256 as shared_clean_tensor_sha256
+        except Exception as exc:
+            raise RidBundleError("RID shared-clean hashing requires raven.pairing_provenance") from exc
+        pre_sha = shared_clean_tensor_sha256(base_latent.detach())
         out = self.get_wm_latents(latents_clean=base_latent)
-        post_sha = rid_bundle.sha256_tensor(out["zT_torch"])
+        if out["zT_torch"].dtype != base_latent.dtype:
+            out["zT_torch"] = out["zT_torch"].to(dtype=base_latent.dtype)
+            out["zT_PIL"] = torch_to_PIL(out["zT_torch"])
+            out["zT"] = out["zT_PIL"]
+        out["zT_clean_torch"] = base_latent
+        post_sha = shared_clean_tensor_sha256(out["zT_torch"])
         if post_sha == pre_sha:
             raise RidBundleError("RID shared-clean injection made no latent change")
         out.update(

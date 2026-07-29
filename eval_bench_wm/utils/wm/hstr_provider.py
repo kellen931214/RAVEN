@@ -15,6 +15,7 @@ from utils import utils
 
 OFFICIAL_HSTR_PROFILE = "official_sfwmark_sd21"
 LEGACY_HSTR_PROFILE = "legacy_raven"
+SHARED_TR_CLEAN_HSTR_PROFILE = "official_math_shared_tr_clean"
 OFFICIAL_BASE_KEY_SEED = 7433
 OFFICIAL_MODEL_ID = "stabilityai/stable-diffusion-2-1-base"
 OFFICIAL_SCHEDULER = "DDIM"
@@ -27,7 +28,7 @@ HSTR_SHARED_TR_CLEAN_MODE = "official_math_shared_tr_clean"
 
 parser = argparse.ArgumentParser(add_help=False)
 parser.add_argument("--hstr_seed", default=None, type=int)
-parser.add_argument("--hstr_profile", default=LEGACY_HSTR_PROFILE, choices=[LEGACY_HSTR_PROFILE, OFFICIAL_HSTR_PROFILE])
+parser.add_argument("--hstr_profile", default=LEGACY_HSTR_PROFILE, choices=[LEGACY_HSTR_PROFILE, OFFICIAL_HSTR_PROFILE, SHARED_TR_CLEAN_HSTR_PROFILE])
 parser.add_argument("--hstr_key_index", default=1, type=int)
 parser.add_argument("--hstr_bundle_dir", default=None, type=str)
 parser.add_argument("--hstr_create_bundle", action="store_true", default=False)
@@ -73,7 +74,7 @@ class HSTRProvider(WmProvider):
         **kwargs,
     ):
         super().__init__(**kwargs)
-        if hstr_profile not in (LEGACY_HSTR_PROFILE, OFFICIAL_HSTR_PROFILE):
+        if hstr_profile not in (LEGACY_HSTR_PROFILE, OFFICIAL_HSTR_PROFILE, SHARED_TR_CLEAN_HSTR_PROFILE):
             raise ValueError(f"unknown HSTR profile {hstr_profile!r}")
         if wm_capacity != 2048:
             raise ValueError("official HSTR wm_capacity must be 2048")
@@ -82,10 +83,11 @@ class HSTRProvider(WmProvider):
         self.shape = (1, latent_channel, hw_latent, hw_latent)
         self.hstr_seed = hstr_seed
         self.wm_capacity = int(wm_capacity)
-        self.base_key_seed = OFFICIAL_BASE_KEY_SEED if self.profile == OFFICIAL_HSTR_PROFILE else (999999 if hstr_seed is None else int(hstr_seed))
+        self.uses_official_math = self.profile in (OFFICIAL_HSTR_PROFILE, SHARED_TR_CLEAN_HSTR_PROFILE)
+        self.base_key_seed = OFFICIAL_BASE_KEY_SEED if self.uses_official_math else (999999 if hstr_seed is None else int(hstr_seed))
         self.hstr_seed_list = list(range(self.base_key_seed, self.base_key_seed + self.wm_capacity))
         self.fix_gt = int(fix_gt)
-        self.key_index = int(hstr_key_index if self.profile == OFFICIAL_HSTR_PROFILE else self._legacy_key_index(self.fix_gt))
+        self.key_index = int(hstr_key_index if self.uses_official_math else self._legacy_key_index(self.fix_gt))
         if not 0 <= self.key_index < self.wm_capacity:
             raise ValueError(f"--hstr_key_index must be in [0, {self.wm_capacity - 1}], got {self.key_index}")
         self.selected_key_seed = int(self.hstr_seed_list[self.key_index])
@@ -103,6 +105,8 @@ class HSTRProvider(WmProvider):
         self.center_slice = (slice(None), slice(None), slice(self.start, self.end), slice(self.start, self.end))
         if self.profile == OFFICIAL_HSTR_PROFILE:
             self._validate_official_profile()
+        elif self.profile == SHARED_TR_CLEAN_HSTR_PROFILE:
+            self._validate_shared_clean_profile()
 
         self.masks, self.watermark_region_mask_hstr = self.__get_watermarking_mask()
         self.bundle: sfw_bundle.SfwBundle | None = None
@@ -153,7 +157,7 @@ class HSTRProvider(WmProvider):
             "num_inference_steps_target": OFFICIAL_STEPS,
             "guidance_scale_target": OFFICIAL_GUIDANCE_SCALE,
         }
-        applied = {"profile": OFFICIAL_HSTR_PROFILE, "overrides": {}}
+        applied = {"profile": getattr(args, "hstr_profile", LEGACY_HSTR_PROFILE), "overrides": {}}
         for field, value in defaults.items():
             if f"--{field}" not in explicit:
                 setattr(args, field, value)
@@ -174,6 +178,21 @@ class HSTRProvider(WmProvider):
             raise ValueError(f"{OFFICIAL_HSTR_PROFILE} requires scheduler {OFFICIAL_SCHEDULER}")
         if self.resolution != OFFICIAL_RESOLUTION:
             raise ValueError(f"{OFFICIAL_HSTR_PROFILE} requires resolution {OFFICIAL_RESOLUTION}")
+
+    def _validate_shared_clean_profile(self) -> None:
+        if tuple(self.latent_shape) != (1, 4, 64, 64):
+            raise ValueError(
+                f"{SHARED_TR_CLEAN_HSTR_PROFILE} requires latent_shape=(1,4,64,64), "
+                f"got {tuple(self.latent_shape)}"
+            )
+        if self.shape != (1, 4, 64, 64):
+            raise ValueError(f"{SHARED_TR_CLEAN_HSTR_PROFILE} requires shape=(1,4,64,64), got {self.shape}")
+        if self.start != 10 or self.end != 54:
+            raise ValueError(f"{SHARED_TR_CLEAN_HSTR_PROFILE} requires center slice 10:54")
+        if self.scheduler_type not in (None, OFFICIAL_SCHEDULER):
+            raise ValueError(f"{SHARED_TR_CLEAN_HSTR_PROFILE} requires scheduler {OFFICIAL_SCHEDULER}")
+        if self.resolution != OFFICIAL_RESOLUTION:
+            raise ValueError(f"{SHARED_TR_CLEAN_HSTR_PROFILE} requires resolution {OFFICIAL_RESOLUTION}")
 
     def get_wm_type(self) -> str:
         return "HSTR"
@@ -200,7 +219,7 @@ class HSTRProvider(WmProvider):
             "selected_key_seed": int(self.selected_key_seed),
             "rng_algorithm": (
                 "torch.Generator(device).manual_seed(key_seed)+torch.randn_like_diffusers_prepare_latents"
-                if self.profile == OFFICIAL_HSTR_PROFILE else "legacy_explicit_reconstruction_of_previous_key_index"
+                if self.uses_official_math else "legacy_explicit_reconstruction_of_previous_key_index"
             ),
             "rng_device": str(self.rng_device),
             "hermitian_enforcement_version": "sfwmark_7866612_utils_enforce_hermitian_symmetry",
@@ -301,9 +320,13 @@ class HSTRProvider(WmProvider):
             )
         if not torch.isfinite(base_latent.detach()).all():
             raise sfw_bundle.SfwBundleError("HSTR shared-clean base latent contains NaN or Inf")
-        pre_sha = sfw_bundle.sha256_tensor(base_latent.detach())
+        try:
+            from raven.pairing_provenance import tensor_sha256 as shared_clean_tensor_sha256
+        except Exception as exc:
+            raise sfw_bundle.SfwBundleError("HSTR shared-clean hashing requires raven.pairing_provenance") from exc
+        pre_sha = shared_clean_tensor_sha256(base_latent.detach())
         out = self.get_wm_latents(latents_clean=base_latent)
-        post_sha = sfw_bundle.sha256_tensor(out["zT_torch"])
+        post_sha = shared_clean_tensor_sha256(out["zT_torch"])
         if post_sha == pre_sha:
             raise sfw_bundle.SfwBundleError("HSTR shared-clean injection made no latent change")
         out.update(

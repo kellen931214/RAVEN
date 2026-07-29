@@ -112,7 +112,7 @@ def parse_fourier_args(spec: MethodSpec, argv: Optional[List[str]] = None) -> ar
         parser.add_argument("--rid-shift-semantics", default="official_code_exact")
         parser.add_argument("--rid-torch-dtype", default="float32")
     elif spec.method == "HSTR":
-        parser.add_argument("--hstr-profile", default="official_sfwmark_sd21")
+        parser.add_argument("--hstr-profile", default=spec.protocol_mode)
         parser.add_argument("--hstr-key-index", default=1, type=int)
         parser.add_argument("--hstr-rng-device", default="cpu", choices=["cpu", "cuda"])
         parser.add_argument("--hstr-save-full-keybook", action="store_true", default=False)
@@ -199,7 +199,8 @@ def _bundle_state(spec: MethodSpec, provider: Any, args: argparse.Namespace) -> 
         f"{spec.method.lower()}_mask_sha256": str(
             manifest.get("mask_sha256")
             or getattr(provider, "watermark_mask_sha256", None)
-            or getattr(provider, "rid_mask_sha256", "")
+            or getattr(provider, "rid_mask_sha256", None)
+            or (provider.mask_sha256() if hasattr(provider, "mask_sha256") else "")
         ),
         f"{spec.method.lower()}_key_index": int(
             getattr(provider, "key_index", getattr(provider, "selected_key_index", 0))

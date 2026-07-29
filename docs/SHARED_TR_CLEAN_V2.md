@@ -326,3 +326,20 @@ They must never generate, copy, rename, re-encode, or overwrite a clean image.
 Legacy cohorts are not relabelled as `formal_shared_tr_clean`; a cohort earns
 that classification only after `raven_repro/scripts/audit_shared_clean_cohorts.py`
 validates it against the canonical TR metadata by `run_id`.
+
+### Issue #6 pre-merge GPU smoke (2026-07-29)
+
+The pre-merge two-row RID/HSTR/HSQR smoke used canonical TR metadata from `/workspace/RAVEN/data/tr/diffusiondb/metadata.csv` and run_ids `0 1`. Outputs were written under `outputs/smoke/issue6_shared_tr_clean_gpu_20260729T1930Z/` in the Issue #6 worktree only. The runner selected physical GPU 2 by UUID (`GPU-1289e71c-7313-be4c-7cf2-68c895107672`), an idle RTX 3090 (`sm_86`), with `CUDA_DEVICE_ORDER=PCI_BUS_ID`; no CPU fallback occurred.
+
+HSTR uses a separate provider profile, `official_math_shared_tr_clean`, for this protocol. It preserves the official SFWMark HSTR key math and geometry but accepts the canonical Tree-Ring generation configuration. This is not the same as `official_sfwmark_sd21` and must not be reported as end-to-end official HSTR reproduction.
+
+Smoke metadata:
+
+```text
+RID:  outputs/smoke/issue6_shared_tr_clean_gpu_20260729T1930Z/RID/metadata.csv
+HSTR: outputs/smoke/issue6_shared_tr_clean_gpu_20260729T1930Z/HSTR_v2/metadata.csv
+HSQR: outputs/smoke/issue6_shared_tr_clean_gpu_20260729T1930Z/HSQR_v2/metadata.csv
+Audit: outputs/smoke/issue6_shared_tr_clean_gpu_20260729T1930Z/cross_method_audit_rid_hstr_hsqr.json
+```
+
+The audit passed for all three methods (`2` rows each), verified files, matched by `run_id`, and confirmed the shared TR source metadata SHA `b359a5104f93d54580914f152f074a72f7aae59e8ab6ef4a6a05ab91662aa66c`. Canonical clean files remained unchanged before and after generation.
