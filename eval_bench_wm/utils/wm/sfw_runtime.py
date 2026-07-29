@@ -137,6 +137,7 @@ def run_provenance(args, provider: HSQRProvider, pipe_provider) -> typing.Dict[s
         "guidance_scale": float(args.guidance_scale_target),
         "inversion_impl_version": sfw_inversion.SFW_INVERSION_IMPL_VERSION,
         "inversion_parity_status": sfw_inversion.SFW_INVERSION_PARITY_STATUS,
+        "inversion_weights_parity": sfw_inversion.SFW_INVERSION_WEIGHTS_PARITY,
         "created_utc": sfw_bundle.utc_now(),
     }
     provenance.update(provider.key_identity())
@@ -184,6 +185,7 @@ def score_image(
         "inversion_guidance_scale": float(provider.inversion_guidance),
         "inversion_impl_version": sfw_inversion.SFW_INVERSION_IMPL_VERSION,
         "inversion_parity_status": sfw_inversion.SFW_INVERSION_PARITY_STATUS,
+        "inversion_weights_parity": sfw_inversion.SFW_INVERSION_WEIGHTS_PARITY,
         "vae_sample": bool(provider.vae_sample),
         "recovered_latent_sha256": None,
     }

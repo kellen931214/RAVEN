@@ -6,7 +6,7 @@ This file records implementation bugs, validated non-bugs, ablations, and the ev
 
 | Date | Area | Status | Evidence |
 | --- | --- | --- | --- |
-| 2026-07-29 | HSQR (SFWMark) official alignment + standalone verification (Issue #5) | `HSQRProvider` stays the single authoritative HSQR implementation and gains an immutable `official_sfwmark_sd21` profile (base key seed 7433, explicit `--hsqr_key_index`, no global RNG), a persisted hash-bound SFW bundle, per-batch-item detector output, explicit `score = -L1 distance` semantics and an official-protocol inversion front-end. `run_watermark.py --wm_type HSQR` produces N indexed non-overwriting images with an independent complete base latent per sample; `run_verify_watermark.py --wm_type HSQR` verifies suspect images in a fresh process from the bundle alone. Legacy behaviour is preserved byte-for-byte under `legacy_raven`, which stays the parser default so the existing formal generators are unchanged. Two-sample GPU smoke on RTX 3090 separated watermarked (`-39.5`, `-42.8`) from clean (`-70.8`, `-71.3`) with ROC-AUC `1.0`; the run used the cached `RedbeardNZ` SD2.1-base mirror because `stabilityai/stable-diffusion-2-1-base` is not reachable, so it is labelled `legacy_or_ablation_mode`, not an official evaluation. Inversion parity is a documented-protocol transcription, **not** fixture-verified against the official repository. | `eval_bench_wm/utils/wm/hsqr_provider.py`; `eval_bench_wm/utils/wm/sfw_bundle.py`; `eval_bench_wm/utils/wm/sfw_inversion.py`; `eval_bench_wm/utils/wm/sfw_runtime.py`; `eval_bench_wm/tests/test_hsqr_official_parity.py` |
+| 2026-07-29 | HSQR (SFWMark) official alignment + standalone verification (Issue #5) | `HSQRProvider` stays the single authoritative HSQR implementation and gains an immutable `official_sfwmark_sd21` profile (base key seed 7433, explicit `--hsqr_key_index`, no global RNG), a persisted hash-bound SFW bundle, per-batch-item detector output, explicit `score = -L1 distance` semantics and an official-protocol inversion front-end. `run_watermark.py --wm_type HSQR` produces N indexed non-overwriting images with an independent complete base latent per sample; `run_verify_watermark.py --wm_type HSQR` verifies suspect images in a fresh process from the bundle alone. Legacy behaviour is preserved byte-for-byte under `legacy_raven`, which stays the parser default so the existing formal generators are unchanged. Two-sample GPU smoke on RTX 3090 separated watermarked (`-39.5`, `-42.8`) from clean (`-70.8`, `-71.3`) with ROC-AUC `1.0`; the run used the cached `RedbeardNZ` SD2.1-base mirror because `stabilityai/stable-diffusion-2-1-base` is not reachable, so it is labelled `legacy_or_ablation_mode`, not an official evaluation. Parity against the official code is now **proven by executing the frozen official source**, not transcribed: static fixtures (keys 0/1/1024/2047) and the whole inversion front-end are bitwise identical. The official weights remain unavailable, so published numbers are still not reproduced. | `eval_bench_wm/utils/wm/hsqr_provider.py`; `eval_bench_wm/utils/wm/sfw_bundle.py`; `eval_bench_wm/utils/wm/sfw_inversion.py`; `eval_bench_wm/utils/wm/sfw_runtime.py`; `eval_bench_wm/tests/test_hsqr_official_fixtures.py`; `eval_bench_wm/tests/test_hsqr_inversion_parity.py` |
 | 2026-07-29 | GM + T2S formal evaluation chain | GaussMarker and T2SMark are now runnable end-to-end through `run_raven_formal_eval.py`. Method dispatch is driven by the existing per-method provenance tables rather than literal `if method == "GS"` branches. GM detects from the cohort's persisted bundle (config read from the bundle manifest, never restated); T2S detects per sample from each row's portable state through a thin adapter over the same two standalone functions `run_verification.py` uses. Each method reports its own metric, threshold family and attack-success definition: GM `gm_raw_bit_accuracy` at a clean-calibrated empirical threshold (its official ensemble threshold does not exist for this bundle — no GNR, no classifier), T2S `t2s_score_true_key` under the stored `paired_key_comparison` rule, which is explicitly not TPR@1%FPR. No GPU smoke was run before the formal launch, by explicit user direction. | `raven_repro/scripts/extract_verification_scores.py`; `raven_repro/scripts/evaluate_verification.py`; `raven_repro/raven/eval_protocol.py`; `experiments/update_experiment_table.py` |
 | 2026-07-29 | GM + T2S `shared_tr_clean_v2` formal cohorts (Issue #9) | Formal 1001-row GM and T2S cohorts generated from fixed `main` `01ce7d7`, GPU 0 (RTX 3090, sm_86). All 1001 canonical clean images byte-identical before and after. The T2S runner's own final audit rejected the cohort on a `t2s_session_key_sha256` repeat, which is a birthday collision of a 16-bit key, not shared state; the audit gate was corrected and the cohort kept. T2S's in-runner summary/pairing/cross-method JSONs are absent (crash after the last row) and are supplied by the standalone cross-method audit instead. | `data/gm/diffusiondb_shared_tr/GM`; `data/t2s/diffusiondb_shared_tr/T2S`; `audit/shared_clean_tr_gs_gm_t2s.json`; `raven_repro/raven/pairing_provenance.py` |
 | 2026-07-28 | GM + T2S `shared_tr_clean_v2` (Issue #9, phase 1) | GaussMarker and T2SMark now consume the canonical Tree-Ring source row — same prompt, base latent, clean image and generation config — and generate only their own watermarked image. New authoritative provider entrypoints `GmProvider.get_wm_latents_from_base_latent` and the T2S `|z|`-multiset consumption gate prove the supplied latent was embedded into rather than replaced. Cross-method audit extended to TR/GS/GM/T2S. Two-row GPU smoke passed; the canonical clean images are byte-identical before and after. No formal 1000/1001 cohort generated. | `experiments/generate_gm_from_tr_shared_clean.py`; `experiments/generate_t2s_from_tr_shared_clean.py`; `experiments/shared_clean_tr.py`; `raven_repro/scripts/audit_shared_clean_cohorts.py`; `raven_repro/tests/test_shared_tr_clean_gm_t2s.py`; `docs/SHARED_TR_CLEAN_V2.md` |
@@ -26,6 +26,171 @@ This file records implementation bugs, validated non-bugs, ablations, and the ev
 
 
 
+
+## 2026-07-29 — HSQR: parity fixtures regenerated from the frozen official source (Issue #5 follow-up)
+
+### Problem
+
+The first Issue #5 commit closed the functional gaps but left the parity claim
+resting on a *transcription*. Two things were unverified:
+
+1. The static fixtures in `eval_bench_wm/tests/hsqr_official_reference.py`
+   (key book, payload, QR pattern, injection, centre FFT, complex L1, score sign)
+   were re-derived from the frozen written specification plus the `qrcode`
+   package. Nobody had run the official code, so a subtle misreading of the
+   official geometry would have reproduced itself identically in the "reference"
+   and in the provider, and every test would still have passed.
+2. `utils/wm/sfw_inversion.py` carried
+   `SFW_INVERSION_PARITY_STATUS = documented_protocol_transcription_not_fixture_verified`.
+   The official `ddim_invert` drives the **whole diffusers pipeline** with a
+   swapped-in `DDIMInverseScheduler`, while RAVEN runs its own loop over the
+   repository's *vendored* `DDIMInverseScheduler`. Whether those two agree was an
+   open question, not a verified fact.
+
+The previous session recorded the official repository and the official model as
+inaccessible. Re-probing showed that only half of that is still true.
+
+### Root cause
+
+The blockers were environmental, and were re-tested rather than assumed:
+
+| Artifact | Previous session | Now |
+| --- | --- | --- |
+| `thomas11809/SFWMark` @ `78666128…` | reported unreachable | **reachable**; cloned and pinned |
+| `stabilityai/stable-diffusion-2-1-base` | HTTP 404 | still HTTP 404 |
+
+The model 404 was re-checked with a valid Hub token (`whoami-v2` succeeds):
+`stable-diffusion-2-1-base`, `stable-diffusion-2-1` and `stable-diffusion-2-base`
+all return 404 while `runwayml/stable-diffusion-v1-5` returns 307. The whole
+`stabilityai` SD-2 family is **delisted from the Hub**; this is not an auth
+problem, not a network problem, and not fixable from inside this environment.
+
+### Fix
+
+**1. Execute the official source instead of transcribing it.**
+New `eval_bench_wm/tests/official_sfwmark_source.py` runs the real bytes of the
+official `src/utils.py`. Importing it normally is impossible here — it imports
+the union of every dependency the official project needs (`bm3d`, `compressai`,
+`lpips`, `pyzbar`, `prettytable`, `pytorch_fid`), and builds compressai VAE
+attack models on `cuda` at module scope. The loader therefore:
+
+* **hash-pins** `src/utils.py` to `d3deb279006a143e2e082a1bf1195c5cc4846722bf01a702c58efbb834f6dea8`
+  and verifies the checkout's `HEAD` is the frozen commit — fixtures cannot be
+  regenerated from a different revision;
+* stubs **only** dependencies that are genuinely missing, and
+* **audits every stub touch** into `STUB_USAGE`. Tests assert this list is empty
+  across the HSQR calls, which is the machine-checked form of "no stub can
+  influence a fixture value". It is empty.
+
+`torch`/`torchvision` are imported eagerly before the `exec`: importing torch for
+the first time *inside* `exec` re-runs its C++ `TORCH_LIBRARY` registration and
+aborts the process.
+
+**2. Regenerate the fixtures from the official code.**
+`eval_bench_wm/tools/generate_hsqr_official_fixtures.py` runs official and
+provider side by side and **refuses to write a fixture file unless every key
+matches**, so a fixture can never record a disagreement. Keys 0, 1, 1024 and 2047
+are compared at **zero tolerance**:
+
+| Comparison | Tolerance | Result |
+| --- | --- | --- |
+| key seed, payload | exact | match |
+| QR pattern (1 764 booleans/key) | bitwise | 0 differing elements |
+| injected latent `(4,4,64,64)` | `max_abs_diff == 0` | bitwise identical |
+| per-item L1 distance | exact float equality | equal |
+| canonical score | `score == -distance` | equal |
+
+The four previously spec-derived digests (`4fb8b70e…`, `a57eb682…`, `40484253…`,
+`a37f0bed…`) were **confirmed correct** — the transcription was right, and is now
+proven rather than asserted. `hsqr_official_reference.py` is kept deliberately as
+an independent second derivation.
+
+The official key mapping is confirmed from `generate.py`:
+`w_seed_list = [*range(7433, 7433+2048)]` with `make_hsqr_pattern(idx=w_seed_list[i])`,
+i.e. key `i` → seed `7433+i` → payload `HSQR{seed % 10000}`.
+
+**3. Frozen official inversion parity evidence.**
+`eval_bench_wm/tools/hsqr_inversion_parity.py` runs the official `transform_img`,
+`pil2latent` and `ddim_invert` against `utils/wm/sfw_inversion` on the **same
+loaded pipeline**, capturing intermediates with a UNet forward pre-hook so
+neither path is modified and both are observed identically. Every artifact Issue
+#5 names was compared, on a real watermarked image (key 0, VAE-decoded):
+
+| Artifact | max_abs_diff | Bitwise identical |
+| --- | --- | --- |
+| preprocessed input tensor | `0.000e+00` | yes |
+| VAE latent | `0.000e+00` | yes |
+| inverse scheduler timesteps (50) | — | identical sequence (`1 … 981`) |
+| intermediate latents, steps 0/1/24/48/49 | `0.000e+00` | yes |
+| final recovered latent | `0.000e+00` | yes |
+| HSQR L1 distance | `0.000e+00` | `39.810848` both |
+| canonical score | `0.000e+00` | `-39.810848` both |
+
+This also settles the open question above: the repository's vendored
+`DDIMInverseScheduler` and the pipeline-driven official path produce **identical**
+results. `SFW_INVERSION_PARITY_STATUS` is upgraded to
+`official_code_parity_verified_bitwise`.
+
+**4. Keep the weights claim separate and honest.**
+Bitwise code parity is *not* reproduction of the published numbers. A second
+field `inversion_weights_parity = official_weights_unavailable_not_verified` is
+now recorded next to the status on every record and in the CSV. The parity tool
+**refuses** any non-official model unless `--allow-non-official-model` is passed
+(verified: it errors out on the mirror by default), and the evidence file always
+records `official_model_used`. The run used the `RedbeardNZ` SD-2.1-base mirror
+with that flag, and is labelled non-official. The mirror cannot be proven
+weight-identical to the original, because the original is gone.
+
+`test_parity_label_matches_the_measured_evidence` asserts the label and the
+measurement agree **in both directions**, so the status string cannot be upgraded
+without evidence, nor left stale after a regression.
+
+### Affected files
+
+* new `eval_bench_wm/tests/official_sfwmark_source.py`
+* new `eval_bench_wm/tools/generate_hsqr_official_fixtures.py`
+* new `eval_bench_wm/tools/hsqr_inversion_parity.py`
+* new `eval_bench_wm/tests/fixtures/hsqr_official_fixtures.json`
+* new `eval_bench_wm/tests/fixtures/hsqr_inversion_parity_evidence.json`
+* new `eval_bench_wm/tests/test_hsqr_official_fixtures.py`
+* new `eval_bench_wm/tests/test_hsqr_inversion_parity.py`
+* `eval_bench_wm/utils/wm/sfw_inversion.py` (parity constants, docstring)
+* `eval_bench_wm/utils/wm/sfw_runtime.py`, `eval_bench_wm/utils/wm/hsqr_provider.py`
+  (`inversion_weights_parity` recorded)
+* `eval_bench_wm/run_verify_watermark.py` (CSV column)
+* `eval_bench_wm/tests/hsqr_official_reference.py`, `eval_bench_wm/README.md` (scope)
+
+No provider, bundle format, verification runner or inversion path was duplicated
+or rewritten; `HSQRProvider` remains the single authoritative implementation and
+legacy `legacy_raven` behaviour is untouched.
+
+### Validation
+
+Focused tests only, covering exactly the new fixtures and parity evidence plus
+the HSQR files whose recorded fields changed:
+
+* `tests/test_hsqr_official_fixtures.py` + `tests/test_hsqr_inversion_parity.py`
+  — **23 passed, 4 skipped, 31 subtests** (the 4 skips are the live-official-source
+  class; with `SFWMARK_OFFICIAL_SRC` set: **15 passed, 24 subtests**, 0 skipped)
+* `tests/test_hsqr_official_parity.py` + `test_hsqr_bundle.py` +
+  `test_hsqr_verification.py` — **97 passed, 15 subtests** (unchanged)
+* GPU preflight passed before any GPU work (`RTX 6000 Ada`, torch `2.5.1+cu124`).
+
+Not run, deliberately: formal cohorts, attack chains, quality metrics, the
+`raven_repro` suite and every unrelated test — no code on those paths changed.
+
+### Remaining blockers
+
+* **Official weights unavailable.** `stabilityai/stable-diffusion-2-1-base` is
+  delisted (HTTP 404 with a valid token). Exact reproduction of the published
+  SFWMark numbers cannot be performed here and is **not claimed**. Everything
+  derived from a mirror run stays labelled non-official.
+* The official checkout is not vendored (separate licence), so the live
+  re-derivation tests skip in a clone without `SFWMARK_OFFICIAL_SRC`. The
+  committed fixtures keep the element-wise assertions running regardless.
+* HSTR (Issue #4) still needs to adopt the shared `sfw_*` modules.
+
+---
 
 ## 2026-07-29 — HSQR (SFWMark) official alignment and standalone verification (Issue #5)
 
@@ -242,6 +407,10 @@ identical configuration resumed without regenerating or overwriting anything.
   transcription that has not been compared element-wise against an official
   fixture (`SFW_INVERSION_PARITY_STATUS =
   documented_protocol_transcription_not_fixture_verified`).
+  **Superseded** by the follow-up entry at the top of this file: the inversion
+  front-end is now bitwise-verified against the frozen official code
+  (`official_code_parity_verified_bitwise`). The mirror-model caveat still
+  stands, so this smoke remains ineligible for formal output.
 
 ### Watermark-specific record
 - Source-data validity: no HSQR source cohort was generated or modified; the

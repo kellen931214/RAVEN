@@ -867,6 +867,7 @@ class HSQRProvider(WmProvider):
             "inversion_steps": int(self.inversion_steps),
             "inversion_impl_version": sfw_inversion.SFW_INVERSION_IMPL_VERSION,
             "inversion_parity_status": sfw_inversion.SFW_INVERSION_PARITY_STATUS,
+            "inversion_weights_parity": sfw_inversion.SFW_INVERSION_WEIGHTS_PARITY,
             "vae_sample": bool(self.vae_sample),
             "vae_scaling_factor": float(self.vae_scaling_factor)
                                    if self.vae_scaling_factor is not None else None,

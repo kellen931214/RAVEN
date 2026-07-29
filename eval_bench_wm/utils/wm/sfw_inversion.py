@@ -17,16 +17,30 @@ Official reference:
     https://github.com/thomas11809/SFWMark
     commit 78666128b44614a0cc471993649e3132d5dddfcb (``src/detect.py``)
 
+This is deliberately not the generic ``PipeProvider.invert_images`` path, which
+resizes differently (``PIL_to_torch`` keeps the source resolution), calls the
+full diffusers pipeline with ``guidance_scale=1.0`` and re-enters the
+pipeline's own preprocessing.
+
 Parity status
 -------------
-This is a *transcription of the documented official protocol*, built on the
-RAVEN pipeline components (``utils/pipe``). It is deliberately not the generic
-``PipeProvider.invert_images`` path, which resizes differently
-(``PIL_to_torch`` keeps the source resolution), calls the full diffusers
-pipeline with ``guidance_scale=1.0`` and re-enters the pipeline's own
-preprocessing. :data:`SFW_INVERSION_PARITY_STATUS` records that no element-wise
-fixture from the official repository has been compared yet; any result derived
-from this path must carry that label rather than claim exact official parity.
+Verified **bitwise** against the frozen official implementation. The official
+``transform_img`` / ``pil2latent`` / ``ddim_invert`` were executed from the
+hash-pinned official ``src/utils.py`` and compared against this module on the
+same loaded pipeline; the preprocessed input tensor, VAE latent, all 50 inverse
+scheduler timesteps, every sampled intermediate latent, the final recovered
+latent, the HSQR L1 distance and the canonical score all agreed exactly
+(``max_abs_diff == 0``). Evidence:
+``eval_bench_wm/tests/fixtures/hsqr_inversion_parity_evidence.json``; regenerate
+with ``eval_bench_wm/tools/hsqr_inversion_parity.py``.
+
+What that does **not** establish is numerical reproduction of the published
+SFWMark numbers: that needs the official ``stabilityai/stable-diffusion-2-1-base``
+weights, and the whole ``stabilityai`` SD-2 family is currently delisted from the
+Hugging Face Hub (HTTP 404 with a valid token). The parity run therefore used
+mirror weights, which is recorded in the evidence file via ``official_model_used``
+and in :data:`SFW_INVERSION_WEIGHTS_PARITY`. The two claims are kept separate on
+purpose: the *code* is proven equivalent, the *weights* are not proven identical.
 """
 
 from __future__ import annotations
@@ -36,9 +50,20 @@ import typing
 import torch
 
 
-#: Recorded in every inversion/detection record. Do not upgrade this string to
-#: an "exact parity" claim without an element-wise official fixture comparison.
-SFW_INVERSION_PARITY_STATUS = "documented_protocol_transcription_not_fixture_verified"
+#: Recorded in every inversion/detection record. Upgraded from
+#: ``documented_protocol_transcription_not_fixture_verified`` once the
+#: element-wise comparison against the frozen official code came back bitwise
+#: identical on every compared artifact.
+SFW_INVERSION_PARITY_STATUS = "official_code_parity_verified_bitwise"
+
+#: The separate, still-unproven half of the claim: the official weights are
+#: delisted from the Hub, so the parity run used mirror weights.
+SFW_INVERSION_WEIGHTS_PARITY = "official_weights_unavailable_not_verified"
+
+#: Evidence backing :data:`SFW_INVERSION_PARITY_STATUS`, relative to the repo root.
+SFW_INVERSION_PARITY_EVIDENCE = (
+    "eval_bench_wm/tests/fixtures/hsqr_inversion_parity_evidence.json"
+)
 
 SFW_INVERSION_IMPL_VERSION = "sfw_inversion_v1"
 
@@ -167,4 +192,5 @@ def invert_pil_image(
         "inversion_steps": int(num_inference_steps),
         "inversion_impl_version": SFW_INVERSION_IMPL_VERSION,
         "inversion_parity_status": SFW_INVERSION_PARITY_STATUS,
+        "inversion_weights_parity": SFW_INVERSION_WEIGHTS_PARITY,
     }

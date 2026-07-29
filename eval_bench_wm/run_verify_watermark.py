@@ -462,6 +462,7 @@ HSQR_CSV_COLUMNS = [
     "selected_pattern_sha256",
     "inversion_steps",
     "inversion_parity_status",
+    "inversion_weights_parity",
     "recovered_latent_sha256",
 ]
 
