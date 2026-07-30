@@ -1012,7 +1012,14 @@ def verify_stage(args: argparse.Namespace, config: dict[str, Any]) -> int:
                 config["attack_config"]["model_revision"],
                 "--device",
                 args.device,
+                "--min-cpu-mem-gb",
+                str(args.verify_min_cpu_mem_gb),
+                "--warn-cpu-mem-gb",
+                str(args.verify_warn_cpu_mem_gb),
+                "--max-process-ram-gb",
+                str(args.verify_max_process_ram_gb),
             ]
+            + (["--resume"] if args.resume else [])
         )
         run_subprocess(
             [
@@ -1418,6 +1425,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--dtype", default="float16", choices=["float16"])
     parser.add_argument("--gpu", default=None)
+    parser.add_argument("--verify-min-cpu-mem-gb", type=float, default=64.0)
+    parser.add_argument("--verify-warn-cpu-mem-gb", type=float, default=80.0)
+    parser.add_argument("--verify-max-process-ram-gb", type=float, default=16.0)
     parser.add_argument("--stage", required=True, choices=STAGES)
     return parser
 

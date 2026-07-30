@@ -2,6 +2,84 @@
 
 This file records implementation bugs, validated non-bugs, ablations, and the evidence used to verify each change. Large logs and generated outputs are not copied here; paths point to the source artifacts.
 
+## 2026-07-29 — Issue #17 RID/HSTR/HSQR detached formal waiter
+
+### Problem
+RID/HSTR/HSQR shared-clean generation and formal evaluation were registered, but
+there was no detached, resume-safe waiter that would first run the required
+two-row end-to-end smoke for all three methods and only then launch independent
+1001-row formal jobs as supported idle GPUs became available.
+
+### Root cause
+The existing formal runner had stage-level resume gates, but verification did
+not pass the extractor's `--resume` option or the Issue #17 CPU memory policy
+through to `extract_verification_scores.py`. Existing waiters either targeted TR
+variants or older all-dataset scheduling and did not generate RID/HSTR/HSQR
+shared-clean cohorts from explicit `/workspace/RAVEN` TR sources.
+
+### Affected files
+- `experiments/run_raven_formal_eval.py`: verification extractor resume and
+  CPU memory guard arguments.
+- `experiments/wait_and_run_raven_issue17_fourier.py`: detached waiter for
+  RID/HSTR/HSQR smoke, cross-method audit, formal runs and table update.
+- `raven_repro/scripts/build_formal_source_manifest.py`: formal source manifest
+  pins the new waiter.
+- `audit/formal_source_manifest.json`: rebuilt for the final committed source
+  state before launch.
+
+### Affected outputs
+No formal RID/HSTR/HSQR output existed from this change at implementation time.
+The waiter writes runtime state under ignored `logs/issue17_fourier_waiter/`,
+smoke roots under `/tmp/raven-{rid,hstr,hsqr}-issue17-smoke/`, formal method
+cohorts under `data/{rid,hstr,hsqr}/diffusiondb_shared_tr/<METHOD>/`, formal
+evaluation roots under `outputs/<method>/diffusiondb_shared_tr/formal/<run-key>/`,
+and tables through `experiments/update_experiment_table.py`.
+
+### Fix
+Added a detached waiter that polls every 60 seconds, accepts only GPUs with no
+compute process, utilization at most 5%, used memory below 1 GiB and a passing
+PyTorch CUDA allocation/kernel probe, and excludes GPU 6 / Blackwell sm_120.
+It uses atomic waiter, method and GPU locks; launches method workers in separate
+process groups; stops before formal execution if any smoke or cross-method audit
+fails; and updates the experiment table only as a completion hook after a
+validated run. Stopping the waiter writes a stop file and does not signal active
+method workers; explicit method stop sends SIGTERM only to that method's stored
+process group.
+
+### Reused code
+Reused the RID/HSTR/HSQR shared-clean generators, `audit_shared_clean_cohorts.py`,
+`run_raven_formal_eval.py` stages, formal source manifest validation,
+`formal_output_root`, `formal_run_key`, structured completion files and the
+deterministic experiment-table updater.
+
+### Historical bug coverage
+Reviewed the RID/HSTR/HSQR formal registration, Issue #6 shared-clean generation,
+PR #16 smoke blocker, GM/T2S formal-chain precedent, shared-clean resume/coverage
+gates, TR flat layout, GPU compatibility waiter notes, CPU memory guard policy,
+formal provenance hardening and experiment-table entries. The waiter fails
+closed on invalid partials rather than deleting, renaming, overwriting or
+silently recomputing them.
+
+### Regression prevention
+The formal verification stage now forwards `--resume` and the 80 GiB warning /
+64 GiB hard-stop / 16 GiB RSS memory policy to the extractor. The waiter records
+one-line events, structured status and a machine-readable summary; every stage
+is followed by a local completeness check before the next stage starts.
+
+### Validation
+Pending in this commit: shell syntax checks, focused `py_compile`, focused CPU
+tests, manifest rebuild, commit, push and detached waiter launch.
+
+### Git provenance
+- Repository: `/workspace/RAVEN-worktrees/shared-clean-attack-eval`
+- Branch: `issue-shared-clean-attack-eval`
+- Commit: pending at time of entry
+- Remote branch: `origin/issue-shared-clean-attack-eval`
+- Push status: pending at time of entry
+- Entry point: `experiments/wait_and_run_raven_issue17_fourier.py`
+- Formal output eligibility: waiter implementation only until the detached
+  smoke and formal jobs complete under a clean pushed commit.
+
 ## Current Status
 
 | Date | Area | Status | Evidence |
