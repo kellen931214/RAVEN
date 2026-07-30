@@ -945,11 +945,12 @@ def run_subprocess(command: list[str]) -> None:
 def verify_stage(args: argparse.Namespace, config: dict[str, Any]) -> int:
     wm_records = require_complete_records(args, config, "watermarked")
     records_path = args.output_root / "attack_records_watermarked.jsonl"
-    if records_path.exists():
+    if not records_path.exists():
+        with records_path.open("w", encoding="utf-8") as handle:
+            for row in wm_records:
+                handle.write(json.dumps(row, sort_keys=True, allow_nan=False) + "\n")
+    elif not args.resume:
         raise FileExistsError(records_path)
-    with records_path.open("x", encoding="utf-8") as handle:
-        for row in wm_records:
-            handle.write(json.dumps(row, sort_keys=True, allow_nan=False) + "\n")
     snapshot_index = args.output_root / "snapshots" / "snapshot_index.jsonl"
     manifest = args.output_root / "verification" / "manifest.csv"
     manifest_command = [
