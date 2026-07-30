@@ -1025,18 +1025,22 @@ def verify_stage(args: argparse.Namespace, config: dict[str, Any]) -> int:
             ]
             + (["--resume"] if args.resume else [])
         )
-        run_subprocess(
-            [
-                sys.executable,
-                str(RAVEN_REPRO / "scripts" / "evaluate_verification.py"),
-                "--method",
-                args.method,
-                "--records",
-                str(scores),
-                "--output-json",
-                str(verification / "verification_result.json"),
-            ]
-        )
+        verification_result_path = verification / "verification_result.json"
+        if not verification_result_path.exists():
+            run_subprocess(
+                [
+                    sys.executable,
+                    str(RAVEN_REPRO / "scripts" / "evaluate_verification.py"),
+                    "--method",
+                    args.method,
+                    "--records",
+                    str(scores),
+                    "--output-json",
+                    str(verification_result_path),
+                ]
+            )
+        elif not args.resume:
+            raise FileExistsError(verification_result_path)
     return 0
 
 
