@@ -854,19 +854,12 @@ def main() -> int:
                 if method in {"RID", "HSTR", "HSQR"}:
                     prefix = method.lower()
                     fourier_bundle_manifest(row, str(identifier), method)
-                    if method == "RID":
-                        detector_target_hash = tensor_sha256(provider.gt_patch)
-                    elif method == "HSTR":
-                        detector_target_hash = getattr(provider, "selected_pattern_sha256", tensor_sha256(provider.gt_patch))
+                    if method in {"RID", "HSTR"}:
+                        bundle_manifest = getattr(getattr(provider, "bundle", None), "manifest", {})
+                        detector_target_hash = getattr(provider, "selected_pattern_sha256", bundle_manifest.get("selected_pattern_sha256", tensor_sha256(provider.gt_patch)))
+                        detector_mask_hash = getattr(provider, "watermark_mask_sha256", bundle_manifest.get("mask_sha256", tensor_sha256(provider.watermarking_mask)))
                     else:
                         detector_target_hash = str(provider.bundle.manifest.get("selected_pattern_sha256", ""))
-
-                    if method == "RID":
-                        detector_mask_hash = tensor_sha256(provider.watermarking_mask)
-                    elif method == "HSTR":
-                        detector_mask_hash = getattr(provider, "watermark_mask_sha256", tensor_sha256(provider.watermark_region_mask_hstr))
-                    else:
-                        # HSQR uses its recorded mask identity from the bundle/cohort metadata
                         detector_mask_hash = getattr(provider, "watermark_mask_sha256", str(row.get("hsqr_mask_sha256", "")))
                     source_target_hash = str(row.get("watermark_target_sha256", ""))
                     source_mask_hash = str(row.get("watermark_mask_sha256", ""))
