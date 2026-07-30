@@ -972,7 +972,10 @@ def verify_stage(args: argparse.Namespace, config: dict[str, Any]) -> int:
             ["--attack-config", str(config["attack_config_source_path"])]
         )
     manifest_command.extend(["--output", str(manifest)])
-    run_subprocess(manifest_command)
+    if not manifest.exists():
+        run_subprocess(manifest_command)
+    elif not args.resume:
+        raise FileExistsError(manifest)
     verification = args.output_root / "verification"
     if args.method == "TR":
         tr_command = [
