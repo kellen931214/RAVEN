@@ -866,9 +866,8 @@ def main() -> int:
                     elif method == "HSTR":
                         detector_mask_hash = tensor_sha256(provider.watermark_region_mask_hstr)
                     else:
-                        # HSQR has no detector mask tensor separate from the center-slice
-                        # protocol; compute the same canonical protocol identity as generation.
-                        detector_mask_hash = hsqr_center_slice_mask_sha256(provider)
+                        # HSQR uses its recorded mask identity from the bundle/cohort metadata
+                        detector_mask_hash = getattr(provider, "watermark_mask_sha256", str(row.get("hsqr_mask_sha256", "")))
                     source_target_hash = str(row.get("watermark_target_sha256", ""))
                     source_mask_hash = str(row.get("watermark_mask_sha256", ""))
                     if not source_target_hash or source_target_hash != detector_target_hash:
