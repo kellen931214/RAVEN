@@ -864,7 +864,7 @@ def main() -> int:
                     if method == "RID":
                         detector_mask_hash = tensor_sha256(provider.watermarking_mask)
                     elif method == "HSTR":
-                        detector_mask_hash = tensor_sha256(provider.watermark_region_mask_hstr)
+                        detector_mask_hash = getattr(provider, "watermark_mask_sha256", tensor_sha256(provider.watermark_region_mask_hstr))
                     else:
                         # HSQR uses its recorded mask identity from the bundle/cohort metadata
                         detector_mask_hash = getattr(provider, "watermark_mask_sha256", str(row.get("hsqr_mask_sha256", "")))
