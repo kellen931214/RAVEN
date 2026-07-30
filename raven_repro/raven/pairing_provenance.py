@@ -669,6 +669,9 @@ def audit_pairing_rows(
                     raise ValueError(
                         f"{label} image SHA drift run_id={run_id}: expected {expected}, got {actual}"
                     )
+            verifier = METHOD_ARTIFACT_VERIFIERS.get(method)
+            if verifier is not None:
+                verifier(row, run_id)
 
         clean_sha = str(row["clean_sha256"])
         wm_sha = str(row["watermarked_sha256"])

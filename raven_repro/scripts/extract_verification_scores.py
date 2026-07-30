@@ -38,6 +38,16 @@ PROVENANCE_FIELDS = [
     "t2s_num_inversion_steps", "t2s_watermark_id", "t2s_state_path",
     "t2s_state_sha256", "t2s_provider_config_sha256", "t2s_decision_rule",
     "t2s_score_direction",
+    # Shared-clean Fourier methods: persisted bundle identity and score family.
+    "rid_protocol_mode", "rid_bundle_dir", "rid_bundle_config_sha256",
+    "rid_selected_pattern_sha256", "rid_mask_sha256", "rid_key_index",
+    "rid_score_definition", "rid_score_direction",
+    "hstr_protocol_mode", "hstr_bundle_dir", "hstr_bundle_config_sha256",
+    "hstr_selected_pattern_sha256", "hstr_mask_sha256", "hstr_key_index",
+    "hstr_score_definition", "hstr_score_direction",
+    "hsqr_protocol_mode", "hsqr_bundle_dir", "hsqr_bundle_config_sha256",
+    "hsqr_selected_pattern_sha256", "hsqr_mask_sha256", "hsqr_key_index",
+    "hsqr_score_definition", "hsqr_score_direction",
 ]
 PATH_FIELDS = [item for stage in STAGES for item in (f"{stage}_path", f"{stage}_sha256")]
 SCORE_FIELDS = [
@@ -65,9 +75,15 @@ T2S_FIELDS = [
     for suffix in ("t2s_score_true_key", "t2s_score_control_key", "t2s_score_margin",
                    "t2s_detection_success", "t2s_key_accuracy", "t2s_message_accuracy")
 ]
+FOURIER_METHOD_FIELDS = [
+    f"{stage}_{method.lower()}_{suffix}"
+    for stage in STAGES
+    for method in ("RID", "HSTR", "HSQR")
+    for suffix in ("raw_l1", "canonical_score")
+]
 FIELDNAMES = (
     PROVENANCE_FIELDS + PATH_FIELDS + SCORE_FIELDS + GS_FIELDS + GM_FIELDS
-    + T2S_FIELDS + ["error"]
+    + T2S_FIELDS + FOURIER_METHOD_FIELDS + ["error"]
 )
 
 
@@ -265,6 +281,113 @@ class T2SStateDetector:
             self.state, reversed_latents
         )
 
+
+
+def hsqr_center_slice_mask_sha256(provider) -> str:
+    from raven.eval_protocol import canonical_json_hash
+
+    return canonical_json_hash({
+        "method": "HSQR",
+        "mask_identity": "center_slice_protocol",
+        "center_slice": [int(provider.start), int(provider.end)],
+        "watermark_channels": [int(ch) for ch in provider.watermark_channels],
+        "latent_shape": [int(dim) for dim in provider.latent_shape],
+        "version": 1,
+    })
+
+
+def _manifest_value(manifest: dict, field: str, identifier: str, method: str):
+    if field not in manifest or manifest[field] in (None, ""):
+        raise RuntimeError(f"run_id={identifier}: {method} bundle manifest missing {field}")
+    return manifest[field]
+
+
+def fourier_bundle_manifest(row: dict[str, str], identifier: str, method: str) -> tuple[Path, dict]:
+    """Load and bind the shared-clean RID/HSTR/HSQR bundle named by one row."""
+    prefix = method.lower()
+    bundle_dir = Path(str(row.get(f"{prefix}_bundle_dir", ""))).resolve()
+    manifest_path = bundle_dir / "manifest.json"
+    if not manifest_path.is_file():
+        raise RuntimeError(f"run_id={identifier}: {method} bundle manifest not found: {manifest_path}")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    checks = [
+        (f"{prefix}_bundle_config_sha256", "bundle_config_sha256"),
+        (f"{prefix}_selected_pattern_sha256", "selected_pattern_sha256"),
+    ]
+    if "mask_sha256" in manifest:
+        checks.append((f"{prefix}_mask_sha256", "mask_sha256"))
+    for row_field, manifest_field in checks:
+        expected = str(row.get(row_field, ""))
+        actual = str(manifest.get(manifest_field, ""))
+        if not expected or expected != actual:
+            raise RuntimeError(
+                f"run_id={identifier}: {method} bundle/source {row_field} mismatch: "
+                f"source={expected!r} bundle={actual!r}"
+            )
+    return bundle_dir, manifest
+
+
+def rid_provider_kwargs_from_bundle(row: dict[str, str], identifier: str) -> dict:
+    bundle_dir, manifest = fourier_bundle_manifest(row, identifier, "RID")
+    return {
+        "rid_profile": _manifest_value(manifest, "profile_name", identifier, "RID"),
+        "rid_bundle_dir": str(bundle_dir),
+        "rid_create_bundle": False,
+        "rid_key_index": int(_manifest_value(manifest, "selected_key_index", identifier, "RID")),
+        "rid_key_seed": int(_manifest_value(manifest, "rng_seed", identifier, "RID")),
+        "rid_key_rng_device": str(_manifest_value(manifest, "rng_device", identifier, "RID")),
+        "rid_key_rng_dtype": str(_manifest_value(manifest, "rng_dtype", identifier, "RID")),
+        "channel_min": int(_manifest_value(manifest, "channel_min", identifier, "RID")),
+        "ring_value_range": int(_manifest_value(manifest, "ring_value_range", identifier, "RID")),
+        "quantization_levels": int(_manifest_value(manifest, "quantization_levels", identifier, "RID")),
+        "ring_width": int(_manifest_value(manifest, "ring_width", identifier, "RID")),
+        "assigned_keys": int(_manifest_value(manifest, "assigned_keys", identifier, "RID")),
+        "fix_gt": int(_manifest_value(manifest, "fix_gt", identifier, "RID")),
+        "time_shift": int(_manifest_value(manifest, "spatial_shift", identifier, "RID")),
+        "time_shift_factor": float(_manifest_value(manifest, "spatial_shift_factor", identifier, "RID")),
+        "rid_shift_semantics": str(_manifest_value(manifest, "spatial_shift_factor_semantics", identifier, "RID")),
+        "rid_torch_dtype": str(_manifest_value(manifest, "torch_dtype", identifier, "RID")),
+        "rid_inversion_prompt": "",
+        "rid_inversion_guidance": float(_manifest_value(manifest, "inversion_guidance_scale", identifier, "RID")),
+        "rid_inversion_steps": int(_manifest_value(manifest, "inversion_steps", identifier, "RID")),
+        "rid_vae_sample": bool(_manifest_value(manifest, "vae_sample", identifier, "RID")),
+        "rid_vae_scaling_factor": float(_manifest_value(manifest, "vae_scaling_factor", identifier, "RID")),
+        "rid_profile_is_official": manifest.get("profile_is_official"),
+        "rid_profile_overrides": manifest.get("profile_overrides") or {},
+        "modelid_target": str(_manifest_value(manifest, "model_id", identifier, "RID")),
+        "model_revision": str(_manifest_value(manifest, "model_revision", identifier, "RID")),
+        "scheduler_target": str(_manifest_value(manifest, "scheduler", identifier, "RID")),
+        "resolution": int(_manifest_value(manifest, "resolution", identifier, "RID")),
+    }
+
+
+def hstr_provider_kwargs_from_bundle(row: dict[str, str], identifier: str) -> dict:
+    bundle_dir, manifest = fourier_bundle_manifest(row, identifier, "HSTR")
+    return {
+        "hstr_profile": str(_manifest_value(manifest, "profile_name", identifier, "HSTR")),
+        "hstr_bundle_dir": str(bundle_dir),
+        "hstr_create_bundle": False,
+        "hstr_key_index": int(_manifest_value(manifest, "selected_key_index", identifier, "HSTR")),
+        "hstr_rng_device": str(_manifest_value(manifest, "rng_device", identifier, "HSTR")),
+        "latent_channel": int(_manifest_value(manifest, "latent_shape", identifier, "HSTR")[1]),
+        "hw_latent": int(_manifest_value(manifest, "latent_shape", identifier, "HSTR")[2]),
+        "start": int(_manifest_value(manifest, "center_slice", identifier, "HSTR")[0]),
+        "end": int(_manifest_value(manifest, "center_slice", identifier, "HSTR")[1]),
+        "wm_capacity": int(_manifest_value(manifest, "wm_capacity", identifier, "HSTR")),
+        "modelid_target": str(_manifest_value(manifest, "model_id", identifier, "HSTR")),
+        "model_revision": str(_manifest_value(manifest, "model_revision", identifier, "HSTR")),
+        "scheduler_target": str(_manifest_value(manifest, "scheduler_type", identifier, "HSTR")),
+        "resolution": int(_manifest_value(manifest, "resolution", identifier, "HSTR")),
+    }
+
+
+def hsqr_provider_from_bundle(row: dict[str, str], identifier: str, latent_shape, device):
+    from utils.wm import sfw_bundle
+    from utils.wm.hsqr_provider import HSQRProvider
+
+    bundle_dir, _manifest = fourier_bundle_manifest(row, identifier, "HSQR")
+    bundle = sfw_bundle.SfwBundle.load(bundle_dir)
+    return HSQRProvider.from_bundle(bundle, latent_shape=latent_shape, device=device)
 
 def t2s_state_for_row(row: dict[str, str], identifier: str):
     """Load and bind this row's portable T2S state (fail closed on any drift)."""
@@ -528,6 +651,37 @@ def main() -> int:
             )
         target = getattr(provider, "gt_patch", None)
         target_hash = tensor_sha256(target.real.contiguous()) if target is not None else ""
+    elif method == "RID":
+        first_row = manifest_rows[0]
+        first_id = first(first_row, "run_id", "sample_id", "id", "index") or "0"
+        provider = provider_class(method)(
+            latent_shape=latent_shape,
+            dtype=pipe.get_dtype(),
+            device=device,
+            **rid_provider_kwargs_from_bundle(first_row, str(first_id)),
+        )
+        if getattr(provider, "bundle", None) is None or provider.state_source != "bundle":
+            raise RuntimeError("RID verification requires an existing persisted bundle")
+        target_hash = tensor_sha256(provider.gt_patch)
+    elif method == "HSTR":
+        first_row = manifest_rows[0]
+        first_id = first(first_row, "run_id", "sample_id", "id", "index") or "0"
+        provider = provider_class(method)(
+            latent_shape=latent_shape,
+            dtype=pipe.get_dtype(),
+            device=device,
+            **hstr_provider_kwargs_from_bundle(first_row, str(first_id)),
+        )
+        if getattr(provider, "bundle", None) is None or provider.state_source != "bundle":
+            raise RuntimeError("HSTR verification requires an existing persisted bundle")
+        target_hash = tensor_sha256(provider.gt_patch)
+    elif method == "HSQR":
+        first_row = manifest_rows[0]
+        first_id = first(first_row, "run_id", "sample_id", "id", "index") or "0"
+        provider = hsqr_provider_from_bundle(first_row, str(first_id), latent_shape, device)
+        if getattr(provider, "bundle", None) is None:
+            raise RuntimeError("HSQR verification requires an existing persisted bundle")
+        target_hash = tensor_sha256(provider.gt_patch)
     elif method not in per_sample_provider_methods:
         provider = provider_class(method)(
             latent_shape=latent_shape, dtype=pipe.get_dtype(), device=device, **uniform_kwargs
@@ -697,6 +851,53 @@ def main() -> int:
                         "source_watermark_target_sha256": row.get("watermark_target_sha256", ""),
                         "detector_watermark_target_sha256": state.state_sha256(),
                     })
+                if method in {"RID", "HSTR", "HSQR"}:
+                    prefix = method.lower()
+                    fourier_bundle_manifest(row, str(identifier), method)
+                    if method in {"RID", "HSTR"}:
+                        bundle_manifest = getattr(getattr(provider, "bundle", None), "manifest", {})
+                        if hasattr(provider, "selected_pattern_sha256") and provider.selected_pattern_sha256:
+                            detector_target_hash = str(provider.selected_pattern_sha256)
+                        elif bundle_manifest.get("selected_pattern_sha256"):
+                            detector_target_hash = str(bundle_manifest["selected_pattern_sha256"])
+                        else:
+                            detector_target_hash = tensor_sha256(provider.gt_patch)
+
+                        if hasattr(provider, "watermark_mask_sha256") and provider.watermark_mask_sha256:
+                            detector_mask_hash = str(provider.watermark_mask_sha256)
+                        elif bundle_manifest.get("mask_sha256"):
+                            detector_mask_hash = str(bundle_manifest["mask_sha256"])
+                        elif hasattr(provider, "watermarking_mask"):
+                            detector_mask_hash = tensor_sha256(provider.watermarking_mask)
+                        else:
+                            detector_mask_hash = tensor_sha256(provider.watermark_region_mask_hstr)
+                    else:
+                        detector_target_hash = str(provider.bundle.manifest.get("selected_pattern_sha256", ""))
+                        detector_mask_hash = getattr(provider, "watermark_mask_sha256", str(row.get("hsqr_mask_sha256", "")))
+                    source_target_hash = str(row.get("watermark_target_sha256", ""))
+                    source_mask_hash = str(row.get("watermark_mask_sha256", ""))
+                    if not source_target_hash or source_target_hash != detector_target_hash:
+                        raise RuntimeError(f"run_id={identifier}: {method} detector/source target SHA mismatch")
+                    if not source_mask_hash or source_mask_hash != detector_mask_hash:
+                        raise RuntimeError(f"run_id={identifier}: {method} detector/source mask SHA mismatch")
+                    record.update({
+                        f"{prefix}_protocol_mode": row.get(f"{prefix}_protocol_mode", ""),
+                        f"{prefix}_bundle_dir": row.get(f"{prefix}_bundle_dir", ""),
+                        f"{prefix}_bundle_config_sha256": row.get(f"{prefix}_bundle_config_sha256", ""),
+                        f"{prefix}_selected_pattern_sha256": row.get(f"{prefix}_selected_pattern_sha256", ""),
+                        f"{prefix}_mask_sha256": row.get(f"{prefix}_mask_sha256", ""),
+                        f"{prefix}_key_index": row.get(f"{prefix}_key_index", ""),
+                        f"{prefix}_score_definition": {
+                            "RID": "rid_neg_channel_min_complex_l1",
+                            "HSTR": "hstr_score=-min(channel_0_l1,channel_3_l1)",
+                            "HSQR": "hsqr_negative_mean_complex_l1_distance",
+                        }[method],
+                        f"{prefix}_score_direction": "higher_is_watermarked",
+                        "source_watermark_target_sha256": source_target_hash,
+                        "detector_watermark_target_sha256": detector_target_hash,
+                        "source_watermark_mask_sha256": source_mask_hash,
+                        "detector_watermark_mask_sha256": detector_mask_hash,
+                    })
                 record["provider_parameters"] = json.dumps(uniform_kwargs, sort_keys=True)
                 record["watermark_seed"] = next((kwargs[key] for key in ("w_seed", "rid_seed", "hstr_seed", "hsqr_seed") if key in kwargs), "")
                 record["fix_gt"], record["offset"] = kwargs.get("fix_gt", ""), kwargs.get("offset", "")
@@ -738,6 +939,10 @@ def main() -> int:
                         record[f"{stage}_t2s_detection_success"] = bool(
                             result["detection_success"]
                         )
+                    if method in {"RID", "HSTR", "HSQR"}:
+                        prefix = method.lower()
+                        record[f"{stage}_{prefix}_raw_l1"] = raw
+                        record[f"{stage}_{prefix}_canonical_score"] = record[f"{stage}_canonical_score"]
                 if method == "GS":
                     for stage in STAGES:
                         decoded = stage_results[stage]["message_bits_str_list"][0]

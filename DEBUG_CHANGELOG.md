@@ -2,6 +2,84 @@
 
 This file records implementation bugs, validated non-bugs, ablations, and the evidence used to verify each change. Large logs and generated outputs are not copied here; paths point to the source artifacts.
 
+## 2026-07-29 — Issue #17 RID/HSTR/HSQR detached formal waiter
+
+### Problem
+RID/HSTR/HSQR shared-clean generation and formal evaluation were registered, but
+there was no detached, resume-safe waiter that would first run the required
+two-row end-to-end smoke for all three methods and only then launch independent
+1001-row formal jobs as supported idle GPUs became available.
+
+### Root cause
+The existing formal runner had stage-level resume gates, but verification did
+not pass the extractor's `--resume` option or the Issue #17 CPU memory policy
+through to `extract_verification_scores.py`. Existing waiters either targeted TR
+variants or older all-dataset scheduling and did not generate RID/HSTR/HSQR
+shared-clean cohorts from explicit `/workspace/RAVEN` TR sources.
+
+### Affected files
+- `experiments/run_raven_formal_eval.py`: verification extractor resume and
+  CPU memory guard arguments.
+- `experiments/wait_and_run_raven_issue17_fourier.py`: detached waiter for
+  RID/HSTR/HSQR smoke, cross-method audit, formal runs and table update.
+- `raven_repro/scripts/build_formal_source_manifest.py`: formal source manifest
+  pins the new waiter.
+- `audit/formal_source_manifest.json`: rebuilt for the final committed source
+  state before launch.
+
+### Affected outputs
+No formal RID/HSTR/HSQR output existed from this change at implementation time.
+The waiter writes runtime state under ignored `logs/issue17_fourier_waiter/`,
+smoke roots under `/tmp/raven-{rid,hstr,hsqr}-issue17-smoke/`, formal method
+cohorts under `data/{rid,hstr,hsqr}/diffusiondb_shared_tr/<METHOD>/`, formal
+evaluation roots under `outputs/<method>/diffusiondb_shared_tr/formal/<run-key>/`,
+and tables through `experiments/update_experiment_table.py`.
+
+### Fix
+Added a detached waiter that polls every 60 seconds, accepts only GPUs with no
+compute process, utilization at most 5%, used memory below 1 GiB and a passing
+PyTorch CUDA allocation/kernel probe, and excludes GPU 6 / Blackwell sm_120.
+It uses atomic waiter, method and GPU locks; launches method workers in separate
+process groups; stops before formal execution if any smoke or cross-method audit
+fails; and updates the experiment table only as a completion hook after a
+validated run. Stopping the waiter writes a stop file and does not signal active
+method workers; explicit method stop sends SIGTERM only to that method's stored
+process group.
+
+### Reused code
+Reused the RID/HSTR/HSQR shared-clean generators, `audit_shared_clean_cohorts.py`,
+`run_raven_formal_eval.py` stages, formal source manifest validation,
+`formal_output_root`, `formal_run_key`, structured completion files and the
+deterministic experiment-table updater.
+
+### Historical bug coverage
+Reviewed the RID/HSTR/HSQR formal registration, Issue #6 shared-clean generation,
+PR #16 smoke blocker, GM/T2S formal-chain precedent, shared-clean resume/coverage
+gates, TR flat layout, GPU compatibility waiter notes, CPU memory guard policy,
+formal provenance hardening and experiment-table entries. The waiter fails
+closed on invalid partials rather than deleting, renaming, overwriting or
+silently recomputing them.
+
+### Regression prevention
+The formal verification stage now forwards `--resume` and the 80 GiB warning /
+64 GiB hard-stop / 16 GiB RSS memory policy to the extractor. The waiter records
+one-line events, structured status and a machine-readable summary; every stage
+is followed by a local completeness check before the next stage starts.
+
+### Validation
+Pending in this commit: shell syntax checks, focused `py_compile`, focused CPU
+tests, manifest rebuild, commit, push and detached waiter launch.
+
+### Git provenance
+- Repository: `/workspace/RAVEN-worktrees/shared-clean-attack-eval`
+- Branch: `issue-shared-clean-attack-eval`
+- Commit: pending at time of entry
+- Remote branch: `origin/issue-shared-clean-attack-eval`
+- Push status: pending at time of entry
+- Entry point: `experiments/wait_and_run_raven_issue17_fourier.py`
+- Formal output eligibility: waiter implementation only until the detached
+  smoke and formal jobs complete under a clean pushed commit.
+
 ## Current Status
 
 | Date | Area | Status | Evidence |
@@ -28,6 +106,68 @@ This file records implementation bugs, validated non-bugs, ablations, and the ev
 
 
 
+
+## 2026-07-29 — RID/HSTR/HSQR shared-clean formal attack/eval registration
+
+### Problem
+PR #16 adds RID, HSTR and HSQR `shared_tr_clean_v2` generation/provenance, but the existing formal RAVEN removal-attack and evaluation pipeline was still registered around TR, GS, GM and T2S. RID/HSTR/HSQR rows could not safely flow through canonical method roots, attack-cache provenance, bundle-bound verification, aggregate/validate, or experiment-table metric extraction.
+
+### Root cause
+The formal registries still lacked RID/HSTR/HSQR canonical data/output roots and required provider-config fields. Verification constructed RID/HSTR/HSQR detectors from loose seed defaults instead of the persisted bundles named by shared-clean rows, and the table updater had no method-specific RID/HSTR/HSQR detector extractor, so a structured detector payload would fail closed rather than report the method's own score family.
+
+### Affected files
+- `raven_repro/raven/eval_protocol.py`: method/path/provider registries, pairing artifact audit, Fourier L1 attack-success reducer.
+- `experiments/run_raven_formal_eval.py`: aggregate reducer registration and non-TR verification validation.
+- `experiments/shared_tr_clean_fourier.py`: HSQR center-slice mask identity for bundles without a saved mask tensor.
+- `raven_repro/scripts/extract_verification_scores.py`: RID/HSTR/HSQR bundle-bound detector construction and score columns.
+- `raven_repro/scripts/evaluate_verification.py`: RID/HSTR/HSQR canonical-score detector summaries.
+- `experiments/update_experiment_table.py`: RID/HSTR/HSQR detector extractor registration.
+- `raven_repro/tests/test_shared_clean_attack_eval_issue6.py`: focused CPU regression coverage.
+- `docs/SHARED_TR_CLEAN_V2.md`; `audit/formal_eval_protocol.md`.
+
+### Affected outputs
+No formal cohort, attack output, detector inversion on a real cohort, FID, CLIP, PSNR, SSIM, quality metric, model load, dataset preprocessing, dataset download, or dataset extraction was run or modified. Existing generation, attack, verification, quality and table artifacts remain historical and require their own validation before use.
+
+### Fix
+Registered RID/HSTR/HSQR canonical method roots and required shared-clean provider-config fields. Reused the existing formal snapshot, RAVEN attack, attack cache, verification manifest, quality/FID/CLIP, aggregate and validate stages. Verification now loads RID/HSTR/HSQR detectors from the persisted `RidBundle` / `SfwBundle` named by the row, re-checks bundle config, selected pattern and mask hashes, and records method-specific raw L1 plus canonical score columns. Aggregate/table reporting uses explicit canonical-score semantics: RID `rid_neg_channel_min_complex_l1`, HSTR `hstr_score`, HSQR `hsqr_score`, all `higher_is_watermarked`, with raw L1 recorded as `lower_is_watermarked` and clean-calibrated thresholds named as canonical-score thresholds.
+
+### Reused code
+Reused `run_raven_formal_eval.py` stages, `attack_cache` record layout, `validate_resume_record`, `build_verification_manifest.py`, provider bundle loaders (`RidBundle`, `SfwBundle`, `HSQRProvider.from_bundle`), `audit_pairing_rows`, `audit_shared_clean_cohorts`, `summarize_detection`, `formal_quality_summary`, `stage_fid_records`, and the table updater's extractor registry.
+
+### Historical bug coverage
+Reviewed the Issue #6, PR #16, GM/T2S shared-clean, RingID, HSTR, HSQR, formal-eval and experiment-table changelog entries. Searched the formal runner, attack cache, verification score extraction, quality/FID/CLIP, aggregate/validate, table updater and method/path/schema registries before editing. Tightened `audit_pairing_rows(..., verify_files=True)` so method artifact verifiers also bind persisted RID/HSTR/HSQR bundles.
+
+### Regression prevention
+Focused CPU tests cover method dispatch and path resolution, snapshot manifest duplicate rejection, attack-record provenance and cache resume rejection, verification manifest provenance preservation, provider-config required fields, detector extractor registration, score direction and threshold score-space semantics, experiment-table extraction, bundle/provenance mismatch rejection, HSQR center-slice mask identity, source clean mismatch rejection through the shared-clean audit, and safe resume validation. Validation rejects score rows that are missing, duplicated, out of input order or error-bearing.
+
+### Validation
+- `free -h`: 251 GiB total, 121 GiB available before edits/tests.
+- `python -m py_compile experiments/run_raven_formal_eval.py experiments/shared_tr_clean_fourier.py raven_repro/raven/eval_protocol.py raven_repro/raven/pairing_provenance.py raven_repro/scripts/extract_verification_scores.py raven_repro/scripts/evaluate_verification.py raven_repro/scripts/build_verification_manifest.py experiments/update_experiment_table.py raven_repro/tests/test_shared_clean_attack_eval_issue6.py` passed.
+- `python -m pytest -q raven_repro/tests/test_shared_clean_attack_eval_issue6.py` passed (`20 passed`).
+- No GPU command, generation smoke, full cohort, real-image removal attack, detector inversion on real cohorts, FID, CLIP, PSNR, SSIM, model load or dataset download was run.
+
+### Git provenance
+- Repository: `/workspace/RAVEN-worktrees/shared-clean-attack-eval`
+- Branch: `issue-shared-clean-attack-eval`
+- Commit: pending at time of entry
+- Remote branch: `origin/issue-shared-clean-attack-eval` / stacked PR target `issue-6-shared-clean`
+- Push status: pending at time of entry
+- Entry point: `experiments/run_raven_formal_eval.py`
+- Formal output eligibility: code/test implementation only; no formal cohort or quality/attack evaluation run.
+
+### Watermark evaluation details
+- Source-data validity: not re-evaluated on real cohorts in this change.
+- Clean/watermarked pairing status: enforced by existing shared-clean pairing hashes and audits for RID/HSTR/HSQR rows.
+- Base-latent uniqueness status: enforced by `audit_pairing_rows`; not newly measured on a real cohort.
+- Watermark target and mask status: verification binds detector target/mask to row and persisted bundle hashes.
+- Attack-pairing status: attacked-watermarked records are bound by `run_id`, source snapshot SHA, source manifest SHA, attack config hash, pairing SHA, provider config hash, target/mask hashes and method provenance; attacked-clean remains TR-only.
+- Detector score definition: RID/HSTR/HSQR raw L1 lower-is-watermarked; canonical score `-raw_l1` higher-is-watermarked.
+- Threshold calibration source: empirical clean canonical-score cohort inside `evaluate_verification.py`; no real calibration run performed here.
+- Actual empirical FPR: structured field required in detector payload/table extraction; no real value generated here.
+- Quality metric reference: unchanged formal reference, attacked watermarked versus original watermarked valid overlap for PSNR/SSIM; no quality metric run here.
+- CLIP input definition: unchanged attacked-watermarked image versus original prompt; no CLIP run here.
+- FID staging status: unchanged fresh staging from verified manifest; no FID run here.
+- Outputs requiring regeneration: any RID/HSTR/HSQR formal attack/eval outputs must be generated under clean, pushed code and validated before reporting.
 ## 2026-07-29 — Issue #6 shared Tree-Ring clean protocol for RID/HSTR/HSQR
 
 ### Problem

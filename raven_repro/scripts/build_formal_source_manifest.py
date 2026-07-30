@@ -20,6 +20,7 @@ CORE_FILES = (
     "experiments/run_raven_no_color_eval.py",
     "experiments/wait_and_run_raven_eval_all_datasets.py",
     "experiments/wait_and_run_raven_protocol_variants.py",
+    "experiments/wait_and_run_raven_issue17_fourier.py",
     "experiments/build_raven_formal_eval_table.py",
     "raven_repro/raven/attention.py",
     "raven_repro/raven/color_transfer.py",

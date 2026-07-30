@@ -41,6 +41,7 @@ from raven.eval_protocol import (  # noqa: E402
     formal_attack_config_hash,
     formal_quality_summary,
     formal_runtime_provenance,
+    fourier_l1_attack_success_summary,
     gm_attack_success_summary,
     gs_attack_success_summary,
     t2s_attack_success_summary,
@@ -850,9 +851,11 @@ def require_complete_records(args: argparse.Namespace, config: dict[str, Any], r
 def quality_stage(args: argparse.Namespace, config: dict[str, Any]) -> int:
     records = require_complete_records(args, config, "watermarked")
     root = args.output_root / "metrics" / "quality" / config["quality_config_hash"]
-    if root.exists():
+    if (root / "quality_records.jsonl").exists():
+        return 0
+    if root.exists() and not args.resume:
         raise FileExistsError(root)
-    root.mkdir(parents=True)
+    root.mkdir(parents=True, exist_ok=True)
     rows = []
     for record in records:
         with Image.open(record["watermarked_path"]) as reference, Image.open(record["attacked_path"]) as attacked:
@@ -872,7 +875,7 @@ def quality_stage(args: argparse.Namespace, config: dict[str, Any]) -> int:
                 **metric,
             }
         )
-    with (root / "quality_records.jsonl").open("x", encoding="utf-8") as handle:
+    with (root / "quality_records.jsonl").open("w", encoding="utf-8") as handle:
         for row in rows:
             handle.write(json.dumps(row, sort_keys=True, allow_nan=False) + "\n")
     return 0
@@ -888,6 +891,8 @@ def fid_stage(args: argparse.Namespace, config: dict[str, Any]) -> int:
         reference_definition="original watermarked images from immutable formal snapshots",
         attacked_definition="formal RAVEN final post-color-transfer attacked-watermarked images",
     )
+    if (fid_root / "fid_result.json").exists():
+        return 0
     from raven.quality import clean_fid
 
     result = clean_fid(
@@ -911,9 +916,11 @@ def fid_stage(args: argparse.Namespace, config: dict[str, Any]) -> int:
 def clip_stage(args: argparse.Namespace, config: dict[str, Any]) -> int:
     records = require_complete_records(args, config, "watermarked")
     root = args.output_root / "metrics" / "clip" / config["quality_config_hash"]
-    if root.exists():
+    if (root / "clip_records.jsonl").exists():
+        return 0
+    if root.exists() and not args.resume:
         raise FileExistsError(root)
-    root.mkdir(parents=True)
+    root.mkdir(parents=True, exist_ok=True)
     from raven.quality import openclip_text_image_scores
 
     result = openclip_text_image_scores(
@@ -929,7 +936,7 @@ def clip_stage(args: argparse.Namespace, config: dict[str, Any]) -> int:
         for record, score in zip(records, result["scores"])
     ]
     require_uniform_clip_provenance(rows)
-    with (root / "clip_records.jsonl").open("x", encoding="utf-8") as handle:
+    with (root / "clip_records.jsonl").open("w", encoding="utf-8") as handle:
         for row in rows:
             handle.write(json.dumps(row, sort_keys=True, allow_nan=False) + "\n")
     write_json_exclusive(root / "clip_result.json", {**result, **provenance})
@@ -944,11 +951,12 @@ def run_subprocess(command: list[str]) -> None:
 def verify_stage(args: argparse.Namespace, config: dict[str, Any]) -> int:
     wm_records = require_complete_records(args, config, "watermarked")
     records_path = args.output_root / "attack_records_watermarked.jsonl"
-    if records_path.exists():
+    if not records_path.exists():
+        with records_path.open("w", encoding="utf-8") as handle:
+            for row in wm_records:
+                handle.write(json.dumps(row, sort_keys=True, allow_nan=False) + "\n")
+    elif not args.resume:
         raise FileExistsError(records_path)
-    with records_path.open("x", encoding="utf-8") as handle:
-        for row in wm_records:
-            handle.write(json.dumps(row, sort_keys=True, allow_nan=False) + "\n")
     snapshot_index = args.output_root / "snapshots" / "snapshot_index.jsonl"
     manifest = args.output_root / "verification" / "manifest.csv"
     manifest_command = [
@@ -970,7 +978,10 @@ def verify_stage(args: argparse.Namespace, config: dict[str, Any]) -> int:
             ["--attack-config", str(config["attack_config_source_path"])]
         )
     manifest_command.extend(["--output", str(manifest)])
-    run_subprocess(manifest_command)
+    if not manifest.exists():
+        run_subprocess(manifest_command)
+    elif not args.resume:
+        raise FileExistsError(manifest)
     verification = args.output_root / "verification"
     if args.method == "TR":
         tr_command = [
@@ -1011,20 +1022,31 @@ def verify_stage(args: argparse.Namespace, config: dict[str, Any]) -> int:
                 config["attack_config"]["model_revision"],
                 "--device",
                 args.device,
+                "--min-cpu-mem-gb",
+                str(args.verify_min_cpu_mem_gb),
+                "--warn-cpu-mem-gb",
+                str(args.verify_warn_cpu_mem_gb),
+                "--max-process-ram-gb",
+                str(args.verify_max_process_ram_gb),
             ]
+            + (["--resume"] if args.resume else [])
         )
-        run_subprocess(
-            [
-                sys.executable,
-                str(RAVEN_REPRO / "scripts" / "evaluate_verification.py"),
-                "--method",
-                args.method,
-                "--records",
-                str(scores),
-                "--output-json",
-                str(verification / "verification_result.json"),
-            ]
-        )
+        verification_result_path = verification / "verification_result.json"
+        if not verification_result_path.exists():
+            run_subprocess(
+                [
+                    sys.executable,
+                    str(RAVEN_REPRO / "scripts" / "evaluate_verification.py"),
+                    "--method",
+                    args.method,
+                    "--records",
+                    str(scores),
+                    "--output-json",
+                    str(verification_result_path),
+                ]
+            )
+        elif not args.resume:
+            raise FileExistsError(verification_result_path)
     return 0
 
 
@@ -1057,6 +1079,9 @@ def aggregate_stage(args: argparse.Namespace, config: dict[str, Any]) -> int:
         "GS": gs_attack_success_summary,
         "GM": gm_attack_success_summary,
         "T2S": t2s_attack_success_summary,
+        "RID": fourier_l1_attack_success_summary,
+        "HSTR": fourier_l1_attack_success_summary,
+        "HSQR": fourier_l1_attack_success_summary,
     }
     method_summary: dict[str, Any] = {}
     reducer = method_summary_reducers.get(args.method)
@@ -1269,6 +1294,43 @@ def validate_stage(args: argparse.Namespace, config: dict[str, Any]) -> int:
             for key in finite_keys:
                 if not math.isfinite(float(protocol[key])):
                     raise RuntimeError(f"non-finite TR aggregate {protocol_name}.{key}")
+    else:
+        score_path = args.output_root / "verification" / "scores.csv"
+        with score_path.open(newline="", encoding="utf-8-sig") as handle:
+            score_rows = list(csv.DictReader(handle))
+        expected_order = [str(row["run_id"]) for row in snapshot_rows]
+        score_order = [str(row.get("run_id", "")) for row in score_rows]
+        if score_order != expected_order:
+            raise RuntimeError("verification score rows are not one-per-input in input order")
+        if any(row.get("error") for row in score_rows):
+            raise RuntimeError("verification score output contains error rows")
+        if {row.get("provider_config_hash") for row in score_rows} != providers:
+            raise RuntimeError(f"{args.method} verification provider config mismatch")
+        for score in score_rows:
+            run_id = str(score["run_id"])
+            record = next(row for row in records if str(row["run_id"]) == run_id)
+            if score.get("source_watermark_target_sha256") != record.get("watermark_target_sha256"):
+                raise RuntimeError(f"run_id={run_id}: score/source target hash mismatch")
+            if score.get("source_watermark_mask_sha256") != record.get("watermark_mask_sha256"):
+                raise RuntimeError(f"run_id={run_id}: score/source mask hash mismatch")
+            if score.get("detector_watermark_target_sha256") != record.get("watermark_target_sha256"):
+                raise RuntimeError(f"run_id={run_id}: detector/source target hash mismatch")
+            if score.get("detector_watermark_mask_sha256") != record.get("watermark_mask_sha256"):
+                raise RuntimeError(f"run_id={run_id}: detector/source mask hash mismatch")
+            for stage in ("clean", "watermarked", "attacked"):
+                value = float(score[f"{stage}_canonical_score"])
+                if not math.isfinite(value):
+                    raise RuntimeError(f"run_id={run_id}: non-finite {stage} canonical score")
+        metric = detector_payload.get("metric", {})
+        for key in (
+            "clean_calibrated_threshold",
+            "clean_calibrated_actual_empirical_fpr",
+            "before_detection_rate_at_clean_calibrated_threshold",
+            "attacked_detection_rate_at_clean_calibrated_threshold",
+            "attacked_roc_auc",
+        ):
+            if key in metric and not math.isfinite(float(metric[key])):
+                raise RuntimeError(f"non-finite {args.method} detector metric {key}")
     aggregate = args.output_root / "formal_aggregate.json"
     if not aggregate.is_file():
         raise FileNotFoundError(aggregate)
@@ -1377,6 +1439,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--dtype", default="float16", choices=["float16"])
     parser.add_argument("--gpu", default=None)
+    parser.add_argument("--verify-min-cpu-mem-gb", type=float, default=64.0)
+    parser.add_argument("--verify-warn-cpu-mem-gb", type=float, default=80.0)
+    parser.add_argument("--verify-max-process-ram-gb", type=float, default=16.0)
     parser.add_argument("--stage", required=True, choices=STAGES)
     return parser
 

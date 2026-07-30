@@ -378,7 +378,7 @@ def method_from_path(run_root: Path) -> str | None:
     parts = [part.lower() for part in Path(run_root).resolve().parts]
     if "outputs" in parts:
         index = parts.index("outputs")
-        if index + 1 < len(parts) and parts[index + 1] in {"tr", "gs", "gm", "t2s"}:
+        if index + 1 < len(parts) and parts[index + 1] in {"tr", "gs", "gm", "t2s", "rid", "hstr", "hsqr"}:
             return parts[index + 1].upper()
     return None
 
@@ -1012,11 +1012,118 @@ def extract_t2s_detector_metrics(sources: Sources) -> DetectorMetrics:
     return result
 
 
+FOURIER_DETECTOR_CONFIG = {
+    "RID": {
+        "detector_metric": "rid_neg_channel_min_complex_l1",
+        "before_score": "mean_canonical_score_before",
+        "after_score": "mean_canonical_score_attacked",
+    },
+    "HSTR": {
+        "detector_metric": "hstr_score",
+        "before_score": "mean_canonical_score_before",
+        "after_score": "mean_canonical_score_attacked",
+    },
+    "HSQR": {
+        "detector_metric": "hsqr_score",
+        "before_score": "mean_canonical_score_before",
+        "after_score": "mean_canonical_score_attacked",
+    },
+}
+
+FOURIER_REQUIRED_METRIC_KEYS = (
+    "detector_metric",
+    "raw_detector_metric",
+    "score_direction",
+    "raw_score_direction",
+    "threshold_type",
+    "threshold_score_space",
+    "threshold_comparison_operator",
+    "clean_calibrated_threshold",
+    "before_detection_rate_at_clean_calibrated_threshold",
+    "attacked_detection_rate_at_clean_calibrated_threshold",
+)
+
+
+def extract_fourier_detector_metrics(method: str, sources: Sources) -> DetectorMetrics:
+    """RID/HSTR/HSQR: canonical score = -raw L1, clean-calibrated threshold."""
+    found = method_metric_block(sources, FOURIER_REQUIRED_METRIC_KEYS)
+    if found is None:
+        return DetectorMetrics()
+    metric, source = found
+    config = FOURIER_DETECTOR_CONFIG[method]
+    if metric.get("detector_metric") != config["detector_metric"]:
+        raise UpdaterError(
+            f"unknown {method} detector schema in {source}: "
+            f"detector_metric={metric.get('detector_metric')!r}"
+        )
+    if metric.get("score_direction") != "higher_is_watermarked":
+        raise UpdaterError(f"{method} canonical score direction is not higher_is_watermarked in {source}")
+    if metric.get("raw_score_direction") != "lower_is_watermarked":
+        raise UpdaterError(f"{method} raw L1 direction is not lower_is_watermarked in {source}")
+    if metric.get("threshold_score_space") != "canonical_score":
+        raise UpdaterError(f"{method} threshold score space is not canonical_score in {source}")
+    if metric.get("threshold_type") != "empirical_clean_1pct_fpr":
+        raise UpdaterError(f"unknown {method} threshold family in {source}: {metric.get('threshold_type')!r}")
+    operator = metric.get("threshold_comparison_operator")
+    if operator not in (">", ">="):
+        raise UpdaterError(f"unsupported {method} threshold comparison operator {operator!r} in {source}")
+    result = DetectorMetrics(
+        detector_metric=config["detector_metric"],
+        score_direction="higher_is_watermarked",
+        threshold_type="empirical_clean_1pct_fpr",
+        threshold=check_finite(metric.get("clean_calibrated_threshold"), "clean_calibrated_threshold", source),
+        nominal_fpr=check_finite(metric.get("target_fpr"), "target_fpr", source),
+        before_score=check_finite(metric.get(config["before_score"]), config["before_score"], source),
+        after_score=check_finite(metric.get(config["after_score"]), config["after_score"], source),
+        before_detection_rate=check_finite(
+            metric.get("before_detection_rate_at_clean_calibrated_threshold"),
+            "before_detection_rate_at_clean_calibrated_threshold",
+            source,
+        ),
+        after_detection_rate=check_finite(
+            metric.get("attacked_detection_rate_at_clean_calibrated_threshold"),
+            "attacked_detection_rate_at_clean_calibrated_threshold",
+            source,
+        ),
+        empirical_clean_fpr=check_finite(
+            metric.get("clean_calibrated_actual_empirical_fpr"),
+            "clean_calibrated_actual_empirical_fpr",
+            source,
+        ),
+        roc_auc=check_finite(metric.get("attacked_roc_auc"), "attacked_roc_auc", source),
+    )
+    result.attack_success = authoritative_attack_success(sources)
+    if result.attack_success is not None and result.after_detection_rate is not None:
+        expected = 1.0 - float(result.after_detection_rate)
+        if abs(float(result.attack_success) - expected) > 1e-9:
+            raise UpdaterError(
+                f"{method} attack success in {source} is {result.attack_success!r}, "
+                f"which is not 1 - attacked detection rate ({expected!r})"
+            )
+    return result
+
+
+def extract_rid_detector_metrics(sources: Sources) -> DetectorMetrics:
+    return extract_fourier_detector_metrics("RID", sources)
+
+
+def extract_hstr_detector_metrics(sources: Sources) -> DetectorMetrics:
+    return extract_fourier_detector_metrics("HSTR", sources)
+
+
+def extract_hsqr_detector_metrics(sources: Sources) -> DetectorMetrics:
+    return extract_fourier_detector_metrics("HSQR", sources)
+
+
+
 DETECTOR_EXTRACTORS: dict[str, Any] = {
     "GS": extract_gs_detector_metrics,
     "TR": extract_tr_detector_metrics,
     "GM": extract_gm_detector_metrics,
     "T2S": extract_t2s_detector_metrics,
+    "RID": extract_rid_detector_metrics,
+    "HSTR": extract_hstr_detector_metrics,
+    "HSQR": extract_hsqr_detector_metrics,
 }
 
 
