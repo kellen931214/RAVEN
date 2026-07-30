@@ -851,9 +851,11 @@ def require_complete_records(args: argparse.Namespace, config: dict[str, Any], r
 def quality_stage(args: argparse.Namespace, config: dict[str, Any]) -> int:
     records = require_complete_records(args, config, "watermarked")
     root = args.output_root / "metrics" / "quality" / config["quality_config_hash"]
-    if root.exists():
+    if (root / "quality_records.jsonl").exists():
+        return 0
+    if root.exists() and not args.resume:
         raise FileExistsError(root)
-    root.mkdir(parents=True)
+    root.mkdir(parents=True, exist_ok=True)
     rows = []
     for record in records:
         with Image.open(record["watermarked_path"]) as reference, Image.open(record["attacked_path"]) as attacked:
@@ -873,7 +875,7 @@ def quality_stage(args: argparse.Namespace, config: dict[str, Any]) -> int:
                 **metric,
             }
         )
-    with (root / "quality_records.jsonl").open("x", encoding="utf-8") as handle:
+    with (root / "quality_records.jsonl").open("w", encoding="utf-8") as handle:
         for row in rows:
             handle.write(json.dumps(row, sort_keys=True, allow_nan=False) + "\n")
     return 0
@@ -889,6 +891,8 @@ def fid_stage(args: argparse.Namespace, config: dict[str, Any]) -> int:
         reference_definition="original watermarked images from immutable formal snapshots",
         attacked_definition="formal RAVEN final post-color-transfer attacked-watermarked images",
     )
+    if (fid_root / "fid_result.json").exists():
+        return 0
     from raven.quality import clean_fid
 
     result = clean_fid(
@@ -912,9 +916,11 @@ def fid_stage(args: argparse.Namespace, config: dict[str, Any]) -> int:
 def clip_stage(args: argparse.Namespace, config: dict[str, Any]) -> int:
     records = require_complete_records(args, config, "watermarked")
     root = args.output_root / "metrics" / "clip" / config["quality_config_hash"]
-    if root.exists():
+    if (root / "clip_records.jsonl").exists():
+        return 0
+    if root.exists() and not args.resume:
         raise FileExistsError(root)
-    root.mkdir(parents=True)
+    root.mkdir(parents=True, exist_ok=True)
     from raven.quality import openclip_text_image_scores
 
     result = openclip_text_image_scores(
@@ -930,7 +936,7 @@ def clip_stage(args: argparse.Namespace, config: dict[str, Any]) -> int:
         for record, score in zip(records, result["scores"])
     ]
     require_uniform_clip_provenance(rows)
-    with (root / "clip_records.jsonl").open("x", encoding="utf-8") as handle:
+    with (root / "clip_records.jsonl").open("w", encoding="utf-8") as handle:
         for row in rows:
             handle.write(json.dumps(row, sort_keys=True, allow_nan=False) + "\n")
     write_json_exclusive(root / "clip_result.json", {**result, **provenance})
