@@ -854,7 +854,13 @@ def main() -> int:
                 if method in {"RID", "HSTR", "HSQR"}:
                     prefix = method.lower()
                     fourier_bundle_manifest(row, str(identifier), method)
-                    detector_target_hash = tensor_sha256(provider.gt_patch)
+                    if method == "RID":
+                        detector_target_hash = tensor_sha256(provider.gt_patch)
+                    elif method == "HSTR":
+                        detector_target_hash = getattr(provider, "selected_pattern_sha256", tensor_sha256(provider.gt_patch))
+                    else:
+                        detector_target_hash = str(provider.bundle.manifest.get("selected_pattern_sha256", ""))
+
                     if method == "RID":
                         detector_mask_hash = tensor_sha256(provider.watermarking_mask)
                     elif method == "HSTR":

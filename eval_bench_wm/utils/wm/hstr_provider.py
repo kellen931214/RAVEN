@@ -74,7 +74,7 @@ class HSTRProvider(WmProvider):
         **kwargs,
     ):
         super().__init__(**kwargs)
-        if hstr_profile not in (LEGACY_HSTR_PROFILE, OFFICIAL_HSTR_PROFILE, SHARED_TR_CLEAN_HSTR_PROFILE):
+        if hstr_profile not in (LEGACY_HSTR_PROFILE, OFFICIAL_HSTR_PROFILE, SHARED_TR_CLEAN_HSTR_PROFILE, HSTR_SHARED_TR_CLEAN_MODE):
             raise ValueError(f"unknown HSTR profile {hstr_profile!r}")
         if wm_capacity != 2048:
             raise ValueError("official HSTR wm_capacity must be 2048")
@@ -83,7 +83,7 @@ class HSTRProvider(WmProvider):
         self.shape = (1, latent_channel, hw_latent, hw_latent)
         self.hstr_seed = hstr_seed
         self.wm_capacity = int(wm_capacity)
-        self.uses_official_math = self.profile in (OFFICIAL_HSTR_PROFILE, SHARED_TR_CLEAN_HSTR_PROFILE)
+        self.uses_official_math = self.profile in (OFFICIAL_HSTR_PROFILE, SHARED_TR_CLEAN_HSTR_PROFILE, HSTR_SHARED_TR_CLEAN_MODE)
         self.base_key_seed = OFFICIAL_BASE_KEY_SEED if self.uses_official_math else (999999 if hstr_seed is None else int(hstr_seed))
         self.hstr_seed_list = list(range(self.base_key_seed, self.base_key_seed + self.wm_capacity))
         self.fix_gt = int(fix_gt)
