@@ -856,8 +856,21 @@ def main() -> int:
                     fourier_bundle_manifest(row, str(identifier), method)
                     if method in {"RID", "HSTR"}:
                         bundle_manifest = getattr(getattr(provider, "bundle", None), "manifest", {})
-                        detector_target_hash = getattr(provider, "selected_pattern_sha256", bundle_manifest.get("selected_pattern_sha256", tensor_sha256(provider.gt_patch)))
-                        detector_mask_hash = getattr(provider, "watermark_mask_sha256", bundle_manifest.get("mask_sha256", tensor_sha256(provider.watermarking_mask)))
+                        if hasattr(provider, "selected_pattern_sha256") and provider.selected_pattern_sha256:
+                            detector_target_hash = str(provider.selected_pattern_sha256)
+                        elif bundle_manifest.get("selected_pattern_sha256"):
+                            detector_target_hash = str(bundle_manifest["selected_pattern_sha256"])
+                        else:
+                            detector_target_hash = tensor_sha256(provider.gt_patch)
+
+                        if hasattr(provider, "watermark_mask_sha256") and provider.watermark_mask_sha256:
+                            detector_mask_hash = str(provider.watermark_mask_sha256)
+                        elif bundle_manifest.get("mask_sha256"):
+                            detector_mask_hash = str(bundle_manifest["mask_sha256"])
+                        elif hasattr(provider, "watermarking_mask"):
+                            detector_mask_hash = tensor_sha256(provider.watermarking_mask)
+                        else:
+                            detector_mask_hash = tensor_sha256(provider.watermark_region_mask_hstr)
                     else:
                         detector_target_hash = str(provider.bundle.manifest.get("selected_pattern_sha256", ""))
                         detector_mask_hash = getattr(provider, "watermark_mask_sha256", str(row.get("hsqr_mask_sha256", "")))
