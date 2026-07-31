@@ -39,7 +39,9 @@ Thumbs.db
 .claude/
 
 # Generated experiment artifacts
-outputs/
+outputs/**
+!outputs/**/_table/
+!outputs/**/_table/**
 logs/
 out/
 raven_repro/outputs/
