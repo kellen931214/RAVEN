@@ -40,8 +40,7 @@ Thumbs.db
 
 # Generated experiment artifacts
 outputs/**
-!outputs/**/_table/
-!outputs/**/_table/*.md
+!outputs/**/*.md
 logs/
 out/
 raven_repro/outputs/
