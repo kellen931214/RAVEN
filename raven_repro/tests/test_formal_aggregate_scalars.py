@@ -29,6 +29,10 @@ from experiments.update_experiment_table import (  # noqa: E402
 )
 from raven.eval_protocol import (  # noqa: E402
     GS_ATTACK_SUCCESS_FIELD,
+    QUALITY_FORMAL_CLASSIFICATION,
+    QUALITY_GATE_SCHEMA_VERSION,
+    QUALITY_IDENTITY_SMOKE_CLASSIFICATION,
+    QUALITY_LEGACY_CLASSIFICATION,
     QUALITY_PSNR_FIELD,
     QUALITY_SSIM_FIELD,
     formal_quality_summary,
@@ -121,6 +125,69 @@ def test_quality_summary_reads_the_named_field_not_the_alias(tmp_path):
     assert summary["quality_ssim_mean"] == pytest.approx(0.85, abs=1e-12)
 
 
+def gate_quality_row(run_id, psnr, ssim, *, dx, dy, classification=QUALITY_FORMAL_CLASSIFICATION):
+    return quality_row(
+        run_id,
+        psnr,
+        ssim,
+        quality_gate_schema_version=QUALITY_GATE_SCHEMA_VERSION,
+        quality_gate_classification=classification,
+        planned_flow_dx_image_px=dx,
+        planned_flow_dy_image_px=dy,
+        effective_source_flow_dx_image_px=dx,
+        effective_source_flow_dy_image_px=dy,
+    )
+
+
+def test_quality_summary_allows_exact_identity_smoke_psnr_infinity(tmp_path):
+    rows = [
+        gate_quality_row(
+            0,
+            float("inf"),
+            1.0,
+            dx=0.0,
+            dy=0.0,
+            classification=QUALITY_IDENTITY_SMOKE_CLASSIFICATION,
+        )
+    ]
+    path = write_quality(tmp_path / "quality_records.jsonl", rows)
+    summary = formal_quality_summary(path, expected_count=1)
+    assert summary["quality_gate_classification"] == QUALITY_IDENTITY_SMOKE_CLASSIFICATION
+    assert summary["quality_psnr_mean"] is None
+    assert summary["quality_psnr_mean_is_infinite"] is True
+    assert summary["quality_ssim_mean"] == pytest.approx(1.0, abs=1e-12)
+
+
+def test_quality_summary_accepts_non_identity_finite_gate(tmp_path):
+    rows = [gate_quality_row(0, 31.0, 0.94, dx=2.0, dy=-2.0)]
+    path = write_quality(tmp_path / "quality_records.jsonl", rows)
+    summary = formal_quality_summary(path, expected_count=1)
+    assert summary["quality_gate_classification"] == QUALITY_FORMAL_CLASSIFICATION
+    assert summary["quality_psnr_mean"] == pytest.approx(31.0, abs=1e-12)
+    assert summary["quality_psnr_mean_is_infinite"] is False
+
+
+def test_quality_summary_rejects_non_identity_non_finite_gate(tmp_path):
+    rows = [gate_quality_row(0, float("inf"), 0.94, dx=2.0, dy=-2.0)]
+    path = write_quality(tmp_path / "quality_records.jsonl", rows)
+    with pytest.raises(RuntimeError, match="non-identity quality row has infinite PSNR"):
+        formal_quality_summary(path, expected_count=1)
+
+
+def test_quality_summary_rejects_legacy_identity_infinity_without_schema(tmp_path):
+    rows = [quality_row(0, float("inf"), 1.0)]
+    path = write_quality(tmp_path / "quality_records.jsonl", rows)
+    with pytest.raises(RuntimeError, match="missing quality gate schema"):
+        formal_quality_summary(path, expected_count=1)
+
+
+def test_quality_summary_classifies_finite_legacy_rows(tmp_path):
+    rows = [quality_row(0, 30.0, 0.9)]
+    path = write_quality(tmp_path / "quality_records.jsonl", rows)
+    summary = formal_quality_summary(path, expected_count=1)
+    assert summary["quality_gate_classification"] == QUALITY_LEGACY_CLASSIFICATION
+
+
 @pytest.mark.parametrize(
     "kwargs, rows, match",
     [
@@ -143,7 +210,7 @@ def test_quality_summary_reads_the_named_field_not_the_alias(tmp_path):
         (
             {"expected_count": 1},
             [quality_row(0, float("inf"), 0.8)],
-            "non-finite",
+            "missing quality gate schema",
         ),
         (
             {"expected_count": 1},

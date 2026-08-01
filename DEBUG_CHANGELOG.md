@@ -80,6 +80,62 @@ tests, manifest rebuild, commit, push and detached waiter launch.
 - Formal output eligibility: waiter implementation only until the detached
   smoke and formal jobs complete under a clean pushed commit.
 
+## 2026-08-01 — Quality gate identity-smoke PSNR handling
+
+### Problem
+A gate patch intended to allow exact shift=0 identity smoke quality records could not be applied (`git apply` reported `error: corrupt patch at line 25`). Formal shifts had not started and repository source was still clean, so reusing the corrupt patch would risk an unauditable gate change.
+
+### Root cause
+The original patch file could not be located in `/workspace/RAVEN` or `/tmp` during this repair session, so its hunk structure could not be trusted or inspected. The existing quality reducer and validation gate treated every non-finite PSNR as a formal failure, which is correct for non-identity runs but blocks the exact identity smoke control where PSNR is mathematically infinite.
+
+### Affected files
+- `raven_repro/raven/eval_protocol.py:formal_quality_summary`
+- `experiments/run_raven_formal_eval.py:quality_stage`
+- `experiments/run_raven_formal_eval.py:validate_stage`
+- `raven_repro/tests/test_formal_aggregate_scalars.py`
+
+### Affected outputs
+No source cohort, generation artifact, attack artifact, detector output, FID, CLIP, PSNR/SSIM artifact, smoke artifact, formal output, or experiment table was modified or regenerated.
+
+### Fix
+Replaced the failed patch path with a direct minimal source edit. Quality rows now carry an explicit `raven_quality_gate_v1` schema and planned/effective flow fields. `PSNR=Infinity` is accepted only when every planned and effective flow is exactly zero and the row is explicitly classified as `identity_smoke_control`; it is stored as the string `"Infinity"` so JSON output remains strict. Non-identity quality PSNR/SSIM must remain finite and fail closed otherwise. Identity smoke summaries omit the formal PSNR scalar rather than clipping infinity to an arbitrary finite value.
+
+### Reused code
+Reused `formal_quality_summary`, existing per-row quality JSONL reduction, existing quality record run-ID/count/SHA gates, and existing formal validation staging.
+
+### Historical bug coverage
+Reviewed the formal aggregate scalar, TensorFlow FID protocol, formal validation hardening, RAVEN quality PSNR/SSIM, and smoke/formal eligibility changelog entries. The change does not alter detector thresholds, method-specific metric schemas, attack success definitions, CLIP, FID, or watermark pairing logic.
+
+### Regression prevention
+Added focused synthetic tests for exact identity PSNR infinity, non-identity finite quality, non-identity infinity rejection, and legacy missing-schema infinity rejection. Small gates now validate as `validated_gate_result` with `formal_output_eligible=false`; only `expected_count >= 1000` can receive `validated_formal_result`.
+
+### Validation
+Pending at time of entry: `git diff --check`, `py_compile`, focused quality gate tests, modified-file scope check, and artifact/table immutability check.
+
+### Watermark integrity
+- Source data: unchanged.
+- Clean/watermarked pairing status: unchanged.
+- Base-latent uniqueness status: unchanged.
+- Watermark target and mask status: unchanged.
+- Attack-pairing status: unchanged; no attack was run.
+- Detector score definition: unchanged.
+- Threshold calibration source: unchanged.
+- Actual empirical FPR: unchanged; not recalibrated.
+- Quality metric reference: unchanged watermarked input versus post-color attacked image over verified overlap; exact identity smoke may record `PSNR=Infinity` only as a non-formal control.
+- CLIP input definition: unchanged.
+- FID staging status: unchanged.
+- Outputs requiring regeneration: none from this source-only repair.
+
+### Git provenance
+- Repository: `/workspace/RAVEN`
+- Branch: `main`
+- Commit: pending at time of entry
+- Remote branch: `origin/main`
+- Push status: pending at time of entry
+- Entry point: `experiments/run_raven_formal_eval.py`
+- Formal output eligibility: source gate repair only; no formal result produced.
+
+
 ## Current Status
 
 | Date | Area | Status | Evidence |

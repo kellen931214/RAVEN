@@ -941,6 +941,16 @@ def validate_resume_record(
 QUALITY_PSNR_FIELD = "post_color_vs_watermarked_overlap_psnr"
 QUALITY_SSIM_FIELD = "post_color_vs_watermarked_overlap_ssim"
 QUALITY_REFERENCE = "watermarked input"
+QUALITY_GATE_SCHEMA_VERSION = "raven_quality_gate_v1"
+QUALITY_FORMAL_CLASSIFICATION = "formal_quality_metric"
+QUALITY_LEGACY_CLASSIFICATION = "legacy_quality_metric"
+QUALITY_IDENTITY_SMOKE_CLASSIFICATION = "identity_smoke_control"
+QUALITY_FLOW_FIELDS = (
+    "planned_flow_dx_image_px",
+    "planned_flow_dy_image_px",
+    "effective_source_flow_dx_image_px",
+    "effective_source_flow_dy_image_px",
+)
 
 
 def _finite_metric(value: Any, field: str, run_id: Any) -> float:
@@ -948,6 +958,42 @@ def _finite_metric(value: Any, field: str, run_id: Any) -> float:
     if not math.isfinite(number):
         raise RuntimeError(f"non-finite formal quality metric run_id={run_id}: {field}={value}")
     return number
+
+
+def quality_gate_classification(row: Mapping[str, Any]) -> str:
+    """Classify one quality row without weakening formal finite-metric gates."""
+    run_id = row.get("run_id")
+    psnr = float(row[QUALITY_PSNR_FIELD])
+    ssim = float(row[QUALITY_SSIM_FIELD])
+    if not math.isfinite(ssim):
+        raise RuntimeError(
+            f"non-finite formal quality metric run_id={run_id}: "
+            f"{QUALITY_SSIM_FIELD}={row[QUALITY_SSIM_FIELD]}"
+        )
+    if math.isfinite(psnr):
+        if row.get("quality_gate_schema_version") == QUALITY_GATE_SCHEMA_VERSION:
+            return str(row.get("quality_gate_classification") or QUALITY_FORMAL_CLASSIFICATION)
+        return QUALITY_LEGACY_CLASSIFICATION
+    if not math.isinf(psnr) or psnr < 0:
+        raise RuntimeError(
+            f"non-finite formal quality metric run_id={run_id}: "
+            f"{QUALITY_PSNR_FIELD}={row[QUALITY_PSNR_FIELD]}"
+        )
+    if row.get("quality_gate_schema_version") != QUALITY_GATE_SCHEMA_VERSION:
+        raise RuntimeError(f"missing quality gate schema for identity PSNR run_id={run_id}")
+    missing = [field for field in QUALITY_FLOW_FIELDS if field not in row]
+    if missing:
+        raise RuntimeError(f"missing quality gate flow fields run_id={run_id}: {missing}")
+    flows = [float(row[field]) for field in QUALITY_FLOW_FIELDS]
+    if not all(math.isfinite(value) for value in flows):
+        raise RuntimeError(f"non-finite quality gate flow run_id={run_id}")
+    if not all(math.isclose(value, 0.0, abs_tol=0.0) for value in flows):
+        raise RuntimeError(f"non-identity quality row has infinite PSNR run_id={run_id}")
+    if str(row.get("quality_gate_classification")) != QUALITY_IDENTITY_SMOKE_CLASSIFICATION:
+        raise RuntimeError(
+            f"identity PSNR row is not classified as {QUALITY_IDENTITY_SMOKE_CLASSIFICATION}"
+        )
+    return QUALITY_IDENTITY_SMOKE_CLASSIFICATION
 
 
 def formal_quality_summary(
@@ -990,16 +1036,38 @@ def formal_quality_summary(
     references = {str(row.get("quality_reference", "")) for row in rows}
     if references != {QUALITY_REFERENCE}:
         raise RuntimeError(f"unexpected quality reference definition: {sorted(references)}")
-    psnr = [_finite_metric(row[QUALITY_PSNR_FIELD], QUALITY_PSNR_FIELD, row["run_id"]) for row in rows]
+    classifications = [quality_gate_classification(row) for row in rows]
+    identity_smoke = any(item == QUALITY_IDENTITY_SMOKE_CLASSIFICATION for item in classifications)
+    if identity_smoke and (len(set(classifications)) != 1 or int(expected_count) >= 1000):
+        raise RuntimeError("identity smoke quality rows are not eligible for formal aggregation")
+    psnr = (
+        None
+        if identity_smoke
+        else [_finite_metric(row[QUALITY_PSNR_FIELD], QUALITY_PSNR_FIELD, row["run_id"]) for row in rows]
+    )
     ssim = [_finite_metric(row[QUALITY_SSIM_FIELD], QUALITY_SSIM_FIELD, row["run_id"]) for row in rows]
     overlap_protocols = sorted({str(row.get("overlap_protocol", "")) for row in rows})
+    all_current_schema = all(
+        row.get("quality_gate_schema_version") == QUALITY_GATE_SCHEMA_VERSION for row in rows
+    )
     return {
         "quality_count": len(rows),
-        "quality_psnr_mean": math.fsum(psnr) / len(psnr),
+        "quality_psnr_mean": None if psnr is None else math.fsum(psnr) / len(psnr),
         "quality_ssim_mean": math.fsum(ssim) / len(ssim),
         "quality_psnr_field": QUALITY_PSNR_FIELD,
         "quality_ssim_field": QUALITY_SSIM_FIELD,
         "quality_reference": QUALITY_REFERENCE,
+        "quality_gate_schema_version": QUALITY_GATE_SCHEMA_VERSION if all_current_schema else None,
+        "quality_gate_classification": (
+            QUALITY_IDENTITY_SMOKE_CLASSIFICATION
+            if identity_smoke
+            else (
+                QUALITY_LEGACY_CLASSIFICATION
+                if QUALITY_LEGACY_CLASSIFICATION in classifications
+                else QUALITY_FORMAL_CLASSIFICATION
+            )
+        ),
+        "quality_psnr_mean_is_infinite": bool(identity_smoke),
         "quality_overlap_protocols": overlap_protocols,
         "quality_records_sha256": actual_sha,
     }

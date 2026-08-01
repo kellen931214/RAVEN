@@ -32,6 +32,9 @@ from raven.eval_protocol import (  # noqa: E402
     CLIP_CONFIG,
     FORMAL_ATTACK_CONFIG,
     METRIC_PROTOCOL_VERSION,
+    QUALITY_FORMAL_CLASSIFICATION,
+    QUALITY_GATE_SCHEMA_VERSION,
+    QUALITY_IDENTITY_SMOKE_CLASSIFICATION,
     assert_canonical_output_root,
     assert_formal_debug_info,
     canonical_json_hash,
@@ -865,11 +868,40 @@ def quality_stage(args: argparse.Namespace, config: dict[str, Any]) -> int:
                 record["effective_source_flow_dx_image_px"],
                 record["effective_source_flow_dy_image_px"],
             )
+        planned_dx = float(record["planned_flow_dx_image_px"])
+        planned_dy = float(record["planned_flow_dy_image_px"])
+        effective_dx = float(record["effective_source_flow_dx_image_px"])
+        effective_dy = float(record["effective_source_flow_dy_image_px"])
+        is_identity = (
+            math.isclose(planned_dx, 0.0, abs_tol=0.0)
+            and math.isclose(planned_dy, 0.0, abs_tol=0.0)
+            and math.isclose(effective_dx, 0.0, abs_tol=0.0)
+            and math.isclose(effective_dy, 0.0, abs_tol=0.0)
+        )
+        metric = dict(metric)
+        psnr = float(metric["overlap_psnr"])
+        ssim = float(metric["overlap_ssim"])
+        if not math.isfinite(ssim):
+            raise RuntimeError(f"non-finite formal quality metric: overlap_ssim={ssim}")
+        if math.isinf(psnr) and psnr > 0 and is_identity:
+            metric["overlap_psnr"] = "Infinity"
+        elif not math.isfinite(psnr):
+            raise RuntimeError(f"non-finite formal quality metric: overlap_psnr={psnr}")
         rows.append(
             {
                 "run_id": record["run_id"],
                 "quality_reference": "watermarked input",
                 "overlap_protocol": "inverse warp using effective source flow from actual grid",
+                "quality_gate_schema_version": QUALITY_GATE_SCHEMA_VERSION,
+                "quality_gate_classification": (
+                    QUALITY_IDENTITY_SMOKE_CLASSIFICATION
+                    if is_identity
+                    else QUALITY_FORMAL_CLASSIFICATION
+                ),
+                "planned_flow_dx_image_px": planned_dx,
+                "planned_flow_dy_image_px": planned_dy,
+                "effective_source_flow_dx_image_px": effective_dx,
+                "effective_source_flow_dy_image_px": effective_dy,
                 "post_color_vs_watermarked_overlap_psnr": metric["overlap_psnr"],
                 "post_color_vs_watermarked_overlap_ssim": metric["overlap_ssim"],
                 **metric,
@@ -1206,14 +1238,11 @@ def validate_stage(args: argparse.Namespace, config: dict[str, Any]) -> int:
     quality_rows = [json.loads(line) for line in quality_path.read_text().splitlines() if line]
     if len(quality_rows) != args.expected_count or {str(row["run_id"]) for row in quality_rows} != run_ids:
         raise RuntimeError("quality record count/run-ID mismatch")
-    for row in quality_rows:
-        for field in (
-            "post_color_vs_watermarked_overlap_psnr",
-            "post_color_vs_watermarked_overlap_ssim",
-        ):
-            value = float(row[field])
-            if not math.isfinite(value):
-                raise RuntimeError(f"non-finite formal quality metric: {field}={value}")
+    quality_summary = formal_quality_summary(
+        quality_path,
+        expected_count=args.expected_count,
+        expected_run_ids=run_ids,
+    )
     clip_path = (
         args.output_root / "metrics" / "clip" / config["quality_config_hash"]
         / "clip_records.jsonl"
@@ -1344,8 +1373,11 @@ def validate_stage(args: argparse.Namespace, config: dict[str, Any]) -> int:
         or aggregate_payload.get("paper_comparable") is not False
     ):
         raise RuntimeError("small formal gate is not marked gate-only/non-paper-comparable")
+    validation_status = (
+        "validated_formal_result" if args.expected_count >= 1000 else "validated_gate_result"
+    )
     validation = {
-        "status": "validated_formal_result",
+        "status": validation_status,
         "N": len(records),
         "duplicate_run_ids": 0,
         "missing_paths": 0,
@@ -1362,7 +1394,12 @@ def validate_stage(args: argparse.Namespace, config: dict[str, Any]) -> int:
         "attack_clean_enabled": config["attack_clean_enabled"],
         "recalibrated_metrics_available": config["recalibrated_metrics_available"],
         "formal_protocol_complete": config["formal_protocol_complete"],
-        "result_classification": config["result_classification"],
+        "result_classification": (
+            config["result_classification"]
+            if args.expected_count >= 1000
+            else quality_summary["quality_gate_classification"]
+        ),
+        "formal_output_eligible": args.expected_count >= 1000,
         "attacked_clean_count": config["attacked_clean_count"],
         "attacked_watermarked_count": args.expected_count,
         "verification_count": args.expected_count,
