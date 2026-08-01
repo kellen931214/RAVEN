@@ -29,6 +29,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--expected-gs-bits", type=int, default=256)
     parser.add_argument("--output-json", type=Path, required=True)
     parser.add_argument("--output-rows", type=Path, default=None)
+    parser.add_argument("--overwrite", action="store_true", help="Overwrite existing output files")
     return parser
 
 
@@ -527,6 +528,9 @@ def t2s_report(rows: list[dict[str, str]], target_fpr: float) -> tuple[dict, lis
         }
         for index, row in enumerate(rows)
     ]
+    bit_accuracy_before = optional_mean(rows, "watermarked_t2s_message_accuracy")
+    bit_accuracy_attacked = optional_mean(rows, "attacked_t2s_message_accuracy")
+    bit_accuracy_clean = optional_mean(rows, "clean_t2s_message_accuracy")
     return {
         "N": len(rows),
         "detector_metric": "t2s_score_true_key",
@@ -551,12 +555,20 @@ def t2s_report(rows: list[dict[str, str]], target_fpr: float) -> tuple[dict, lis
                 "paired_key_comparison_detection_rate": paired_rates[stage],
                 "mean_key_accuracy": optional_mean(rows, f"{stage}_t2s_key_accuracy"),
                 "mean_message_accuracy": optional_mean(rows, f"{stage}_t2s_message_accuracy"),
+                "bit_accuracy": optional_mean(rows, f"{stage}_t2s_message_accuracy"),
                 "distribution": distribution(true_key[stage]),
             }
             for stage in stages
         },
         "mean_score_true_key_before": sum(true_key["watermarked"]) / len(true_key["watermarked"]),
         "mean_score_true_key_attacked": sum(true_key["attacked"]) / len(true_key["attacked"]),
+        "bit_accuracy": bit_accuracy_attacked,
+        "bit_accuracy_before": bit_accuracy_before,
+        "bit_accuracy_attacked": bit_accuracy_attacked,
+        "bit_accuracy_clean": bit_accuracy_clean,
+        "mean_message_accuracy_before": bit_accuracy_before,
+        "mean_message_accuracy_attacked": bit_accuracy_attacked,
+        "mean_message_accuracy_clean": bit_accuracy_clean,
         "before_detection_rate_at_paired_key_comparison": paired_rates["watermarked"],
         "attacked_detection_rate_at_paired_key_comparison": paired_rates["attacked"],
         "empirical_clean_fpr_at_paired_key_comparison": paired_rates["clean"],
@@ -581,7 +593,7 @@ def t2s_report(rows: list[dict[str, str]], target_fpr: float) -> tuple[dict, lis
 def main() -> int:
     args = build_parser().parse_args()
     for output in (args.output_json, args.output_rows):
-        if output is not None and output.exists():
+        if output is not None and output.exists() and not args.overwrite:
             raise FileExistsError(f"Refusing to overwrite existing output: {output}")
     with args.records.open(newline="", encoding="utf-8-sig") as handle:
         rows = list(csv.DictReader(handle))

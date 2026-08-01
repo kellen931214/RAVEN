@@ -73,7 +73,8 @@ T2S_FIELDS = [
     f"{stage}_{suffix}"
     for stage in STAGES
     for suffix in ("t2s_score_true_key", "t2s_score_control_key", "t2s_score_margin",
-                   "t2s_detection_success", "t2s_key_accuracy", "t2s_message_accuracy")
+                   "t2s_detection_success", "t2s_key_accuracy", "t2s_message_accuracy",
+                   "t2s_bit_accuracy")
 ]
 FOURIER_METHOD_FIELDS = [
     f"{stage}_{method.lower()}_{suffix}"
@@ -934,6 +935,9 @@ def main() -> int:
                             record[f"{stage}_{field}"] = "" if value is None else value
                         message_accuracy = result.get("message_accuracy")
                         record[f"{stage}_t2s_message_accuracy"] = (
+                            "" if message_accuracy is None else message_accuracy
+                        )
+                        record[f"{stage}_t2s_bit_accuracy"] = (
                             "" if message_accuracy is None else message_accuracy
                         )
                         record[f"{stage}_t2s_detection_success"] = bool(

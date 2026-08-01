@@ -977,10 +977,14 @@ def extract_t2s_detector_metrics(sources: Sources) -> DetectorMetrics:
         # Left as None on purpose: per-sample comparand, no cohort scalar.
         threshold=None,
         before_score=check_finite(
-            metric.get("mean_score_true_key_before"), "mean_score_true_key_before", source
+            first_present(metric, ("bit_accuracy_before", "mean_message_accuracy_before", "mean_score_true_key_before")),
+            "before_score",
+            source,
         ),
         after_score=check_finite(
-            metric.get("mean_score_true_key_attacked"), "mean_score_true_key_attacked", source
+            first_present(metric, ("bit_accuracy_attacked", "mean_message_accuracy_attacked", "mean_score_true_key_attacked")),
+            "after_score",
+            source,
         ),
         before_detection_rate=check_finite(
             metric.get("before_detection_rate_at_paired_key_comparison"),
