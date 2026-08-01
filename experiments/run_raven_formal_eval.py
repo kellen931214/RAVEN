@@ -610,8 +610,9 @@ def planned_shift(
         16,
     )
     rng = random.Random(rng_seed)
-    dx = rng.choice(SHIFT_MAGNITUDES) * rng.choice((-1, 1))
-    dy = rng.choice(SHIFT_MAGNITUDES) * rng.choice((-1, 1))
+    magnitudes = tuple(float(value) for value in attack_config["shift_magnitudes_image_px"])
+    dx = rng.choice(magnitudes) * rng.choice((-1, 1))
+    dy = rng.choice(magnitudes) * rng.choice((-1, 1))
     return float(dx), float(dy), attack_seed
 
 

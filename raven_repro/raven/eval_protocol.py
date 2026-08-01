@@ -570,7 +570,8 @@ def normalize_formal_attack_config(payload: Mapping[str, Any]) -> dict[str, Any]
     config.setdefault("variant_name", "formal_baseline")
     variant_fields = {
         "latent_sampling_mode", "inversion_mode", "scheduler_mode",
-        "shift_plan_mode", "variant_name", "warp_mode", "color_transfer_mode",
+        "shift_magnitudes_image_px", "shift_plan_mode", "variant_name",
+        "warp_mode", "color_transfer_mode",
     }
     drift = {
         key: (FORMAL_ATTACK_CONFIG[key], config[key])
@@ -604,6 +605,20 @@ def normalize_formal_attack_config(payload: Mapping[str, Any]) -> dict[str, Any]
         raise ValueError("latent_sampling_mode must be nearest or bilinear")
     if config["color_transfer_mode"] not in {"paper_exact_two_stage_aligned", "paper_exact_two_stage"}:
         raise ValueError("color_transfer_mode must be paper_exact_two_stage_aligned or paper_exact_two_stage")
+    magnitudes = config.get("shift_magnitudes_image_px")
+    if (
+        not isinstance(magnitudes, list)
+        or not magnitudes
+        or any(
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            or float(value) <= 0.0
+            for value in magnitudes
+        )
+    ):
+        raise ValueError("shift_magnitudes_image_px must be a non-empty list of positive finite numbers")
+    config["shift_magnitudes_image_px"] = [float(value) for value in magnitudes]
     if config["shift_plan_mode"] not in {
         "paper_random_independent_axes", "balanced_deterministic_schedule", "zero"
     }:

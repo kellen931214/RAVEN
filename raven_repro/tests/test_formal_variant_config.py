@@ -182,6 +182,33 @@ def test_zero_shift_plan_preserves_seed_and_uses_zero_effective_plan():
     assert zero_seed == base_seed == 49
 
 
+def test_shift_magnitude_variant_can_drive_non_identity_gate():
+    config = normalize_formal_attack_config(
+        variant_config(
+            scheduler_mode="ddim",
+            shift_plan_mode="paper_random_independent_axes",
+            shift_magnitudes_image_px=[2],
+            variant_name="shift2_non_identity_smoke_gate",
+        )
+    )
+    dx, dy, seed = planned_shift(0, "0", config)
+    assert abs(dx) == 2.0
+    assert abs(dy) == 2.0
+    assert (dx, dy) != (0.0, 0.0)
+    assert seed == 42
+    assert formal_attack_config_hash(config) != formal_attack_config_hash()
+
+
+def test_shift_magnitude_variant_rejects_non_positive_values():
+    import pytest
+
+    for magnitudes in ([], [0], [-2], [float("inf")]):
+        with pytest.raises(ValueError, match="shift_magnitudes_image_px"):
+            normalize_formal_attack_config(
+                variant_config(shift_magnitudes_image_px=magnitudes)
+            )
+
+
 def test_variant_config_rejects_ddpm_inversion_with_ddim_scheduler():
     import pytest
 

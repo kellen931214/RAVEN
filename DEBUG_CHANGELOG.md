@@ -136,6 +136,61 @@ Pending at time of entry: `git diff --check`, `py_compile`, focused quality gate
 - Formal output eligibility: source gate repair only; no formal result produced.
 
 
+## 2026-08-01 — Allow explicit shift-magnitude gate configs
+
+### Problem
+The requested final integration gate must run a non-identity N=2 smoke with `shift=2`, but the formal config validator treated `shift_magnitudes_image_px` as non-variant protocol drift. A `/tmp` shift=2 config therefore failed before any model load with `formal ablation config changes non-variant fields: shift_magnitudes_image_px`.
+
+### Root cause
+`normalize_formal_attack_config` allowed scheduler, inversion, sampling, warp and color-transfer ablations, but not a bounded magnitude-only smoke gate. `planned_shift` also ignored the normalized config field and used the module constant range directly.
+
+### Affected files
+- `raven_repro/raven/eval_protocol.py:normalize_formal_attack_config`
+- `experiments/run_raven_formal_eval.py:planned_shift`
+- `raven_repro/tests/test_formal_variant_config.py`
+
+### Affected outputs
+No data, transform artifact, scorer output, smoke artifact, formal output, or experiment table was modified by this source change.
+
+### Fix
+Allowed `shift_magnitudes_image_px` as an explicit variant field, with fail-closed validation that it is a non-empty list of positive finite numeric image-pixel magnitudes. `planned_shift` now draws magnitudes from the normalized attack config, so a `/tmp` N=2 gate can use `[2]` while existing formal configs keep `[24, ..., 32]`.
+
+### Reused code
+Reused the existing normalized formal attack config hash, planned shift seed derivation, and variant-config regression test path.
+
+### Historical bug coverage
+This does not change zero-shift identity handling, detector thresholds, quality reference definitions, watermark pairing, or table extraction. Full formal shifts remain opt-in and are not launched by this change.
+
+### Regression prevention
+Focused tests cover `[2]` producing non-identity ±2 shifts and rejection of empty, zero, negative or infinite magnitude lists.
+
+### Validation
+Pending at time of entry: `git diff --check`, `py_compile`, focused config/gate tests, manifest rebuild, and shift=2 smoke.
+
+### Watermark integrity
+- Source data: unchanged.
+- Clean/watermarked pairing status: unchanged.
+- Base-latent uniqueness status: unchanged.
+- Watermark target and mask status: unchanged.
+- Attack-pairing status: unchanged at source-change time; no attack run yet.
+- Detector score definition: unchanged Tree-Ring complex L1 protocol.
+- Threshold calibration source: unchanged.
+- Actual empirical FPR: unchanged.
+- Quality metric reference: unchanged watermarked input versus final attacked image over actual-grid effective source flow.
+- CLIP input definition: unchanged.
+- FID staging status: unchanged.
+- Outputs requiring regeneration: none.
+
+### Git provenance
+- Repository: `/workspace/RAVEN`
+- Branch: `main`
+- Commit: pending at time of entry
+- Remote branch: `origin/main`
+- Push status: pending at time of entry
+- Entry point: `experiments/run_raven_formal_eval.py`
+- Formal output eligibility: source gate support only; no formal result produced.
+
+
 ## Current Status
 
 | Date | Area | Status | Evidence |
