@@ -153,7 +153,7 @@ The requested final integration gate must run a non-identity N=2 smoke with `shi
 No data, transform artifact, scorer output, smoke artifact, formal output, or experiment table was modified by this source change.
 
 ### Fix
-Allowed `shift_magnitudes_image_px` as an explicit variant field, with fail-closed validation that it is a non-empty list of positive finite numeric image-pixel magnitudes. `planned_shift` now draws magnitudes from the normalized attack config, so a `/tmp` N=2 gate can use `[2]` while existing formal configs keep `[24, ..., 32]`.
+Allowed `shift_magnitudes_image_px` as an explicit variant field, with fail-closed validation that it is a non-empty list of positive finite numeric image-pixel magnitudes. `planned_shift` now draws magnitudes from the normalized attack config, so a `/tmp` N=2 gate can use `[2]` while existing formal configs keep `[24, ..., 32]`. The quality stage now writes the explicit actual-grid effective-flow overlap protocol after unpacking raw metric aliases, so the current-schema row cannot be overwritten by the helper's legacy alias.
 
 ### Reused code
 Reused the existing normalized formal attack config hash, planned shift seed derivation, and variant-config regression test path.

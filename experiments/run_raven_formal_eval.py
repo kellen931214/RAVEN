@@ -890,6 +890,7 @@ def quality_stage(args: argparse.Namespace, config: dict[str, Any]) -> int:
             raise RuntimeError(f"non-finite formal quality metric: overlap_psnr={psnr}")
         rows.append(
             {
+                **metric,
                 "run_id": record["run_id"],
                 "quality_reference": "watermarked input",
                 "overlap_protocol": "inverse warp using effective source flow from actual grid",
@@ -905,7 +906,6 @@ def quality_stage(args: argparse.Namespace, config: dict[str, Any]) -> int:
                 "effective_source_flow_dy_image_px": effective_dy,
                 "post_color_vs_watermarked_overlap_psnr": metric["overlap_psnr"],
                 "post_color_vs_watermarked_overlap_ssim": metric["overlap_ssim"],
-                **metric,
             }
         )
     with (root / "quality_records.jsonl").open("w", encoding="utf-8") as handle:
