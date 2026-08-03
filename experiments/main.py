@@ -165,20 +165,21 @@ def load_metadata(path: str | Path) -> list[dict[str, str]]:
 
 
 def normalize_metadata_row(row: dict[str, str]) -> dict[str, str]:
+    """Normalize core fields while preserving all original metadata columns.
+
+    Detector-required fields (GM bundle, T2S state, GS secret, TR params,
+    Fourier bundle, target/mask hashes) pass through unmodified.
+    """
+    normalized = dict(row)  # passthrough ALL original columns
     run_id = _first(row, "run_id", "sample_id", "id")
     if not run_id:
         raise ValueError("metadata row missing run_id")
-    watermarked = _first(row, "watermarked_path", "watermarked_image_path")
-    clean = _first(row, "clean_path", "clean_image_path")
-    prompt = _first(row, "prompt", "source_prompt", "caption", "text")
-    prompt_id = _first(row, "prompt_id", "source_id")
-    return {
-        "run_id": run_id,
-        "watermarked_path": watermarked,
-        "clean_path": clean,
-        "prompt": prompt,
-        "prompt_id": prompt_id,
-    }
+    normalized["run_id"] = run_id
+    normalized["watermarked_path"] = _first(row, "watermarked_path", "watermarked_image_path")
+    normalized["clean_path"] = _first(row, "clean_path", "clean_image_path")
+    normalized["prompt"] = _first(row, "prompt", "source_prompt", "caption", "text")
+    normalized["prompt_id"] = _first(row, "prompt_id", "source_id")
+    return normalized
 
 
 def resolve_input_path(row: dict[str, str], role: str) -> Path:
@@ -377,6 +378,7 @@ def main(argv: list[str] | None = None) -> int:
                     "prompt_id": sample_prompt_id,
                     "prompt_source": sample_prompt_source,
                     "negative_prompt": config.get("negative_prompt", ""),
+                    "source_metadata": row,  # full original metadata passthrough
                     "debug_info_path": (
                         str(debug_info_path.resolve())
                         if debug_info_retained and debug_info_path.is_file()
@@ -384,9 +386,9 @@ def main(argv: list[str] | None = None) -> int:
                     ),
                     "debug_info_retained": debug_info_retained,
                     "effective_source_flow_dx_image_px": debug_info.get(
-                        "effective_source_flow_dx_image_px", dx),
+                        "effective_source_flow_dx_image_px") if debug_info else None,
                     "effective_source_flow_dy_image_px": debug_info.get(
-                        "effective_source_flow_dy_image_px", dy),
+                        "effective_source_flow_dy_image_px") if debug_info else None,
                     "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                 }
                 write_record(output_dir, role, run_id, record)
