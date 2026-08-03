@@ -61,6 +61,85 @@ logger = logging.getLogger("raven.eval")
 
 DEFAULT_REQUIRED_STAGES = frozenset({"quality", "detector"})
 
+# ---------------------------------------------------------------------------
+# Score validation — method-aware contract enforcement (Issue #19)
+# ---------------------------------------------------------------------------
+THRESHOLD_METHODS = frozenset({"TR", "GS", "GM", "RID", "HSTR", "HSQR"})
+
+
+def _validate_score(score: Any, method: str) -> tuple[bool, str]:
+    """Validate ``score_image`` return value against the method's contract.
+
+    Returns ``(is_valid, error_message)``.  A valid score must carry every
+    required key with a finite numeric value; anything else is a contract
+    violation and the row must be ``failed_scoring``, not ``scored``.
+    """
+    if not isinstance(score, dict):
+        return False, f"score_image returned non-dict: {type(score).__name__}"
+
+    method_upper = str(method).upper()
+
+    if method_upper == "T2S":
+        return _validate_t2s_score(score)
+    if method_upper in THRESHOLD_METHODS:
+        return _validate_threshold_score(score, method_upper)
+
+    # Unknown method — require at minimum canonical_score
+    return _validate_threshold_score(score, method_upper)
+
+
+def _validate_threshold_score(score: dict[str, Any], method: str) -> tuple[bool, str]:
+    """Threshold-based detector contract: raw_score + canonical_score, both finite."""
+    for field in ("raw_score", "canonical_score"):
+        if field not in score:
+            return False, f"missing required field: {field}"
+        try:
+            value = float(score[field])
+        except (ValueError, TypeError):
+            return False, f"{field} is not convertible to float: {score[field]!r}"
+        if not math.isfinite(value):
+            return False, f"{field} is non-finite: {value!r}"
+        # Store back as float so downstream consumers see a consistent type
+        score[field] = value
+    return True, ""
+
+
+def _validate_t2s_score(score: dict[str, Any]) -> tuple[bool, str]:
+    """T2S contract: true/control keys finite, detection_success present,
+    optional accuracy fields in [0, 1]."""
+    for field in ("t2s_score_true_key", "t2s_score_control_key"):
+        if field not in score:
+            return False, f"missing required field: {field}"
+        try:
+            value = float(score[field])
+        except (ValueError, TypeError):
+            return False, f"{field} is not convertible to float: {score[field]!r}"
+        if not math.isfinite(value):
+            return False, f"{field} is non-finite: {value!r}"
+        score[field] = value
+
+    if "t2s_detection_success" not in score:
+        return False, "missing required field: t2s_detection_success"
+
+    for acc_field in ("t2s_key_accuracy", "t2s_message_accuracy", "t2s_bit_accuracy"):
+        if acc_field in score and score[acc_field] is not None:
+            try:
+                val = float(score[acc_field])
+            except (ValueError, TypeError):
+                return False, f"{acc_field} is not convertible to float: {score[acc_field]!r}"
+            if not math.isfinite(val) or not 0.0 <= val <= 1.0:
+                return False, f"{acc_field} must be in [0, 1], got {val!r}"
+            score[acc_field] = val
+
+    # Normalize raw_score / canonical_score for T2S (same as true key)
+    if "raw_score" not in score:
+        score["raw_score"] = score["t2s_score_true_key"]
+    if "canonical_score" not in score:
+        score["canonical_score"] = score["t2s_score_true_key"]
+
+    return True, ""
+
+
 # ===========================================================================
 # Detector cohort model
 # ===========================================================================
@@ -104,6 +183,140 @@ def _build_detector_image_index(
                 "prompt": rec.get("prompt", ""),
             })
     return index
+
+
+def _scored_cohorts(detector_rows: list[dict[str, Any]]) -> set[str]:
+    """Return cohort names that have at least one valid scored row."""
+    return {
+        row["evaluation_cohort"]
+        for row in detector_rows
+        if row.get("status") == ROW_STATUS_SCORED
+        and row.get("canonical_score") is not None
+    }
+
+
+def _all_expected_cohorts(method: str) -> set[str]:
+    """Return the full set of cohorts the image index *may* produce."""
+    method_upper = str(method).upper()
+    if method_upper == "T2S":
+        return {"original_watermarked", "attacked_watermarked"}
+    return {
+        "original_clean", "original_watermarked",
+        "attacked_watermarked", "attacked_clean",
+    }
+
+
+def _missing_scoring_cohorts(
+    image_index: list[dict[str, Any]],
+    detector_rows: list[dict[str, Any]],
+    method: str,
+) -> list[str]:
+    """Cohorts that were requested (present in image_index) but zero rows scored."""
+    requested = {entry["evaluation_cohort"] for entry in image_index}
+    scored = {r["evaluation_cohort"] for r in detector_rows
+              if r.get("status") == ROW_STATUS_SCORED}
+    return sorted(requested - scored)
+
+
+def _missing_metric_cohorts(
+    metric_availability: dict[str, Any],
+    method: str,
+) -> list[str]:
+    """Cohorts needed for primary metrics that are absent or have no valid scores."""
+    method_upper = str(method).upper()
+    if method_upper == "T2S":
+        required = {"original_watermarked", "attacked_watermarked"}
+    else:
+        required = {"original_clean", "original_watermarked", "attacked_watermarked"}
+    present = set(metric_availability.get("scored_cohorts", []))
+    return sorted(required - present)
+
+
+def _compute_metric_availability(
+    detector_rows: list[dict[str, Any]],
+    method: str,
+    aggregate: dict[str, Any],
+) -> dict[str, Any]:
+    """Determine which metric reports can be produced from scored cohorts.
+
+    Returns a dict with boolean flags for each report type and a list of
+    what is missing per report.
+    """
+    method_upper = str(method).upper()
+    scored_set = _scored_cohorts(detector_rows)
+    cohort_counts = aggregate.get("cohort_counts", {})
+
+    availability: dict[str, Any] = {
+        "scored_cohorts": sorted(scored_set),
+        "cohort_counts": cohort_counts,
+    }
+
+    if method_upper == "T2S":
+        # T2S: needs original_watermarked + attacked_watermarked for
+        # paired-key detection report.  Does NOT need original_clean.
+        has_wm = "original_watermarked" in scored_set
+        has_att = "attacked_watermarked" in scored_set
+        availability["primary_report_available"] = has_wm and has_att
+        availability["any_report_available"] = has_wm or has_att
+        availability["primary_report"] = "paired_key_detection_report"
+        availability["primary_required_cohorts"] = [
+            "original_watermarked", "attacked_watermarked",
+        ]
+        if not availability["primary_report_available"]:
+            availability["primary_missing"] = sorted(
+                {"original_watermarked", "attacked_watermarked"} - scored_set,
+            )
+        # T2S has no threshold/recalibrated distinction
+        availability["threshold_report_available"] = False
+        availability["recalibrated_report_available"] = False
+        availability["threshold_report"] = None
+        return availability
+
+    # Threshold-based methods
+    has_clean = "original_clean" in scored_set
+    has_wm = "original_watermarked" in scored_set
+    has_att = "attacked_watermarked" in scored_set
+    has_att_clean = "attacked_clean" in scored_set
+
+    # Primary threshold report: needs original_clean + wm + attacked
+    threshold_ok = has_clean and has_wm and has_att
+    availability["threshold_report_available"] = threshold_ok
+    availability["threshold_report"] = (
+        "clean_calibrated_threshold_report"
+        if threshold_ok else None
+    )
+    availability["threshold_required_cohorts"] = [
+        "original_clean", "original_watermarked", "attacked_watermarked",
+    ]
+    if not threshold_ok:
+        availability["threshold_missing"] = sorted(
+            {"original_clean", "original_watermarked", "attacked_watermarked"}
+            - scored_set,
+        )
+
+    # Recalibrated report: needs attacked_clean + rest
+    recal_ok = has_att_clean and has_wm and has_att
+    availability["recalibrated_report_available"] = recal_ok
+    availability["recalibrated_report"] = (
+        "recalibrated_threshold_report" if recal_ok else None
+    )
+    availability["recalibrated_required_cohorts"] = [
+        "attacked_clean", "original_watermarked", "attacked_watermarked",
+    ]
+    if not recal_ok and has_att_clean:
+        availability["recalibrated_missing"] = sorted(
+            {"attacked_clean", "original_watermarked", "attacked_watermarked"}
+            - scored_set,
+        )
+    elif not recal_ok:
+        availability["recalibrated_unavailable_reason"] = (
+            "attacked_clean cohort not present"
+        )
+
+    # Any report available?
+    availability["primary_report_available"] = threshold_ok
+    availability["any_report_available"] = threshold_ok or (has_wm and has_att)
+    return availability
 
 
 # ===========================================================================
@@ -359,7 +572,22 @@ def evaluate_detector(
                 record=matched_record,
                 evaluation_entry=entry,
             )
-            row_status = ROW_STATUS_SCORED
+            # ---- Issue #19: validate score contract ----
+            if score is None:
+                row_status = ROW_STATUS_FAILED_SCORING
+                error_msg = "score_image returned None"
+            elif not isinstance(score, dict):
+                row_status = ROW_STATUS_FAILED_SCORING
+                error_msg = (
+                    f"score_image returned non-dict: {type(score).__name__}"
+                )
+            else:
+                valid, validation_error = _validate_score(score, method)
+                if valid:
+                    row_status = ROW_STATUS_SCORED
+                else:
+                    row_status = ROW_STATUS_FAILED_SCORING
+                    error_msg = f"score validation failed: {validation_error}"
         except DetectorMissingStateError as exc:
             row_status = ROW_STATUS_FAILED_MISSING_STATE
             error_msg = str(exc)
@@ -385,7 +613,7 @@ def evaluate_detector(
             "method": method,
             "status": row_status,
         }
-        if score:
+        if isinstance(score, dict) and row_status == ROW_STATUS_SCORED:
             row.update(score)
         if error_msg:
             row["error"] = error_msg
@@ -406,22 +634,41 @@ def evaluate_detector(
     aggregate = det_mod.aggregate(detector_rows, **agg_kwargs)
 
     scored_count = aggregate.get("scored_count", 0)
+    failed_count = aggregate.get("failed_count", 0)
     missing = aggregate.get("missing_cohorts", [])
+    cohort_counts = aggregate.get("cohort_counts", {})
 
-    # Determine stage status
+    # ---- Issue #19: metric availability ----
+    metric_availability = _compute_metric_availability(
+        detector_rows, method, aggregate,
+    )
+    aggregate["metric_availability"] = metric_availability
+    aggregate["missing_scoring_cohorts"] = _missing_scoring_cohorts(
+        image_index, detector_rows, method,
+    )
+    aggregate["missing_metric_cohorts"] = _missing_metric_cohorts(
+        metric_availability, method,
+    )
+
+    # ---- Issue #19: stage status semantics ----
+    primary_available = metric_availability.get("primary_report_available", False)
+    any_available = metric_availability.get("any_report_available", False)
+
     if scored_count == 0:
         stage_status = STATUS_FAILED_SCORING
-    elif missing:
+    elif primary_available and failed_count == 0:
+        stage_status = STATUS_COMPLETED
+    elif any_available:
         stage_status = STATUS_COMPLETED_WITH_ERRORS
-    elif aggregate.get("failed_count", 0) > 0:
+    elif scored_count > 0:
         stage_status = STATUS_COMPLETED_WITH_ERRORS
     else:
-        stage_status = STATUS_COMPLETED
+        stage_status = STATUS_FAILED_SCORING
 
     aggregate["stage"] = "detector"
     aggregate["method"] = method
     aggregate["status"] = stage_status
-    aggregate["available"] = scored_count > 0
+    aggregate["available"] = any_available
     return aggregate
 
 
