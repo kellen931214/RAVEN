@@ -212,6 +212,27 @@ class TestLegacyFallback:
         ])
         assert resolver is None
 
+    def test_same_key_different_metadata_raises(self):
+        """Same (run_id, role) with different embedded metadata → conflict."""
+        with pytest.raises(MetadataConflictError, match="different embedded"):
+            MetadataResolver.from_records_fallback([
+                {"run_id": "1", "role": "watermarked",
+                 "source_metadata": {"run_id": "1", "w_seed": "99"}},
+                {"run_id": "1", "role": "watermarked",
+                 "source_metadata": {"run_id": "1", "w_seed": "100"}},
+            ])
+
+    def test_same_key_identical_metadata_ok(self):
+        """Same (run_id, role) with identical embedded metadata → deduplicated."""
+        resolver = MetadataResolver.from_records_fallback([
+            {"run_id": "1", "role": "watermarked",
+             "source_metadata": {"run_id": "1", "w_seed": "99"}},
+            {"run_id": "1", "role": "watermarked",
+             "source_metadata": {"run_id": "1", "w_seed": "99"}},
+        ])
+        assert resolver is not None
+        assert resolver.resolve("1", "watermarked")["w_seed"] == "99"
+
 
 # ===========================================================================
 # CSV vs embedded conflict
@@ -264,15 +285,29 @@ class TestExplicitRoleColumn:
         resolver = MetadataResolver.from_path(p)
         assert resolver.resolve("1", "watermarked")["watermarked_path"] == "/wm.png"
 
-    def test_explicit_role_beats_path_inference(self, tmp_path):
-        """Explicit role=clean with only watermarked_path still treated as clean."""
+    def test_explicit_role_contradictory_path_raises(self, tmp_path):
+        """Explicit role=clean with only watermarked_path → AmbiguousMetadataError."""
         p = tmp_path / "meta.csv"
         _write_csv(p, [{"run_id": "1", "role": "clean",
+                         "watermarked_path": "/wm.png", "clean_path": ""}])
+        with pytest.raises(AmbiguousMetadataError, match="Contradictory"):
+            MetadataResolver.from_path(p)
+
+    def test_unknown_explicit_role_raises(self, tmp_path):
+        """Explicit role='something_else' → AmbiguousMetadataError."""
+        p = tmp_path / "meta.csv"
+        _write_csv(p, [{"run_id": "1", "role": "something_else",
                          "watermarked_path": "/wm.png"}])
-        resolver = MetadataResolver.from_path(p)
-        # Role=clean wins even though only watermarked_path is present
-        row = resolver.resolve("1", "clean")
-        assert row["role"] == "clean"
+        with pytest.raises(AmbiguousMetadataError, match="Unknown explicit role"):
+            MetadataResolver.from_path(p)
+
+    def test_wm_role_with_only_clean_path_raises(self, tmp_path):
+        """Explicit role=watermarked with only clean_path → AmbiguousMetadataError."""
+        p = tmp_path / "meta.csv"
+        _write_csv(p, [{"run_id": "1", "role": "watermarked",
+                         "clean_path": "/cl.png", "watermarked_path": ""}])
+        with pytest.raises(AmbiguousMetadataError, match="Contradictory"):
+            MetadataResolver.from_path(p)
 
 
 # ===========================================================================
@@ -399,11 +434,11 @@ class TestEvalIntegration:
         assert meta_idx < load_idx, (
             "Metadata resolution must happen BEFORE load_state")
 
-    def test_eval_only_file_not_found_allows_fallback(self):
-        """eval.py only catches FileNotFoundError for CSV; not MetadataResolverError."""
+    def test_eval_path_not_exists_triggers_fallback(self):
+        """eval.py uses path.exists() check before fallback, path.is_file() after."""
         source = (REPO / "experiments" / "eval.py").read_text()
-        # Should check Path(csv_path).is_file() rather than try/except MetadataResolverError
-        assert "Path(csv_path).is_file()" in source or "csv_path and" in source
+        assert "not path.exists()" in source or "path.exists()" in source
+        assert "not path.is_file()" in source or "path.is_file()" in source
 
     def test_eval_fails_closed_on_metadata_errors(self):
         """eval.py catches DuplicateMetadataError etc to fail closed (return error),

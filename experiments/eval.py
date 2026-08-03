@@ -231,31 +231,54 @@ def evaluate_detector(
         DuplicateMetadataError, AmbiguousMetadataError,
     )
     csv_path = config.get("metadata_path", "") if config else ""
-    if csv_path and Path(csv_path).is_file():
-        try:
-            resolver = MetadataResolver.from_path(csv_path)
-        except (DuplicateMetadataError, AmbiguousMetadataError,
-                MetadataResolverError) as exc:
+    if csv_path:
+        path = Path(csv_path)
+        if not path.exists():
+            # CSV genuinely missing — use legacy embedded fallback
+            resolver = MetadataResolver.from_records_fallback(records)
+            if resolver is None:
+                return {
+                    "stage": "detector", "method": method,
+                    "status": STATUS_FAILED_MISSING_REQUIRED_STATE,
+                    "reason": (
+                        f"No metadata CSV found at {csv_path} "
+                        "and no embedded source_metadata in records."
+                    ),
+                }
+        elif not path.is_file():
             return {
                 "stage": "detector", "method": method,
                 "status": STATUS_FAILED_INTERNAL_ERROR,
-                "reason": f"Metadata validation failed: {type(exc).__name__}: {exc}",
+                "reason": (
+                    f"metadata_path exists but is not a regular file: {csv_path}. "
+                    "Expected a CSV file."
+                ),
             }
-        except ValueError as exc:
-            return {
-                "stage": "detector", "method": method,
-                "status": STATUS_FAILED_INTERNAL_ERROR,
-                "reason": f"Metadata CSV invalid: {exc}",
-            }
+        else:
+            try:
+                resolver = MetadataResolver.from_path(csv_path)
+            except (DuplicateMetadataError, AmbiguousMetadataError,
+                    MetadataResolverError) as exc:
+                return {
+                    "stage": "detector", "method": method,
+                    "status": STATUS_FAILED_INTERNAL_ERROR,
+                    "reason": f"Metadata validation failed: {type(exc).__name__}: {exc}",
+                }
+            except ValueError as exc:
+                return {
+                    "stage": "detector", "method": method,
+                    "status": STATUS_FAILED_INTERNAL_ERROR,
+                    "reason": f"Metadata CSV invalid: {exc}",
+                }
     else:
-        # CSV genuinely missing — use legacy embedded fallback
+        # No metadata path configured — use legacy embedded fallback
         resolver = MetadataResolver.from_records_fallback(records)
         if resolver is None:
             return {
                 "stage": "detector", "method": method,
                 "status": STATUS_FAILED_MISSING_REQUIRED_STATE,
                 "reason": (
-                    f"No metadata CSV found at {csv_path or 'unspecified path'} "
+                    "No metadata_path in config.json "
                     "and no embedded source_metadata in records."
                 ),
             }

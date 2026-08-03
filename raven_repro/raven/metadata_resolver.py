@@ -54,23 +54,46 @@ def _normalize_role(row: dict[str, str]) -> str | None:
 
     Priority: explicit ``role`` / ``source_role`` / ``image_role`` column,
     then path inference from ``watermarked_path`` / ``clean_path``.
-    Returns ``None`` for generic rows (both paths present or no path).
+    Returns ``None`` for generic rows (both paths present or neither path
+    and no explicit role).
+
+    Raises ``AmbiguousMetadataError`` for unknown explicit role values or
+    contradictory role/path combinations.
     """
-    # Explicit role columns take priority
+    explicit_role: str | None = None
     for col in ("role", "source_role", "image_role"):
         val = row.get(col)
         if val is not None and str(val).strip():
             v = str(val).strip().lower()
             if v in ("watermarked", "wm"):
-                return "watermarked"
+                explicit_role = "watermarked"
+                break
             if v in ("clean", "cl"):
-                return "clean"
-            # Unknown explicit value → treat as generic
-            return None
+                explicit_role = "clean"
+                break
+            raise AmbiguousMetadataError(
+                f"Unknown explicit role value {v!r} in column {col!r}. "
+                "Expected 'watermarked'/'wm' or 'clean'/'cl'."
+            )
 
-    # Path-based inference
     has_wm = bool(row.get("watermarked_path") or row.get("watermarked_image_path"))
     has_cl = bool(row.get("clean_path") or row.get("clean_image_path"))
+
+    if explicit_role is not None:
+        # Validate role/path consistency
+        if explicit_role == "clean" and has_wm and not has_cl:
+            raise AmbiguousMetadataError(
+                f"Explicit role='clean' but only watermarked_path is present "
+                f"(no clean_path). Contradictory metadata."
+            )
+        if explicit_role == "watermarked" and has_cl and not has_wm:
+            raise AmbiguousMetadataError(
+                f"Explicit role='watermarked' but only clean_path is present "
+                f"(no watermarked_path). Contradictory metadata."
+            )
+        return explicit_role
+
+    # Path-based inference (no explicit role column)
     if has_wm and not has_cl:
         return "watermarked"
     if has_cl and not has_wm:
@@ -178,9 +201,12 @@ class MetadataResolver:
         Role is taken from the record's own ``role`` field.  The same
         run_id with different roles (watermarked, clean) produces two
         role-specific rows rather than duplicate generic rows.
+
+        Same key with *different* embedded metadata raises
+        ``MetadataConflictError`` — identical metadata is deduplicated safely.
         """
         rows: list[dict[str, str]] = []
-        seen: set[tuple[str, str | None]] = set()
+        seen: dict[tuple[str, str | None], dict[str, str]] = {}
         for rec in records:
             embedded = rec.get("source_metadata")
             if not isinstance(embedded, dict) or not embedded:
@@ -195,8 +221,15 @@ class MetadataResolver:
 
             key = (row.get("run_id", ""), row["role"] if "role" in row else None)
             if key in seen:
+                # Same key — validate identical, otherwise conflict
+                if seen[key] != row:
+                    raise MetadataConflictError(
+                        f"Legacy fallback conflict: run_id={key[0]!r} "
+                        f"role={key[1]!r} has two different embedded "
+                        f"source_metadata dicts"
+                    )
                 continue
-            seen.add(key)
+            seen[key] = row
             rows.append(row)
         if not rows:
             return None
