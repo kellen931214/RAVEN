@@ -7,13 +7,17 @@ CLIP — all without importing or initializing ``RavenPipeline``.
 
     python3 experiments/eval.py --output-dir /tmp/run --device cuda
 
-Responsibilities
-----------------
-* Quality: PSNR / SSIM (paired, overlap-aware).
-* Detector: method-specific dispatch for all seven watermark families.
-* FID: clean-fid between reference and attacked image sets.
-* CLIP: prompt-image cosine similarity.
-* Aggregate summary.
+Detector cohort model
+---------------------
+Attack roles (watermarked, clean) are attack input identities.  Detector
+evaluation uses a separate cohort model:
+
+    original_watermarked  → detector on input_path (watermarked input image)
+    attacked_watermarked  → detector on output.png (attacked output)
+    original_clean        → detector on clean input_path
+    attacked_clean        → detector on clean output.png
+
+Results are written to ``evaluation/detector_records.jsonl``.
 
 This module must NOT:
 * Import ``RavenPipeline``.
@@ -24,10 +28,10 @@ This module must NOT:
 from __future__ import annotations
 
 import argparse
-import csv
 import json
 import logging
 import math
+import os
 import sys
 import time
 from pathlib import Path
@@ -39,6 +43,8 @@ sys.path.insert(0, str(RAVEN_REPRO))
 
 from raven.experiment_io import (  # noqa: E402
     config_path,
+    detector_records_path,
+    evaluation_dir,
     output_image_path,
     read_config,
     read_records_jsonl,
@@ -46,34 +52,54 @@ from raven.experiment_io import (  # noqa: E402
 )
 from raven.metrics import (  # noqa: E402
     canonical_watermark_score,
-    calibrate_threshold,
-    detection_rate,
     pair_quality_metrics,
-    roc_auc,
     summarize_detection,
 )
 
 logger = logging.getLogger("raven.eval")
 
 
-# --------------------------------------------------------------------------- #
-# Method dispatch
-# --------------------------------------------------------------------------- #
-def _canonical_score(method: str, raw_score: float) -> float:
-    """Convert a raw provider score to canonical higher-is-watermarked space."""
-    method = method.upper()
-    # GM bit accuracy and T2S score_true_key are already higher-is-watermarked.
-    if method in {"GM", "T2S", "GS"}:
-        return float(raw_score)
-    # TR, RID, HSTR, HSQR: canonical score = -raw (or -log10(p) for TR).
-    if method in {"TR", "RID", "HSTR", "HSQR"}:
-        return -float(raw_score)
-    raise ValueError(f"Unsupported method for canonical score: {method}")
+# ===========================================================================
+# Detector cohort model
+# ===========================================================================
+# Maps attack input roles to detector evaluation cohorts.
+DETECTOR_COHORTS = {
+    "watermarked": {
+        "original": {
+            "evaluation_cohort": "original_watermarked",
+            "image_source": "input",   # read from record["input_path"]
+        },
+        "attacked": {
+            "evaluation_cohort": "attacked_watermarked",
+            "image_source": "output",  # read from output.png
+        },
+    },
+    "clean": {
+        "original": {
+            "evaluation_cohort": "original_clean",
+            "image_source": "input",
+        },
+        "attacked": {
+            "evaluation_cohort": "attacked_clean",
+            "image_source": "output",
+        },
+    },
+}
 
 
-# --------------------------------------------------------------------------- #
+def _resolve_image_path(rec: dict[str, Any], source: str,
+                         output_dir: str | Path) -> Path:
+    if source == "input":
+        return Path(rec.get("input_path", ""))
+    elif source == "output":
+        return output_image_path(output_dir, rec.get("role", "watermarked"),
+                                  str(rec["run_id"]))
+    raise ValueError(f"Unknown image source: {source}")
+
+
+# ===========================================================================
 # Quality stage
-# --------------------------------------------------------------------------- #
+# ===========================================================================
 def evaluate_quality(
     records: list[dict[str, Any]],
     output_dir: str | Path,
@@ -91,8 +117,7 @@ def evaluate_quality(
 
         if not input_path.is_file() or not out_path.is_file():
             results.append({
-                "run_id": run_id,
-                "role": role,
+                "run_id": run_id, "role": role,
                 "error": "missing input or output image",
                 "quality_available": False,
             })
@@ -120,15 +145,13 @@ def evaluate_quality(
                 ssim_values.append(ssim)
 
             results.append({
-                "run_id": run_id,
-                "role": role,
+                "run_id": run_id, "role": role,
                 "quality_available": True,
                 **metrics,
             })
         except Exception as exc:
             results.append({
-                "run_id": run_id,
-                "role": role,
+                "run_id": run_id, "role": role,
                 "error": f"{type(exc).__name__}: {exc}",
                 "quality_available": False,
             })
@@ -143,444 +166,469 @@ def evaluate_quality(
     }
 
 
-# --------------------------------------------------------------------------- #
-# Detector stage — method-specific adapters
-# --------------------------------------------------------------------------- #
-# Each adapter receives (records, output_dir, device) and returns a result dict.
-# When real provider state is unavailable, it returns {"available": False, "reason": "..."}.
-
-def _get_canonical_scores(
+# ===========================================================================
+# Detector execution — orchestration layer
+# ===========================================================================
+def _build_detector_image_index(
     records: list[dict[str, Any]],
+    output_dir: str | Path,
+) -> list[dict[str, Any]]:
+    """Build the list of (run_id, evaluation_cohort, image_path) entries.
+
+    For each attack record, emits original (input) and attacked (output) rows.
+    """
+    index: list[dict[str, Any]] = []
+    for rec in records:
+        run_id = str(rec["run_id"])
+        role = rec.get("role", "watermarked")
+        cohorts = DETECTOR_COHORTS.get(role, {})
+        for variant, info in cohorts.items():
+            image_path = _resolve_image_path(rec, info["image_source"], output_dir)
+            index.append({
+                "run_id": run_id,
+                "source_role": role,
+                "evaluation_cohort": info["evaluation_cohort"],
+                "image_path": str(image_path),
+                "image_source": info["image_source"],
+                "method": rec.get("method", ""),
+                "prompt": rec.get("prompt", ""),
+                "prompt_id": rec.get("prompt_id", ""),
+            })
+    return index
+
+
+def _try_load_provider(method: str, records: list[dict[str, Any]],
+                        device: str) -> tuple[Any, dict[str, Any]] | None:
+    """Attempt to load a method-specific provider from available state.
+
+    Returns ``(provider, provider_info)`` on success, ``None`` on failure.
+    Provider info documents the artifacts that were loaded.
+    """
+    try:
+        if method == "TR":
+            from utils.wm.tr_provider import TrProvider
+            from utils.pipe import pipe_utils
+
+            pipe = pipe_utils.get_pipe_provider(
+                pretrained_model_name_or_path="RedbeardNZ/stable-diffusion-2-1-base",
+                resolution=512, device=torch.device(device),
+                eager_loading=False, schedulers_name="DDIM", disable_tqdm=True,
+            )
+            latent_shape = pipe.get_latent_shape()
+            provider = TrProvider(
+                latent_shape=latent_shape, dtype=pipe.get_dtype(),
+                device=torch.device(device),
+                w_seed=999999, w_channel=3, w_radius=10,
+                w_pattern="ring", w_mask_shape="circle",
+                w_measurement="l1_complex", w_injection="complex",
+            )
+            return provider, {"pipe": pipe, "provider_type": "TrProvider"}
+
+        # Methods that require per-cohort bundle/state — not available without data.
+        if method in {"GM", "T2S", "GS", "RID", "HSTR", "HSQR"}:
+            return None
+
+    except ImportError as exc:
+        logger.debug("Cannot load provider for %s: %s", method, exc)
+        return None
+    except Exception as exc:
+        logger.debug("Provider init failed for %s: %s", method, exc)
+        return None
+
+    return None
+
+
+def _score_image(method: str, provider: Any, provider_info: dict[str, Any],
+                  image_path: str, torch_module) -> dict[str, Any] | None:
+    """Run one image through a method-specific detector. Returns score dict or None."""
+    from PIL import Image, ImageOps
+
+    path = Path(image_path)
+    if not path.is_file():
+        return None
+
+    try:
+        with Image.open(path) as opened:
+            image = ImageOps.exif_transpose(opened).convert("RGB")
+
+        if method == "TR":
+            pipe = provider_info["pipe"]
+            with torch_module.no_grad():
+                inversion = provider.invert_images(
+                    image, pipe_provider_target=pipe, num_inference_steps=50,
+                )
+                recovered = inversion["zT_torch"]
+                result = provider.get_accuracies(recovered)
+                raw = float(result["p_values"][0])
+                import scipy.stats
+                recovered_fft = torch_module.fft.fftshift(
+                    torch_module.fft.fft2(recovered), dim=(-1, -2))
+                mask = provider.watermarking_mask[0]
+                target = provider.gt_patch[0][mask].flatten()
+                target_cat = torch_module.concatenate([target.real, target.imag])
+                for latent_fft in recovered_fft:
+                    observed = latent_fft[mask].flatten()
+                    observed_cat = torch_module.concatenate([observed.real, observed.imag])
+                    sigma = observed_cat.std()
+                    log_p = float(scipy.stats.ncx2.logcdf(
+                        ((observed_cat - target_cat) / sigma).square().sum().item(),
+                        df=len(target_cat),
+                        nc=(target_cat.square() / sigma.square()).sum().item(),
+                    ))
+                canonical = -log_p / math.log(10.0) if math.isfinite(log_p) else float("inf")
+                return {
+                    "raw_score": raw,
+                    "canonical_score": canonical,
+                    "tr_log_p": log_p,
+                }
+        return None
+    except Exception as exc:
+        logger.debug("Score failed for %s: %s", image_path, exc)
+        return None
+
+
+def _detector_available(method: str) -> tuple[bool, str]:
+    """Check whether a detector can run without real provider state.
+
+    Returns ``(available, reason)``.
+    """
+    # Only TR can run without external data (uses built-in defaults).
+    # All other methods need per-cohort state (bundles, secrets, state files).
+    if method == "TR":
+        return True, "TR provider can be constructed from defaults"
+    return False, (
+        f"{method} requires per-cohort provider state "
+        f"(bundle/secret/state files) not available on this machine"
+    )
+
+
+def evaluate_detector(
+    records: list[dict[str, Any]],
+    output_dir: str | Path,
     method: str,
-    score_field: str,
-) -> dict[str, list[float]]:
-    """Extract canonical scores from records.  Returns empty lists if missing."""
-    scores: dict[str, list[float]] = {"clean": [], "watermarked": [], "attacked": []}
-    for rec in records:
-        role = rec.get("role", "watermarked")
-        value = rec.get(score_field)
-        if value is not None and str(value).strip():
-            try:
-                scores[role].append(float(value))
-            except (ValueError, TypeError):
-                pass
-    return scores
-
-
-def evaluate_tr(
-    records: list[dict[str, Any]],
-    output_dir: str | Path,
     device: str = "cuda",
 ) -> dict[str, Any]:
-    """Tree-Ring detector evaluation.
+    """Run detector on all cohorts and write ``evaluation/detector_records.jsonl``.
 
-    Uses the canonical score from debug_info (``effective_source_flow_*``).
-    When attacked-clean records are present, computes recalibrated threshold.
+    When provider state is unavailable, returns a structured unavailable result
+    documenting exactly which artifacts are needed.
     """
-    # TR raw score comes from the pipeline's TR detection or pre-computed scores.
-    # In the new pipeline, scores must be pre-computed and stored in records.
-    scores = _get_canonical_scores(records, "TR", "canonical_score")
-    if not any(scores.values()):
+    output_dir = Path(output_dir)
+    eval_dir = evaluation_dir(output_dir)
+    eval_dir.mkdir(parents=True, exist_ok=True)
+
+    can_run, reason = _detector_available(method)
+    if not can_run:
         return {
-            "method": "TR",
-            "available": False,
-            "reason": "No canonical scores in records. Run TR detector first.",
-        }
-
-    target_fpr = 0.01
-    clean = scores.get("clean", [])
-    watermarked = scores.get("watermarked", [])
-    attacked = scores.get("attacked", [])
-
-    result: dict[str, Any] = {
-        "method": "TR",
-        "available": True,
-        "target_fpr": target_fpr,
-    }
-
-    if watermarked and attacked:
-        if clean:
-            summary = summarize_detection(clean, watermarked, attacked, target_fpr)
-            result["calibration"] = {
-                "threshold": summary.calibration.threshold,
-                "target_fpr": summary.calibration.target_fpr,
-                "actual_fpr": summary.calibration.actual_fpr,
-                "false_positives": summary.calibration.false_positives,
-                "num_clean": summary.calibration.num_clean,
-            }
-            result["watermarked_tpr"] = summary.watermarked_tpr
-            result["attacked_tpr_at_original_threshold"] = summary.attacked_tpr
-            result["watermarked_auc"] = summary.watermarked_auc
-            result["attacked_auc"] = summary.attacked_auc
-            result["attack_success"] = 1.0 - summary.attacked_tpr
-        else:
-            result["warning"] = "No clean scores available; threshold calibration skipped."
-            result["recalibrated_metrics_available"] = False
-
-    # Check for attacked-clean recalibration
-    attacked_clean = [r for r in records if r.get("role") == "clean"]
-    if attacked_clean:
-        result["attacked_clean_count"] = len(attacked_clean)
-        result["recalibrated_metrics_available"] = True
-    else:
-        result["recalibrated_metrics_available"] = False
-
-    return result
-
-
-def evaluate_gs(
-    records: list[dict[str, Any]],
-    output_dir: str | Path,
-    device: str = "cuda",
-) -> dict[str, Any]:
-    """Gaussian Shading detector evaluation."""
-    scores = _get_canonical_scores(records, "GS", "bit_accuracy")
-    if not any(scores.values()):
-        return {
-            "method": "GS",
-            "available": False,
-            "reason": "No bit accuracy scores in records. Run GS detector first.",
-        }
-
-    target_fpr = 0.01
-    clean = scores.get("clean", [])
-    watermarked = scores.get("watermarked", [])
-    attacked = scores.get("attacked", [])
-
-    result: dict[str, Any] = {
-        "method": "GS",
-        "available": True,
-        "target_fpr": target_fpr,
-    }
-
-    if watermarked and attacked and clean:
-        summary = summarize_detection(clean, watermarked, attacked, target_fpr)
-        result["calibration"] = {
-            "threshold": summary.calibration.threshold,
-            "actual_fpr": summary.calibration.actual_fpr,
-        }
-        result["watermarked_tpr"] = summary.watermarked_tpr
-        result["attacked_tpr"] = summary.attacked_tpr
-        result["watermarked_auc"] = summary.watermarked_auc
-        result["attacked_auc"] = summary.attacked_auc
-        result["attack_success"] = 1.0 - summary.attacked_tpr
-
-    return result
-
-
-def evaluate_gm(
-    records: list[dict[str, Any]],
-    output_dir: str | Path,
-    device: str = "cuda",
-) -> dict[str, Any]:
-    """GaussMarker detector evaluation.
-
-    Uses ``gm_raw_bit_accuracy`` as the canonical score (higher = watermarked).
-    Requires GM bundle state for real detection; without it, only orchestration
-    is verified.
-    """
-    scores: dict[str, list[float]] = {"clean": [], "watermarked": [], "attacked": []}
-    for rec in records:
-        role = rec.get("role", "watermarked")
-        value = rec.get("gm_raw_bit_accuracy")
-        if value is not None:
-            try:
-                scores[role].append(float(value))
-            except (ValueError, TypeError):
-                pass
-
-    if not any(scores.values()):
-        return {
-            "method": "GM",
-            "available": False,
-            "reason": (
-                "No gm_raw_bit_accuracy scores in records. "
-                "GM bundle state is required for real detection."
-            ),
-            "required_artifacts": [
-                "gm_bundle_dir (with manifest.json, w1.pth, w2.pth)",
-                "gm_bundle_config_sha256",
-                "gm_w1_file_sha256",
-                "gm_w2_file_sha256",
-                "gm_watermark_sha256",
-                "gm_m_sha256",
-                "gm_target_sha256",
-                "gm_mask_sha256",
-            ],
-        }
-
-    target_fpr = 0.01
-    clean = scores.get("clean", [])
-    watermarked = scores.get("watermarked", [])
-    attacked = scores.get("attacked", [])
-
-    result: dict[str, Any] = {
-        "method": "GM",
-        "available": True,
-        "score_type": "gm_raw_bit_accuracy",
-        "score_direction": "higher_is_watermarked",
-        "target_fpr": target_fpr,
-    }
-
-    if watermarked and attacked and clean:
-        summary = summarize_detection(clean, watermarked, attacked, target_fpr)
-        result["calibration"] = {
-            "threshold": summary.calibration.threshold,
-            "actual_fpr": summary.calibration.actual_fpr,
-        }
-        result["watermarked_tpr"] = summary.watermarked_tpr
-        result["attacked_tpr"] = summary.attacked_tpr
-        result["watermarked_auc"] = summary.watermarked_auc
-        result["attacked_auc"] = summary.attacked_auc
-        result["attack_success"] = 1.0 - summary.attacked_tpr
-    elif watermarked and attacked:
-        result["watermarked_mean_score"] = (
-            sum(watermarked) / len(watermarked) if watermarked else None
-        )
-        result["attacked_mean_score"] = (
-            sum(attacked) / len(attacked) if attacked else None
-        )
-        result["warning"] = "No clean scores; threshold not calibrated."
-
-    return result
-
-
-def evaluate_t2s(
-    records: list[dict[str, Any]],
-    output_dir: str | Path,
-    device: str = "cuda",
-) -> dict[str, Any]:
-    """T2SMark detector evaluation.
-
-    Preserves per-sample bit accuracy, detection under paired-key comparison,
-    and message corruption statistics.  Requires T2S state files for real
-    detection.
-    """
-    # Collect T2S-specific fields from records
-    bit_accuracies: list[float] = []
-    detection_success: list[bool] = []
-    message_accuracies: list[float] = []
-    true_key_scores: dict[str, list[float]] = {
-        "clean": [], "watermarked": [], "attacked": [],
-    }
-
-    for rec in records:
-        role = rec.get("role", "watermarked")
-        for field in ("t2s_bit_accuracy", "bit_accuracy"):
-            val = rec.get(field)
-            if val is not None:
-                try:
-                    bit_accuracies.append(float(val))
-                except (ValueError, TypeError):
-                    pass
-                break
-
-        det = rec.get("t2s_detection_success")
-        if det is not None:
-            detection_success.append(bool(det))
-
-        msg_acc = rec.get("t2s_message_accuracy", rec.get("message_accuracy"))
-        if msg_acc is not None:
-            try:
-                message_accuracies.append(float(msg_acc))
-            except (ValueError, TypeError):
-                pass
-
-        score = rec.get("t2s_score_true_key")
-        if score is not None:
-            try:
-                true_key_scores[role].append(float(score))
-            except (ValueError, TypeError):
-                pass
-
-    has_data = bool(bit_accuracies or detection_success or any(true_key_scores.values()))
-
-    if not has_data:
-        return {
-            "method": "T2S",
-            "available": False,
-            "reason": (
-                "No T2S scores in records. "
-                "T2S state files are required for real detection."
-            ),
-            "required_artifacts": [
-                "t2s_state_path (per-sample portable state)",
-                "t2s_state_sha256",
-                "t2s_provider_config_sha256",
-            ],
-            "preserved_fields": [
-                "per-sample bit accuracy",
-                "mean bit accuracy",
-                "median bit accuracy",
-                "q25 / q75 bit accuracy",
-                "detection threshold (paired_key_comparison)",
-                "before detection rate",
-                "attacked detection rate",
-                "attack success rate",
-                "detected but message corrupted",
-                "detection failed but message readable",
-            ],
-        }
-
-    result: dict[str, Any] = {
-        "method": "T2S",
-        "available": True,
-        "score_type": "t2s_score_true_key",
-        "score_direction": "higher_is_watermarked",
-        "decision_rule": "paired_key_comparison (score_true_key > score_control_key)",
-    }
-
-    if bit_accuracies:
-        import numpy as np
-        arr = np.array(bit_accuracies)
-        result["bit_accuracy"] = {
-            "mean": float(np.mean(arr)),
-            "median": float(np.median(arr)),
-            "q25": float(np.quantile(arr, 0.25)),
-            "q75": float(np.quantile(arr, 0.75)),
-            "min": float(np.min(arr)),
-            "max": float(np.max(arr)),
-            "count": len(bit_accuracies),
-        }
-        # Count corrupted messages (detected but bit_accuracy < 1)
-        corrupted = sum(
-            1 for det, acc in zip(detection_success, bit_accuracies)
-            if det and acc < 1.0
-        )
-        result["message_corrupted_count"] = corrupted
-
-    if detection_success:
-        result["detection_rate"] = sum(detection_success) / len(detection_success)
-        result["detection_count"] = len(detection_success)
-        result["detected_count"] = sum(detection_success)
-
-    if message_accuracies:
-        result["mean_message_accuracy"] = (
-            sum(message_accuracies) / len(message_accuracies)
-        )
-
-    # Secondary: clean-calibrated threshold on score_true_key
-    if true_key_scores["watermarked"] and true_key_scores["attacked"]:
-        result["mean_score_true_key_watermarked"] = (
-            sum(true_key_scores["watermarked"]) / len(true_key_scores["watermarked"])
-        )
-        result["mean_score_true_key_attacked"] = (
-            sum(true_key_scores["attacked"]) / len(true_key_scores["attacked"])
-        )
-
-    return result
-
-
-def evaluate_rid(
-    records: list[dict[str, Any]],
-    output_dir: str | Path,
-    device: str = "cuda",
-) -> dict[str, Any]:
-    """RingID detector evaluation."""
-    return _fourier_eval(records, "RID")
-
-
-def evaluate_hstr(
-    records: list[dict[str, Any]],
-    output_dir: str | Path,
-    device: str = "cuda",
-) -> dict[str, Any]:
-    """HSTR detector evaluation."""
-    return _fourier_eval(records, "HSTR")
-
-
-def evaluate_hsqr(
-    records: list[dict[str, Any]],
-    output_dir: str | Path,
-    device: str = "cuda",
-) -> dict[str, Any]:
-    """HSQR detector evaluation."""
-    return _fourier_eval(records, "HSQR")
-
-
-def _fourier_eval(records: list[dict[str, Any]], method: str) -> dict[str, Any]:
-    """Shared Fourier (RID/HSTR/HSQR) detector evaluation."""
-    prefix = method.lower()
-    scores: dict[str, list[float]] = {"clean": [], "watermarked": [], "attacked": []}
-    for rec in records:
-        role = rec.get("role", "watermarked")
-        for field in (f"{prefix}_canonical_score", "canonical_score", f"{prefix}_raw_l1"):
-            val = rec.get(field)
-            if val is not None:
-                try:
-                    scores[role].append(float(val))
-                except (ValueError, TypeError):
-                    pass
-                break
-
-    if not any(scores.values()):
-        return {
+            "stage": "detector",
             "method": method,
             "available": False,
-            "reason": (
-                f"No {method} scores in records. "
-                f"{method} bundle state is required for real detection."
-            ),
-            "required_artifacts": [
-                f"{prefix}_bundle_dir (with manifest.json)",
-                f"{prefix}_bundle_config_sha256",
-                f"{prefix}_selected_pattern_sha256",
-                f"{prefix}_mask_sha256",
-            ],
+            "reason": reason,
+            "NOT RUN — DATA UNAVAILABLE": True,
         }
 
-    target_fpr = 0.01
-    clean = scores.get("clean", [])
-    watermarked = scores.get("watermarked", [])
-    attacked = scores.get("attacked", [])
+    image_index = _build_detector_image_index(records, output_dir)
+    if not image_index:
+        return {
+            "stage": "detector",
+            "method": method,
+            "available": False,
+            "reason": "No images to score. Run attack first.",
+        }
 
-    result: dict[str, Any] = {
+    import torch
+    provider_result = _try_load_provider(method, records, device)
+    if provider_result is None:
+        return {
+            "stage": "detector",
+            "method": method,
+            "available": False,
+            "reason": f"Provider for {method} could not be initialized.",
+            "NOT RUN — DATA UNAVAILABLE": True,
+        }
+
+    provider, provider_info = provider_result
+    detector_rows: list[dict[str, Any]] = []
+
+    for entry in image_index:
+        score = _score_image(method, provider, provider_info,
+                              entry["image_path"], torch)
+        row = {
+            "run_id": entry["run_id"],
+            "source_role": entry["source_role"],
+            "evaluation_cohort": entry["evaluation_cohort"],
+            "image_path": entry["image_path"],
+            "method": method,
+            "status": "scored" if score else "failed",
+        }
+        if score:
+            row.update(score)
+        else:
+            row["error"] = "scoring failed"
+        detector_rows.append(row)
+
+    # Write detector_records.jsonl
+    det_path = detector_records_path(output_dir)
+    tmp = det_path.with_name(f".detector_records.jsonl.{os.getpid()}.tmp")
+    with tmp.open("w", encoding="utf-8") as handle:
+        for row in detector_rows:
+            handle.write(
+                json.dumps(row, sort_keys=True, ensure_ascii=False) + "\n"
+            )
+    os.replace(tmp, det_path)
+
+    # Aggregate by cohort
+    cohorts: dict[str, list[float]] = {}
+    for row in detector_rows:
+        if row.get("status") != "scored":
+            continue
+        cohort = row["evaluation_cohort"]
+        cs = row.get("canonical_score")
+        if cs is not None and math.isfinite(float(cs)):
+            cohorts.setdefault(cohort, []).append(float(cs))
+
+    aggregate: dict[str, Any] = {
+        "stage": "detector",
         "method": method,
         "available": True,
-        "score_direction": "higher_is_watermarked",
-        "target_fpr": target_fpr,
+        "scored_count": sum(1 for r in detector_rows if r.get("status") == "scored"),
+        "failed_count": sum(1 for r in detector_rows if r.get("status") != "scored"),
+        "cohorts": {c: {"count": len(v)} for c, v in cohorts.items()},
     }
 
-    if watermarked and attacked and clean:
-        summary = summarize_detection(clean, watermarked, attacked, target_fpr)
-        result["calibration"] = {
-            "threshold": summary.calibration.threshold,
-            "actual_fpr": summary.calibration.actual_fpr,
+    # Detection summary using original_clean as negative set
+    clean_scores = cohorts.get("original_clean", [])
+    watermarked_scores = cohorts.get("original_watermarked", [])
+    attacked_scores = cohorts.get("attacked_watermarked", [])
+
+    if clean_scores and watermarked_scores and attacked_scores:
+        try:
+            summary = summarize_detection(
+                clean_scores, watermarked_scores, attacked_scores,
+                target_fpr=0.01,
+            )
+            aggregate["detection_summary"] = {
+                "target_fpr": 0.01,
+                "clean_calibrated_threshold": summary.calibration.threshold,
+                "clean_calibrated_actual_fpr": summary.calibration.actual_fpr,
+                "original_watermarked_tpr": summary.watermarked_tpr,
+                "attacked_watermarked_tpr_at_original_threshold": summary.attacked_tpr,
+                "watermarked_roc_auc": summary.watermarked_auc,
+                "attacked_roc_auc": summary.attacked_auc,
+                "attack_success": 1.0 - summary.attacked_tpr,
+            }
+        except Exception as exc:
+            aggregate["detection_summary_error"] = f"{type(exc).__name__}: {exc}"
+
+    # TR-specific: check for attacked-clean recalibration
+    if method == "TR":
+        attacked_clean_scores = cohorts.get("attacked_clean", [])
+        if attacked_clean_scores and clean_scores:
+            try:
+                recal_summary = summarize_detection(
+                    attacked_clean_scores, watermarked_scores, attacked_scores,
+                    target_fpr=0.01,
+                )
+                aggregate["tr_recalibrated"] = {
+                    "recalibrated_metrics_available": True,
+                    "attacked_clean_recalibrated_threshold": recal_summary.calibration.threshold,
+                    "attacked_clean_actual_fpr": recal_summary.calibration.actual_fpr,
+                    "attacked_tpr_at_recalibrated_threshold": recal_summary.attacked_tpr,
+                }
+            except Exception as exc:
+                aggregate["tr_recalibrated"] = {
+                    "recalibrated_metrics_available": False,
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+        else:
+            aggregate["tr_recalibrated"] = {
+                "recalibrated_metrics_available": False,
+                "reason": "No attacked-clean scores — recalibration not possible.",
+            }
+
+    return aggregate
+
+
+# ===========================================================================
+# FID stage
+# ===========================================================================
+def evaluate_fid(
+    records: list[dict[str, Any]],
+    output_dir: str | Path,
+    device: str = "cuda",
+) -> dict[str, Any]:
+    """Compute FID between original watermarked inputs and attacked outputs.
+
+    Uses ``clean_fid`` from ``raven.quality``.  Staging is temporary.
+    Without real data, returns unavailable.
+    """
+    try:
+        from raven.quality import clean_fid, FID_PRIMARY_MODE
+    except ImportError:
+        return {
+            "stage": "fid",
+            "available": False,
+            "reason": "clean-fid not installed.",
+            "NOT RUN — DATA UNAVAILABLE": True,
         }
-        result["watermarked_tpr"] = summary.watermarked_tpr
-        result["attacked_tpr"] = summary.attacked_tpr
-        result["watermarked_auc"] = summary.watermarked_auc
-        result["attacked_auc"] = summary.attacked_auc
-        result["attack_success"] = 1.0 - summary.attacked_tpr
 
-    return result
+    import tempfile
+    output_dir = Path(output_dir)
+
+    # Collect paired (reference, attacked) paths
+    pairs: list[tuple[Path, Path]] = []
+    for rec in records:
+        role = rec.get("role", "watermarked")
+        input_path = Path(rec.get("input_path", ""))
+        out_path = output_image_path(output_dir, role, str(rec["run_id"]))
+        if input_path.is_file() and out_path.is_file():
+            pairs.append((input_path, out_path))
+
+    if len(pairs) < 2:
+        return {
+            "stage": "fid",
+            "available": False,
+            "reason": f"Need at least 2 paired images for FID, got {len(pairs)}.",
+        }
+
+    # Stage images in temporary directories
+    tmpdir = Path(tempfile.mkdtemp(prefix="raven_fid_"))
+    try:
+        ref_dir = tmpdir / "reference"
+        att_dir = tmpdir / "attacked"
+        ref_dir.mkdir()
+        att_dir.mkdir()
+
+        width = max(6, max(len(str(rec["run_id"])) for rec in records))
+        staged: list[dict[str, Any]] = []
+        for i, (ref_path, att_path) in enumerate(pairs):
+            run_id = str(records[i]["run_id"])
+            name = f"{int(run_id):0{width}d}.png"
+            import shutil
+            shutil.copy2(ref_path, ref_dir / name)
+            shutil.copy2(att_path, att_dir / name)
+            staged.append({
+                "run_id": run_id,
+                "staged_name": name,
+                "reference_path": str(ref_path),
+                "attacked_path": str(att_path),
+            })
+
+        result = clean_fid(str(ref_dir), str(att_dir), device=device)
+        return {
+            "stage": "fid",
+            "available": True,
+            "image_count": len(pairs),
+            "fid_value": result.get("value"),
+            "mode": FID_PRIMARY_MODE,
+            "protocol": result.get("protocol", ""),
+            "staged_records": staged,
+        }
+    except Exception as exc:
+        return {
+            "stage": "fid",
+            "available": False,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+    finally:
+        import shutil
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
 
-DETECTOR_ADAPTERS: dict[str, Any] = {
-    "TR": evaluate_tr,
-    "GS": evaluate_gs,
-    "GM": evaluate_gm,
-    "T2S": evaluate_t2s,
-    "RID": evaluate_rid,
-    "HSTR": evaluate_hstr,
-    "HSQR": evaluate_hsqr,
+# ===========================================================================
+# CLIP stage
+# ===========================================================================
+def evaluate_clip(
+    records: list[dict[str, Any]],
+    output_dir: str | Path,
+    device: str = "cuda",
+) -> dict[str, Any]:
+    """Compute CLIP prompt-image cosine similarity.
+
+    Uses ``openclip_text_image_scores`` from ``raven.quality``.
+    Image = attacked-watermarked output.png.
+    Text = original generation prompt from metadata.
+    """
+    try:
+        from raven.quality import openclip_text_image_scores
+    except ImportError:
+        return {
+            "stage": "clip",
+            "available": False,
+            "reason": "open_clip_torch not installed.",
+            "NOT RUN — DATA UNAVAILABLE": True,
+        }
+
+    output_dir = Path(output_dir)
+    image_paths: list[str] = []
+    prompts: list[str] = []
+
+    for rec in records:
+        role = rec.get("role", "watermarked")
+        out_path = output_image_path(output_dir, role, str(rec["run_id"]))
+        if out_path.is_file():
+            image_paths.append(str(out_path))
+            # Use original generation prompt from metadata record
+            prompts.append(rec.get("prompt", ""))
+
+    if not image_paths:
+        return {
+            "stage": "clip",
+            "available": False,
+            "reason": "No output images with prompts available.",
+        }
+
+    if not all(prompts):
+        return {
+            "stage": "clip",
+            "available": False,
+            "reason": "Some records missing prompt — CLIP requires original generation prompts.",
+        }
+
+    try:
+        result = openclip_text_image_scores(
+            image_paths, prompts, device=device,
+            model_name="ViT-bigG-14",
+            pretrained="laion2b_s39b_b160k",
+        )
+        return {
+            "stage": "clip",
+            "available": True,
+            "image_count": len(image_paths),
+            "model": result.get("model_name", "ViT-bigG-14"),
+            "pretrained": result.get("pretrained", "laion2b_s39b_b160k"),
+            "metric": result.get("metric", "prompt-image cosine similarity"),
+            "mean_score": result.get("mean"),
+            "scores": result.get("scores", []),
+        }
+    except Exception as exc:
+        return {
+            "stage": "clip",
+            "available": False,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+
+
+# ===========================================================================
+# Main evaluation orchestrator
+# ===========================================================================
+STAGE_RUNNERS = {
+    "quality": lambda records, od, dev, cfg: evaluate_quality(records, od),
+    "detector": lambda records, od, dev, cfg: evaluate_detector(
+        records, od, cfg.get("method", "TR"), dev,
+    ),
+    "fid": evaluate_fid,
+    "clip": evaluate_clip,
 }
 
 
-# --------------------------------------------------------------------------- #
-# Main evaluation orchestrator
-# --------------------------------------------------------------------------- #
 def run_evaluation(
     output_dir: str | Path,
     *,
     device: str = "cuda",
     stages: list[str] | None = None,
 ) -> dict[str, Any]:
-    """Run all evaluation stages on a completed output directory.
-
-    Returns a dict with per-stage results.  Stages that cannot run due to
-    missing data are marked ``available: false`` with a ``reason``.
-    """
+    """Run all evaluation stages on a completed output directory."""
     output_dir = Path(output_dir)
     if not config_path(output_dir).is_file():
         raise FileNotFoundError(f"config.json not found in {output_dir}")
@@ -603,56 +651,30 @@ def run_evaluation(
         "stages": {},
     }
 
-    # --- Quality ---
-    if "quality" in stages:
-        logger.info("Running quality evaluation...")
-        result["stages"]["quality"] = evaluate_quality(records, output_dir)
-
-    # --- Detector ---
-    if "detector" in stages:
-        logger.info("Running detector evaluation (method=%s)...", method)
-        adapter = DETECTOR_ADAPTERS.get(method)
-        if adapter is None:
-            result["stages"]["detector"] = {
-                "method": method,
+    for stage in stages:
+        runner = STAGE_RUNNERS.get(stage)
+        if runner is None:
+            result["stages"][stage] = {
                 "available": False,
-                "reason": f"No detector adapter for method {method}",
+                "reason": f"Unknown stage: {stage}",
             }
-        else:
-            try:
-                result["stages"]["detector"] = adapter(records, output_dir, device)
-            except Exception as exc:
-                logger.exception("Detector evaluation failed")
-                result["stages"]["detector"] = {
-                    "method": method,
-                    "available": False,
-                    "error": f"{type(exc).__name__}: {exc}",
-                }
-
-    # --- FID ---
-    if "fid" in stages:
-        logger.info("FID evaluation deferred — requires reference image set.")
-        result["stages"]["fid"] = {
-            "available": False,
-            "reason": "FID requires reference and attacked image sets. Use clean-fid directly.",
-            "NOT RUN — DATA UNAVAILABLE": True,
-        }
-
-    # --- CLIP ---
-    if "clip" in stages:
-        logger.info("CLIP evaluation deferred — requires OpenCLIP model and prompts.")
-        result["stages"]["clip"] = {
-            "available": False,
-            "reason": "CLIP requires OpenCLIP model. Install open_clip_torch and run separately.",
-            "NOT RUN — DATA UNAVAILABLE": True,
-        }
+            continue
+        logger.info("Running %s evaluation...", stage)
+        try:
+            result["stages"][stage] = runner(records, output_dir, device, config)
+        except Exception as exc:
+            logger.exception("%s evaluation failed", stage)
+            result["stages"][stage] = {
+                "available": False,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
 
     return result
 
 
-# --------------------------------------------------------------------------- #
+# ===========================================================================
 # CLI
-# --------------------------------------------------------------------------- #
+# ===========================================================================
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path, required=True,
@@ -691,7 +713,6 @@ def main(argv: list[str] | None = None) -> int:
         logger.exception("Evaluation failed")
         return 1
 
-    # Write result
     result_json = json.dumps(result, indent=2, sort_keys=True, ensure_ascii=False)
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -700,7 +721,6 @@ def main(argv: list[str] | None = None) -> int:
     else:
         print(result_json)
 
-    # Check for unavailable stages
     unavailable = [
         stage for stage, info in result["stages"].items()
         if not info.get("available", True)

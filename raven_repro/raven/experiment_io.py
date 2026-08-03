@@ -5,6 +5,11 @@ Canonical output layout::
     <output-dir>/
     ├── config.json
     ├── records.jsonl
+    ├── evaluation/
+    │   ├── detector_records.jsonl
+    │   ├── quality_records.jsonl
+    │   ├── fid_result.json
+    │   └── clip_result.json
     └── samples/
         ├── watermarked/
         │   └── <run_id>/
@@ -43,7 +48,6 @@ def _resolve_protected() -> frozenset[str]:
         p = Path(path_str)
         if p.exists():
             result.add(str(p.resolve()))
-    # Also protect the repo root regardless of cwd.
     repo = Path(__file__).resolve().parents[2]
     result.add(str(repo))
     result.add(str(repo / "data"))
@@ -76,6 +80,16 @@ def records_jsonl_path(output_dir: str | Path) -> Path:
     return Path(output_dir) / "records.jsonl"
 
 
+def evaluation_dir(output_dir: str | Path) -> Path:
+    """Canonical evaluation output directory."""
+    return Path(output_dir) / "evaluation"
+
+
+def detector_records_path(output_dir: str | Path) -> Path:
+    """Canonical ``evaluation/detector_records.jsonl`` path."""
+    return evaluation_dir(output_dir) / "detector_records.jsonl"
+
+
 def is_sample_complete(output_dir: str | Path, role: str, run_id: str) -> bool:
     """A sample is complete when both ``output.png`` and ``record.json`` exist
     and the record carries ``status: "complete"``."""
@@ -102,21 +116,56 @@ def validate_output_dir_safety(output_dir: str | Path) -> None:
                 )
 
 
-def prepare_output_dir(output_dir: str | Path, overwrite: bool) -> Path:
-    """Create or clear the output directory.
+def _dir_is_empty(path: Path) -> bool:
+    try:
+        return not any(path.iterdir())
+    except FileNotFoundError:
+        return True
 
-    With ``--overwrite`` the directory is removed and recreated.  Without it the
-    directory is created if missing; if it already exists and contains a
-    ``config.json``, resume is assumed (the caller must validate the config).
+
+def prepare_output_dir(
+    output_dir: str | Path,
+    overwrite: bool = False,
+    resume: bool = False,
+) -> Path:
+    """Create or validate the output directory.
+
+    Rules
+    -----
+    * Directory does not exist → create.
+    * Directory exists and is empty → use.
+    * Directory is non-empty + ``--resume`` → validate config later, continue.
+    * Directory is non-empty + ``--overwrite`` → safely delete and recreate.
+    * Directory is non-empty, neither resume nor overwrite → fail.
     """
     path = Path(output_dir).resolve()
+
+    if not path.exists():
+        path.mkdir(parents=True)
+        return path
+
+    if _dir_is_empty(path):
+        return path
+
     if overwrite:
         validate_output_dir_safety(path)
-        if path.exists():
-            import shutil
-            shutil.rmtree(path)
-    path.mkdir(parents=True, exist_ok=True)
-    return path
+        import shutil
+        shutil.rmtree(path)
+        path.mkdir(parents=True)
+        return path
+
+    if resume:
+        if not config_path(path).is_file():
+            raise FileNotFoundError(
+                f"output-dir {path} is non-empty but has no config.json — "
+                "cannot resume."
+            )
+        return path
+
+    raise FileExistsError(
+        f"output-dir {path} is non-empty. Use --resume (to continue) "
+        "or --overwrite (to start fresh)."
+    )
 
 
 def write_config(output_dir: str | Path, config: dict[str, Any]) -> Path:
@@ -223,3 +272,16 @@ def collect_incomplete_run_ids(
             if not is_sample_complete(output_dir, role, str(run_id)):
                 incomplete.append((role, str(run_id)))
     return incomplete
+
+
+def cleanup_intermediates(
+    output_dir: str | Path,
+    role: str,
+    run_id: str,
+) -> None:
+    """Remove pipeline intermediate files, keeping only ``output.png``."""
+    sample = sample_dir(output_dir, role, run_id)
+    keep = {"output.png", "record.json"}
+    for item in list(sample.iterdir()):
+        if item.is_file() and item.name not in keep:
+            item.unlink()

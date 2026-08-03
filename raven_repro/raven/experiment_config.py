@@ -1,16 +1,13 @@
 """Normalized experiment configuration for the unified main/eval pipeline.
 
 Every algorithm parameter that affects reproducibility is declared here with
-an explicit default so the recorded config is self-contained and a config
-mismatch during resume fails fast with the list of drifted fields.
+an explicit default.  The config is split into *algorithm* fields (must match
+for resume) and *execution* fields (can differ across runs).
 """
 
 from __future__ import annotations
 
-import json
 from typing import Any, Mapping
-
-from .eval_protocol import canonical_json_hash
 
 # --------------------------------------------------------------------------- #
 # Diffusion mode mapping
@@ -42,6 +39,59 @@ VALID_DIFFUSION_MODES = frozenset(DIFFUSION_MODE_MAP)
 
 
 # --------------------------------------------------------------------------- #
+# Algorithm fields — must match for resume
+# --------------------------------------------------------------------------- #
+# Fields whose values determine attack output.  If any of these differ between
+# the stored config.json and the current run, resume is refused.
+ALGORITHM_FIELDS = frozenset({
+    "model_id",
+    "model_revision",
+    "dtype",
+    "diffusion_mode",
+    "inversion_mode",
+    "scheduler_mode",
+    "method",
+    "dataset",
+    "roles",
+    "metadata_path",
+    "steps",
+    "strength",
+    "guidance_scale",
+    "shift_space",
+    "warp_mode",
+    "latent_sampling_mode",
+    "padding_mode",
+    "view_guided_attention",
+    "color_transfer",
+    "shift_mode",
+    "shift_x",
+    "shift_y",
+    "shift_magnitude_min",
+    "shift_magnitude_max",
+    "base_seed",
+    "prompt",
+    "negative_prompt",
+    "debug",
+    "save_input_copy",
+})
+
+# --------------------------------------------------------------------------- #
+# Execution fields — can differ across runs
+# --------------------------------------------------------------------------- #
+# These are recorded for provenance but do NOT affect attack output.  They are
+# excluded from resume config comparison.
+EXECUTION_FIELDS = frozenset({
+    "output_dir",
+    "limit",
+    "gpu",
+    "overwrite",
+    "resume",
+    "log_level",
+    "save_intermediates",
+})
+
+
+# --------------------------------------------------------------------------- #
 # Default attack configuration
 # --------------------------------------------------------------------------- #
 DEFAULT_ATTACK_CONFIG: dict[str, Any] = {
@@ -56,7 +106,6 @@ DEFAULT_ATTACK_CONFIG: dict[str, Any] = {
     "padding_mode": "reflection",
     "view_guided_attention": True,
     "color_transfer": True,
-    "color_transfer_mode": "paper_exact_two_stage_aligned",
     "prompt": "",
     "negative_prompt": "",
     "shift_mode": "random",
@@ -70,21 +119,6 @@ DEFAULT_ATTACK_CONFIG: dict[str, Any] = {
     "save_input_copy": True,
     "debug": False,
 }
-
-IMMUTABLE_FIELDS = frozenset({
-    "model_id",
-    "model_revision",
-    "steps",
-    "strength",
-    "guidance_scale",
-    "shift_space",
-    "warp_mode",
-    "latent_sampling_mode",
-    "padding_mode",
-    "view_guided_attention",
-    "color_transfer",
-    "color_transfer_mode",
-})
 
 
 # --------------------------------------------------------------------------- #
@@ -146,11 +180,11 @@ def normalize_config(
     padding_mode: str = "reflection",
     view_guided_attention: bool = True,
     color_transfer: bool = True,
-    color_transfer_mode: str = "paper_exact_two_stage_aligned",
     prompt: str = "",
     negative_prompt: str = "",
     debug: bool = False,
     save_input_copy: bool = True,
+    save_intermediates: bool = False,
     model_id: str = "RedbeardNZ/stable-diffusion-2-1-base",
     model_revision: str = "c6a5e9bab8d874d081de76fa270ae0aefa5410ff",
     dtype: str = "float16",
@@ -185,15 +219,11 @@ def normalize_config(
         roles = ["watermarked"]
 
     config: dict[str, Any] = {
+        # --- algorithm fields ---
         "method": method.upper(),
         "dataset": dataset,
         "metadata_path": str(metadata_path),
-        "output_dir": str(output_dir),
         "roles": list(roles),
-        "limit": limit,
-        "gpu": gpu,
-        "overwrite": overwrite,
-        "resume": resume,
         "diffusion_mode": diffusion_mode,
         "inversion_mode": inversion_mode,
         "scheduler_mode": scheduler_mode,
@@ -212,7 +242,6 @@ def normalize_config(
         "padding_mode": padding_mode,
         "view_guided_attention": bool(view_guided_attention),
         "color_transfer": bool(color_transfer),
-        "color_transfer_mode": color_transfer_mode,
         "prompt": prompt,
         "negative_prompt": negative_prompt,
         "debug": bool(debug),
@@ -220,10 +249,14 @@ def normalize_config(
         "model_id": model_id,
         "model_revision": model_revision,
         "dtype": dtype,
+        # --- execution fields ---
+        "output_dir": str(output_dir),
+        "limit": limit,
+        "gpu": gpu,
+        "overwrite": overwrite,
+        "resume": resume,
+        "save_intermediates": bool(save_intermediates),
     }
-    config["config_hash"] = canonical_json_hash(
-        {key: config[key] for key in sorted(config) if key != "config_hash"}
-    )
     return config
 
 
@@ -242,7 +275,7 @@ def config_for_pipeline(config: dict[str, Any]) -> dict[str, Any]:
         "view_guided_attention": config["view_guided_attention"],
         "color_transfer": config["color_transfer"],
         "seed": None,  # filled per-sample
-        "prompt": config["prompt"],
+        "prompt": None,  # filled per-sample from metadata
         "negative_prompt": config["negative_prompt"],
         "debug": config["debug"],
         "inversion_mode": config["inversion_mode"],
@@ -251,14 +284,14 @@ def config_for_pipeline(config: dict[str, Any]) -> dict[str, Any]:
 
 
 def check_config_match(stored: dict[str, Any], current: dict[str, Any]) -> list[str]:
-    """Return list of fields whose values differ between stored and current config.
+    """Return list of *algorithm* fields whose values differ.
 
-    An empty list means the configs match and resume is safe.
+    Only algorithm fields are compared; execution fields (output_dir, gpu,
+    resume, overwrite, limit, save_intermediates, log_level) are ignored.
+    An empty list means resume is safe.
     """
     mismatches = []
-    for key in sorted(set(stored) | set(current)):
-        if key == "config_hash":
-            continue
+    for key in sorted(ALGORITHM_FIELDS):
         stored_val = stored.get(key)
         current_val = current.get(key)
         if stored_val != current_val:

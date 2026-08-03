@@ -12,11 +12,11 @@
 
 Responsibilities
 ----------------
-* Load metadata CSV.
-* Build and record a normalized config.
+* Load metadata CSV with per-sample prompts.
+* Build and record a normalized config (algorithm + execution fields).
 * Initialize ``RavenPipeline`` **once** for the entire dataset.
-* For each sample: compute the attack seed and shift, run the pipeline,
-  save ``output.png`` and ``record.json``.
+* For each sample: resolve per-sample prompt, compute seed/shift, run the
+  pipeline, save ``output.png`` and ``record.json``.
 * Rebuild ``records.jsonl`` atomically from the per-sample records.
 
 This module must NOT import or invoke any detector, FID, CLIP, PSNR/SSIM
@@ -49,6 +49,7 @@ from raven.experiment_config import (  # noqa: E402
     normalize_config,
 )
 from raven.experiment_io import (  # noqa: E402
+    cleanup_intermediates,
     collect_incomplete_run_ids,
     is_sample_complete,
     output_image_path,
@@ -110,23 +111,27 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--shift-space", default="image_pixels")
     parser.add_argument("--warp-mode", default="raven_paper_nfpa_gap_fill")
     parser.add_argument("--padding-mode", default="reflection")
-    parser.add_argument("--color-transfer", type=_parse_bool, default=True,
-                        help="Enable aligned color transfer (default: true)")
-    parser.add_argument("--color-transfer-mode", default="paper_exact_two_stage_aligned")
+    parser.add_argument("--color-transfer", default="aligned",
+                        choices=["aligned", "none"],
+                        help="Color transfer mode: 'aligned' (paper-exact) or 'none'")
     parser.add_argument("--view-guided-attention", type=_parse_bool, default=True)
     parser.add_argument("--steps", type=int, default=50)
     parser.add_argument("--strength", type=float, default=0.15)
     parser.add_argument("--guidance-scale", type=float, default=2.5)
     parser.add_argument("--base-seed", type=int, default=42)
-    parser.add_argument("--prompt", default="")
+    parser.add_argument("--prompt", default="",
+                        help="Global fallback prompt (metadata prompt takes precedence)")
     parser.add_argument("--negative-prompt", default="")
     parser.add_argument("--model-id", default="RedbeardNZ/stable-diffusion-2-1-base")
-    parser.add_argument("--model-revision", default="c6a5e9bab8d874d081de76fa270ae0aefa5410ff")
+    parser.add_argument("--model-revision",
+                        default="c6a5e9bab8d874d081de76fa270ae0aefa5410ff")
     parser.add_argument("--dtype", default="float16")
     parser.add_argument("--gpu", type=int, default=0)
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--debug", action="store_true")
     parser.add_argument("--save-input-copy", type=_parse_bool, default=False)
+    parser.add_argument("--save-intermediates", action="store_true",
+                        help="Keep pipeline intermediate artifacts (debug_info.json, etc.)")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--log-level", default="INFO",
@@ -166,11 +171,13 @@ def normalize_metadata_row(row: dict[str, str]) -> dict[str, str]:
     watermarked = _first(row, "watermarked_path", "watermarked_image_path")
     clean = _first(row, "clean_path", "clean_image_path")
     prompt = _first(row, "prompt", "source_prompt", "caption", "text")
+    prompt_id = _first(row, "prompt_id", "source_id")
     return {
         "run_id": run_id,
         "watermarked_path": watermarked,
         "clean_path": clean,
         "prompt": prompt,
+        "prompt_id": prompt_id,
     }
 
 
@@ -195,6 +202,8 @@ def main(argv: list[str] | None = None) -> int:
         format="%(asctime)s [%(levelname)s] %(message)s",
         datefmt="%Y-%m-%dT%H:%M:%S",
     )
+
+    color_transfer_bool = args.color_transfer == "aligned"
 
     # --- build config ---
     config = normalize_config(
@@ -222,34 +231,35 @@ def main(argv: list[str] | None = None) -> int:
         latent_sampling_mode=args.sampling,
         padding_mode=args.padding_mode,
         view_guided_attention=args.view_guided_attention,
-        color_transfer=args.color_transfer,
-        color_transfer_mode=args.color_transfer_mode,
+        color_transfer=color_transfer_bool,
         prompt=args.prompt,
         negative_prompt=args.negative_prompt,
         debug=args.debug,
         save_input_copy=args.save_input_copy,
+        save_intermediates=args.save_intermediates,
         model_id=args.model_id,
         model_revision=args.model_revision,
         dtype=args.dtype,
     )
 
     # --- output directory ---
-    output_dir = prepare_output_dir(args.output_dir, args.overwrite)
+    output_dir = prepare_output_dir(
+        args.output_dir, overwrite=args.overwrite, resume=args.resume,
+    )
 
     # --- resume check ---
-    if args.resume and not args.overwrite:
-        existing_config_path = output_dir / "config.json"
-        if existing_config_path.is_file():
-            stored = read_config(output_dir)
-            mismatches = check_config_match(stored, config)
-            if mismatches:
-                logger.error(
-                    "Config mismatch for resume.  Differing fields: %s",
-                    ", ".join(sorted(mismatches)),
-                )
-                return 1
-            config = stored  # reuse stored config exactly
-            logger.info("Resume: config matches, reusing stored config.")
+    existing_config_path = output_dir / "config.json"
+    if args.resume and existing_config_path.is_file():
+        stored = read_config(output_dir)
+        mismatches = check_config_match(stored, config)
+        if mismatches:
+            logger.error(
+                "Config mismatch for resume.  Differing algorithm fields: %s",
+                ", ".join(sorted(mismatches)),
+            )
+            return 1
+        config = stored  # reuse stored config exactly
+        logger.info("Resume: algorithm config matches, reusing stored config.")
 
     write_config(output_dir, config)
 
@@ -259,6 +269,7 @@ def main(argv: list[str] | None = None) -> int:
         rows = rows[: args.limit]
     normalized_rows = [normalize_metadata_row(row) for row in rows]
     run_ids = [row["run_id"] for row in normalized_rows]
+    row_by_id = {row["run_id"]: row for row in normalized_rows}
 
     logger.info("Dataset: %s  Method: %s  Samples: %d  Roles: %s",
                  args.dataset, args.method, len(run_ids), args.roles)
@@ -266,7 +277,8 @@ def main(argv: list[str] | None = None) -> int:
     # --- collect incomplete samples ---
     incomplete = collect_incomplete_run_ids(output_dir, args.roles, run_ids)
     if not incomplete:
-        logger.info("All %d sample(s) complete — nothing to do.", len(run_ids) * len(args.roles))
+        logger.info("All %d sample(s) complete — nothing to do.",
+                     len(run_ids) * len(args.roles))
         rebuild_records_jsonl(output_dir)
         return 0
 
@@ -297,9 +309,9 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     pipeline_kwargs = config_for_pipeline(config)
+    global_fallback_prompt = config.get("prompt", "")
 
     # --- run attack ---
-    row_by_id = {row["run_id"]: row for row in normalized_rows}
     completed = 0
     failed = 0
 
@@ -316,7 +328,12 @@ def main(argv: list[str] | None = None) -> int:
                 logger.info("[%s/%s] seed=%d shift=(%g, %g)",
                              role, run_id, attack_seed, dx, dy)
 
-                # per-sample output dir (pipeline writes debug_info.json etc. here)
+                # Per-sample prompt: metadata row takes precedence over CLI fallback.
+                sample_prompt = row.get("prompt", "") or global_fallback_prompt
+                sample_prompt_id = row.get("prompt_id", "")
+                sample_prompt_source = "metadata" if row.get("prompt", "") else "cli_fallback"
+
+                # per-sample output dir
                 sample_out = output_dir / "samples" / role / run_id
                 sample_out.mkdir(parents=True, exist_ok=True)
 
@@ -327,6 +344,7 @@ def main(argv: list[str] | None = None) -> int:
                     "shift_y": dy,
                     "input_image": image,
                     "output_dir": str(sample_out),
+                    "prompt": sample_prompt,
                 })
 
                 final_image = pipe.run(**kwargs)
@@ -354,8 +372,13 @@ def main(argv: list[str] | None = None) -> int:
                     "scheduler_mode": config["scheduler_mode"],
                     "input_path": str(input_path),
                     "output_path": str(canonical_out),
-                    "config_hash": config["config_hash"],
-                    "debug_info_path": str(debug_info_path) if debug_info_path.is_file() else "",
+                    "prompt": sample_prompt,
+                    "prompt_id": sample_prompt_id,
+                    "prompt_source": sample_prompt_source,
+                    "negative_prompt": config.get("negative_prompt", ""),
+                    "debug_info_path": (
+                        str(debug_info_path.resolve()) if debug_info_path.is_file() else ""
+                    ),
                     "effective_source_flow_dx_image_px": debug_info.get(
                         "effective_source_flow_dx_image_px", dx),
                     "effective_source_flow_dy_image_px": debug_info.get(
@@ -363,6 +386,11 @@ def main(argv: list[str] | None = None) -> int:
                     "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                 }
                 write_record(output_dir, role, run_id, record)
+
+                # Clean up intermediates unless --save-intermediates
+                if not config.get("save_intermediates"):
+                    cleanup_intermediates(output_dir, role, run_id)
+
                 completed += 1
                 logger.info("[%s/%s] done.", role, run_id)
 
