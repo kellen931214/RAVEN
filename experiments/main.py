@@ -378,7 +378,7 @@ def main(argv: list[str] | None = None) -> int:
                     "prompt_id": sample_prompt_id,
                     "prompt_source": sample_prompt_source,
                     "negative_prompt": config.get("negative_prompt", ""),
-                    "source_metadata": row,  # full original metadata passthrough
+                    "metadata_path": str(args.metadata.resolve()),
                     "debug_info_path": (
                         str(debug_info_path.resolve())
                         if debug_info_retained and debug_info_path.is_file()

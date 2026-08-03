@@ -263,9 +263,39 @@ def evaluate_detector(
             "required_artifacts": det_mod.describe_required_artifacts(),
         }
 
-    # Build record lookup: (run_id, source_role) -> record
+    # Resolve metadata: CSV is canonical source, embedded source_metadata is fallback
+    from raven.metadata_resolver import (
+        MetadataResolver, MetadataResolverError, load_metadata_csv,
+    )
+    csv_path = config.get("metadata_path", "") if config else ""
+    enriched_records: list[dict[str, Any]] = []
+    try:
+        resolver = MetadataResolver.from_path(csv_path) if csv_path else None
+    except (FileNotFoundError, MetadataResolverError):
+        resolver = None
+
+    if resolver is None:
+        resolver = MetadataResolver.from_records_fallback(records)
+
+    if resolver is not None:
+        for rec in records:
+            try:
+                enriched_records.append(
+                    resolver.enrich_record(rec, csv_path=csv_path or None)
+                )
+            except MetadataResolverError as exc:
+                return {
+                    "stage": "detector", "method": method,
+                    "status": STATUS_FAILED_INTERNAL_ERROR,
+                    "reason": f"Metadata resolution failed: {exc}",
+                }
+    else:
+        # No metadata available — pass records through unenriched
+        enriched_records = list(records)
+
+    # Build record lookup from enriched records: (run_id, source_role) -> record
     record_index: dict[tuple[str, str], dict[str, Any]] = {}
-    for rec in records:
+    for rec in enriched_records:
         key = (str(rec["run_id"]), rec.get("role", "watermarked"))
         record_index[key] = rec
 
