@@ -48,30 +48,40 @@ from raven.experiment_io import (  # noqa: E402
     output_image_path,
     read_config,
     read_records_jsonl,
-    record_path,
 )
-from raven.metrics import (  # noqa: E402
-    canonical_watermark_score,
-    pair_quality_metrics,
-    summarize_detection,
-)
+from raven.metrics import pair_quality_metrics  # noqa: E402
 
 logger = logging.getLogger("raven.eval")
 
 
 # ===========================================================================
+# Status taxonomy
+# ===========================================================================
+STATUS_COMPLETED = "completed"
+STATUS_SKIPPED_INSUFFICIENT_DATA = "skipped_insufficient_data"
+STATUS_FAILED_MISSING_REQUIRED_STATE = "failed_missing_required_state"
+STATUS_FAILED_MISSING_DEPENDENCY = "failed_missing_dependency"
+STATUS_FAILED_PROVIDER_INITIALIZATION = "failed_provider_initialization"
+STATUS_FAILED_SCORING = "failed_scoring"
+STATUS_FAILED_INTERNAL_ERROR = "failed_internal_error"
+
+# Stages whose failure/non-completion should cause nonzero exit.
+# Quality and detector are required by default; FID/CLIP are optional.
+DEFAULT_REQUIRED_STAGES = frozenset({"quality", "detector"})
+
+
+# ===========================================================================
 # Detector cohort model
 # ===========================================================================
-# Maps attack input roles to detector evaluation cohorts.
 DETECTOR_COHORTS = {
     "watermarked": {
         "original": {
             "evaluation_cohort": "original_watermarked",
-            "image_source": "input",   # read from record["input_path"]
+            "image_source": "input",
         },
         "attacked": {
             "evaluation_cohort": "attacked_watermarked",
-            "image_source": "output",  # read from output.png
+            "image_source": "output",
         },
     },
     "clean": {
@@ -97,14 +107,43 @@ def _resolve_image_path(rec: dict[str, Any], source: str,
     raise ValueError(f"Unknown image source: {source}")
 
 
+def _build_detector_image_index(
+    records: list[dict[str, Any]],
+    output_dir: str | Path,
+) -> list[dict[str, Any]]:
+    index: list[dict[str, Any]] = []
+    for rec in records:
+        run_id = str(rec["run_id"])
+        role = rec.get("role", "watermarked")
+        cohorts = DETECTOR_COHORTS.get(role, {})
+        for variant, info in cohorts.items():
+            image_path = _resolve_image_path(rec, info["image_source"], output_dir)
+            index.append({
+                "run_id": run_id,
+                "source_role": role,
+                "evaluation_cohort": info["evaluation_cohort"],
+                "image_path": str(image_path),
+                "image_source": info["image_source"],
+                "method": rec.get("method", ""),
+                "prompt": rec.get("prompt", ""),
+            })
+    return index
+
+
 # ===========================================================================
 # Quality stage
 # ===========================================================================
 def evaluate_quality(
     records: list[dict[str, Any]],
     output_dir: str | Path,
+    device: str = "cuda",
+    config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Compute per-sample PSNR/SSIM using the effective source flow overlap."""
+    """Compute per-sample PSNR/SSIM using effective source flow overlap.
+
+    Requires ``effective_source_flow_*`` fields in records.
+    Planned-flow fallback is forbidden.
+    """
     results: list[dict[str, Any]] = []
     psnr_values: list[float] = []
     ssim_values: list[float] = []
@@ -123,21 +162,39 @@ def evaluate_quality(
             })
             continue
 
+        # Require effective flow — planned-flow fallback is forbidden.
+        edx = rec.get("effective_source_flow_dx_image_px")
+        edy = rec.get("effective_source_flow_dy_image_px")
+        if edx is None or edy is None:
+            results.append({
+                "run_id": run_id, "role": role,
+                "error": "missing effective_source_flow — planned-flow fallback forbidden",
+                "quality_available": False,
+            })
+            continue
+
         try:
             from PIL import Image
 
-            dx = float(rec.get("effective_source_flow_dx_image_px",
-                               rec.get("planned_flow_dx_image_px", 0)))
-            dy = float(rec.get("effective_source_flow_dy_image_px",
-                               rec.get("planned_flow_dy_image_px", 0)))
+            dx = float(edx)
+            dy = float(edy)
+            if not math.isfinite(dx) or not math.isfinite(dy):
+                results.append({
+                    "run_id": run_id, "role": role,
+                    "error": "non-finite effective flow",
+                    "quality_available": False,
+                })
+                continue
 
             with Image.open(input_path) as ref, Image.open(out_path) as att:
                 metrics = pair_quality_metrics(
                     ref.convert("RGB"), att.convert("RGB"), dx, dy,
                 )
 
-            psnr = float(metrics.get("overlap_psnr", metrics.get("raw_full_psnr", float("nan"))))
-            ssim = float(metrics.get("overlap_ssim", metrics.get("raw_full_ssim", float("nan"))))
+            psnr = float(metrics.get("overlap_psnr",
+                          metrics.get("raw_full_psnr", float("nan"))))
+            ssim = float(metrics.get("overlap_ssim",
+                          metrics.get("raw_full_ssim", float("nan"))))
 
             if math.isfinite(psnr):
                 psnr_values.append(psnr)
@@ -156,10 +213,12 @@ def evaluate_quality(
                 "quality_available": False,
             })
 
+    quality_available = any(r.get("quality_available") for r in results)
     return {
         "stage": "quality",
+        "status": STATUS_COMPLETED if quality_available else STATUS_SKIPPED_INSUFFICIENT_DATA,
+        "available": quality_available,
         "count": len(results),
-        "available": len(psnr_values),
         "psnr_mean": sum(psnr_values) / len(psnr_values) if psnr_values else None,
         "ssim_mean": sum(ssim_values) / len(ssim_values) if ssim_values else None,
         "per_sample": results,
@@ -167,164 +226,30 @@ def evaluate_quality(
 
 
 # ===========================================================================
-# Detector execution — orchestration layer
+# Detector stage — delegates to method-specific modules
 # ===========================================================================
-def _build_detector_image_index(
-    records: list[dict[str, Any]],
-    output_dir: str | Path,
-) -> list[dict[str, Any]]:
-    """Build the list of (run_id, evaluation_cohort, image_path) entries.
-
-    For each attack record, emits original (input) and attacked (output) rows.
-    """
-    index: list[dict[str, Any]] = []
-    for rec in records:
-        run_id = str(rec["run_id"])
-        role = rec.get("role", "watermarked")
-        cohorts = DETECTOR_COHORTS.get(role, {})
-        for variant, info in cohorts.items():
-            image_path = _resolve_image_path(rec, info["image_source"], output_dir)
-            index.append({
-                "run_id": run_id,
-                "source_role": role,
-                "evaluation_cohort": info["evaluation_cohort"],
-                "image_path": str(image_path),
-                "image_source": info["image_source"],
-                "method": rec.get("method", ""),
-                "prompt": rec.get("prompt", ""),
-                "prompt_id": rec.get("prompt_id", ""),
-            })
-    return index
-
-
-def _try_load_provider(method: str, records: list[dict[str, Any]],
-                        device: str) -> tuple[Any, dict[str, Any]] | None:
-    """Attempt to load a method-specific provider from available state.
-
-    Returns ``(provider, provider_info)`` on success, ``None`` on failure.
-    Provider info documents the artifacts that were loaded.
-    """
-    try:
-        if method == "TR":
-            from utils.wm.tr_provider import TrProvider
-            from utils.pipe import pipe_utils
-
-            pipe = pipe_utils.get_pipe_provider(
-                pretrained_model_name_or_path="RedbeardNZ/stable-diffusion-2-1-base",
-                resolution=512, device=torch.device(device),
-                eager_loading=False, schedulers_name="DDIM", disable_tqdm=True,
-            )
-            latent_shape = pipe.get_latent_shape()
-            provider = TrProvider(
-                latent_shape=latent_shape, dtype=pipe.get_dtype(),
-                device=torch.device(device),
-                w_seed=999999, w_channel=3, w_radius=10,
-                w_pattern="ring", w_mask_shape="circle",
-                w_measurement="l1_complex", w_injection="complex",
-            )
-            return provider, {"pipe": pipe, "provider_type": "TrProvider"}
-
-        # Methods that require per-cohort bundle/state — not available without data.
-        if method in {"GM", "T2S", "GS", "RID", "HSTR", "HSQR"}:
-            return None
-
-    except ImportError as exc:
-        logger.debug("Cannot load provider for %s: %s", method, exc)
-        return None
-    except Exception as exc:
-        logger.debug("Provider init failed for %s: %s", method, exc)
-        return None
-
-    return None
-
-
-def _score_image(method: str, provider: Any, provider_info: dict[str, Any],
-                  image_path: str, torch_module) -> dict[str, Any] | None:
-    """Run one image through a method-specific detector. Returns score dict or None."""
-    from PIL import Image, ImageOps
-
-    path = Path(image_path)
-    if not path.is_file():
-        return None
-
-    try:
-        with Image.open(path) as opened:
-            image = ImageOps.exif_transpose(opened).convert("RGB")
-
-        if method == "TR":
-            pipe = provider_info["pipe"]
-            with torch_module.no_grad():
-                inversion = provider.invert_images(
-                    image, pipe_provider_target=pipe, num_inference_steps=50,
-                )
-                recovered = inversion["zT_torch"]
-                result = provider.get_accuracies(recovered)
-                raw = float(result["p_values"][0])
-                import scipy.stats
-                recovered_fft = torch_module.fft.fftshift(
-                    torch_module.fft.fft2(recovered), dim=(-1, -2))
-                mask = provider.watermarking_mask[0]
-                target = provider.gt_patch[0][mask].flatten()
-                target_cat = torch_module.concatenate([target.real, target.imag])
-                for latent_fft in recovered_fft:
-                    observed = latent_fft[mask].flatten()
-                    observed_cat = torch_module.concatenate([observed.real, observed.imag])
-                    sigma = observed_cat.std()
-                    log_p = float(scipy.stats.ncx2.logcdf(
-                        ((observed_cat - target_cat) / sigma).square().sum().item(),
-                        df=len(target_cat),
-                        nc=(target_cat.square() / sigma.square()).sum().item(),
-                    ))
-                canonical = -log_p / math.log(10.0) if math.isfinite(log_p) else float("inf")
-                return {
-                    "raw_score": raw,
-                    "canonical_score": canonical,
-                    "tr_log_p": log_p,
-                }
-        return None
-    except Exception as exc:
-        logger.debug("Score failed for %s: %s", image_path, exc)
-        return None
-
-
-def _detector_available(method: str) -> tuple[bool, str]:
-    """Check whether a detector can run without real provider state.
-
-    Returns ``(available, reason)``.
-    """
-    # Only TR can run without external data (uses built-in defaults).
-    # All other methods need per-cohort state (bundles, secrets, state files).
-    if method == "TR":
-        return True, "TR provider can be constructed from defaults"
-    return False, (
-        f"{method} requires per-cohort provider state "
-        f"(bundle/secret/state files) not available on this machine"
-    )
-
-
 def evaluate_detector(
     records: list[dict[str, Any]],
     output_dir: str | Path,
     method: str,
     device: str = "cuda",
+    config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Run detector on all cohorts and write ``evaluation/detector_records.jsonl``.
+    """Run detector on all cohorts via method-specific detector module."""
+    from raven.detectors import get_detector_module
 
-    When provider state is unavailable, returns a structured unavailable result
-    documenting exactly which artifacts are needed.
-    """
     output_dir = Path(output_dir)
     eval_dir = evaluation_dir(output_dir)
     eval_dir.mkdir(parents=True, exist_ok=True)
 
-    can_run, reason = _detector_available(method)
-    if not can_run:
+    try:
+        det_mod = get_detector_module(method)
+    except ValueError as exc:
         return {
             "stage": "detector",
             "method": method,
-            "available": False,
-            "reason": reason,
-            "NOT RUN — DATA UNAVAILABLE": True,
+            "status": STATUS_FAILED_MISSING_DEPENDENCY,
+            "reason": str(exc),
         }
 
     image_index = _build_detector_image_index(records, output_dir)
@@ -332,40 +257,71 @@ def evaluate_detector(
         return {
             "stage": "detector",
             "method": method,
-            "available": False,
-            "reason": "No images to score. Run attack first.",
+            "status": STATUS_SKIPPED_INSUFFICIENT_DATA,
+            "reason": "No images to score.",
         }
 
-    import torch
-    provider_result = _try_load_provider(method, records, device)
-    if provider_result is None:
+    # Try loading provider state
+    provider_info = None
+    load_error_type = STATUS_FAILED_MISSING_REQUIRED_STATE
+    try:
+        if method in {"RID", "HSTR", "HSQR"}:
+            provider_info = det_mod.load_state(records, device, method=method)
+        elif method == "T2S":
+            provider_info = det_mod.load_state(records, device)
+        else:
+            provider_info = det_mod.load_state(records, device)
+    except ImportError as exc:
+        load_error_type = STATUS_FAILED_MISSING_DEPENDENCY
+        logger.debug("Detector dependency missing: %s", exc)
+    except Exception as exc:
+        load_error_type = STATUS_FAILED_PROVIDER_INITIALIZATION
+        logger.debug("Provider init failed: %s", exc)
+
+    if provider_info is None:
         return {
             "stage": "detector",
             "method": method,
-            "available": False,
-            "reason": f"Provider for {method} could not be initialized.",
-            "NOT RUN — DATA UNAVAILABLE": True,
+            "status": load_error_type,
+            "reason": f"Provider state for {method} is not available on this machine.",
+            "required_artifacts": det_mod.describe_required_artifacts(),
         }
 
-    provider, provider_info = provider_result
+    # Score every image
     detector_rows: list[dict[str, Any]] = []
-
+    row_index = 0
     for entry in image_index:
-        score = _score_image(method, provider, provider_info,
-                              entry["image_path"], torch)
+        # For T2S, pass the corresponding record for per-sample state
+        extra_kwargs: dict[str, Any] = {}
+        if method == "T2S":
+            run_id = entry["run_id"]
+            matching = [r for r in records if str(r.get("run_id", "")) == run_id]
+            if matching:
+                extra_kwargs["row"] = matching[0]
+
+        score = None
+        try:
+            score = det_mod.score_image(
+                provider_info, entry["image_path"],
+                row_index=row_index, **extra_kwargs,
+            )
+        except Exception:
+            pass
+
         row = {
             "run_id": entry["run_id"],
             "source_role": entry["source_role"],
             "evaluation_cohort": entry["evaluation_cohort"],
             "image_path": entry["image_path"],
             "method": method,
-            "status": "scored" if score else "failed",
+            "status": STATUS_COMPLETED if score else STATUS_FAILED_SCORING,
         }
         if score:
             row.update(score)
         else:
             row["error"] = "scoring failed"
         detector_rows.append(row)
+        row_index += 1
 
     # Write detector_records.jsonl
     det_path = detector_records_path(output_dir)
@@ -377,121 +333,82 @@ def evaluate_detector(
             )
     os.replace(tmp, det_path)
 
-    # Aggregate by cohort
-    cohorts: dict[str, list[float]] = {}
-    for row in detector_rows:
-        if row.get("status") != "scored":
-            continue
-        cohort = row["evaluation_cohort"]
-        cs = row.get("canonical_score")
-        if cs is not None and math.isfinite(float(cs)):
-            cohorts.setdefault(cohort, []).append(float(cs))
-
-    aggregate: dict[str, Any] = {
-        "stage": "detector",
-        "method": method,
-        "available": True,
-        "scored_count": sum(1 for r in detector_rows if r.get("status") == "scored"),
-        "failed_count": sum(1 for r in detector_rows if r.get("status") != "scored"),
-        "cohorts": {c: {"count": len(v)} for c, v in cohorts.items()},
-    }
-
-    # Detection summary using original_clean as negative set
-    clean_scores = cohorts.get("original_clean", [])
-    watermarked_scores = cohorts.get("original_watermarked", [])
-    attacked_scores = cohorts.get("attacked_watermarked", [])
-
-    if clean_scores and watermarked_scores and attacked_scores:
-        try:
-            summary = summarize_detection(
-                clean_scores, watermarked_scores, attacked_scores,
-                target_fpr=0.01,
-            )
-            aggregate["detection_summary"] = {
-                "target_fpr": 0.01,
-                "clean_calibrated_threshold": summary.calibration.threshold,
-                "clean_calibrated_actual_fpr": summary.calibration.actual_fpr,
-                "original_watermarked_tpr": summary.watermarked_tpr,
-                "attacked_watermarked_tpr_at_original_threshold": summary.attacked_tpr,
-                "watermarked_roc_auc": summary.watermarked_auc,
-                "attacked_roc_auc": summary.attacked_auc,
-                "attack_success": 1.0 - summary.attacked_tpr,
-            }
-        except Exception as exc:
-            aggregate["detection_summary_error"] = f"{type(exc).__name__}: {exc}"
-
-    # TR-specific: check for attacked-clean recalibration
-    if method == "TR":
-        attacked_clean_scores = cohorts.get("attacked_clean", [])
-        if attacked_clean_scores and clean_scores:
-            try:
-                recal_summary = summarize_detection(
-                    attacked_clean_scores, watermarked_scores, attacked_scores,
-                    target_fpr=0.01,
-                )
-                aggregate["tr_recalibrated"] = {
-                    "recalibrated_metrics_available": True,
-                    "attacked_clean_recalibrated_threshold": recal_summary.calibration.threshold,
-                    "attacked_clean_actual_fpr": recal_summary.calibration.actual_fpr,
-                    "attacked_tpr_at_recalibrated_threshold": recal_summary.attacked_tpr,
-                }
-            except Exception as exc:
-                aggregate["tr_recalibrated"] = {
-                    "recalibrated_metrics_available": False,
-                    "error": f"{type(exc).__name__}: {exc}",
-                }
-        else:
-            aggregate["tr_recalibrated"] = {
-                "recalibrated_metrics_available": False,
-                "reason": "No attacked-clean scores — recalibration not possible.",
-            }
-
+    # Aggregate
+    agg_kwargs: dict[str, Any] = {}
+    if method in {"RID", "HSTR", "HSQR"}:
+        agg_kwargs["method"] = method
+    aggregate = det_mod.aggregate(detector_rows, **agg_kwargs)
+    aggregate["stage"] = "detector"
+    aggregate["method"] = method
+    aggregate["status"] = STATUS_COMPLETED
+    aggregate["available"] = True
     return aggregate
 
 
 # ===========================================================================
-# FID stage
+# FID stage — watermarked role only
 # ===========================================================================
 def evaluate_fid(
     records: list[dict[str, Any]],
     output_dir: str | Path,
     device: str = "cuda",
+    config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Compute FID between original watermarked inputs and attacked outputs.
+    """FID: original watermarked input vs attacked watermarked output.
 
-    Uses ``clean_fid`` from ``raven.quality``.  Staging is temporary.
-    Without real data, returns unavailable.
+    Clean-role records are excluded.
     """
     try:
         from raven.quality import clean_fid, FID_PRIMARY_MODE
     except ImportError:
         return {
             "stage": "fid",
-            "available": False,
+            "status": STATUS_FAILED_MISSING_DEPENDENCY,
             "reason": "clean-fid not installed.",
-            "NOT RUN — DATA UNAVAILABLE": True,
         }
 
+    import hashlib
+    import shutil
     import tempfile
+
     output_dir = Path(output_dir)
 
-    # Collect paired (reference, attacked) paths
-    pairs: list[tuple[Path, Path]] = []
-    for rec in records:
-        role = rec.get("role", "watermarked")
+    # Watermarked role ONLY
+    wm_records = [r for r in records if r.get("role") == "watermarked"]
+    if not wm_records:
+        return {
+            "stage": "fid",
+            "status": STATUS_SKIPPED_INSUFFICIENT_DATA,
+            "reason": "No watermarked records for FID.",
+        }
+
+    # Build pairs with safe deterministic filenames
+    pairs: list[dict[str, Any]] = []
+    for rec in wm_records:
+        run_id = str(rec["run_id"])
         input_path = Path(rec.get("input_path", ""))
-        out_path = output_image_path(output_dir, role, str(rec["run_id"]))
+        out_path = output_image_path(output_dir, "watermarked", run_id)
         if input_path.is_file() and out_path.is_file():
-            pairs.append((input_path, out_path))
+            # Safe deterministic name: zero-pad numeric, hash non-numeric
+            try:
+                safe_name = f"{int(run_id):06d}"
+            except (ValueError, TypeError):
+                h = hashlib.sha256(run_id.encode()).hexdigest()[:12]
+                safe_name = f"{h}"
+            pairs.append({
+                "run_id": run_id,
+                "safe_name": safe_name,
+                "reference_path": str(input_path),
+                "attacked_path": str(out_path),
+            })
 
     if len(pairs) < 2:
         return {
             "stage": "fid",
-            "available": False,
-            "reason": f"Need at least 2 paired images for FID, got {len(pairs)}.",
+            "status": STATUS_SKIPPED_INSUFFICIENT_DATA,
+            "reason": f"Need at least 2 paired images, got {len(pairs)}.",
         }
 
-    # Stage images in temporary directories
     tmpdir = Path(tempfile.mkdtemp(prefix="raven_fid_"))
     try:
         ref_dir = tmpdir / "reference"
@@ -499,90 +416,79 @@ def evaluate_fid(
         ref_dir.mkdir()
         att_dir.mkdir()
 
-        width = max(6, max(len(str(rec["run_id"])) for rec in records))
-        staged: list[dict[str, Any]] = []
-        for i, (ref_path, att_path) in enumerate(pairs):
-            run_id = str(records[i]["run_id"])
-            name = f"{int(run_id):0{width}d}.png"
-            import shutil
-            shutil.copy2(ref_path, ref_dir / name)
-            shutil.copy2(att_path, att_dir / name)
-            staged.append({
-                "run_id": run_id,
-                "staged_name": name,
-                "reference_path": str(ref_path),
-                "attacked_path": str(att_path),
-            })
+        for pair in pairs:
+            shutil.copy2(pair["reference_path"],
+                          ref_dir / f"{pair['safe_name']}.png")
+            shutil.copy2(pair["attacked_path"],
+                          att_dir / f"{pair['safe_name']}.png")
 
         result = clean_fid(str(ref_dir), str(att_dir), device=device)
         return {
             "stage": "fid",
-            "available": True,
+            "status": STATUS_COMPLETED,
             "image_count": len(pairs),
             "fid_value": result.get("value"),
             "mode": FID_PRIMARY_MODE,
             "protocol": result.get("protocol", ""),
-            "staged_records": staged,
+            "staged_records": pairs,
         }
     except Exception as exc:
         return {
             "stage": "fid",
-            "available": False,
+            "status": STATUS_FAILED_INTERNAL_ERROR,
             "error": f"{type(exc).__name__}: {exc}",
         }
     finally:
-        import shutil
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 # ===========================================================================
-# CLIP stage
+# CLIP stage — watermarked role only
 # ===========================================================================
 def evaluate_clip(
     records: list[dict[str, Any]],
     output_dir: str | Path,
     device: str = "cuda",
+    config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Compute CLIP prompt-image cosine similarity.
+    """CLIP: attacked watermarked output.png vs original generation prompt.
 
-    Uses ``openclip_text_image_scores`` from ``raven.quality``.
-    Image = attacked-watermarked output.png.
-    Text = original generation prompt from metadata.
+    Clean-role records are excluded.
     """
     try:
         from raven.quality import openclip_text_image_scores
     except ImportError:
         return {
             "stage": "clip",
-            "available": False,
+            "status": STATUS_FAILED_MISSING_DEPENDENCY,
             "reason": "open_clip_torch not installed.",
-            "NOT RUN — DATA UNAVAILABLE": True,
         }
 
     output_dir = Path(output_dir)
+
+    # Watermarked role ONLY
+    wm_records = [r for r in records if r.get("role") == "watermarked"]
     image_paths: list[str] = []
     prompts: list[str] = []
 
-    for rec in records:
-        role = rec.get("role", "watermarked")
-        out_path = output_image_path(output_dir, role, str(rec["run_id"]))
+    for rec in wm_records:
+        out_path = output_image_path(output_dir, "watermarked", str(rec["run_id"]))
         if out_path.is_file():
             image_paths.append(str(out_path))
-            # Use original generation prompt from metadata record
             prompts.append(rec.get("prompt", ""))
 
     if not image_paths:
         return {
             "stage": "clip",
-            "available": False,
-            "reason": "No output images with prompts available.",
+            "status": STATUS_SKIPPED_INSUFFICIENT_DATA,
+            "reason": "No watermarked output images available.",
         }
 
     if not all(prompts):
         return {
             "stage": "clip",
-            "available": False,
-            "reason": "Some records missing prompt — CLIP requires original generation prompts.",
+            "status": STATUS_SKIPPED_INSUFFICIENT_DATA,
+            "reason": "Some records missing prompt.",
         }
 
     try:
@@ -591,35 +497,47 @@ def evaluate_clip(
             model_name="ViT-bigG-14",
             pretrained="laion2b_s39b_b160k",
         )
+        scores = result.get("scores", [])
+        import numpy as np
         return {
             "stage": "clip",
-            "available": True,
+            "status": STATUS_COMPLETED,
             "image_count": len(image_paths),
-            "model": result.get("model_name", "ViT-bigG-14"),
+            "model_name": result.get("model_name", "ViT-bigG-14"),
             "pretrained": result.get("pretrained", "laion2b_s39b_b160k"),
             "metric": result.get("metric", "prompt-image cosine similarity"),
+            "count": len(scores),
             "mean_score": result.get("mean"),
-            "scores": result.get("scores", []),
+            "std": float(np.std(scores)) if scores else None,
+            "scores": scores,
         }
     except Exception as exc:
         return {
             "stage": "clip",
-            "available": False,
+            "status": STATUS_FAILED_INTERNAL_ERROR,
             "error": f"{type(exc).__name__}: {exc}",
         }
 
 
 # ===========================================================================
-# Main evaluation orchestrator
+# Stage runners (uniform signature)
 # ===========================================================================
-STAGE_RUNNERS = {
-    "quality": lambda records, od, dev, cfg: evaluate_quality(records, od),
+STAGE_RUNNERS: dict[str, Any] = {
+    "quality": evaluate_quality,
     "detector": lambda records, od, dev, cfg: evaluate_detector(
-        records, od, cfg.get("method", "TR"), dev,
+        records, od, cfg.get("method", "TR"), dev, cfg,
     ),
     "fid": evaluate_fid,
     "clip": evaluate_clip,
 }
+
+NONZERO_STATUSES = frozenset({
+    STATUS_FAILED_MISSING_REQUIRED_STATE,
+    STATUS_FAILED_MISSING_DEPENDENCY,
+    STATUS_FAILED_PROVIDER_INITIALIZATION,
+    STATUS_FAILED_SCORING,
+    STATUS_FAILED_INTERNAL_ERROR,
+})
 
 
 def run_evaluation(
@@ -627,6 +545,7 @@ def run_evaluation(
     *,
     device: str = "cuda",
     stages: list[str] | None = None,
+    allow_missing_metrics: bool = False,
 ) -> dict[str, Any]:
     """Run all evaluation stages on a completed output directory."""
     output_dir = Path(output_dir)
@@ -655,7 +574,7 @@ def run_evaluation(
         runner = STAGE_RUNNERS.get(stage)
         if runner is None:
             result["stages"][stage] = {
-                "available": False,
+                "status": STATUS_FAILED_INTERNAL_ERROR,
                 "reason": f"Unknown stage: {stage}",
             }
             continue
@@ -665,9 +584,31 @@ def run_evaluation(
         except Exception as exc:
             logger.exception("%s evaluation failed", stage)
             result["stages"][stage] = {
-                "available": False,
+                "status": STATUS_FAILED_INTERNAL_ERROR,
                 "error": f"{type(exc).__name__}: {exc}",
             }
+
+    # Compute overall status
+    stage_statuses = {
+        s: info.get("status", STATUS_FAILED_INTERNAL_ERROR)
+        for s, info in result["stages"].items()
+    }
+    failed = {
+        s for s, status in stage_statuses.items()
+        if status in NONZERO_STATUSES
+    }
+    skipped = {
+        s for s, status in stage_statuses.items()
+        if status == STATUS_SKIPPED_INSUFFICIENT_DATA
+        and s in DEFAULT_REQUIRED_STAGES
+        and not allow_missing_metrics
+    }
+    result["failed_stages"] = sorted(failed)
+    result["skipped_stages"] = sorted(skipped)
+    result["overall_status"] = (
+        STATUS_COMPLETED if not (failed or skipped)
+        else STATUS_SKIPPED_INSUFFICIENT_DATA
+    )
 
     return result
 
@@ -684,6 +625,8 @@ def build_parser() -> argparse.ArgumentParser:
                         choices=["quality", "detector", "fid", "clip"],
                         default=["quality", "detector"],
                         help="Stages to run (default: quality detector)")
+    parser.add_argument("--allow-missing-metrics", action="store_true",
+                        help="Exit 0 even when required stages are unavailable")
     parser.add_argument("--output", type=Path, default=None,
                         help="Write evaluation result JSON to this path")
     parser.add_argument("--log-level", default="INFO",
@@ -708,6 +651,7 @@ def main(argv: list[str] | None = None) -> int:
             args.output_dir,
             device=args.device,
             stages=args.stages,
+            allow_missing_metrics=args.allow_missing_metrics,
         )
     except Exception as exc:
         logger.exception("Evaluation failed")
@@ -721,13 +665,17 @@ def main(argv: list[str] | None = None) -> int:
     else:
         print(result_json)
 
-    unavailable = [
-        stage for stage, info in result["stages"].items()
-        if not info.get("available", True)
-    ]
-    if unavailable:
-        logger.warning("Stages not run (data unavailable): %s", ", ".join(unavailable))
+    failed = result.get("failed_stages", [])
+    skipped = result.get("skipped_stages", [])
+    if failed:
+        logger.error("Failed stages: %s", ", ".join(failed))
+    if skipped:
+        logger.warning("Skipped required stages (no data): %s", ", ".join(skipped))
 
+    if failed:
+        return 2
+    if skipped and not args.allow_missing_metrics:
+        return 3
     return 0
 
 

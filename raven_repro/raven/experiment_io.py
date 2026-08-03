@@ -105,15 +105,17 @@ def is_sample_complete(output_dir: str | Path, role: str, run_id: str) -> bool:
 
 
 def validate_output_dir_safety(output_dir: str | Path) -> None:
-    """Refuse to delete protected directories during --overwrite."""
+    """Refuse to delete protected directories during --overwrite.
+
+    Rejects the protected directory itself AND any child path.
+    """
     resolved = str(Path(output_dir).resolve())
     for protected in _resolve_protected():
         if resolved == protected or resolved.startswith(protected + os.sep):
-            if resolved != protected:
-                raise ValueError(
-                    f"output-dir {resolved} is inside a protected directory. "
-                    "Choose a path outside the repository data/ and outputs/ trees."
-                )
+            raise ValueError(
+                f"output-dir {resolved} is a protected directory or inside one. "
+                "Choose a path outside the repository data/ and outputs/ trees."
+            )
 
 
 def _dir_is_empty(path: Path) -> bool:

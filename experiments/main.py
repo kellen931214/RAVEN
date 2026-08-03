@@ -356,6 +356,7 @@ def main(argv: list[str] | None = None) -> int:
                 # Build record from debug_info
                 debug_info_path = sample_out / "debug_info.json"
                 debug_info: dict[str, Any] = {}
+                debug_info_retained = bool(config.get("save_intermediates"))
                 if debug_info_path.is_file():
                     debug_info = json.loads(debug_info_path.read_text(encoding="utf-8"))
 
@@ -377,8 +378,11 @@ def main(argv: list[str] | None = None) -> int:
                     "prompt_source": sample_prompt_source,
                     "negative_prompt": config.get("negative_prompt", ""),
                     "debug_info_path": (
-                        str(debug_info_path.resolve()) if debug_info_path.is_file() else ""
+                        str(debug_info_path.resolve())
+                        if debug_info_retained and debug_info_path.is_file()
+                        else ""
                     ),
+                    "debug_info_retained": debug_info_retained,
                     "effective_source_flow_dx_image_px": debug_info.get(
                         "effective_source_flow_dx_image_px", dx),
                     "effective_source_flow_dy_image_px": debug_info.get(
