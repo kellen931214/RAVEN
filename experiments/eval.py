@@ -223,15 +223,67 @@ def evaluate_detector(
                 "status": STATUS_SKIPPED_INSUFFICIENT_DATA,
                 "reason": "No images to score."}
 
-    # Load provider state with proper error classification
+    # Resolve metadata BEFORE loading provider.  CSV is canonical; only
+    # FileNotFoundError triggers legacy embedded fallback.  All other
+    # metadata errors (duplicates, missing rows, conflicts) fail closed.
+    from raven.metadata_resolver import (
+        MetadataResolver, MetadataResolverError, MetadataConflictError,
+        DuplicateMetadataError, AmbiguousMetadataError,
+    )
+    csv_path = config.get("metadata_path", "") if config else ""
+    if csv_path and Path(csv_path).is_file():
+        try:
+            resolver = MetadataResolver.from_path(csv_path)
+        except (DuplicateMetadataError, AmbiguousMetadataError,
+                MetadataResolverError) as exc:
+            return {
+                "stage": "detector", "method": method,
+                "status": STATUS_FAILED_INTERNAL_ERROR,
+                "reason": f"Metadata validation failed: {type(exc).__name__}: {exc}",
+            }
+        except ValueError as exc:
+            return {
+                "stage": "detector", "method": method,
+                "status": STATUS_FAILED_INTERNAL_ERROR,
+                "reason": f"Metadata CSV invalid: {exc}",
+            }
+    else:
+        # CSV genuinely missing — use legacy embedded fallback
+        resolver = MetadataResolver.from_records_fallback(records)
+        if resolver is None:
+            return {
+                "stage": "detector", "method": method,
+                "status": STATUS_FAILED_MISSING_REQUIRED_STATE,
+                "reason": (
+                    f"No metadata CSV found at {csv_path or 'unspecified path'} "
+                    "and no embedded source_metadata in records."
+                ),
+            }
+
+    # Enrich all records with resolved metadata
+    enriched_records: list[dict[str, Any]] = []
+    for rec in records:
+        try:
+            enriched_records.append(
+                resolver.enrich_record(rec, csv_path=csv_path or None)
+            )
+        except MetadataResolverError as exc:
+            return {
+                "stage": "detector", "method": method,
+                "status": STATUS_FAILED_INTERNAL_ERROR,
+                "reason": f"Metadata resolution failed for "
+                         f"run_id={rec.get('run_id')}: {exc}",
+            }
+
+    # Load provider state with resolved (enriched) records
     provider_info = None
     load_error_type = STATUS_FAILED_MISSING_REQUIRED_STATE
     load_error_detail = ""
     try:
         if method in {"RID", "HSTR", "HSQR"}:
-            provider_info = det_mod.load_state(records, device, method=method)
+            provider_info = det_mod.load_state(enriched_records, device, method=method)
         else:
-            provider_info = det_mod.load_state(records, device)
+            provider_info = det_mod.load_state(enriched_records, device)
     except DetectorMissingStateError as exc:
         load_error_type = STATUS_FAILED_MISSING_REQUIRED_STATE
         load_error_detail = str(exc)
@@ -262,36 +314,6 @@ def evaluate_detector(
             "reason": load_error_detail,
             "required_artifacts": det_mod.describe_required_artifacts(),
         }
-
-    # Resolve metadata: CSV is canonical source, embedded source_metadata is fallback
-    from raven.metadata_resolver import (
-        MetadataResolver, MetadataResolverError, load_metadata_csv,
-    )
-    csv_path = config.get("metadata_path", "") if config else ""
-    enriched_records: list[dict[str, Any]] = []
-    try:
-        resolver = MetadataResolver.from_path(csv_path) if csv_path else None
-    except (FileNotFoundError, MetadataResolverError):
-        resolver = None
-
-    if resolver is None:
-        resolver = MetadataResolver.from_records_fallback(records)
-
-    if resolver is not None:
-        for rec in records:
-            try:
-                enriched_records.append(
-                    resolver.enrich_record(rec, csv_path=csv_path or None)
-                )
-            except MetadataResolverError as exc:
-                return {
-                    "stage": "detector", "method": method,
-                    "status": STATUS_FAILED_INTERNAL_ERROR,
-                    "reason": f"Metadata resolution failed: {exc}",
-                }
-    else:
-        # No metadata available — pass records through unenriched
-        enriched_records = list(records)
 
     # Build record lookup from enriched records: (run_id, source_role) -> record
     record_index: dict[tuple[str, str], dict[str, Any]] = {}

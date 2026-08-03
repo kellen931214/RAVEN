@@ -50,90 +50,98 @@ def _normalize_run_id(row: dict[str, str]) -> str:
 
 
 def _normalize_role(row: dict[str, str]) -> str | None:
-    """Return 'watermarked' or 'clean' if the row has a detectable role."""
+    """Return 'watermarked' or 'clean' from explicit column or path inference.
+
+    Priority: explicit ``role`` / ``source_role`` / ``image_role`` column,
+    then path inference from ``watermarked_path`` / ``clean_path``.
+    Returns ``None`` for generic rows (both paths present or no path).
+    """
+    # Explicit role columns take priority
+    for col in ("role", "source_role", "image_role"):
+        val = row.get(col)
+        if val is not None and str(val).strip():
+            v = str(val).strip().lower()
+            if v in ("watermarked", "wm"):
+                return "watermarked"
+            if v in ("clean", "cl"):
+                return "clean"
+            # Unknown explicit value → treat as generic
+            return None
+
+    # Path-based inference
     has_wm = bool(row.get("watermarked_path") or row.get("watermarked_image_path"))
     has_cl = bool(row.get("clean_path") or row.get("clean_image_path"))
     if has_wm and not has_cl:
         return "watermarked"
     if has_cl and not has_wm:
         return "clean"
-    return None  # ambiguous or unknown
+    return None  # both or neither → generic
 
 
 class MetadataResolver:
     """Resolves per-sample metadata from the canonical CSV.
 
-    Joins attack records by ``(run_id, role)`` with role-specific CSV rows,
-    falling back to ``run_id``-only join when no role column exists.
+    Supports mixed generic rows (no role) and role-specific rows in the same
+    CSV.  ``resolve(run_id, role)`` first looks for an exact ``(run_id, role)``
+    match; if none exists, it falls back to a unique generic ``run_id``-only row.
     """
 
     def __init__(self, csv_rows: list[dict[str, str]]):
         self._by_runid_role: dict[tuple[str, str], dict[str, str]] = {}
         self._by_runid: dict[str, dict[str, str]] = {}
-        self._has_role_index = False
 
         for row in csv_rows:
             run_id = _normalize_run_id(row)
             role = _normalize_role(row)
             if role is not None:
-                self._has_role_index = True
                 key = (run_id, role)
                 if key in self._by_runid_role:
                     raise DuplicateMetadataError(
-                        f"Duplicate metadata row for (run_id={run_id!r}, role={role!r})"
+                        f"Duplicate metadata row for "
+                        f"(run_id={run_id!r}, role={role!r})"
                     )
                 self._by_runid_role[key] = row
             else:
                 if run_id in self._by_runid:
                     raise DuplicateMetadataError(
-                        f"Duplicate metadata row for run_id={run_id!r}"
+                        f"Duplicate generic metadata row for run_id={run_id!r}"
                     )
                 self._by_runid[run_id] = row
-
-    @property
-    def has_role_index(self) -> bool:
-        return self._has_role_index
 
     def resolve(self, run_id: str, role: str) -> dict[str, str]:
         """Return the metadata row for a given (run_id, role).
 
-        Prefer role-indexed lookup when available; fall back to run_id-only.
+        Tries ``(run_id, role)`` first, then generic ``run_id`` as fallback.
+        Fails if neither exists.
         """
-        if self._has_role_index:
-            key = (str(run_id), str(role))
-            if key in self._by_runid_role:
-                return dict(self._by_runid_role[key])
-            raise MetadataResolverError(
-                f"No metadata row for (run_id={run_id!r}, role={role!r})"
-            )
+        key = (str(run_id), str(role))
+        if key in self._by_runid_role:
+            return dict(self._by_runid_role[key])
         if str(run_id) in self._by_runid:
             return dict(self._by_runid[str(run_id)])
         raise MetadataResolverError(
-            f"No metadata row for run_id={run_id!r}"
+            f"No metadata row for (run_id={run_id!r}, role={role!r}) "
+            f"and no generic row for run_id={run_id!r}"
         )
 
     def enrich_record(
         self, record: dict[str, Any], *, csv_path: str | None = None,
     ) -> dict[str, Any]:
-        """Return a copy of *record* with resolved metadata merged in.
+        """Return a copy of *record* with resolved CSV metadata merged in.
 
-        Backwards compatibility: if *record* contains ``source_metadata``
-        and the CSV row is also available, the two are compared and conflicts
-        raise ``MetadataConflictError``.  If the CSV is unavailable, the
-        embedded ``source_metadata`` is used as a fallback.
+        Backwards compatibility: if *record* carries embedded ``source_metadata``
+        and the CSV row is also available, the two are validated for consistency
+        on shared fields.  Conflicts raise ``MetadataConflictError``.
         """
         enriched = dict(record)
         run_id = str(record["run_id"])
         role = str(record.get("role", "watermarked"))
         embedded = record.get("source_metadata")
 
-        try:
-            csv_row = self.resolve(run_id, role)
-        except MetadataResolverError:
-            csv_row = None
+        csv_row = self.resolve(run_id, role)
 
-        if csv_row is not None and isinstance(embedded, dict) and embedded:
-            # Both sources available — validate consistency on shared fields
+        if isinstance(embedded, dict) and embedded:
+            # Validate consistency on shared fields
             conflicts = []
             shared_keys = set(csv_row) & set(embedded)
             for key in sorted(shared_keys):
@@ -147,20 +155,9 @@ class MetadataResolver:
                     f"with embedded source_metadata on fields: {conflicts}"
                 )
 
-        if csv_row is not None:
-            # Primary path: resolved CSV metadata
-            enriched["_metadata"] = dict(csv_row)
-        elif isinstance(embedded, dict) and embedded:
-            # Fallback: embedded source_metadata from legacy record
-            enriched["_metadata"] = dict(embedded)
-        else:
-            raise MetadataResolverError(
-                f"No metadata available for run_id={run_id!r} role={role!r}. "
-                f"CSV: {csv_path or 'not specified'}"
-            )
+        enriched["_metadata"] = dict(csv_row)
 
-        # Also merge top-level convenience aliases for common fields
-        # so detector adapters still find them without code changes
+        # Top-level aliases for backwards-compatible detector access
         meta = enriched["_metadata"]
         for field in meta:
             if field not in enriched or enriched.get(field) in (None, ""):
@@ -176,26 +173,31 @@ class MetadataResolver:
     def from_records_fallback(
         cls, records: list[dict[str, Any]],
     ) -> MetadataResolver | None:
-        """Build a resolver from embedded ``source_metadata`` in records.
+        """Build a resolver from embedded ``source_metadata`` in legacy records.
 
-        Returns ``None`` when no records carry embedded metadata.
-        Inherits ``run_id`` from the record when missing from the embedded dict.
+        Role is taken from the record's own ``role`` field.  The same
+        run_id with different roles (watermarked, clean) produces two
+        role-specific rows rather than duplicate generic rows.
         """
         rows: list[dict[str, str]] = []
+        seen: set[tuple[str, str | None]] = set()
         for rec in records:
             embedded = rec.get("source_metadata")
-            if isinstance(embedded, dict) and embedded:
-                row = {str(k): str(v) for k, v in embedded.items()}
-                if "run_id" not in row and "sample_id" not in row and "id" not in row:
-                    row["run_id"] = str(rec.get("run_id", ""))
-                # Preserve role hint from record
-                if "watermarked_path" not in row and "clean_path" not in row:
-                    role = rec.get("role", "watermarked")
-                    if role == "watermarked":
-                        row["watermarked_path"] = rec.get("input_path", "")
-                    elif role == "clean":
-                        row["clean_path"] = rec.get("input_path", "")
-                rows.append(row)
+            if not isinstance(embedded, dict) or not embedded:
+                continue
+            row = {str(k): str(v) for k, v in embedded.items()}
+            if "run_id" not in row and "sample_id" not in row and "id" not in row:
+                row["run_id"] = str(rec.get("run_id", ""))
+
+            # Use record's own role to create role-specific row
+            rec_role = str(rec.get("role", "watermarked")).strip().lower()
+            row["role"] = rec_role if rec_role in ("watermarked", "clean") else "watermarked"
+
+            key = (row.get("run_id", ""), row["role"] if "role" in row else None)
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append(row)
         if not rows:
             return None
         return cls(rows)
