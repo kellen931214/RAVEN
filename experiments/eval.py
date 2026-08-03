@@ -105,8 +105,8 @@ def _validate_threshold_score(score: dict[str, Any], method: str) -> tuple[bool,
 
 
 def _validate_t2s_score(score: dict[str, Any]) -> tuple[bool, str]:
-    """T2S contract: true/control keys finite, detection_success present,
-    optional accuracy fields in [0, 1]."""
+    """T2S contract: true/control keys finite, detection_success is real bool,
+    optional accuracy fields in [0, 1], margin finite if present."""
     for field in ("t2s_score_true_key", "t2s_score_control_key"):
         if field not in score:
             return False, f"missing required field: {field}"
@@ -118,8 +118,28 @@ def _validate_t2s_score(score: dict[str, Any]) -> tuple[bool, str]:
             return False, f"{field} is non-finite: {value!r}"
         score[field] = value
 
+    # detection_success must be a real bool — "false"/1/None/[] all rejected
     if "t2s_detection_success" not in score:
         return False, "missing required field: t2s_detection_success"
+    if not isinstance(score["t2s_detection_success"], bool):
+        return False, (
+            f"t2s_detection_success must be a real bool, got "
+            f"{type(score['t2s_detection_success']).__name__}: "
+            f"{score['t2s_detection_success']!r}"
+        )
+
+    # Margin: if present and not None, must be finite float
+    if "t2s_score_margin" in score and score["t2s_score_margin"] is not None:
+        try:
+            margin = float(score["t2s_score_margin"])
+        except (ValueError, TypeError):
+            return False, (
+                f"t2s_score_margin is not convertible to float: "
+                f"{score['t2s_score_margin']!r}"
+            )
+        if not math.isfinite(margin):
+            return False, f"t2s_score_margin is non-finite: {margin!r}"
+        score["t2s_score_margin"] = margin
 
     for acc_field in ("t2s_key_accuracy", "t2s_message_accuracy", "t2s_bit_accuracy"):
         if acc_field in score and score[acc_field] is not None:
@@ -232,6 +252,53 @@ def _missing_metric_cohorts(
     return sorted(required - present)
 
 
+# Cohort classification for threshold-based methods
+_PRIMARY_COHORTS = frozenset({
+    "original_clean", "original_watermarked", "attacked_watermarked",
+})
+_OPTIONAL_COHORTS = frozenset({"attacked_clean"})
+
+
+def _compute_primary_optional_counts(
+    detector_rows: list[dict[str, Any]],
+    method: str,
+) -> dict[str, Any]:
+    """Separate primary vs optional cohort counts for threshold methods.
+
+    T2S has no primary/optional distinction — all required cohorts are primary.
+    """
+    method_upper = str(method).upper()
+    if method_upper == "T2S":
+        scored = sum(1 for r in detector_rows if r.get("status") == ROW_STATUS_SCORED)
+        failed = len(detector_rows) - scored
+        return {
+            "primary_requested_count": len(detector_rows),
+            "primary_scored_count": scored,
+            "primary_failed_count": failed,
+            "optional_requested_count": 0,
+            "optional_scored_count": 0,
+            "optional_failed_count": 0,
+        }
+
+    primary_rows = [r for r in detector_rows
+                    if r.get("evaluation_cohort") in _PRIMARY_COHORTS]
+    optional_rows = [r for r in detector_rows
+                     if r.get("evaluation_cohort") in _OPTIONAL_COHORTS]
+
+    return {
+        "primary_requested_count": len(primary_rows),
+        "primary_scored_count": sum(1 for r in primary_rows
+                                     if r.get("status") == ROW_STATUS_SCORED),
+        "primary_failed_count": sum(1 for r in primary_rows
+                                     if r.get("status") != ROW_STATUS_SCORED),
+        "optional_requested_count": len(optional_rows),
+        "optional_scored_count": sum(1 for r in optional_rows
+                                      if r.get("status") == ROW_STATUS_SCORED),
+        "optional_failed_count": sum(1 for r in optional_rows
+                                      if r.get("status") != ROW_STATUS_SCORED),
+    }
+
+
 def _compute_metric_availability(
     detector_rows: list[dict[str, Any]],
     method: str,
@@ -241,6 +308,11 @@ def _compute_metric_availability(
 
     Returns a dict with boolean flags for each report type and a list of
     what is missing per report.
+
+    ``recalibrated_cohorts_available`` means the required scored cohorts
+    exist.  ``recalibrated_report_available`` means the aggregate actually
+    contains a recalibrated result block (e.g. ``tr_recalibrated`` with
+    ``recalibrated_metrics_available == True``).
     """
     method_upper = str(method).upper()
     scored_set = _scored_cohorts(detector_rows)
@@ -268,11 +340,12 @@ def _compute_metric_availability(
             )
         # T2S has no threshold/recalibrated distinction
         availability["threshold_report_available"] = False
+        availability["recalibrated_cohorts_available"] = False
         availability["recalibrated_report_available"] = False
         availability["threshold_report"] = None
         return availability
 
-    # Threshold-based methods
+    # ---- Threshold-based methods ----
     has_clean = "original_clean" in scored_set
     has_wm = "original_watermarked" in scored_set
     has_att = "attacked_watermarked" in scored_set
@@ -294,29 +367,59 @@ def _compute_metric_availability(
             - scored_set,
         )
 
-    # Recalibrated report: needs attacked_clean + rest
-    recal_ok = has_att_clean and has_wm and has_att
-    availability["recalibrated_report_available"] = recal_ok
-    availability["recalibrated_report"] = (
-        "recalibrated_threshold_report" if recal_ok else None
-    )
+    # Recalibrated cohorts: are the required scored cohorts present?
+    recal_cohorts_ok = has_att_clean and has_wm and has_att
+    availability["recalibrated_cohorts_available"] = recal_cohorts_ok
     availability["recalibrated_required_cohorts"] = [
         "attacked_clean", "original_watermarked", "attacked_watermarked",
     ]
-    if not recal_ok and has_att_clean:
+
+    # Recalibrated report: must actually exist in aggregate output
+    availability["recalibrated_report_available"] = _check_recalibrated_report(
+        aggregate, method_upper,
+    )
+
+    if recal_cohorts_ok and not availability["recalibrated_report_available"]:
+        availability["recalibrated_unavailable_reason"] = (
+            "scored cohorts are available but aggregate does not contain "
+            "a recalibrated result block"
+        )
+    elif not recal_cohorts_ok and has_att_clean:
         availability["recalibrated_missing"] = sorted(
             {"attacked_clean", "original_watermarked", "attacked_watermarked"}
             - scored_set,
         )
-    elif not recal_ok:
+    elif not recal_cohorts_ok:
         availability["recalibrated_unavailable_reason"] = (
             "attacked_clean cohort not present"
         )
 
-    # Any report available?
+    # Primary report = threshold report
     availability["primary_report_available"] = threshold_ok
     availability["any_report_available"] = threshold_ok or (has_wm and has_att)
     return availability
+
+
+def _check_recalibrated_report(
+    aggregate: dict[str, Any],
+    method: str,
+) -> bool:
+    """Check whether aggregate actually contains a recalibrated result block.
+
+    Only returns True when the method-specific recalibrated payload is
+    present AND signals availability (e.g. ``recalibrated_metrics_available:
+    True``).  Never fabricates availability from cohort presence alone.
+    """
+    if method == "TR":
+        recal = aggregate.get("tr_recalibrated")
+        if isinstance(recal, dict) and recal.get("recalibrated_metrics_available") is True:
+            return True
+        return False
+
+    # GS/GM/fourier adapters do not currently emit recalibrated blocks.
+    # Their aggregate output carries only detection_summary.
+    # Future: if they add recalibration, add method-specific checks here.
+    return False
 
 
 # ===========================================================================
@@ -650,13 +753,19 @@ def evaluate_detector(
         metric_availability, method,
     )
 
+    # ---- Issue #19: primary/optional cohort counts ----
+    primary_optional = _compute_primary_optional_counts(detector_rows, method)
+    aggregate.update(primary_optional)
+
     # ---- Issue #19: stage status semantics ----
     primary_available = metric_availability.get("primary_report_available", False)
     any_available = metric_availability.get("any_report_available", False)
+    primary_failed = primary_optional.get("primary_failed_count", 0)
+    optional_failed = primary_optional.get("optional_failed_count", 0)
 
     if scored_count == 0:
         stage_status = STATUS_FAILED_SCORING
-    elif primary_available and failed_count == 0:
+    elif primary_available and primary_failed == 0:
         stage_status = STATUS_COMPLETED
     elif any_available:
         stage_status = STATUS_COMPLETED_WITH_ERRORS
@@ -664,6 +773,10 @@ def evaluate_detector(
         stage_status = STATUS_COMPLETED_WITH_ERRORS
     else:
         stage_status = STATUS_FAILED_SCORING
+
+    # Optional cohort failures must not downgrade primary completion
+    if stage_status == STATUS_COMPLETED and optional_failed > 0:
+        aggregate["optional_metrics_incomplete"] = True
 
     aggregate["stage"] = "detector"
     aggregate["method"] = method

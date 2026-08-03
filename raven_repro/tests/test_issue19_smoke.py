@@ -386,6 +386,104 @@ class TestScoreContractT2S:
             # T2S has no threshold-based report
             assert ma["primary_report"] == "paired_key_detection_report"
 
+    # ---- Focused: detection_success type validation ----
+    def test_detection_success_string_false_fails(self, monkeypatch):
+        """t2s_detection_success='false' (string) → failed_scoring."""
+        from experiments.eval import evaluate_detector
+        from raven.detectors import STATUS_FAILED_SCORING
+
+        rec = _make_record("1", "watermarked", method="T2S",
+                           source_metadata=T2S_META)
+        self._patch_t2s(monkeypatch, lambda *a, **kw: {
+            "t2s_score_true_key": 0.85,
+            "t2s_score_control_key": 0.40,
+            "t2s_detection_success": "false",  # string, not bool
+        })
+
+        with tempfile.TemporaryDirectory() as td:
+            out = _write_fake_run(Path(td), method="T2S", records=[rec])
+            result = evaluate_detector([rec], out, "T2S", device="cpu")
+            assert result["status"] == STATUS_FAILED_SCORING
+            assert result["scored_count"] == 0
+
+    def test_detection_success_int_1_fails(self, monkeypatch):
+        """t2s_detection_success=1 (int) → failed_scoring."""
+        from experiments.eval import evaluate_detector
+        from raven.detectors import STATUS_FAILED_SCORING
+
+        rec = _make_record("1", "watermarked", method="T2S",
+                           source_metadata=T2S_META)
+        self._patch_t2s(monkeypatch, lambda *a, **kw: {
+            "t2s_score_true_key": 0.85,
+            "t2s_score_control_key": 0.40,
+            "t2s_detection_success": 1,  # int, not bool
+        })
+
+        with tempfile.TemporaryDirectory() as td:
+            out = _write_fake_run(Path(td), method="T2S", records=[rec])
+            result = evaluate_detector([rec], out, "T2S", device="cpu")
+            assert result["status"] == STATUS_FAILED_SCORING
+            assert result["scored_count"] == 0
+
+    def test_detection_success_none_fails(self, monkeypatch):
+        """t2s_detection_success=None → failed_scoring."""
+        from experiments.eval import evaluate_detector
+        from raven.detectors import STATUS_FAILED_SCORING
+
+        rec = _make_record("1", "watermarked", method="T2S",
+                           source_metadata=T2S_META)
+        self._patch_t2s(monkeypatch, lambda *a, **kw: {
+            "t2s_score_true_key": 0.85,
+            "t2s_score_control_key": 0.40,
+            "t2s_detection_success": None,
+        })
+
+        with tempfile.TemporaryDirectory() as td:
+            out = _write_fake_run(Path(td), method="T2S", records=[rec])
+            result = evaluate_detector([rec], out, "T2S", device="cpu")
+            assert result["status"] == STATUS_FAILED_SCORING
+            assert result["scored_count"] == 0
+
+    def test_margin_nan_with_valid_keys_fails(self, monkeypatch):
+        """t2s_score_margin=NaN but true/control keys valid → failed_scoring."""
+        from experiments.eval import evaluate_detector
+        from raven.detectors import STATUS_FAILED_SCORING
+
+        rec = _make_record("1", "watermarked", method="T2S",
+                           source_metadata=T2S_META)
+        self._patch_t2s(monkeypatch, lambda *a, **kw: {
+            "t2s_score_true_key": 0.85,
+            "t2s_score_control_key": 0.40,
+            "t2s_detection_success": True,
+            "t2s_score_margin": float("nan"),
+        })
+
+        with tempfile.TemporaryDirectory() as td:
+            out = _write_fake_run(Path(td), method="T2S", records=[rec])
+            result = evaluate_detector([rec], out, "T2S", device="cpu")
+            assert result["status"] == STATUS_FAILED_SCORING
+            assert result["scored_count"] == 0
+
+    def test_margin_inf_with_valid_keys_fails(self, monkeypatch):
+        """t2s_score_margin=inf but true/control keys valid → failed_scoring."""
+        from experiments.eval import evaluate_detector
+        from raven.detectors import STATUS_FAILED_SCORING
+
+        rec = _make_record("1", "watermarked", method="T2S",
+                           source_metadata=T2S_META)
+        self._patch_t2s(monkeypatch, lambda *a, **kw: {
+            "t2s_score_true_key": 0.85,
+            "t2s_score_control_key": 0.40,
+            "t2s_detection_success": True,
+            "t2s_score_margin": float("inf"),
+        })
+
+        with tempfile.TemporaryDirectory() as td:
+            out = _write_fake_run(Path(td), method="T2S", records=[rec])
+            result = evaluate_detector([rec], out, "T2S", device="cpu")
+            assert result["status"] == STATUS_FAILED_SCORING
+            assert result["scored_count"] == 0
+
 
 # ---------------------------------------------------------------------------
 # Metric cohort completeness — threshold-based methods
@@ -461,26 +559,29 @@ class TestMetricCohortCompleteness:
             assert result["missing_metric_cohorts"] == []
 
     def test_no_attacked_clean_does_not_block_original_report(self, monkeypatch):
-        """attacked_clean missing → threshold_report OK, only recalibrated unavailable."""
-        from experiments.eval import evaluate_detector
-        from raven.detectors import STATUS_COMPLETED
+        """attacked_clean scoring fails, but 3 primary cohorts succeed → completed.
 
-        # clean record generates: original_clean + attacked_clean
-        # watermarked records generate: original_watermarked + attacked_watermarked
-        # With 1 clean + 1 watermarked → all 4 cohorts present (attacked_clean included)
-        # To test missing attacked_clean, we need it to fail scoring.
-        # Instead, test that recalibrated is False when attacked_clean is absent.
-        # Since DETECTOR_COHORTS generates attacked_clean from clean records,
-        # having scored clean always creates attacked_clean too. This test
-        # verifies the availability structure is correct.
+        Uses evaluation_entry to make ONLY attacked_clean return None while
+        original_clean, original_watermarked, attacked_watermarked all score
+        successfully.  The primary threshold report must be complete even
+        though recalibrated is unavailable.
+        """
+        from experiments.eval import evaluate_detector
+        from raven.detectors import STATUS_COMPLETED, ROW_STATUS_FAILED_SCORING
 
         rec_clean = _make_record("1", "clean", method="TR",
                                   source_metadata=TR_META)
         rec_wm = _make_record("1", "watermarked", method="TR",
                                source_metadata=TR_META)
-        self._patch_tr(monkeypatch, lambda *a, **kw: {
-            "raw_score": 0.001, "canonical_score": 10.0,
-        })
+
+        def fake_score(provider_info, image_path, *,
+                       record=None, evaluation_entry=None, steps=50):
+            if (evaluation_entry is not None
+                    and evaluation_entry.get("evaluation_cohort") == "attacked_clean"):
+                return None  # attacked_clean fails
+            return {"raw_score": 0.001, "canonical_score": 10.0}
+
+        self._patch_tr(monkeypatch, fake_score)
 
         with tempfile.TemporaryDirectory() as td:
             out = _write_fake_run(Path(td), method="TR",
@@ -488,11 +589,34 @@ class TestMetricCohortCompleteness:
             result = evaluate_detector([rec_clean, rec_wm], out,
                                        "TR", device="cpu")
 
-            assert result["status"] == STATUS_COMPLETED
+            # Stage must be completed — primary cohorts all OK
+            assert result["status"] == STATUS_COMPLETED, (
+                f"expected completed, got {result['status']}"
+            )
+            # Primary counts: 3 primary entries (orig_clean + orig_wm + att_wm)
+            assert result["primary_scored_count"] == 3
+            assert result["primary_failed_count"] == 0
+            # Optional: 1 attacked_clean entry failed
+            assert result["optional_requested_count"] == 1
+            assert result["optional_scored_count"] == 0
+            assert result["optional_failed_count"] == 1
+            # optional_metrics_incomplete flag set
+            assert result.get("optional_metrics_incomplete") is True
+
             ma = result["metric_availability"]
             assert ma["threshold_report_available"] is True
-            # attacked_clean generated from clean role → both available
-            assert ma["recalibrated_report_available"] is True
+            assert ma["primary_report_available"] is True
+            # Recalibrated cohorts ARE available (attacked_clean exists in image_index)
+            # but NO rows scored → recalibrated_report_available = False
+            assert ma["recalibrated_report_available"] is False
+
+            # Check detector_records.jsonl
+            rows = _read_detector_rows(out)
+            statuses = {(r["evaluation_cohort"], r["status"]) for r in rows}
+            assert ("original_clean", "scored") in statuses
+            assert ("original_watermarked", "scored") in statuses
+            assert ("attacked_watermarked", "scored") in statuses
+            assert ("attacked_clean", ROW_STATUS_FAILED_SCORING) in statuses
 
     def test_cannot_convert_to_float_fails(self, monkeypatch):
         """String that can't convert to float → failed_scoring."""
@@ -626,12 +750,99 @@ class TestOutputStructure:
             for field in ("stage", "method", "status", "available",
                           "requested_count", "scored_count", "failed_count",
                           "cohort_counts", "metric_availability",
-                          "missing_scoring_cohorts", "missing_metric_cohorts"):
+                          "missing_scoring_cohorts", "missing_metric_cohorts",
+                          "primary_requested_count", "primary_scored_count",
+                          "primary_failed_count",
+                          "optional_requested_count", "optional_scored_count",
+                          "optional_failed_count"):
                 assert field in result, f"Missing top-level field: {field}"
 
             ma = result["metric_availability"]
             for field in ("scored_cohorts", "cohort_counts",
                           "primary_report_available", "any_report_available",
                           "threshold_report_available",
+                          "recalibrated_cohorts_available",
                           "recalibrated_report_available"):
                 assert field in ma, f"Missing metric_availability field: {field}"
+
+
+# ---------------------------------------------------------------------------
+# Recalibrated report availability — must reflect actual aggregate output
+# ---------------------------------------------------------------------------
+class TestRecalibratedReport:
+    """recalibrated_report_available must only be True when aggregate
+    actually contains a recalibrated result block."""
+
+    @staticmethod
+    def _patch_gs(monkeypatch, fake_score_fn):
+        import raven.detectors.gs_detector as mod
+        monkeypatch.setattr(mod, "load_state",
+                            lambda records, device, **extra: {"fake": True})
+        monkeypatch.setattr(mod, "score_image", fake_score_fn)
+
+    def test_gs_cohorts_ok_but_no_recalibrated_report(self, monkeypatch):
+        """GS adapter has no recalibrated block → recalibrated_report_available=False."""
+        from experiments.eval import evaluate_detector
+        from raven.detectors import STATUS_COMPLETED
+
+        GS_META = {"gs_secret_index": "5", "gs_secret_bundle_sha256": "abc",
+                    "gs_protocol_mode": "official_compatible"}
+        rec_clean = _make_record("1", "clean", method="GS",
+                                  source_metadata=GS_META)
+        rec_wm = _make_record("1", "watermarked", method="GS",
+                               source_metadata=GS_META)
+
+        self._patch_gs(monkeypatch, lambda *a, **kw: {
+            "raw_score": 0.8, "canonical_score": 0.8,
+        })
+
+        with tempfile.TemporaryDirectory() as td:
+            out = _write_fake_run(Path(td), method="GS",
+                                  records=[rec_clean, rec_wm])
+            result = evaluate_detector([rec_clean, rec_wm], out,
+                                       "GS", device="cpu")
+
+            assert result["status"] == STATUS_COMPLETED
+            ma = result["metric_availability"]
+            # All 4 cohorts scored successfully
+            assert ma["threshold_report_available"] is True
+            # Recalibrated cohorts ARE present
+            assert ma["recalibrated_cohorts_available"] is True
+            # But GS adapter emits no recalibrated block
+            assert ma["recalibrated_report_available"] is False
+            assert "recalibrated_unavailable_reason" in ma
+
+    def test_tr_with_recalibrated_data_shows_available(self, monkeypatch):
+        """TR aggregate with tr_recalibrated → recalibrated_report_available=True
+        only if recalibrated_metrics_available is True."""
+        from experiments.eval import evaluate_detector
+
+        rec_clean = _make_record("1", "clean", method="TR",
+                                  source_metadata=TR_META)
+        rec_wm = _make_record("1", "watermarked", method="TR",
+                               source_metadata=TR_META)
+
+        # TR aggregate sets recalibrated_metrics_available based on
+        # attacked_clean cohort existing + summarize_detection succeeding.
+        # With this mock (all 4 cohorts → valid scores), the TR aggregate
+        # will compute detection_summary from clean+wm+att but
+        # tr_recalibrated needs attacked_clean + clean both non-empty.
+        # Our mock returns valid scores for everything, so recalibrated
+        # should be computed.
+        import raven.detectors.tr_detector as tr_mod
+        monkeypatch.setattr(tr_mod, "load_state",
+                            lambda records, device, **extra: {"fake": True})
+        monkeypatch.setattr(tr_mod, "score_image",
+                            lambda *a, **kw: {"raw_score": 0.001,
+                                              "canonical_score": 10.0})
+
+        with tempfile.TemporaryDirectory() as td:
+            out = _write_fake_run(Path(td), method="TR",
+                                  records=[rec_clean, rec_wm])
+            result = evaluate_detector([rec_clean, rec_wm], out,
+                                       "TR", device="cpu")
+
+            ma = result["metric_availability"]
+            assert ma["recalibrated_cohorts_available"] is True
+            # TR actually emitted tr_recalibrated with valid metrics
+            assert ma["recalibrated_report_available"] is True
