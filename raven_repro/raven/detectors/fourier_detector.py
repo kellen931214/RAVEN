@@ -12,6 +12,13 @@ Method-specific state gates (Issue #24):
 
 Canonical score = ``-raw_l1`` (higher is watermarked).
 
+Protocol mode and provider profile are DISTINCT identities:
+  - ``<prefix>_protocol_mode`` is the generation/evaluation protocol,
+    validated against the method's shared-tr-clean constant
+    (``raven.pairing_provenance``).
+  - ``manifest.profile_name`` is the provider profile, validated against
+    the canonical kwargs profile and ``provider.profile``.
+
 All failure classification is structural — never derived from exception
 message substrings.
 """
@@ -89,6 +96,10 @@ REQUIRED_METADATA_FIELDS: frozenset[str] = frozenset(
     _METHOD_REQUIRED_FIELDS.get("RID", ())
 )
 
+# Bundle schema families.  RID uses RidBundle; HSTR/HSQR share SfwBundle.
+_RID_BUNDLE_SCHEMAS = frozenset({"rid_bundle_v1"})
+_SFW_BUNDLE_SCHEMAS = frozenset({"sfw_bundle_v1"})
+
 
 def describe_required_artifacts() -> list[str]:
     return [
@@ -117,6 +128,22 @@ def _get_extract_module():
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
+
+
+def _protocol_mode_for_method(method: str) -> str:
+    """Canonical protocol mode constant for a Fourier method."""
+    from raven.pairing_provenance import METHOD_PROTOCOL_MODES
+    field, mode = METHOD_PROTOCOL_MODES[method]
+    return mode
+
+
+def _profile_for_kwargs(method: str, kwargs: dict[str, Any]) -> str:
+    """Provider profile carried by the canonical kwargs helper."""
+    if method == "RID":
+        return str(kwargs.get("rid_profile", ""))
+    if method == "HSTR":
+        return str(kwargs.get("hstr_profile", ""))
+    return ""
 
 
 # ===========================================================================
@@ -162,45 +189,79 @@ def _validate_method_tag(
         )
 
 
-def _validate_manifest_method_identity(
+def _validate_manifest_schema(
     manifest: dict[str, Any],
     method: str,
     row_label: str,
 ) -> None:
-    """Verify bundle manifest method identity matches evaluation method.
+    """Fail closed on bundle schema identity.
 
-    Only checks when the manifest carries an explicit method/schema tag.
-    Does not fabricate fields for schemas that lack them.
+    RID must be a repository-supported RidBundle schema; HSTR/HSQR must be a
+    repository-supported SfwBundle schema.  Unknown non-empty schemas are
+    rejected.  A missing schema is left to the canonical bundle loader.
     """
-    # RID bundles use rid_bundle schema
-    schema = str(manifest.get("schema", manifest.get("bundle_schema", "")))
-    if schema:
-        rid_schemas = {"rid_bundle_v1", "rid_bundle_v2"}
-        sfw_schemas = {"sfw_bundle_v1", "sfw_bundle_v2"}
-        if method in {"RID"} and schema in sfw_schemas:
-            raise DetectorStateValidationError(
-                f"{row_label}: manifest schema {schema!r} is not a RID bundle"
-            )
-        if method in {"HSTR", "HSQR"} and schema in rid_schemas:
-            raise DetectorStateValidationError(
-                f"{row_label}: manifest schema {schema!r} is not an SFW bundle"
-            )
+    schema = str(manifest.get("schema", manifest.get("bundle_schema", ""))).strip()
+    if not schema:
+        return
+    if method == "RID" and schema not in _RID_BUNDLE_SCHEMAS:
+        raise DetectorStateValidationError(
+            f"{row_label}: unsupported RID bundle schema {schema!r}; "
+            f"supported: {sorted(_RID_BUNDLE_SCHEMAS)}"
+        )
+    if method in {"HSTR", "HSQR"} and schema not in _SFW_BUNDLE_SCHEMAS:
+        raise DetectorStateValidationError(
+            f"{row_label}: unsupported SFW bundle schema {schema!r}; "
+            f"supported: {sorted(_SFW_BUNDLE_SCHEMAS)}"
+        )
 
-    # SFW bundles carry a methods array; RID bundles do not
-    manifest_methods = manifest.get("methods", manifest.get("watermark_methods"))
-    if manifest_methods is not None:
-        if isinstance(manifest_methods, list):
-            if method not in manifest_methods:
-                raise DetectorStateValidationError(
-                    f"{row_label}: manifest methods {manifest_methods} do not "
-                    f"include {method!r}"
-                )
-        elif isinstance(manifest_methods, str):
-            if method != manifest_methods:
-                raise DetectorStateValidationError(
-                    f"{row_label}: manifest method {manifest_methods!r} != "
-                    f"{method!r}"
-                )
+
+def _validate_protocol_mode(
+    record: dict[str, Any],
+    method: str,
+    row_label: str,
+) -> None:
+    """Verify the row protocol mode against the method's canonical constant.
+
+    Protocol mode is the generation/evaluation protocol — a different
+    identity from the provider profile.
+    """
+    prefix = method.lower()
+    row_protocol = str(record.get(f"{prefix}_protocol_mode", ""))
+    expected = _protocol_mode_for_method(method)
+    if row_protocol != expected:
+        raise DetectorStateValidationError(
+            f"{row_label}: row {prefix}_protocol_mode={row_protocol!r} does not "
+            f"match canonical protocol mode {expected!r}"
+        )
+
+
+def _validate_provider_profile(
+    method: str,
+    manifest: dict[str, Any],
+    kwargs: dict[str, Any],
+    provider,
+    row_label: str,
+) -> None:
+    """Verify manifest profile == kwargs profile == provider profile."""
+    prefix = method.lower()
+    manifest_profile = str(manifest.get("profile_name", "")).strip()
+    kwargs_profile = _profile_for_kwargs(method, kwargs)
+    provider_profile = str(getattr(provider, "profile", "")).strip()
+
+    if not manifest_profile:
+        raise DetectorStateValidationError(
+            f"{row_label}: bundle manifest has no profile_name"
+        )
+    if kwargs_profile and manifest_profile != kwargs_profile:
+        raise DetectorStateValidationError(
+            f"{row_label}: manifest profile_name={manifest_profile!r} does not "
+            f"match provider kwargs {prefix}_profile={kwargs_profile!r}"
+        )
+    if provider_profile and manifest_profile != provider_profile:
+        raise DetectorStateValidationError(
+            f"{row_label}: manifest profile_name={manifest_profile!r} does not "
+            f"match provider profile={provider_profile!r}"
+        )
 
 
 def _validate_key_index(
@@ -237,23 +298,41 @@ def _validate_key_index(
         )
 
 
-def _validate_protocol_profile(
-    record: dict[str, Any],
+def _validate_pipe_profile_fields(
     method: str,
     manifest: dict[str, Any],
     row_label: str,
-) -> None:
-    """Verify row protocol_mode matches the bundle's canonical profile identity."""
-    prefix = method.lower()
-    row_protocol = str(record.get(f"{prefix}_protocol_mode", ""))
+) -> tuple[str, str, str, int]:
+    """Extract and validate pipe profile fields from the manifest.
 
-    # Canonical profile identity from manifest
-    profile_name = str(manifest.get("profile_name", ""))
-    if profile_name and row_protocol != profile_name:
+    All fields are mandatory — no fallback to default model/scheduler.
+    Missing → DetectorStateValidationError (bundle exists but incomplete).
+    Returns (model_id, model_revision, scheduler, resolution).
+    """
+    model_id = str(manifest.get("model_id", "")).strip()
+    model_revision = str(manifest.get("model_revision", "")).strip()
+    resolution = manifest.get("resolution")
+    scheduler = str(
+        manifest.get("scheduler_type", manifest.get("scheduler", ""))
+    ).strip()
+
+    if not model_id:
         raise DetectorStateValidationError(
-            f"{row_label}: row {prefix}_protocol_mode={row_protocol!r} does not "
-            f"match manifest profile_name={profile_name!r}"
+            f"{row_label}: bundle manifest has no model_id"
         )
+    if not model_revision:
+        raise DetectorStateValidationError(
+            f"{row_label}: bundle manifest has no model_revision"
+        )
+    if not scheduler:
+        raise DetectorStateValidationError(
+            f"{row_label}: bundle manifest has no scheduler/scheduler_type"
+        )
+    if resolution is None or not str(resolution).strip():
+        raise DetectorStateValidationError(
+            f"{row_label}: bundle manifest has no resolution"
+        )
+    return model_id, model_revision, scheduler, int(resolution)
 
 
 # ---------------------------------------------------------------------------
@@ -299,7 +378,6 @@ def _compute_detector_mask_hash(provider, method: str, manifest: dict) -> str:
         return str(provider.watermark_mask_sha256)
     if manifest.get("mask_sha256"):
         return str(manifest["mask_sha256"])
-    # Use canonical center-slice mask identity if available
     if hasattr(provider, "watermark_channels") and hasattr(provider, "start") and hasattr(provider, "end"):
         try:
             from raven.eval_protocol import canonical_json_hash
@@ -313,7 +391,6 @@ def _compute_detector_mask_hash(provider, method: str, manifest: dict) -> str:
             })
         except Exception:
             pass
-    # Fallback: hash the actual mask tensor from provider
     if hasattr(provider, "watermarking_mask"):
         return tensor_sha256(provider.watermarking_mask)
     return ""
@@ -335,7 +412,6 @@ def _validate_row_target_mask(
     source_target = str(record.get("watermark_target_sha256", "")).strip()
     source_mask = str(record.get("watermark_mask_sha256", "")).strip()
 
-    # Source provenance is mandatory
     if not source_target:
         raise DetectorMissingStateError(
             f"{method}: missing watermark_target_sha256 for run_id={row_id}"
@@ -348,7 +424,6 @@ def _validate_row_target_mask(
     detector_target = _compute_detector_target_hash(provider, method, manifest)
     detector_mask = _compute_detector_mask_hash(provider, method, manifest)
 
-    # Detector must be able to derive identities
     if not detector_target:
         raise DetectorStateValidationError(
             f"{method}: detector could not derive target identity for run_id={row_id}"
@@ -378,18 +453,19 @@ def load_state(records: list[dict[str, Any]], device: str,
                method: str = "RID", **extra) -> dict[str, Any]:
     """Load Fourier provider via canonical bundle helpers.
 
-    Validation order (structural — never derived from error messages):
+    Validation order — every step structural, never message-derived:
 
-    1. Method tag verification
-    2. Required metadata preflight (every row)
-    3. Bundle directory existence (path preflight)
-    4. Canonical bundle manifest loading
-    5. Manifest method identity check
-    6. Provider construction via method-specific kwargs helper
-    7. Method-specific state gates (state_source for RID/HSTR)
-    8. Key index match against manifest/provider
-    9. Protocol/profile match against manifest
-    10. Cohort consistency (same bundle_dir/key_index/protocol across rows)
+    1. Method tag verification (all rows)
+    2. Required metadata preflight (all rows)
+    3. Artifact path preflight — bundle dir + manifest.json (all rows)
+    4. Canonical manifest loading (all rows)
+    5. Manifest schema / method identity (all rows)
+    6. Protocol mode (all rows)
+    7. Mixed-cohort identity comparison (all rows) — BEFORE any pipe/provider
+    8. One pipe construction from validated profile (no fallback)
+    9. One provider construction via method-specific kwargs helper
+    10. State gates (state_source for RID/HSTR)
+    11. Key index + provider profile validation
     """
     import torch
 
@@ -422,21 +498,23 @@ def load_state(records: list[dict[str, Any]], device: str,
         _validate_required_row_metadata(record, method,
                                          f"{method} run_id={row_id}")
 
-    # --- Step 3: path preflight — bundle directory must exist ---------------
-    first = records[0]
-    identifier = str(first.get("run_id", "0"))
-    bundle_dir_str = str(first.get(f"{prefix}_bundle_dir", ""))
-    bundle_dir = Path(bundle_dir_str)
-    if not bundle_dir.is_dir():
-        raise DetectorMissingStateError(
-            f"{method}: {prefix}_bundle_dir does not exist or is not a "
-            f"directory: {bundle_dir_str}"
-        )
-    manifest_path = bundle_dir / "manifest.json"
-    if not manifest_path.is_file():
-        raise DetectorMissingStateError(
-            f"{method}: bundle manifest.json not found at {manifest_path}"
-        )
+    # --- Step 3: artifact path preflight on every row -----------------------
+    # All rows must point at an existing bundle dir with manifest.json —
+    # not just the first row.
+    for i, record in enumerate(records):
+        row_id = str(record.get("run_id", i))
+        row_label = f"{method} run_id={row_id}"
+        bundle_dir = Path(str(record.get(f"{prefix}_bundle_dir", "")))
+        if not bundle_dir.is_dir():
+            raise DetectorMissingStateError(
+                f"{row_label}: {prefix}_bundle_dir does not exist or is not "
+                f"a directory: {bundle_dir}"
+            )
+        manifest_path = bundle_dir / "manifest.json"
+        if not manifest_path.is_file():
+            raise DetectorMissingStateError(
+                f"{row_label}: bundle manifest.json not found at {manifest_path}"
+            )
 
     # --- Step 4: load extract module ----------------------------------------
     try:
@@ -446,51 +524,77 @@ def load_state(records: list[dict[str, Any]], device: str,
             f"Cannot load extract_verification_scores: {exc}"
         ) from exc
 
-    # --- Step 5: canonical bundle manifest loading --------------------------
-    # At this point path preflight already passed, so any RuntimeError from
-    # the canonical helper is a state validation failure (SHA/config mismatch).
+    # --- Step 5: canonical manifest loading + validation on every row -------
+    first = records[0]
+    identifier = str(first.get("run_id", "0"))
+    row_manifests: list[dict[str, Any]] = []
+    for i, record in enumerate(records):
+        row_id = str(record.get("run_id", i))
+        row_label = f"{method} run_id={row_id}"
+        try:
+            _bundle_path, manifest = mod.fourier_bundle_manifest(
+                record, str(row_id), method)
+        except Exception as exc:
+            raise DetectorStateValidationError(
+                f"{row_label}: bundle validation failed: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+        row_manifests.append(manifest)
+        _validate_manifest_schema(manifest, method, row_label)
+        _validate_protocol_mode(record, method, row_label)
+
+    manifest = row_manifests[0]
+
+    # --- Step 6: mixed-cohort identity comparison BEFORE provider -----------
+    # If any row disagrees on resolved bundle identity, fail before any
+    # pipe/provider construction.
+    cohort_identity_fields = (
+        f"{prefix}_bundle_dir",
+        f"{prefix}_bundle_config_sha256",
+        f"{prefix}_selected_pattern_sha256",
+        f"{prefix}_mask_sha256",
+        f"{prefix}_key_index",
+        f"{prefix}_protocol_mode",
+        "watermark_target_sha256",
+        "watermark_mask_sha256",
+    )
+    for field in cohort_identity_fields:
+        expected = str(first.get(field, ""))
+        for i, record in enumerate(records):
+            row_id = str(record.get("run_id", i))
+            actual = str(record.get(field, ""))
+            if actual != expected:
+                raise DetectorStateValidationError(
+                    f"{method} run_id={row_id}: mixed cohort field {field}: "
+                    f"expected={expected!r} got={actual!r}"
+                )
+
+    # Manifest-level identity must be uniform across rows too.
+    for manifest_field in ("bundle_config_sha256", "selected_pattern_sha256",
+                           "mask_sha256", "selected_key_index",
+                           "profile_name", "model_id", "model_revision",
+                           "scheduler", "scheduler_type", "resolution"):
+        values = {
+            str(m.get(manifest_field, ""))
+            for m in row_manifests
+        }
+        if len(values) > 1:
+            raise DetectorStateValidationError(
+                f"{method}: mixed manifest {manifest_field} across rows: "
+                f"{sorted(values)}"
+            )
+
+    # --- Step 7: pipe profile fields (no fallback) --------------------------
+    row_label = f"{method} run_id={identifier}"
+    model_id, model_revision, scheduler, resolution = \
+        _validate_pipe_profile_fields(method, manifest, row_label)
+
+    # --- Step 8: one pipe construction --------------------------------------
     try:
-        bundle_dir_path, manifest = mod.fourier_bundle_manifest(
-            first, str(identifier), method)
-    except Exception as exc:
-        raise DetectorStateValidationError(
-            f"{method} bundle validation failed for run_id={identifier}: "
-            f"{type(exc).__name__}: {exc}"
-        ) from exc
-
-    # --- Step 6: manifest method identity check -----------------------------
-    _validate_manifest_method_identity(manifest, method,
-                                        f"{method} run_id={identifier}")
-
-    # --- Step 7: provider construction --------------------------------------
-    try:
-        if method == "RID":
-            kwargs = mod.rid_provider_kwargs_from_bundle(first, str(identifier))
-        elif method == "HSTR":
-            kwargs = mod.hstr_provider_kwargs_from_bundle(first, str(identifier))
-        else:
-            kwargs = {}
-
         device_obj = torch.device(device)
-
-        # Pipe configuration from validated manifest / canonical kwargs.
-        # Never hardcode fallback scheduler or model — the bundle is the
-        # source of truth for the profile that embedded this cohort.
-        if method in {"RID", "HSTR"}:
-            model_id = str(kwargs["modelid_target"])
-            model_revision = str(kwargs.get("model_revision", ""))
-            resolution = int(kwargs["resolution"])
-            if method == "RID":
-                scheduler = str(kwargs["scheduler_target"])
-            else:
-                scheduler = str(kwargs["scheduler_target"])
-        else:  # HSQR — extract from manifest directly
-            model_id = str(manifest.get("model_id", ""))
-            model_revision = str(manifest.get("model_revision", ""))
-            resolution = int(manifest.get("resolution", 0))
-            scheduler = str(manifest.get("scheduler_type",
-                            manifest.get("scheduler", "DDIM")))
-
+        load_options = (
+            {"revision": model_revision} if model_revision else {}
+        )
         pipe = pipe_utils.get_pipe_provider(
             pretrained_model_name_or_path=model_id,
             resolution=resolution,
@@ -498,8 +602,28 @@ def load_state(records: list[dict[str, Any]], device: str,
             eager_loading=False,
             schedulers_name=scheduler,
             disable_tqdm=True,
+            **load_options,
         )
         latent_shape = pipe.get_latent_shape()
+    except (DetectorMissingStateError, DetectorStateValidationError):
+        raise
+    except ImportError as exc:
+        raise DetectorDependencyError(
+            f"{method} pipe dependencies not available: {exc}"
+        ) from exc
+    except Exception as exc:
+        raise DetectorProviderInitializationError(
+            f"{method} pipe construction failed: {type(exc).__name__}: {exc}"
+        ) from exc
+
+    # --- Step 9: one provider construction ----------------------------------
+    try:
+        if method == "RID":
+            kwargs = mod.rid_provider_kwargs_from_bundle(first, str(identifier))
+        elif method == "HSTR":
+            kwargs = mod.hstr_provider_kwargs_from_bundle(first, str(identifier))
+        else:
+            kwargs = {}
 
         if method == "RID":
             from eval_bench_wm.utils.wm.ringid_provider import RingIDProvider
@@ -518,7 +642,6 @@ def load_state(records: list[dict[str, Any]], device: str,
                 **kwargs,
             )
         elif method == "HSQR":
-            from eval_bench_wm.utils.wm.hsqr_provider import HSQRProvider
             provider = mod.hsqr_provider_from_bundle(
                 first, str(identifier), latent_shape, device_obj)
         else:
@@ -526,7 +649,7 @@ def load_state(records: list[dict[str, Any]], device: str,
                 f"Unknown Fourier method: {method}"
             )
 
-        # --- Step 8: method-specific state gates ---------------------------
+        # --- Step 10: method-specific state gates ---------------------------
         if method in {"RID", "HSTR"}:
             if getattr(provider, "bundle", None) is None:
                 raise DetectorStateValidationError(
@@ -542,67 +665,23 @@ def load_state(records: list[dict[str, Any]], device: str,
                 raise DetectorStateValidationError(
                     f"{method} provider has no persisted bundle"
                 )
-    except (DetectorStateValidationError, DetectorMissingStateError):
+
+        # --- Step 11: key index + provider profile --------------------------
+        _validate_key_index(first, method, manifest, kwargs,
+                             f"{method} run_id={identifier}")
+        _validate_provider_profile(method, manifest, kwargs, provider,
+                                    f"{method} run_id={identifier}")
+    except (DetectorMissingStateError, DetectorStateValidationError):
         raise
-    except TypeError as exc:
-        raise DetectorProviderInitializationError(
-            f"{method} provider construction failed: {exc}"
+    except ImportError as exc:
+        raise DetectorDependencyError(
+            f"{method} provider dependencies not available: {exc}"
         ) from exc
-
-    # --- Step 9: key index validation against manifest/provider ------------
-    _validate_key_index(first, method, manifest, kwargs,
-                         f"{method} run_id={identifier}")
-
-    # --- Step 10: protocol/profile validation against manifest -------------
-    _validate_protocol_profile(first, method, manifest,
-                                f"{method} run_id={identifier}")
-
-    # -------------------------------------------------------------------
-    # Per-row cohort consistency + cross-validation.
-    # Every row must share the same canonical bundle identity AND each
-    # row's own metadata must be validated against it.
-    # -------------------------------------------------------------------
-    cohort_bundle_dir = str(first.get(f"{prefix}_bundle_dir", ""))
-    cohort_key_index = str(first.get(f"{prefix}_key_index", ""))
-    cohort_protocol = str(first.get(f"{prefix}_protocol_mode", ""))
-
-    for i, record in enumerate(records):
-        row_id = str(record.get("run_id", i))
-        row_label = f"{method} run_id={row_id}"
-
-        # Per-row canonical bundle validation
-        try:
-            mod.fourier_bundle_manifest(record, row_id, method)
-        except Exception as exc:
-            raise DetectorStateValidationError(
-                f"{row_label}: bundle validation failed: "
-                f"{type(exc).__name__}: {exc}"
-            ) from exc
-
-        # Cross-validate key index and protocol against canonical values
-        _validate_key_index(record, method, manifest, kwargs, row_label)
-        _validate_protocol_profile(record, method, manifest, row_label)
-
-        # Cohort consistency
-        row_bundle_dir = str(record.get(f"{prefix}_bundle_dir", ""))
-        row_key_index = str(record.get(f"{prefix}_key_index", ""))
-        row_protocol = str(record.get(f"{prefix}_protocol_mode", ""))
-
-        if row_bundle_dir != cohort_bundle_dir:
-            raise DetectorStateValidationError(
-                f"{row_label}: mixed bundle_dir in cohort: "
-                f"expected={cohort_bundle_dir!r} got={row_bundle_dir!r}"
-            )
-        if row_key_index != cohort_key_index:
-            raise DetectorStateValidationError(
-                f"{row_label}: mixed key_index in cohort: "
-                f"expected={cohort_key_index!r} got={row_key_index!r}"
-            )
-        if row_protocol != cohort_protocol:
-            raise DetectorStateValidationError(
-                f"{row_label}: mixed protocol_mode in cohort: "
-                f"expected={cohort_protocol!r} got={row_protocol!r}"
-            )
+    except Exception as exc:
+        raise DetectorProviderInitializationError(
+            f"{method} provider construction failed: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
 
     score_definition = _METHOD_SCORE_DEFINITIONS.get(
         method, f"{prefix}_score = -raw_l1")
@@ -614,9 +693,9 @@ def load_state(records: list[dict[str, Any]], device: str,
         "device_obj": device_obj,
         "method": method,
         "score_definition": score_definition,
-        "_cohort_bundle_dir": cohort_bundle_dir,
-        "_cohort_key_index": cohort_key_index,
-        "_cohort_protocol": cohort_protocol,
+        "_cohort_bundle_dir": str(first.get(f"{prefix}_bundle_dir", "")),
+        "_cohort_key_index": str(first.get(f"{prefix}_key_index", "")),
+        "_cohort_protocol": str(first.get(f"{prefix}_protocol_mode", "")),
         "_cohort_bundle_config": str(first.get(f"{prefix}_bundle_config_sha256", "")),
         "_cohort_selected_pattern": str(first.get(f"{prefix}_selected_pattern_sha256", "")),
         "_cohort_mask": str(first.get(f"{prefix}_mask_sha256", "")),
@@ -631,16 +710,17 @@ def score_image(provider_info: dict[str, Any], image_path: str, *,
                 steps: int = 50) -> dict[str, Any]:
     """Score one image using the Fourier provider via canonical evaluate_image.
 
-    Per-row target/mask SHA validation (Issue #24): when ``record`` is
-    provided, validates source watermarked target/mask identity against the
-    detector's computed values before scoring.  Missing provenance is a
-    hard failure (fail-closed).
+    Per-row target/mask SHA validation (Issue #24): the resolved source
+    record is mandatory.  ``record=None`` fails closed — provenance
+    validation is never optional.
 
     Missing image raises ``FileNotFoundError`` (image absence is not a
     detector state issue — Issue #25 taxonomy).
 
     Canonical score = ``-raw_l1`` (delegates to extract module's
-    canonical_score).
+    canonical_score).  The whole scoring boundary is wrapped:
+    evaluate_image / raw_score / canonical_score / finiteness all map to
+    ``DetectorScoringError``.
     """
     import torch
 
@@ -653,22 +733,27 @@ def score_image(provider_info: dict[str, Any], image_path: str, *,
     mod = provider_info["extract_module"]
     manifest = provider_info.get("_manifest", {})
 
-    # Per-row target/mask identity validation (fail-closed)
-    if record is not None:
-        _validate_row_target_mask(provider, method, record, manifest)
+    # Per-row target/mask identity validation — mandatory
+    if record is None:
+        raise DetectorMissingStateError(
+            f"{method} scoring requires resolved source metadata"
+        )
+    _validate_row_target_mask(provider, method, record, manifest)
 
-    # Delegate scoring to canonical helpers — no watermark maths rewritten
+    # Delegate scoring to canonical helpers — no watermark maths rewritten.
+    # Entire scoring boundary in one try → DetectorScoringError.
     try:
         result = mod.evaluate_image(
             torch, provider, provider_info["pipe"], path, steps)
+        raw = float(mod.raw_score(method, result))
+        canonical = float(mod.canonical_score(method, raw, result))
+        if not math.isfinite(raw) or not math.isfinite(canonical):
+            raise ValueError("non-finite score")
     except Exception as exc:
         raise DetectorScoringError(
             f"{method} scoring failed for {image_path}: "
             f"{type(exc).__name__}: {exc}"
         ) from exc
-
-    raw = mod.raw_score(method, result)
-    canonical = mod.canonical_score(method, raw, result)
 
     score_definition = provider_info.get(
         "score_definition",
