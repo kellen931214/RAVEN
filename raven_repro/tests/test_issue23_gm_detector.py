@@ -58,6 +58,12 @@ from raven.detectors import (  # noqa: E402
 # Record builders — gm_protocol_mode ≠ gm_profile
 # ============================================================================
 
+# The monkeypatched tensor_sha256 returns "tensor_hash_" + str(shape).
+# gt_patch (1,1,64,64) and watermarking_mask (1,1,64,64) both produce
+# this value, so records must carry it to pass cohort-level preflight.
+_TENSOR_HASH = "tensor_hash_torch.Size([1, 1, 64, 64])"
+
+
 def _gm_record(run_id="0", **overrides):
     record = {
         "run_id": run_id,
@@ -69,8 +75,8 @@ def _gm_record(run_id="0", **overrides):
         "gm_m_sha256": "m" * 64,
         "gm_watermark_sha256": "n" * 64,
         "gm_target_sha256": "o" * 64,
-        "watermark_target_sha256": "d" * 64,
-        "watermark_mask_sha256": "e" * 64,
+        "watermark_target_sha256": _TENSOR_HASH,
+        "watermark_mask_sha256": _TENSOR_HASH,
     }
     record.update(overrides)
     return record
@@ -108,6 +114,13 @@ def _make_bundle_dir(tmp_path: Path, **manifest_overrides) -> Path:
         "watermark_sha256": "n" * 64,
         "w2_tensor_sha256": "o" * 64,
         "watermark_bits_seed": 7,
+        "inversion_guidance": 1.0,
+        "inversion_steps": 50,
+        "vae_sample": True,
+        "vae_scaling_factor": 0.18215,
+        "model_nf": 128,
+        "classifier_type": 0,
+        "profile_is_official": False,
     }
     manifest.update(manifest_overrides)
     (bundle / "manifest.json").write_text(json.dumps(manifest))
@@ -187,12 +200,19 @@ class _StubExtractModule:
             "gm_watermark_bits_seed": manifest.get("watermark_bits_seed", 7),
             "gm_use_gnr": False,
             "gm_gnr_path": None,
+            "gm_model_nf": manifest.get("model_nf", 128),
+            "gm_classifier_type": manifest.get("classifier_type", 0),
             "gm_use_classifier": False,
             "gm_classifier_path": None,
             "modelid_target": str(manifest["model_id"]),
             "model_revision": str(manifest["model_revision"]),
             "scheduler_target": str(manifest["scheduler"]),
             "resolution": int(manifest["resolution"]),
+            "gm_inversion_guidance": float(manifest.get("inversion_guidance", 1.0)),
+            "gm_inversion_steps": int(manifest.get("inversion_steps", 50)),
+            "gm_vae_sample": bool(manifest.get("vae_sample", True)),
+            "gm_vae_scaling_factor": float(manifest.get("vae_scaling_factor", 0.18215)),
+            "gm_profile_is_official": manifest.get("profile_is_official"),
             "w_seed": int(manifest["w_seed"]),
             "w_channel": int(manifest["w_channel"]),
             "w_pattern": str(manifest["w_pattern"]),
@@ -203,10 +223,11 @@ class _StubExtractModule:
         }
 
     def evaluate_image(self, torch_mod, provider, pipe, path, steps):
+        # GNR=False, classifier=False: no restored score, no classifier prob.
         return {
             "gm_raw_bit_accuracy": 0.85,
             "gm_raw_ring_l1": 0.12,
-            "gm_restored_bit_accuracy": 0.90,
+            "gm_restored_bit_accuracy": None,
             "gm_classifier_probability": None,
             "gm_report_label": "gm_raw_bit_accuracy",
             "gm_score_definition": "spatial-domain per-pixel bit match rate",
@@ -1334,7 +1355,8 @@ class TestGnrUsage:
             "gm_restored_bit_accuracy": None, "gm_classifier_probability": None,
             "gm_report_label": "x", "gm_score_definition": "x",
             "gm_threshold_source": "x", "gm_comparison_operator": ">=",
-            "gm_used_gnr": True, "gm_used_classifier": False,
+            "gm_used_gnr": True, "gm_restored_bit_accuracy": 0.90,
+            "gm_used_classifier": False, "gm_classifier_probability": None,
         }
         gnr_provider_info["extract_module"] = stub
 
@@ -1472,7 +1494,8 @@ class TestClassifierUsage:
             "gm_restored_bit_accuracy": None, "gm_classifier_probability": None,
             "gm_report_label": "x", "gm_score_definition": "x",
             "gm_threshold_source": "x", "gm_comparison_operator": ">=",
-            "gm_used_gnr": False, "gm_used_classifier": True,
+            "gm_used_gnr": True, "gm_restored_bit_accuracy": 0.90,
+            "gm_used_classifier": True, "gm_classifier_probability": 0.85,
         }
         clf_provider_info["extract_module"] = stub
 
@@ -1990,7 +2013,7 @@ class TestCanonicalConfigStrictBool:
         import raven.detectors.gm_detector as gm_mod
         stub = _StubExtractModule()
         stub.evaluate_image = lambda *a, **kw: self._make_stub_result(
-            gm_used_gnr=None)
+            gm_used_gnr=None, gm_restored_bit_accuracy=0.90)
         provider_info["_canonical_kwargs"] = {
             "gm_use_gnr": True, "gm_use_classifier": False}
         provider_info["extract_module"] = stub
@@ -2004,10 +2027,15 @@ class TestCanonicalConfigStrictBool:
     def test_canonical_classifier_true_fallback(self, provider_info, fake_image):
         import raven.detectors.gm_detector as gm_mod
         stub = _StubExtractModule()
+        # No GNR or classifier flags in scorer → both fall back to canonical.
+        # Classifier requires GNR, so canonical must have both True.
         stub.evaluate_image = lambda *a, **kw: self._make_stub_result(
-            gm_used_classifier=None)
+            gm_used_gnr=None,
+            gm_used_classifier=None,
+            gm_restored_bit_accuracy=0.90,
+            gm_classifier_probability=0.85)
         provider_info["_canonical_kwargs"] = {
-            "gm_use_gnr": False, "gm_use_classifier": True}
+            "gm_use_gnr": True, "gm_use_classifier": True}
         provider_info["extract_module"] = stub
 
         record = _gm_record("0",
@@ -2015,6 +2043,7 @@ class TestCanonicalConfigStrictBool:
             watermark_mask_sha256=provider_info["provider_mask_hash"])
         score = score_image(provider_info, fake_image, record=record)
         assert score["gm_classifier_used"] is True
+        assert score["gm_gnr_used"] is True
 
 
 # ============================================================================
@@ -2368,3 +2397,323 @@ class TestNonNullableFieldsRejectNone:
             assert provider_calls[0] == 0
         finally:
             fake_gm.GmProvider = StubGmProvider
+
+
+# ============================================================================
+# Extra kwargs, scoring contract, semantic consistency, real extract
+# ============================================================================
+
+class TestExtraKwargsRejected:
+
+    def test_extra_kwarg_mixed_across_rows_rejected(
+        self, mock_deps, bundle_dir, monkeypatch):
+        import raven.detectors.gm_detector as gm_mod
+        provider_calls = [0]
+
+        class CountingProvider(StubGmProvider):
+            def __init__(self, **kw):
+                provider_calls[0] += 1
+                super().__init__(**kw)
+        fake_gm = sys.modules.get("eval_bench_wm.utils.wm.gm_provider")
+        fake_gm.GmProvider = CountingProvider
+
+        class ExtraKwargExtract(_StubExtractModule):
+            def gm_provider_kwargs(self, row, identifier):
+                kw = super().gm_provider_kwargs(row, identifier)
+                if str(row.get("run_id")) == "1":
+                    kw["gm_inversion_seed"] = 999
+                return kw
+
+        monkeypatch.setattr(gm_mod, "_get_extract_module",
+                            lambda: ExtraKwargExtract())
+        try:
+            records = [
+                _gm_record("0", gm_bundle_dir=str(bundle_dir)),
+                _gm_record("1", gm_bundle_dir=str(bundle_dir)),
+            ]
+            with pytest.raises(DetectorStateValidationError,
+                               match="unexpected keys"):
+                load_state(records, "cpu")
+            assert provider_calls[0] == 0
+        finally:
+            fake_gm.GmProvider = StubGmProvider
+
+
+class TestScoringContract:
+
+    def test_raw_score_bool_rejected(self, provider_info, fake_image, monkeypatch):
+        import raven.detectors.gm_detector as gm_mod
+        stub = _StubExtractModule()
+        stub.raw_score = lambda m, r: True
+        monkeypatch.setattr(gm_mod, "_get_extract_module", lambda: stub)
+        provider_info["extract_module"] = stub
+        record = _gm_record("0",
+            watermark_target_sha256=provider_info["provider_target_hash"],
+            watermark_mask_sha256=provider_info["provider_mask_hash"])
+        with pytest.raises(DetectorScoringError, match="scoring failed"):
+            score_image(provider_info, fake_image, record=record)
+
+    def test_canonical_score_string_rejected(
+        self, provider_info, fake_image, monkeypatch):
+        import raven.detectors.gm_detector as gm_mod
+        stub = _StubExtractModule()
+        stub.canonical_score = lambda m, r, res: "0.5"
+        monkeypatch.setattr(gm_mod, "_get_extract_module", lambda: stub)
+        provider_info["extract_module"] = stub
+        record = _gm_record("0",
+            watermark_target_sha256=provider_info["provider_target_hash"],
+            watermark_mask_sha256=provider_info["provider_mask_hash"])
+        with pytest.raises(DetectorScoringError, match="scoring failed"):
+            score_image(provider_info, fake_image, record=record)
+
+    def test_negative_ring_l1_rejected(self, provider_info, fake_image, monkeypatch):
+        import raven.detectors.gm_detector as gm_mod
+        stub = _StubExtractModule()
+        stub.evaluate_image = lambda *a, **kw: {
+            "gm_raw_bit_accuracy": 0.85, "gm_raw_ring_l1": -0.5,
+            "gm_restored_bit_accuracy": None, "gm_classifier_probability": None,
+            "gm_report_label": "x", "gm_score_definition": "x",
+            "gm_threshold_source": "x", "gm_comparison_operator": ">=",
+            "gm_used_gnr": False, "gm_used_classifier": False,
+        }
+        monkeypatch.setattr(gm_mod, "_get_extract_module", lambda: stub)
+        provider_info["extract_module"] = stub
+        record = _gm_record("0",
+            watermark_target_sha256=provider_info["provider_target_hash"],
+            watermark_mask_sha256=provider_info["provider_mask_hash"])
+        with pytest.raises(DetectorScoringError, match="scoring failed"):
+            score_image(provider_info, fake_image, record=record)
+
+
+class TestGnrClassifierSemanticConsistency:
+
+    def test_gnr_false_restored_not_none_rejected(
+        self, provider_info, fake_image, monkeypatch):
+        import raven.detectors.gm_detector as gm_mod
+        stub = _StubExtractModule()
+        stub.evaluate_image = lambda *a, **kw: {
+            "gm_raw_bit_accuracy": 0.85, "gm_raw_ring_l1": 0.12,
+            "gm_restored_bit_accuracy": 0.90,
+            "gm_classifier_probability": None,
+            "gm_report_label": "x", "gm_score_definition": "x",
+            "gm_threshold_source": "x", "gm_comparison_operator": ">=",
+            "gm_used_gnr": False, "gm_used_classifier": False,
+        }
+        monkeypatch.setattr(gm_mod, "_get_extract_module", lambda: stub)
+        provider_info["extract_module"] = stub
+        record = _gm_record("0",
+            watermark_target_sha256=provider_info["provider_target_hash"],
+            watermark_mask_sha256=provider_info["provider_mask_hash"])
+        with pytest.raises(DetectorScoringError, match="restored_bit_accuracy"):
+            score_image(provider_info, fake_image, record=record)
+
+    def test_classifier_false_prob_not_none_rejected(
+        self, provider_info, fake_image, monkeypatch):
+        import raven.detectors.gm_detector as gm_mod
+        stub = _StubExtractModule()
+        stub.evaluate_image = lambda *a, **kw: {
+            "gm_raw_bit_accuracy": 0.85, "gm_raw_ring_l1": 0.12,
+            "gm_restored_bit_accuracy": None,
+            "gm_classifier_probability": 0.85,
+            "gm_report_label": "x", "gm_score_definition": "x",
+            "gm_threshold_source": "x", "gm_comparison_operator": ">=",
+            "gm_used_gnr": False, "gm_used_classifier": False,
+        }
+        monkeypatch.setattr(gm_mod, "_get_extract_module", lambda: stub)
+        provider_info["extract_module"] = stub
+        record = _gm_record("0",
+            watermark_target_sha256=provider_info["provider_target_hash"],
+            watermark_mask_sha256=provider_info["provider_mask_hash"])
+        with pytest.raises(DetectorScoringError, match="classifier_probability"):
+            score_image(provider_info, fake_image, record=record)
+
+    def test_classifier_true_gnr_false_rejected(
+        self, provider_info, fake_image, monkeypatch):
+        import raven.detectors.gm_detector as gm_mod
+        stub = _StubExtractModule()
+        # GNR=False with restored present → first semantic check fails
+        # (GNR not used but restored returned).
+        stub.evaluate_image = lambda *a, **kw: {
+            "gm_raw_bit_accuracy": 0.85, "gm_raw_ring_l1": 0.12,
+            "gm_restored_bit_accuracy": 0.90,
+            "gm_classifier_probability": 0.85,
+            "gm_report_label": "x", "gm_score_definition": "x",
+            "gm_threshold_source": "x", "gm_comparison_operator": ">=",
+            "gm_used_gnr": False, "gm_used_classifier": True,
+        }
+        provider_info["_canonical_kwargs"] = {
+            "gm_use_gnr": False, "gm_use_classifier": True}
+        monkeypatch.setattr(gm_mod, "_get_extract_module", lambda: stub)
+        provider_info["extract_module"] = stub
+        record = _gm_record("0",
+            watermark_target_sha256=provider_info["provider_target_hash"],
+            watermark_mask_sha256=provider_info["provider_mask_hash"])
+        with pytest.raises(DetectorScoringError,
+                           match="restored_bit_accuracy"):
+            score_image(provider_info, fake_image, record=record)
+
+    def test_gnr_true_restored_none_rejected(
+        self, provider_info, fake_image, monkeypatch):
+        import raven.detectors.gm_detector as gm_mod
+        stub = _StubExtractModule()
+        stub.evaluate_image = lambda *a, **kw: {
+            "gm_raw_bit_accuracy": 0.85, "gm_raw_ring_l1": 0.12,
+            "gm_restored_bit_accuracy": None,
+            "gm_classifier_probability": None,
+            "gm_report_label": "x", "gm_score_definition": "x",
+            "gm_threshold_source": "x", "gm_comparison_operator": ">=",
+            "gm_used_gnr": True, "gm_used_classifier": False,
+        }
+        provider_info["_canonical_kwargs"] = {
+            "gm_use_gnr": True, "gm_use_classifier": False}
+        monkeypatch.setattr(gm_mod, "_get_extract_module", lambda: stub)
+        provider_info["extract_module"] = stub
+        record = _gm_record("0",
+            watermark_target_sha256=provider_info["provider_target_hash"],
+            watermark_mask_sha256=provider_info["provider_mask_hash"])
+        with pytest.raises(DetectorScoringError,
+                           match="restored_bit_accuracy"):
+            score_image(provider_info, fake_image, record=record)
+
+
+class TestProfileIsOfficial:
+
+    def test_gm_profile_is_official_in_provenance(self, mock_deps, bundle_dir):
+        records = [_gm_record("0", gm_bundle_dir=str(bundle_dir))]
+        info = load_state(records, "cpu")
+        assert "gm_profile_is_official" in info["verified_provenance"]
+        assert isinstance(info["verified_provenance"]["gm_profile_is_official"], bool)
+
+    def test_gm_profile_is_official_in_score_record(
+        self, provider_info, fake_image):
+        record = _gm_record("0",
+            watermark_target_sha256=provider_info["provider_target_hash"],
+            watermark_mask_sha256=provider_info["provider_mask_hash"])
+        score = score_image(provider_info, fake_image, record=record)
+        assert "gm_profile_is_official" in score
+        assert isinstance(score["gm_profile_is_official"], bool)
+
+
+class TestRealExtractScript:
+
+    def _load_real_extract(self):
+        from importlib import util
+        repo = Path(__file__).resolve().parents[2]
+        scripts_dir = repo / "raven_repro" / "scripts"
+        spec = util.spec_from_file_location(
+            "extract_verification_scores_real",
+            scripts_dir / "extract_verification_scores.py")
+        real_mod = util.module_from_spec(spec)
+        spec.loader.exec_module(real_mod)
+        return real_mod
+
+    def _make_valid_bundle_for_real_extract(self, tmp_path, **overrides):
+        """Create a bundle whose manifest SHA fields match actual file content."""
+        import hashlib
+        bd = tmp_path / "real_bundle"
+        bd.mkdir(parents=True, exist_ok=True)
+        w1_data = b"\x00" * 64
+        w2_data = b"\x01" * 64
+        (bd / "w1.pth").write_bytes(w1_data)
+        (bd / "w2.pth").write_bytes(w2_data)
+        w1_sha = hashlib.sha256(w1_data).hexdigest()
+        w2_sha = hashlib.sha256(w2_data).hexdigest()
+
+        config = {
+            "profile": "legacy",
+            "model_id": "RedbeardNZ/stable-diffusion-2-1-base",
+            "model_revision": "fake",
+            "scheduler": "DDIM",
+            "resolution": 512,
+            "torch_dtype": "float32",
+            "channel_copy": 1, "w_copy": 1, "h_copy": 1,
+            "w_seed": 42, "w_channel": 3,
+            "w_pattern": "ring", "w_mask_shape": "circle",
+            "w_radius": 10, "w_measurement": "l1_complex",
+            "w_injection": "complex",
+            "inversion_guidance": 1.0, "inversion_steps": 50,
+            "vae_sample": True, "vae_scaling_factor": 0.18215,
+            "model_nf": 128, "classifier_type": 0,
+            "profile_is_official": False,
+        }
+        config.update(overrides)
+        config_sha = hashlib.sha256(
+            json.dumps(config, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+
+        manifest = {
+            **config,
+            "bundle_config_sha256": config_sha,
+            "w1_file_sha256": w1_sha,
+            "w2_file_sha256": w2_sha,
+            "m_sha256": "m" * 64, "watermark_sha256": "n" * 64,
+            "w2_tensor_sha256": "o" * 64,
+        }
+        (bd / "manifest.json").write_text(json.dumps(manifest))
+        return bd, manifest
+
+    def test_real_gm_provider_kwargs_returns_all_canonical_fields(
+        self, tmp_path):
+        """The real extract_verification_scores.gm_provider_kwargs() must
+        return all fields in _CANONICAL_KWARGS_FIELDS."""
+        real_mod = self._load_real_extract()
+        bd, manifest = self._make_valid_bundle_for_real_extract(tmp_path)
+
+        row = {
+            "run_id": "0",
+            "gm_bundle_dir": str(bd),
+            "gm_bundle_config_sha256": manifest["bundle_config_sha256"],
+            "gm_w1_file_sha256": manifest["w1_file_sha256"],
+            "gm_w2_file_sha256": manifest["w2_file_sha256"],
+            "gm_m_sha256": manifest["m_sha256"],
+            "gm_watermark_sha256": manifest["watermark_sha256"],
+            "gm_target_sha256": manifest["w2_tensor_sha256"],
+        }
+        kwargs = real_mod.gm_provider_kwargs(row, "0")
+        for field in _CANONICAL_KWARGS_FIELDS:
+            assert field in kwargs, f"real extract missing {field}"
+
+    def test_real_gm_provider_kwargs_with_nullable_watermark_bits_seed(
+        self, bundle_dir):
+        """When manifest has no watermark_bits_seed, the real extract returns None.
+        Must use a correctly constructed bundle where all SHA fields match."""
+        bd2 = _make_bundle_dir(bundle_dir.parent / "noseed",
+                               watermark_bits_seed=None)
+        # Remove watermark_bits_seed from manifest and recompute config SHA
+        import hashlib
+        manifest = json.loads((bd2 / "manifest.json").read_text())
+        del manifest["watermark_bits_seed"]
+        config = {k: manifest[k] for k in sorted(manifest)
+                  if k not in ("bundle_config_sha256", "w1_file_sha256",
+                               "w2_file_sha256", "m_sha256",
+                               "watermark_sha256", "w2_tensor_sha256")}
+        config_sha = hashlib.sha256(
+            json.dumps(config, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        w1_sha = hashlib.sha256((bd2 / "w1.pth").read_bytes()).hexdigest()
+        w2_sha = hashlib.sha256((bd2 / "w2.pth").read_bytes()).hexdigest()
+        manifest["bundle_config_sha256"] = config_sha
+        manifest["w1_file_sha256"] = w1_sha
+        manifest["w2_file_sha256"] = w2_sha
+        (bd2 / "manifest.json").write_text(json.dumps(manifest))
+
+        from importlib import util
+        repo = Path(__file__).resolve().parents[2]
+        scripts_dir = repo / "raven_repro" / "scripts"
+        spec = util.spec_from_file_location(
+            "extract_verification_scores_real2",
+            scripts_dir / "extract_verification_scores.py")
+        real_mod = util.module_from_spec(spec)
+        spec.loader.exec_module(real_mod)
+
+        row = _gm_record(
+            "0", gm_bundle_dir=str(bd2),
+            gm_bundle_config_sha256=manifest["bundle_config_sha256"],
+            gm_w1_file_sha256=manifest["w1_file_sha256"],
+            gm_w2_file_sha256=manifest["w2_file_sha256"],
+            gm_m_sha256=manifest["m_sha256"],
+            gm_watermark_sha256=manifest["watermark_sha256"],
+            gm_target_sha256=manifest["w2_tensor_sha256"],
+        )
+        kwargs = real_mod.gm_provider_kwargs(row, "0")
+        assert kwargs["gm_watermark_bits_seed"] is None
