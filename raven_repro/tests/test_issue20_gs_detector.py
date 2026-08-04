@@ -1159,6 +1159,51 @@ class TestActiveDetectionPolicy:
             self._scored(monkeypatch, tmp_path, mode="official_onebit",
                          nominal_fpr=1e-5, official_fpr=1e-6)
 
+    # ---- final validation gaps ----
+    def test_legacy_threshold_below_zero_fails(self, monkeypatch, tmp_path):
+        with pytest.raises(DetectorScoringError, match="out of range"):
+            self._scored(monkeypatch, tmp_path, mode="legacy_default",
+                         threshold=-0.1)
+
+    def test_legacy_threshold_above_one_fails(self, monkeypatch, tmp_path):
+        with pytest.raises(DetectorScoringError, match="out of range"):
+            self._scored(monkeypatch, tmp_path, mode="legacy_default",
+                         threshold=1.5)
+
+    def test_legacy_nominal_fpr_zero_fails(self, monkeypatch, tmp_path):
+        with pytest.raises(DetectorScoringError,
+                          match="0 < fpr <= 1"):
+            self._scored(monkeypatch, tmp_path, mode="legacy_default",
+                         nominal_fpr=0.0)
+
+    def test_legacy_nominal_fpr_negative_fails(self, monkeypatch, tmp_path):
+        with pytest.raises(DetectorScoringError,
+                          match="0 < fpr <= 1"):
+            self._scored(monkeypatch, tmp_path, mode="legacy_default",
+                         nominal_fpr=-1e-6)
+
+    def test_legacy_nominal_fpr_above_one_fails(self, monkeypatch, tmp_path):
+        with pytest.raises(DetectorScoringError,
+                          match="0 < fpr <= 1"):
+            self._scored(monkeypatch, tmp_path, mode="legacy_default",
+                         nominal_fpr=1.5)
+
+    def test_bool_threshold_fails(self, monkeypatch, tmp_path):
+        """threshold=True must be rejected, not float(True)==1.0."""
+        with pytest.raises(DetectorScoringError, match="must not be bool"):
+            self._scored(monkeypatch, tmp_path, mode="official_onebit",
+                         threshold=True)
+
+    def test_bool_tau_fails(self, monkeypatch, tmp_path):
+        with pytest.raises(DetectorScoringError, match="must not be bool"):
+            self._scored(monkeypatch, tmp_path, mode="official_onebit",
+                         policy_tau_onebit=True)
+
+    def test_bool_fpr_fails(self, monkeypatch, tmp_path):
+        with pytest.raises(DetectorScoringError, match="must not be bool"):
+            self._scored(monkeypatch, tmp_path, mode="official_onebit",
+                         nominal_fpr=True)
+
 
 # ---------------------------------------------------------------------------
 # 1. Per-source provider cache
@@ -2511,14 +2556,18 @@ class TestAggregate:
     def _policy_row(self, cohort, success, mode="official_onebit",
                     threshold=0.9, tau_onebit=0.9, tau_bits=0.95,
                     fpr=1e-6, user_number=1000000, op=">=",
-                    policy_hash="POLICY_HASH", **overrides):
+                    official_op=None, policy_hash="POLICY_HASH",
+                    threshold_type="official_beta_tail_tau_onebit",
+                    **overrides):
+        if official_op is None:
+            official_op = op
         row = {
             "status": ROW_STATUS_SCORED,
             "evaluation_cohort": cohort,
             "canonical_score": 0.85,
             "gs_detection_mode": mode,
             "gs_active_threshold": threshold,
-            "gs_active_threshold_type": "official_beta_tail_tau_onebit",
+            "gs_active_threshold_type": threshold_type,
             "gs_active_comparison_operator": op,
             "gs_active_nominal_fpr": fpr,
             "gs_active_calibrated_from_current_clean_negatives": False,
@@ -2527,7 +2576,7 @@ class TestAggregate:
             "gs_official_tau_bits": tau_bits,
             "gs_official_fpr": fpr,
             "gs_official_user_number": user_number,
-            "gs_official_comparison_operator": op,
+            "gs_official_comparison_operator": official_op,
             "gs_official_source": "test",
             "gs_detection_policy_hash": policy_hash,
         }
@@ -2639,6 +2688,84 @@ class TestAggregate:
             self._policy_row("original_watermarked", True),
             dict(self._policy_row("attacked_watermarked", True),
                  **{"gs_official_source": ""}),
+        ]
+        result = aggregate(rows)
+        assert result["gs_official_detection_summary_status"] == \
+            "failed_state_validation"
+
+    # ---- final validation gaps ----
+    def test_aggregate_wrong_official_operator_fails_closed(self):
+        """gs_official_comparison_operator must be '>='."""
+        rows = [
+            self._policy_row("original_watermarked", True),
+            self._policy_row("attacked_watermarked", True,
+                             official_op=">"),
+        ]
+        result = aggregate(rows)
+        assert result["gs_official_detection_summary_status"] == \
+            "failed_state_validation"
+
+    def test_aggregate_official_active_operator_mismatch_fails_closed(self):
+        """Official mode: active op must agree with official op."""
+        rows = [
+            self._policy_row("original_watermarked", True),
+            self._policy_row("attacked_watermarked", True,
+                             op=">", official_op=">="),
+        ]
+        result = aggregate(rows)
+        assert result["gs_official_detection_summary_status"] == \
+            "failed_state_validation"
+
+    def test_aggregate_bool_threshold_fails_closed(self):
+        rows = [
+            self._policy_row("original_watermarked", True,
+                             threshold=True),
+            self._policy_row("attacked_watermarked", True),
+        ]
+        result = aggregate(rows)
+        assert result["gs_official_detection_summary_status"] == \
+            "failed_state_validation"
+
+    def test_aggregate_bool_tau_fails_closed(self):
+        rows = [
+            self._policy_row("original_watermarked", True,
+                             tau_onebit=True),
+            self._policy_row("attacked_watermarked", True),
+        ]
+        result = aggregate(rows)
+        assert result["gs_official_detection_summary_status"] == \
+            "failed_state_validation"
+
+    def test_aggregate_bool_fpr_fails_closed(self):
+        rows = [
+            self._policy_row("original_watermarked", True, fpr=True),
+            self._policy_row("attacked_watermarked", True),
+        ]
+        result = aggregate(rows)
+        assert result["gs_official_detection_summary_status"] == \
+            "failed_state_validation"
+
+    def test_aggregate_legacy_threshold_out_of_range_fails_closed(self):
+        """legacy_default threshold must stay in [0,1] in aggregate too."""
+        rows = [
+            self._policy_row("original_watermarked", True),
+            self._policy_row(
+                "attacked_watermarked", True, mode="legacy_default",
+                threshold=1.5, op=">", official_op=">=",
+                threshold_type="legacy_default_threshold"),
+        ]
+        result = aggregate(rows)
+        assert result["gs_official_detection_summary_status"] == \
+            "failed_state_validation"
+
+    def test_aggregate_legacy_nominal_fpr_invalid_fails_closed(self):
+        """legacy nominal_fpr must satisfy 0 < fpr <= 1."""
+        rows = [
+            self._policy_row("original_watermarked", True),
+            self._policy_row(
+                "attacked_watermarked", True, mode="legacy_default",
+                fpr=0.0, op=">", official_op=">=",
+                threshold_type="legacy_default_threshold"),
         ]
         result = aggregate(rows)
         assert result["gs_official_detection_summary_status"] == \

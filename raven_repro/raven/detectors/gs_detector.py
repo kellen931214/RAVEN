@@ -728,7 +728,16 @@ def _validate_scoring_result(result: dict[str, Any], run_id: str) -> None:
 
 
 def _finite_float(value: Any, label: str, run_id: str) -> float:
-    """Convert *value* to a finite float or raise DetectorScoringError."""
+    """Convert *value* to a finite float or raise DetectorScoringError.
+
+    Rejects bool — ``float(True) == 1.0`` must never pass a threshold/tau/
+    fpr check.
+    """
+    if isinstance(value, bool):
+        raise DetectorScoringError(
+            f"run_id={run_id}: GS active policy {label} must not be bool, "
+            f"got {value!r}"
+        )
     try:
         result = float(value)
     except (ValueError, TypeError):
@@ -915,6 +924,19 @@ def _validate_active_policy(
         nominal_fpr = _finite_float(active_policy["nominal_fpr"],
                                     "nominal_fpr", run_id)
 
+        # All modes — including legacy_default — keep the threshold in [0,1]
+        # and the nominal fpr in (0, 1].
+        if not (0.0 <= threshold_f <= 1.0):
+            raise DetectorScoringError(
+                f"run_id={run_id}: GS active policy threshold out of "
+                f"range [0,1]: {threshold_f!r}"
+            )
+        if not (0.0 < nominal_fpr <= 1.0):
+            raise DetectorScoringError(
+                f"run_id={run_id}: GS active policy nominal_fpr must "
+                f"satisfy 0 < fpr <= 1, got {nominal_fpr!r}"
+            )
+
         # ---- cross-validation vs official_thresholds() record ----
         expected_t1 = float(threshold_record["gs_official_tau_onebit"])
         expected_tb = float(threshold_record["gs_official_tau_bits"])
@@ -983,11 +1005,6 @@ def _validate_active_policy(
                     f"run_id={run_id}: GS active policy comparison_operator "
                     f"{operator!r} disagrees with official_thresholds "
                     f"({expected_op!r})"
-                )
-            if not (0.0 <= threshold_f <= 1.0):
-                raise DetectorScoringError(
-                    f"run_id={run_id}: GS active policy threshold out of "
-                    f"range [0,1]: {threshold_f!r}"
                 )
     except DetectorScoringError:
         raise
@@ -1359,6 +1376,11 @@ def _validate_policy_row_values(row: dict[str, Any]) -> None:
             f"run_id={run_id}: GS policy row official tau out of range "
             f"[0,1]: onebit={tau_onebit!r} bits={tau_bits!r}"
         )
+    if not (0.0 <= threshold <= 1.0):
+        raise DetectorStateValidationError(
+            f"run_id={run_id}: GS policy row active threshold out of "
+            f"range [0,1]: {threshold!r}"
+        )
     if not (0.0 < fpr <= 1.0):
         raise DetectorStateValidationError(
             f"run_id={run_id}: GS policy row official fpr must satisfy "
@@ -1368,6 +1390,20 @@ def _validate_policy_row_values(row: dict[str, Any]) -> None:
         raise DetectorStateValidationError(
             f"run_id={run_id}: GS policy row nominal_fpr must satisfy "
             f"0 < nominal_fpr <= 1, got {nominal_fpr!r}"
+        )
+
+    # Official operator must be ">=" (official family only); official modes
+    # must agree with the active operator.
+    official_op = row["gs_official_comparison_operator"]
+    if not isinstance(official_op, str):
+        raise DetectorStateValidationError(
+            f"run_id={run_id}: GS policy row official comparison_operator "
+            f"must be a string, got {type(official_op).__name__}"
+        )
+    if official_op != ">=":
+        raise DetectorStateValidationError(
+            f"run_id={run_id}: GS policy row official comparison_operator "
+            f"must be '>=', got {official_op!r}"
         )
 
     try:
@@ -1436,6 +1472,12 @@ def _validate_policy_row_values(row: dict[str, Any]) -> None:
                 f"tau_bits={tau_bits!r}"
             )
     if mode in ("official_onebit", "official_traceability"):
+        if operator != official_op:
+            raise DetectorStateValidationError(
+                f"run_id={run_id}: GS policy row active comparison_operator "
+                f"{operator!r} disagrees with official "
+                f"comparison_operator {official_op!r}"
+            )
         if not math.isclose(nominal_fpr, fpr, rel_tol=1e-9, abs_tol=1e-12):
             raise DetectorStateValidationError(
                 f"run_id={run_id}: GS policy row nominal_fpr "
