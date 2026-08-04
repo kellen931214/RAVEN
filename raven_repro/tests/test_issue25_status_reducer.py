@@ -1959,3 +1959,242 @@ class TestCombinedMethodFailures:
                 assert (result["stages"]["detector"]["status"]
                         == "failed_missing_image")
 
+
+# ===========================================================================
+# M. Count invariant tests
+# ===========================================================================
+class TestCountInvariant:
+    """Orchestrator overrides adapter counts with full image_index counts."""
+
+    def test_setup_failure_counts_all_requested_entries(self, monkeypatch):
+        """setup failure + preflight: requested=4, scored=0, failed=1,
+        unscored=3, invariant satisfied.
+
+        Uses different run_ids so deleting one input only affects
+        that record's original-cohort entry (not both records).
+        """
+        from experiments.eval import evaluate_detector
+        from raven.detectors import DetectorMissingStateError
+        import raven.detectors.tr_detector as tr_mod
+
+        monkeypatch.setattr(
+            tr_mod, "load_state",
+            lambda records, device, **extra: (_ for _ in ()).throw(
+                DetectorMissingStateError("state not found")),
+        )
+
+        rec_clean = _make_record("100", "clean", method="TR",
+                                 source_metadata=TR_META)
+        rec_wm = _make_record("200", "watermarked", method="TR",
+                              source_metadata=TR_META)
+
+        with tempfile.TemporaryDirectory() as td:
+            out = _write_fake_run(Path(td), method="TR",
+                                  records=[rec_clean, rec_wm])
+            # Delete only clean's input image
+            Path(rec_clean["input_path"]).unlink()
+
+            result = evaluate_detector([rec_clean, rec_wm], out,
+                                       "TR", device="cpu")
+            # TR: clean→2 entries, wm→2 entries = 4 total
+            assert result["requested_count"] == 4
+            assert result["scored_count"] == 0
+            assert result["failed_count"] == 1  # 1 preflight missing-image
+            assert result["unscored_due_to_setup_count"] == 3
+            assert result["count_invariant_satisfied"] is True
+            assert (result["requested_count"]
+                    == result["scored_count"]
+                    + result["failed_count"]
+                    + result["unscored_due_to_setup_count"])
+
+    def test_setup_failure_without_preflight_rows(self, monkeypatch):
+        """setup failure, no preflight failures: all entries unscored."""
+        from experiments.eval import evaluate_detector
+        from raven.detectors import DetectorMissingStateError
+        import raven.detectors.tr_detector as tr_mod
+
+        monkeypatch.setattr(
+            tr_mod, "load_state",
+            lambda records, device, **extra: (_ for _ in ()).throw(
+                DetectorMissingStateError("no provider state")),
+        )
+
+        rec_clean = _make_record("1", "clean", method="TR",
+                                 source_metadata=TR_META)
+        rec_wm = _make_record("1", "watermarked", method="TR",
+                              source_metadata=TR_META)
+
+        with tempfile.TemporaryDirectory() as td:
+            out = _write_fake_run(Path(td), method="TR",
+                                  records=[rec_clean, rec_wm])
+            result = evaluate_detector([rec_clean, rec_wm], out,
+                                       "TR", device="cpu")
+            assert result["requested_count"] == 4
+            assert result["scored_count"] == 0
+            assert result["failed_count"] == 0
+            assert result["unscored_due_to_setup_count"] == 4
+            assert result["count_invariant_satisfied"] is True
+
+    def test_partial_row_failure_count_invariant(self, monkeypatch):
+        """setup succeeds, some rows fail → normal counts, unscored=0."""
+        from experiments.eval import evaluate_detector
+        from raven.detectors import DetectorMissingStateError
+
+        rec_clean = _make_record("1", "clean", method="TR",
+                                 source_metadata=TR_META)
+        rec_wm = _make_record("1", "watermarked", method="TR",
+                              source_metadata=TR_META)
+
+        call_count = [0]
+
+        def partial_fail(*a, **kw):
+            call_count[0] += 1
+            if call_count[0] >= 4:
+                raise DetectorMissingStateError("missing state")
+            return {"raw_score": 0.001, "canonical_score": 10.0}
+
+        _patch_tr_module(monkeypatch, score_fn=partial_fail)
+
+        with tempfile.TemporaryDirectory() as td:
+            out = _write_fake_run(Path(td), method="TR",
+                                  records=[rec_clean, rec_wm])
+            result = evaluate_detector([rec_clean, rec_wm], out,
+                                       "TR", device="cpu")
+            assert result["requested_count"] == 4
+            assert result["scored_count"] >= 2
+            assert result["failed_count"] >= 1
+            assert result["unscored_due_to_setup_count"] == 0
+            assert result["count_invariant_satisfied"] is True
+            assert (result["requested_count"]
+                    == result["scored_count"]
+                    + result["failed_count"]
+                    + result["unscored_due_to_setup_count"])
+
+    def test_success_count_invariant(self, monkeypatch):
+        """All rows score → unscored=0, invariant satisfied."""
+        from experiments.eval import evaluate_detector
+
+        rec_clean = _make_record("1", "clean", method="TR",
+                                 source_metadata=TR_META)
+        rec_wm = _make_record("1", "watermarked", method="TR",
+                              source_metadata=TR_META)
+        rec_wm2 = _make_record("2", "watermarked", method="TR",
+                               source_metadata=TR_META)
+        _patch_tr_module(monkeypatch, score_fn=lambda *a, **kw: {
+            "raw_score": 0.001, "canonical_score": 10.0,
+        })
+
+        with tempfile.TemporaryDirectory() as td:
+            out = _write_fake_run(Path(td), method="TR",
+                                  records=[rec_clean, rec_wm, rec_wm2])
+            result = evaluate_detector([rec_clean, rec_wm, rec_wm2],
+                                       out, "TR", device="cpu")
+            assert result["requested_count"] == 6
+            assert result["scored_count"] == 6
+            assert result["failed_count"] == 0
+            assert result["unscored_due_to_setup_count"] == 0
+            assert result["count_invariant_satisfied"] is True
+
+    def test_gm_combined_failure_requested_count(self, monkeypatch):
+        """GM missing bundle + deleted input: requested=4, scored=0,
+        failed=1, unscored=3."""
+        from experiments.eval import evaluate_detector
+        from raven.detectors import DetectorMissingStateError
+        import raven.detectors.gm_detector as gm_mod
+
+        monkeypatch.setattr(
+            gm_mod, "load_state",
+            lambda records, device, **extra: (_ for _ in ()).throw(
+                DetectorMissingStateError("GM bundle not found")),
+        )
+
+        GM_META = {"gm_bundle_path": "/nonexistent/bundle",
+                    "gm_bundle_sha256": "abc"}
+        rec_wm = _make_record("1", "watermarked", method="GM",
+                              source_metadata=GM_META)
+        rec_wm2 = _make_record("2", "watermarked", method="GM",
+                               source_metadata=GM_META)
+
+        with tempfile.TemporaryDirectory() as td:
+            out = _write_fake_run(Path(td), method="GM",
+                                  records=[rec_wm, rec_wm2])
+            # Delete one input image
+            Path(rec_wm["input_path"]).unlink()
+
+            result = evaluate_detector([rec_wm, rec_wm2], out,
+                                       "GM", device="cpu")
+            # 2 watermarked → 4 entries. 1 input deleted → 1 preflight failed.
+            assert result["requested_count"] == 4
+            assert result["scored_count"] == 0
+            assert result["failed_count"] == 1
+            assert result["unscored_due_to_setup_count"] == 3
+            assert result["count_invariant_satisfied"] is True
+
+    def test_all_methods_count_invariant(self, monkeypatch):
+        """Across all 7 methods, orchestrator counts are consistent."""
+        from experiments.eval import evaluate_detector
+
+        METHODS = ["TR", "GS", "GM", "T2S", "RID", "HSTR", "HSQR"]
+        METHOD_METAS = {
+            "TR": TR_META,
+            "GS": {"gs_secret_index": "5", "gs_secret_bundle_sha256": "abc",
+                    "gs_protocol_mode": "official_compatible"},
+            "GM": {"gm_bundle_path": "/tmp/fake_bundle",
+                    "gm_bundle_sha256": "abc"},
+            "T2S": {"t2s_state_path": "/tmp/fake.pt",
+                     "t2s_state_sha256": "abc",
+                     "t2s_provider_config_sha256": "def",
+                     "t2s_protocol_mode": "official"},
+            "RID": {"fourier_key": "42", "fourier_key_sha256": "abc"},
+            "HSTR": {"fourier_key": "42", "fourier_key_sha256": "abc"},
+            "HSQR": {"fourier_key": "42", "fourier_key_sha256": "abc"},
+        }
+
+        # T2S needs extra fields; threshold methods need raw_score +
+        # canonical_score only.
+        THRESHOLD_SCORE = {"raw_score": 0.001, "canonical_score": 10.0}
+        T2S_SCORE = {
+            "raw_score": 0.85, "canonical_score": 0.85,
+            "t2s_score_true_key": 0.85,
+            "t2s_score_control_key": 0.40,
+            "t2s_score_margin": 0.45,
+            "t2s_detection_success": True,
+        }
+
+        for idx, method in enumerate(METHODS):
+            det_pkg = "raven.detectors"
+            mod_map = {
+                "TR": "tr_detector", "GS": "gs_detector",
+                "GM": "gm_detector", "T2S": "t2s_detector",
+                "RID": "fourier_detector", "HSTR": "fourier_detector",
+                "HSQR": "fourier_detector",
+            }
+            import importlib
+            mod = importlib.import_module(f".{mod_map[method]}", det_pkg)
+            monkeypatch.setattr(mod, "load_state",
+                                lambda records, device, **extra: {"fake": True})
+            score = T2S_SCORE if method == "T2S" else THRESHOLD_SCORE
+            monkeypatch.setattr(mod, "score_image",
+                                lambda *a, sc=score, **kw: dict(sc))
+
+            meta = METHOD_METAS[method]
+            rec_wm = _make_record(str(idx + 1), "watermarked",
+                                  method=method, source_metadata=meta)
+
+            with tempfile.TemporaryDirectory() as td:
+                out = _write_fake_run(Path(td), method=method,
+                                      records=[rec_wm])
+                result = evaluate_detector([rec_wm], out, method,
+                                           device="cpu")
+                assert result["requested_count"] == 2, (
+                    f"{method}: requested={result['requested_count']}")
+                assert result["scored_count"] == 2, (
+                    f"{method}: scored={result['scored_count']}")
+                assert result["failed_count"] == 0, (
+                    f"{method}: failed={result['failed_count']}")
+                assert result["unscored_due_to_setup_count"] == 0, (
+                    f"{method}: unscored={result['unscored_due_to_setup_count']}")
+                assert result["count_invariant_satisfied"] is True, (
+                    f"{method}: invariant violated")
+
+

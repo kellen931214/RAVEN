@@ -858,14 +858,35 @@ def evaluate_detector(
             handle.write(json.dumps(row, sort_keys=True, ensure_ascii=False) + "\n")
     os.replace(tmp, det_path)
 
-    # Aggregate
+    # Aggregate (adapter sees only detector_rows, not full image_index)
     agg_kwargs: dict[str, Any] = {}
     if method in {"RID", "HSTR", "HSQR"}:
         agg_kwargs["method"] = method
     aggregate = det_mod.aggregate(detector_rows, **agg_kwargs)
 
-    scored_count = aggregate.get("scored_count", 0)
-    failed_count = aggregate.get("failed_count", 0)
+    # ---- Issue #25: orchestrator is count source of truth ----
+    # Adapter only receives detector_rows; it cannot know about entries
+    # that were never scored due to setup failure.  Compute final counts
+    # from image_index + detector_rows + unscored count.
+    row_scored_count = sum(
+        1 for row in detector_rows
+        if row.get("status") == ROW_STATUS_SCORED
+    )
+    row_failed_count = len(detector_rows) - row_scored_count
+    requested_count = len(image_index)
+
+    aggregate["requested_count"] = requested_count
+    aggregate["scored_count"] = row_scored_count
+    aggregate["failed_count"] = row_failed_count
+    aggregate["unscored_due_to_setup_count"] = unscored_due_to_setup_count
+
+    # Count invariant: requested = scored + failed + unscored
+    count_invariant_ok = (
+        requested_count
+        == row_scored_count + row_failed_count + unscored_due_to_setup_count
+    )
+    aggregate["count_invariant_satisfied"] = count_invariant_ok
+
     cohort_counts = aggregate.get("cohort_counts", {})
 
     # ---- Issue #19: metric availability ----
@@ -915,9 +936,6 @@ def evaluate_detector(
         aggregate["setup_failure_cause"] = setup_failure_cause
         aggregate["setup_error_type"] = setup_error_type
         aggregate["setup_error"] = setup_error_message
-    if unscored_due_to_setup_count > 0:
-        aggregate["unscored_due_to_setup_count"] = unscored_due_to_setup_count
-
     aggregate["stage"] = "detector"
     aggregate["method"] = method
     aggregate["status"] = stage_status
