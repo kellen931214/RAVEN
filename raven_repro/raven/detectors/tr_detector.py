@@ -260,29 +260,46 @@ def _optional_uniform_assertion(
     records: list[dict[str, Any]],
     field: str,
 ) -> tuple[str | None, bool]:
-    """Resolve an optional source-assertion field across the cohort.
+    """Resolve an optional source-assertion field across the cohort, per row.
 
-    Returns ``(value, asserted)``.  When no record carries a non-empty value,
-    ``(None, False)`` — the runtime-derived value must be used and the source
-    assertion marked unavailable.  When present, all non-empty values must
-    agree; mixed → DetectorStateValidationError.
+    Returns ``(value, asserted)``:
+
+    - every record missing/blank → ``(None, False)`` — the runtime-derived
+      value must be used and the source assertion marked unavailable.
+    - every record present and identical → ``(value, True)``.
+    - some records present, some missing → DetectorStateValidationError
+      (the cohort must not be labelled asserted from a subset of rows).
+    - every record present but differing → DetectorStateValidationError.
     """
-    values: list[str] = []
+    present: dict[int, str] = {}
+    absent: list[int] = []
     for idx, record in enumerate(records):
         raw = record.get(field)
-        if raw is None:
-            continue
-        text = str(raw).strip()
+        text = str(raw).strip() if raw is not None else ""
         if text:
-            values.append(text)
-    unique = sorted(set(values))
-    if len(unique) > 1:
-        raise DetectorStateValidationError(
-            f"Mixed {field} across TR cohort: {unique} — where present the "
-            f"source assertion must be uniform"
-        )
-    if not unique:
+            present[idx] = text
+        else:
+            absent.append(idx)
+
+    if not present:
         return None, False
+
+    if absent:
+        present_ids = [str(records[i].get("run_id", "?")) for i in present]
+        absent_ids = [str(records[i].get("run_id", "?")) for i in absent]
+        raise DetectorStateValidationError(
+            f"Partial {field} across TR cohort: present at record index(es) "
+            f"{sorted(present)} (run_ids={present_ids}), missing at record "
+            f"index(es) {absent} (run_ids={absent_ids}).  Optional source "
+            f"assertions must be present on every record or on none."
+        )
+
+    unique = sorted(set(present.values()))
+    if len(unique) != 1:
+        raise DetectorStateValidationError(
+            f"Mixed {field} across TR cohort: {unique} — present on every "
+            f"record but not uniform"
+        )
     return unique[0], True
 
 
@@ -856,8 +873,14 @@ def aggregate(detector_rows: list[dict[str, Any]], **extra) -> dict[str, Any]:
     attacked = cohorts.get("attacked_watermarked", [])
 
     if clean and watermarked and attacked:
-        summary = summarize_detection(clean, watermarked, attacked,
-                                      target_fpr=0.01)
+        try:
+            summary = summarize_detection(clean, watermarked, attacked,
+                                          target_fpr=0.01)
+        except Exception as exc:
+            raise DetectorScoringError(
+                f"TR primary detection metric computation failed: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
         result["detection_summary"] = {
             "target_fpr": 0.01,
             "threshold_comparison_operator": ">=",
@@ -881,8 +904,14 @@ def aggregate(detector_rows: list[dict[str, Any]], **extra) -> dict[str, Any]:
     # data unavailability.
     attacked_clean = cohorts.get("attacked_clean", [])
     if attacked_clean and clean and watermarked and attacked:
-        recal = summarize_detection(
-            attacked_clean, watermarked, attacked, target_fpr=0.01)
+        try:
+            recal = summarize_detection(
+                attacked_clean, watermarked, attacked, target_fpr=0.01)
+        except Exception as exc:
+            raise DetectorScoringError(
+                f"TR recalibrated metric computation failed: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
         result["tr_recalibrated"] = {
             "recalibrated_metrics_available": True,
             "attacked_clean_count": len(attacked_clean),

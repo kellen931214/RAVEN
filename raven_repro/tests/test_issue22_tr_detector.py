@@ -652,6 +652,98 @@ class TestOptionalAssertions:
 
 
 # ===========================================================================
+# 5b — Partial optional assertions are rejected per row
+# ===========================================================================
+class TestPartialAssertions:
+    def test_partial_vae_id_assertion_rejected(self, monkeypatch):
+        """Row 1 asserts vae_id, row 2 does not → state validation, never a
+        cohort-wide asserted label."""
+        from raven.detectors.tr_detector import load_state, DetectorStateValidationError
+
+        row1 = _make_record("1", profile=dict(TR_PROFILE, vae_id="custom/vae"))
+        row2 = _make_record("2", profile=dict(TR_PROFILE))
+        del row2["vae_id"]
+
+        with _mock_load_state_deps(monkeypatch):
+            with pytest.raises(DetectorStateValidationError,
+                               match="vae_id"):
+                load_state([row1, row2], "cpu")
+
+    def test_partial_vae_scaling_assertion_rejected(self, monkeypatch):
+        from raven.detectors.tr_detector import load_state, DetectorStateValidationError
+
+        row1 = _make_record("1", profile=dict(TR_PROFILE,
+                                              vae_scaling_factor="0.18215"))
+        row2 = _make_record("2", profile=dict(TR_PROFILE))
+        del row2["vae_scaling_factor"]
+
+        with _mock_load_state_deps(monkeypatch):
+            with pytest.raises(DetectorStateValidationError,
+                               match="vae_scaling_factor"):
+                load_state([row1, row2], "cpu")
+
+    def test_partial_provider_hash_assertion_rejected(self, monkeypatch):
+        from raven.detectors.tr_detector import load_state, DetectorStateValidationError
+
+        row1 = _make_record("1")
+        row2 = _make_record("2")
+        del row2["provider_config_hash"]
+
+        with _mock_load_state_deps(monkeypatch):
+            with pytest.raises(DetectorStateValidationError,
+                               match="provider_config_hash"):
+                load_state([row1, row2], "cpu")
+
+    def test_partial_assertion_error_lists_run_ids(self, monkeypatch):
+        """Error message must include the run_ids of present and missing rows."""
+        from raven.detectors.tr_detector import load_state, DetectorStateValidationError
+
+        row1 = _make_record("10", profile=dict(TR_PROFILE, vae_id="custom/vae"))
+        row2 = _make_record("20", profile=dict(TR_PROFILE))
+        del row2["vae_id"]
+
+        with _mock_load_state_deps(monkeypatch):
+            with pytest.raises(DetectorStateValidationError) as excinfo:
+                load_state([row1, row2], "cpu")
+        message = str(excinfo.value)
+        assert "10" in message
+        assert "20" in message
+
+    def test_all_absent_optional_assertion_is_false(self, monkeypatch):
+        """Generator-style rows: every optional assertion absent → (None,
+        False) — no fabrication of source verification."""
+        from raven.detectors.tr_detector import load_state
+
+        records = [_generator_record("1"), _generator_record("2")]
+
+        with _mock_load_state_deps(monkeypatch):
+            _patch_tensor_sha256(monkeypatch)
+            result = load_state(records, "cpu")
+
+        assert result["tr_vae_id_source_asserted"] is False
+        assert result["tr_vae_scaling_source_asserted"] is False
+        assert result["tr_provider_config_hash_source_asserted"] is False
+        assert result["tr_inverse_scheduler_source_asserted"] is False
+        assert result["tr_detector_dtype_source_asserted"] is False
+
+    def test_all_present_matching_optional_assertion_is_true(self, monkeypatch):
+        """Every record asserts the same value → (value, True)."""
+        from raven.detectors.tr_detector import load_state
+
+        records = [
+            _make_record("1", profile=dict(TR_PROFILE, vae_id="custom/vae")),
+            _make_record("2", profile=dict(TR_PROFILE, vae_id="custom/vae")),
+        ]
+
+        with _mock_load_state_deps(monkeypatch):
+            _patch_tensor_sha256(monkeypatch)
+            result = load_state(records, "cpu")
+
+        assert result["tr_vae_id_source_asserted"] is True
+        assert result["verified_profile"]["vae_id"] == "custom/vae"
+
+
+# ===========================================================================
 # 6 — Provider config hash canonical semantics
 # ===========================================================================
 class TestProviderHashSemantics:
@@ -894,8 +986,10 @@ class TestMeasurementContract:
 # 12 — Recalibration computation error never disguised as unavailable
 # ===========================================================================
 class TestRecalibrationError:
-    def test_recal_metric_error_propagates(self, monkeypatch):
-        from raven.detectors.tr_detector import aggregate
+    def test_recal_metric_error_is_structured(self, monkeypatch):
+        """All recalibration inputs present + summarize_detection raises →
+        structured DetectorScoringError, never a fake unavailable block."""
+        from raven.detectors.tr_detector import aggregate, DetectorScoringError
         from raven.detectors import ROW_STATUS_SCORED
 
         import raven.metrics as metrics
@@ -922,7 +1016,30 @@ class TestRecalibrationError:
              "canonical_score": 2.0},
         ]
 
-        with pytest.raises(RuntimeError, match="metric bug"):
+        with pytest.raises(DetectorScoringError, match="metric bug"):
+            aggregate(rows)
+
+    def test_primary_metric_error_is_structured(self, monkeypatch):
+        """Primary cohorts present + summarize_detection raises → structured
+        DetectorScoringError."""
+        from raven.detectors.tr_detector import aggregate, DetectorScoringError
+        from raven.detectors import ROW_STATUS_SCORED
+
+        import raven.metrics as metrics
+        monkeypatch.setattr(
+            metrics, "summarize_detection",
+            mock.MagicMock(side_effect=RuntimeError("primary bug")))
+
+        rows = [
+            {"status": ROW_STATUS_SCORED, "evaluation_cohort": "original_clean",
+             "canonical_score": 5.0},
+            {"status": ROW_STATUS_SCORED, "evaluation_cohort": "original_watermarked",
+             "canonical_score": 10.0},
+            {"status": ROW_STATUS_SCORED, "evaluation_cohort": "attacked_watermarked",
+             "canonical_score": 7.0},
+        ]
+
+        with pytest.raises(DetectorScoringError, match="primary bug"):
             aggregate(rows)
 
     def test_recal_metric_error_with_missing_positive_cohort_is_unavailable(self, monkeypatch):
@@ -1600,3 +1717,234 @@ class TestManifestCompatibility:
             assert any(alias in row for alias in aliases), (
                 f"generator row cannot satisfy {canonical} via {aliases}"
             )
+
+
+# ===========================================================================
+# 19 — Real TrProvider w_channel=-1 canonical scoring
+# ===========================================================================
+def _real_tr_provider_import():
+    """Import the REAL TrProvider, stubbing only utils.image_utils (which
+    pulls in lpips, unavailable in this environment).  All watermark math —
+    FFT, mask construction, gt_patch, non-central chi-square p-value — runs
+    for real."""
+    import sys
+    import types
+
+    fake_image_utils = types.ModuleType("utils.image_utils")
+    fake_image_utils.torch_to_PIL = lambda tensor: tensor
+    sys.modules.setdefault("utils.image_utils", fake_image_utils)
+
+    eb = str(REPO / "eval_bench_wm")
+    if eb not in sys.path:
+        sys.path.insert(0, eb)
+
+    import importlib
+    return importlib.import_module("utils.wm.tr_provider").TrProvider
+
+
+class TestWChannelMinusOneRealScoring:
+    """Real TrProvider scoring with w_channel=-1 — no mocked get_accuracies,
+    no mocked mask/gt_patch.  Only pipe inversion and image loading are
+    mocked."""
+
+    LATENT_SHAPE = (1, 4, 64, 64)
+
+    @staticmethod
+    def _build_provider(w_channel):
+        import torch
+
+        TrProvider = _real_tr_provider_import()
+        return TrProvider(
+            latent_shape=TestWChannelMinusOneRealScoring.LATENT_SHAPE,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+            w_seed=99,
+            w_channel=w_channel,
+            w_radius=10,
+            w_pattern="ring",
+            w_mask_shape="circle",
+            w_measurement="l1_complex",
+            w_injection="complex",
+            w_pattern_const=0.0,
+        )
+
+    @staticmethod
+    def _mock_pipe():
+        import torch
+        import types
+
+        pipe = mock.MagicMock()
+        pipe.invert_images.return_value = {
+            "zT_torch": torch.randn(*TestWChannelMinusOneRealScoring.LATENT_SHAPE),
+        }
+        return pipe
+
+    @staticmethod
+    def _make_image(tmp_path):
+        from PIL import Image
+        img = tmp_path / "input.png"
+        Image.new("RGB", (64, 64)).save(img)
+        return str(img)
+
+    def test_w_channel_minus_one_real_provider_scoring(self, tmp_path):
+        """Full canonical path: real provider, real mask/gt_patch, real
+        get_accuracies, real evaluate_image → finite raw/canonical scores."""
+        import torch
+        from raven.detectors import tr_detector
+
+        provider = self._build_provider(-1)
+        assert provider.watermarking_mask.shape == self.LATENT_SHAPE
+        # All 4 channels covered by the mask.
+        for ch in range(1, self.LATENT_SHAPE[1]):
+            assert bool(
+                (provider.watermarking_mask[:, 0]
+                 == provider.watermarking_mask[:, ch]).all()
+            ), "w_channel=-1 mask must cover every channel"
+
+        pipe = self._mock_pipe()
+        mod = tr_detector._get_extract_module()
+
+        result = mod.evaluate_image(torch, provider, pipe,
+                                    Path(self._make_image(tmp_path)), 50)
+
+        assert "p_values" in result
+        assert len(result["p_values"]) == 1
+        assert result["p_values"][0] >= 0.0
+
+        raw = mod.raw_score("TR", result)
+        canonical = mod.canonical_score("TR", raw, result)
+        assert math.isfinite(float(raw))
+        assert math.isfinite(float(canonical))
+
+    def test_w_channel_minus_one_real_get_accuracies(self, tmp_path):
+        """Real get_accuracies completes and produces p-values."""
+        import torch
+
+        provider = self._build_provider(-1)
+        latents = torch.randn(*self.LATENT_SHAPE)
+
+        accuracies = provider.get_accuracies(latents)
+        assert "p_values" in accuracies
+        assert len(accuracies["p_values"]) == 1
+        assert 0.0 <= accuracies["p_values"][0] <= 1.0
+
+    def test_w_channel_minus_one_visualization_is_nonempty(self, tmp_path):
+        """Every visualization tensor must be non-empty for w_channel=-1 —
+        never an empty [:, -1:0] slice."""
+        import torch
+
+        provider = self._build_provider(-1)
+        latents = torch.randn(*self.LATENT_SHAPE)
+
+        outs = provider.get_wm_latents(latents)
+        for key in ("zT_clean_fft_wchannel_torch",
+                    "zT_fft_wchannel_torch",
+                    "pristine_zT_fft_wchannel_torch"):
+            tensor = outs[key]
+            assert tensor.numel() > 0, f"{key} is empty"
+            assert tensor.shape[-1] == 64, f"{key} shape {tensor.shape}"
+            assert tensor.shape[1] == 4, (
+                f"{key} must carry all 4 channels for w_channel=-1, got "
+                f"{tensor.shape}")
+
+        result = provider.get_accuracies(latents)
+        for key in ("zT_fft_torch", "zT_fft_wchannel_torch",
+                    "zT_fft_wchannel_PIL"):
+            assert key in result, f"missing {key}"
+
+    def test_w_channel_three_visualization_still_single_channel(self, tmp_path):
+        """Regression: w_channel >= 0 keeps selecting exactly one channel."""
+        import torch
+
+        provider = self._build_provider(3)
+        latents = torch.randn(*self.LATENT_SHAPE)
+
+        outs = provider.get_wm_latents(latents)
+        tensor = outs["zT_fft_wchannel_torch"]
+        assert tensor.shape[1] == 1, f"expected 1 channel, got {tensor.shape}"
+
+
+# ===========================================================================
+# 20 — Orchestrator aggregate failure contract
+# ===========================================================================
+class TestAggregateFailureOrchestrator:
+    """Real evaluate_detector with summarize_detection raising — the stage
+    result must be structured failed_scoring, records preserved, exit 2 with
+    and without --allow-missing-metrics."""
+
+    def _four_cohort_records(self):
+        profile = dict(TR_PROFILE_GENERATOR)
+        rec_clean = _generator_record("1", "clean", profile=profile)
+        rec_wm = _generator_record("1", "watermarked", profile=profile)
+        return [rec_clean, rec_wm]
+
+    def test_metric_failure_structured_stage_result(self, monkeypatch):
+        import raven.metrics as metrics
+        monkeypatch.setattr(
+            metrics, "summarize_detection",
+            mock.MagicMock(side_effect=RuntimeError("metric bug")))
+
+        from experiments.eval import evaluate_detector
+        from raven.detectors import (
+            STATUS_FAILED_SCORING, FAILURE_CAUSE_SCORING_ERROR,
+        )
+
+        records = self._four_cohort_records()
+        with _patch_integration(monkeypatch):
+            with tempfile.TemporaryDirectory() as td:
+                out = _write_fake_run(Path(td), method="TR", records=records)
+                result = evaluate_detector(records, out, "TR", device="cpu")
+
+                assert result["status"] == STATUS_FAILED_SCORING
+                assert result["dominant_failure_cause"] == FAILURE_CAUSE_SCORING_ERROR
+                assert result.get("aggregate_error_type") == "DetectorScoringError"
+                assert "metric bug" in result.get("aggregate_error", "")
+
+                # counts + invariant preserved
+                assert result["requested_count"] == 4
+                assert result["scored_count"] == 4
+                assert result["failed_count"] == 0
+                assert result["unscored_due_to_setup_count"] == 0
+                assert result["count_invariant_satisfied"] is True
+
+                # detector_records.jsonl preserved
+                rows = _read_detector_rows(out)
+                assert len(rows) == 4
+                assert all(r["status"] == "scored" for r in rows)
+
+    def test_cli_exit_without_allow_is_2(self, monkeypatch):
+        import raven.metrics as metrics
+        monkeypatch.setattr(
+            metrics, "summarize_detection",
+            mock.MagicMock(side_effect=RuntimeError("metric bug")))
+
+        from experiments.eval import main
+
+        records = self._four_cohort_records()
+        with _patch_integration(monkeypatch):
+            with tempfile.TemporaryDirectory() as td:
+                out = _write_fake_run(Path(td), method="TR", records=records)
+                rc = main([
+                    "--output-dir", str(out), "--device", "cpu",
+                    "--log-level", "ERROR", "--stages", "detector",
+                ])
+                assert rc == 2, f"expected exit 2, got {rc}"
+
+    def test_cli_exit_with_allow_is_2(self, monkeypatch):
+        import raven.metrics as metrics
+        monkeypatch.setattr(
+            metrics, "summarize_detection",
+            mock.MagicMock(side_effect=RuntimeError("metric bug")))
+
+        from experiments.eval import main
+
+        records = self._four_cohort_records()
+        with _patch_integration(monkeypatch):
+            with tempfile.TemporaryDirectory() as td:
+                out = _write_fake_run(Path(td), method="TR", records=records)
+                rc = main([
+                    "--output-dir", str(out), "--device", "cpu",
+                    "--log-level", "ERROR", "--stages", "detector",
+                    "--allow-missing-metrics",
+                ])
+                assert rc == 2, f"expected exit 2 with allow, got {rc}"

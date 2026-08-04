@@ -862,7 +862,37 @@ def evaluate_detector(
     agg_kwargs: dict[str, Any] = {}
     if method in {"RID", "HSTR", "HSQR"}:
         agg_kwargs["method"] = method
-    aggregate = det_mod.aggregate(detector_rows, **agg_kwargs)
+    # ---- Aggregate phase exception boundary ----
+    # An adapter metric-computation failure must not abort the whole stage:
+    # detector_records.jsonl is already written above, and the stage result
+    # stays a normal dict classified as failed_scoring / scoring_error.
+    aggregate_failure: dict[str, Any] | None = None
+    try:
+        aggregate = det_mod.aggregate(detector_rows, **agg_kwargs)
+    except DetectorScoringError as exc:
+        aggregate = {}
+        aggregate_failure = {"aggregate_error_type": type(exc).__name__,
+                             "aggregate_error": str(exc)}
+    except DetectorMissingStateError as exc:
+        aggregate = {}
+        aggregate_failure = {"aggregate_error_type": type(exc).__name__,
+                             "aggregate_error": str(exc)}
+    except DetectorDependencyError as exc:
+        aggregate = {}
+        aggregate_failure = {"aggregate_error_type": type(exc).__name__,
+                             "aggregate_error": str(exc)}
+    except DetectorProviderInitializationError as exc:
+        aggregate = {}
+        aggregate_failure = {"aggregate_error_type": type(exc).__name__,
+                             "aggregate_error": str(exc)}
+    except DetectorStateValidationError as exc:
+        aggregate = {}
+        aggregate_failure = {"aggregate_error_type": type(exc).__name__,
+                             "aggregate_error": str(exc)}
+    except Exception as exc:
+        aggregate = {}
+        aggregate_failure = {"aggregate_error_type": type(exc).__name__,
+                             "aggregate_error": f"{type(exc).__name__}: {exc}"}
 
     # ---- Issue #25: orchestrator is count source of truth ----
     # Adapter only receives detector_rows; it cannot know about entries
@@ -936,6 +966,23 @@ def evaluate_detector(
         aggregate["setup_failure_cause"] = setup_failure_cause
         aggregate["setup_error_type"] = setup_error_type
         aggregate["setup_error"] = setup_error_message
+
+    # Aggregate phase failure: the adapter could not produce a metric
+    # aggregate.  detector_records.jsonl and all counts are preserved; the
+    # stage is classified as failed_scoring / scoring_error regardless of
+    # how many rows scored.
+    if aggregate_failure is not None:
+        aggregate.update(aggregate_failure)
+        aggregate["dominant_failure_cause"] = FAILURE_CAUSE_SCORING_ERROR
+        aggregate["status"] = STATUS_FAILED_SCORING
+        aggregate["available"] = row_scored_count > 0
+        aggregate["status_reducer_reason"] = (
+            "aggregate phase failed: "
+            f"{aggregate_failure['aggregate_error_type']}: "
+            f"{aggregate_failure['aggregate_error']}"
+        )
+        return aggregate
+
     aggregate["stage"] = "detector"
     aggregate["method"] = method
     aggregate["status"] = stage_status
