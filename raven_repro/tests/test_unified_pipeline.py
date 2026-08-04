@@ -461,7 +461,8 @@ class TestTRFailClosed:
     def test_required_fields_are_enforced(self):
         from raven.detectors.tr_detector import REQUIRED_METADATA_FIELDS
         required = {"w_seed", "w_channel", "w_radius", "w_pattern",
-                    "w_mask_shape", "w_measurement", "w_injection"}
+                    "w_mask_shape", "w_measurement", "w_injection",
+                    "w_pattern_const"}
         assert REQUIRED_METADATA_FIELDS == required
 
     def test_no_silent_defaults_in_load_state(self):
