@@ -2928,7 +2928,8 @@ def _fourier_real_deps(monkeypatch, method="RID"):
             "mask_sha256": "tgt_sha",
         }
         prov.profile = "legacy"
-        prov.state_source = "bundle"
+        # HSQR must NOT depend on a state_source attribute — leave it absent
+        # so the adapter proves it never consults that field.
         prov.selected_pattern_sha256 = "tgt_sha"
         prov.watermark_mask_sha256 = "tgt_sha"
         prov.latent_shape = latent_shape
@@ -3333,9 +3334,30 @@ class TestGSRealAdapter:
 
                 assert result["status"] == STATUS_COMPLETED
                 assert result["scored_count"] == 4
-                # Provider should be constructed exactly twice — one per source
-                assert GsProvider.call_count >= 1, \
-                    "GsProvider never constructed by real load_state"
+                # Exactly one provider per source — two sources, two providers.
+                assert GsProvider.call_count == 2, \
+                    f"expected 2 provider constructions, got {GsProvider.call_count}"
+                # Constructor kwargs must carry each source's own secret index.
+                call_kwargs = [call.kwargs for call in GsProvider.call_args_list]
+                secret_indices = {kw.get("gs_secret_index") for kw in call_kwargs}
+                assert secret_indices == {5, 7}, \
+                    f"expected gs_secret_index in {{5, 7}}, got {secret_indices}"
+                # The two sources must NOT share a provider instance: each
+                # scored row carries the secret index of ITS source.  A shared
+                # provider would stamp the same secret on both rows.
+                rows = _read_detector_rows(out)
+                clean_secrets = {
+                    r["gs_secret_index"]
+                    for r in rows if r["source_role"] == "clean"
+                }
+                wm_secrets = {
+                    r["gs_secret_index"]
+                    for r in rows if r["source_role"] == "watermarked"
+                }
+                assert clean_secrets == {5}, \
+                    f"clean rows must carry secret 5, got {clean_secrets}"
+                assert wm_secrets == {7}, \
+                    f"watermarked rows must carry secret 7, got {wm_secrets}"
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -4015,28 +4037,35 @@ class TestHSQRRealAdapter:
 
             with _fourier_real_deps(monkeypatch, "HSQR"):
                 csv_path = tdp / "metadata.csv"
-                csv_rows = [{
-                    "run_id": "1", "role": "watermarked", "method": "HSQR",
-                    "hsqr_bundle_dir": str(bundle_dir),
-                    "hsqr_bundle_config_sha256": "hsqr_cfg_sha",
-                    "hsqr_selected_pattern_sha256": "hsqr_pat_sha",
-                    "hsqr_mask_sha256": "hsqr_mask_sha",
-                    "hsqr_key_index": "0",
-                    "hsqr_protocol_mode": HSQR_SHARED_TR_CLEAN_MODE,
-                    "watermark_target_sha256": "tgt_sha",
-                    "watermark_mask_sha256": "tgt_sha",
-                }]
-                _write_metadata_csv(csv_path, csv_rows)
+                def hsqr_row(role):
+                    return {
+                        "run_id": "1", "role": role, "method": "HSQR",
+                        "hsqr_bundle_dir": str(bundle_dir),
+                        "hsqr_bundle_config_sha256": "hsqr_cfg_sha",
+                        "hsqr_selected_pattern_sha256": "hsqr_pat_sha",
+                        "hsqr_mask_sha256": "hsqr_mask_sha",
+                        "hsqr_key_index": "0",
+                        "hsqr_protocol_mode": HSQR_SHARED_TR_CLEAN_MODE,
+                        "watermark_target_sha256": "tgt_sha",
+                        "watermark_mask_sha256": "tgt_sha",
+                    }
+                _write_metadata_csv(csv_path, [hsqr_row("clean"),
+                                               hsqr_row("watermarked")])
 
+                rec_clean = _min_record("1", "clean", "HSQR")
                 rec_wm = _min_record("1", "watermarked", "HSQR")
 
                 out = _write_fake_run(tdp, method="HSQR",
-                                      records=[rec_wm],
+                                      records=[rec_clean, rec_wm],
                                       config={"metadata_path": str(csv_path)})
-                result = evaluate_detector([rec_wm],
+                result = evaluate_detector([rec_clean, rec_wm],
                                            out, "HSQR", device="cpu", config={"method": "HSQR", "metadata_path": str(csv_path)})
-                # HSQR: single watermarked record → still completed
-                # (no clean cohort needed since it's single-record context
-                # tested through evaluate_detector)
-                assert result["status"] != "failed_state_validation", \
-                    "HSQR should not require state_source contract"
+                # The fake HSQR provider has NO state_source attribute at all
+                # (see _fake_hsqr_from_bundle).  If the adapter consulted that
+                # field, load_state would fail.  Success proves HSQR does not
+                # depend on the RID/HSTR state_source contract.
+                assert result["status"] == STATUS_COMPLETED, \
+                    f"HSQR must complete without state_source, got {result['status']}: {result.get('setup_error')}"
+                assert result["scored_count"] == 4
+                rows = _read_detector_rows(out)
+                assert all(r["status"] == "scored" for r in rows)
