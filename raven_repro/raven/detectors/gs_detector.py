@@ -2,9 +2,10 @@
 
 Every source sample gets its own canonical ``GsProvider``, constructed once
 and cached per ``(run_id, role)``.  The adapter validates required metadata,
-provider configuration identity, pipe profile uniformity, secret provenance,
-watermark target/mask identity, and scoring outputs — all before returning a
-scored row.  No GS algorithm is reimplemented here.
+formal provider configuration identity (``require_uniform_provider_config``),
+pipe profile uniformity, secret provenance, watermark target/mask identity,
+and scoring outputs — all before returning a scored row.  No GS algorithm is
+reimplemented here.
 
 Failure taxonomy
 ----------------
@@ -44,6 +45,19 @@ REQUIRED_METADATA_FIELDS: frozenset[str] = frozenset({
     "provider_config_hash",
 })
 
+# Runtime provider fields that must match the canonical config (fail closed
+# against constructor defaults drift or ignored kwargs).
+_RUNTIME_PROVIDER_FIELDS: tuple[str, ...] = (
+    "gs_protocol_mode",
+    "message_width_in_bytes",
+    "l",
+    "num_replications",
+    "gs_channel_copy",
+    "gs_hw_copy",
+    "gs_fpr",
+    "gs_user_number",
+)
+
 
 # ---------------------------------------------------------------------------
 # Required metadata fields that must be present before provider_kwargs
@@ -61,7 +75,8 @@ _GS_REQUIRED_METADATA_FIELDS: tuple[str, ...] = (
     "provider_config_hash",
 )
 
-# Pipe-level fields validated for cohort uniformity (not in PROVIDER_FIELDS_BY_METHOD["GS"])
+# Pipe-level fields validated for cohort uniformity (NOT part of the formal
+# provider_config_hash — they are a separate pipe identity).
 _GS_PIPE_CONFIG_FIELDS: tuple[str, ...] = (
     "model_id",
     "model_revision",
@@ -80,6 +95,7 @@ def describe_required_artifacts() -> list[str]:
         "watermark_target_sha256",
         "watermark_mask_sha256",
         "provider_config_hash",
+        "model_id, model_revision, scheduler, resolution",
         "Stable Diffusion inversion pipe",
     ]
 
@@ -94,13 +110,32 @@ def _ensure_paths():
 # ---------------------------------------------------------------------------
 # Metadata preflight — must run BEFORE any provider_kwargs call
 # ---------------------------------------------------------------------------
+def _strict_nonneg_int(value: Any) -> int:
+    """Return *value* as a non-negative int, or raise ValueError.
+
+    Rejects bool, float, scientific notation, and non-numeric strings —
+    unlike ``int(raw)`` which silently accepts ``1.5`` and ``1e2``.
+    """
+    if isinstance(value, bool):
+        raise ValueError(f"bool is not a valid secret index: {value!r}")
+    if isinstance(value, int):
+        if value < 0:
+            raise ValueError(f"negative secret index: {value!r}")
+        return value
+    if isinstance(value, str) and value.strip().isdigit():
+        idx = int(value.strip())
+        if idx < 0:
+            raise ValueError(f"negative secret index: {value!r}")
+        return idx
+    raise ValueError(f"invalid secret index: {value!r}")
+
+
 def _validate_required_gs_metadata(record: dict[str, Any]) -> None:
     """Validate that *record* carries every required GS metadata field.
 
     Runs before ``provider_kwargs("GS", row)`` so canonical defaults cannot
     mask missing or invalid values.  ``gs_secret_index`` must be a
-    non-negative integer — anything else (float, negative, non-numeric
-    string) is ``DetectorStateValidationError``.
+    non-negative integer (strict — rejects float, bool, scientific notation).
     """
     run_id = str(record.get("run_id", ""))
     if not run_id.strip():
@@ -121,16 +156,13 @@ def _validate_required_gs_metadata(record: dict[str, Any]) -> None:
                 f"run_id={run_id}: missing required GS metadata field: {field}"
             )
 
-    secret_index_raw = record.get("gs_secret_index")
     try:
-        idx = int(secret_index_raw)
-        if idx < 0:
-            raise ValueError
-    except (ValueError, TypeError):
+        _strict_nonneg_int(record.get("gs_secret_index"))
+    except ValueError as exc:
         raise DetectorStateValidationError(
             f"run_id={run_id}: gs_secret_index must be a non-negative "
-            f"integer, got {secret_index_raw!r}"
-        )
+            f"integer, got {record.get('gs_secret_index')!r}"
+        ) from exc
 
 
 # ---------------------------------------------------------------------------
@@ -163,43 +195,56 @@ def _build_metadata_index(
 
 
 # ---------------------------------------------------------------------------
-# Provider configuration identity
+# Pipe config — independent fail-closed validation (NOT provider hash)
 # ---------------------------------------------------------------------------
 def _validate_pipe_config_uniformity(
     enriched_records: list[dict[str, Any]],
 ) -> dict[str, Any]:
     """Extract pipe-level config from resolved metadata, verify uniformity.
 
-    Returns a dict with *model_id*, *model_revision*, *scheduler*,
-    *resolution* (all guaranteed to be identical across the cohort).
+    Every record MUST carry model_id, model_revision, scheduler, resolution.
+    Missing/None/empty → ``DetectorMissingStateError``; invalid resolution →
+    ``DetectorStateValidationError``; mixed profile → ``DetectorStateValidationError``.
+    No fallback defaults.
     """
     pipe_hashes: dict[str, dict[str, Any]] = {}
     for rec in enriched_records:
-        model_id = str(rec.get("model_id",
-                               "RedbeardNZ/stable-diffusion-2-1-base"))
-        model_revision = str(rec.get("model_revision", ""))
-        scheduler = str(rec.get("scheduler", "DDIM"))
-        resolution_raw = rec.get("resolution", "512")
+        run_id = str(rec.get("run_id", ""))
+        model_id = rec.get("model_id")
+        model_revision = rec.get("model_revision")
+        scheduler = rec.get("scheduler")
+        resolution_raw = rec.get("resolution")
+
+        for field in _GS_PIPE_CONFIG_FIELDS:
+            value = rec.get(field)
+            if value is None or str(value).strip() == "":
+                raise DetectorMissingStateError(
+                    f"run_id={run_id}: missing required pipe config "
+                    f"field: {field}"
+                )
+
         try:
             resolution = int(resolution_raw)
         except (ValueError, TypeError):
             raise DetectorStateValidationError(
-                f"run_id={rec.get('run_id')}: resolution must be an "
-                f"integer, got {resolution_raw!r}"
+                f"run_id={run_id}: resolution must be an integer, "
+                f"got {resolution_raw!r}"
             )
 
         from raven.eval_protocol import canonical_json_hash
 
         h = canonical_json_hash({
-            "model_id": model_id,
-            "model_revision": model_revision if model_revision else None,
-            "scheduler": scheduler,
+            "model_id": str(model_id),
+            "model_revision": str(model_revision) if str(model_revision).strip() else None,
+            "scheduler": str(scheduler),
             "resolution": resolution,
         })
         pipe_hashes[h] = {
-            "model_id": model_id,
-            "model_revision": model_revision if model_revision else None,
-            "scheduler": scheduler,
+            "model_id": str(model_id),
+            "model_revision": (
+                str(model_revision) if str(model_revision).strip() else None
+            ),
+            "scheduler": str(scheduler),
             "resolution": resolution,
         }
     if len(pipe_hashes) != 1:
@@ -211,17 +256,22 @@ def _validate_pipe_config_uniformity(
     return config
 
 
+# ---------------------------------------------------------------------------
+# Provider configuration identity — FORMAL hash only
+# ---------------------------------------------------------------------------
 def _validate_gs_provider_config(
     enriched_records: list[dict[str, Any]],
-) -> tuple[dict[str, Any], str]:
-    """Compute canonical GS provider config and hash from enriched records.
+) -> tuple[dict[str, Any], str, str, str]:
+    """Compute canonical GS provider config + hashes from enriched records.
 
-    Uses ``require_uniform_provider_config`` from the formal extraction path.
-    Returns ``(canonical_config, canonical_hash)``.
+    The provider_config_hash is the FORMAL ``require_uniform_provider_config``
+    hash — pipe config and detection mode are NEVER mixed into it.  Pipe and
+    detection-policy identities are returned as separate hashes.
+
+    Returns ``(canonical_config, canonical_hash, pipe_hash, detection_policy_hash)``.
     """
     from raven.eval_protocol import (
         require_uniform_provider_config,
-        provider_config_hash,
         canonical_json_hash,
     )
 
@@ -234,11 +284,16 @@ def _validate_gs_provider_config(
             f"GS provider config not uniform: {exc}"
         ) from exc
 
-    # Augment with gs_detection_mode and pipe fields for full identity
-    augmented = dict(canonical_config)
+    # Pipe identity — separate, never part of provider_config_hash
     pipe_cfg = _validate_pipe_config_uniformity(enriched_records)
-    augmented.update(pipe_cfg)
-    # gs_detection_mode is detection-time policy but part of adapter identity
+    pipe_hash = canonical_json_hash({
+        "model_id": pipe_cfg["model_id"],
+        "model_revision": pipe_cfg["model_revision"],
+        "scheduler": pipe_cfg["scheduler"],
+        "resolution": pipe_cfg["resolution"],
+    })
+
+    # Detection policy — separate, never part of provider_config_hash
     detection_modes = {
         str(r.get("gs_detection_mode", "official_onebit"))
         for r in enriched_records
@@ -247,10 +302,11 @@ def _validate_gs_provider_config(
         raise DetectorStateValidationError(
             f"GS detection mode not uniform: {sorted(detection_modes)}"
         )
-    augmented["gs_detection_mode"] = next(iter(detection_modes))
+    detection_policy_hash = canonical_json_hash(
+        {"gs_detection_mode": next(iter(detection_modes))},
+    )
 
-    augmented_hash = canonical_json_hash(augmented)
-    return augmented, augmented_hash
+    return canonical_config, canonical_hash, pipe_hash, detection_policy_hash
 
 
 # ---------------------------------------------------------------------------
@@ -265,28 +321,40 @@ def _construct_provider(
 ) -> tuple[Any, dict[str, Any]]:
     """Construct a canonical GS provider for one source sample.
 
-    Uses ``provider_kwargs("GS", metadata)`` from the formal extraction path.
-    Validates secret provenance, target, mask, and protocol identity against
-    the resolved metadata.  Returns ``(provider, provenance_record)``.
+    Merges the cohort-wide canonical config with per-row ``provider_kwargs``
+    (secret index / sampling seed), so the provider receives the full formal
+    configuration — never just the per-row secret state.  Validates runtime
+    provider fields against the canonical config, secret provenance, target,
+    mask, and protocol identity against the resolved metadata.
+
+    Returns ``(provider, provenance_record)``.
 
     Raises:
         DetectorMissingStateError: secret index out of range or bundle missing.
-        DetectorStateValidationError: any identity mismatch.
+        DetectorStateValidationError: any identity/runtime mismatch.
         DetectorProviderInitializationError: constructor failure.
     """
     from extract_verification_scores import provider_kwargs as _canonical_gs_kwargs
 
     run_id = str(metadata.get("run_id", ""))
 
-    gs_kwargs = _canonical_gs_kwargs("GS", metadata)
-    secret_index = gs_kwargs.get("gs_secret_index")
+    per_row_kwargs = _canonical_gs_kwargs("GS", metadata)
+    secret_index = per_row_kwargs.get("gs_secret_index")
+
+    # Full provider kwargs = canonical cohort config + per-row secret state
+    provider_kwargs_full = dict(canonical_config)
+    provider_kwargs_full.update(per_row_kwargs)
+    # gs_detection_mode is a detection-time policy, not part of the embedding
+    # config hash, but it is still honored from verified metadata.
+    detection_mode = str(metadata.get("gs_detection_mode", "official_onebit"))
+    provider_kwargs_full.setdefault("gs_detection_mode", detection_mode)
 
     try:
         provider = GsProvider(
             latent_shape=pipe.get_latent_shape(),
             dtype=pipe.get_dtype(),
             device=device_obj,
-            **gs_kwargs,
+            **provider_kwargs_full,
         )
     except IndexError:
         raise DetectorMissingStateError(
@@ -312,6 +380,22 @@ def _construct_provider(
             f"run_id={run_id}: GS provider construction failed: "
             f"{type(exc).__name__}: {exc}"
         ) from exc
+
+    # ---- runtime config validation (fail closed against defaults drift) ----
+    for field in _RUNTIME_PROVIDER_FIELDS:
+        expected = provider_kwargs_full.get(field)
+        actual = getattr(provider, field, None)
+        if expected is None:
+            continue
+        try:
+            match = float(expected) == float(actual)
+        except (ValueError, TypeError):
+            match = str(expected) == str(actual)
+        if not match:
+            raise DetectorStateValidationError(
+                f"run_id={run_id}: GS provider runtime {field} mismatch: "
+                f"canonical={expected!r} runtime={actual!r}"
+            )
 
     # ---- secret provenance ----
     try:
@@ -400,6 +484,31 @@ def _construct_provider(
 # ---------------------------------------------------------------------------
 # Scoring output validation
 # ---------------------------------------------------------------------------
+def _validate_decoded_bits(
+    decoded_str: Any, run_id: str, message_width_in_bytes: int,
+) -> None:
+    """Validate decoded bits string: non-empty, 0/1 only, exact length.
+
+    Raises ``DetectorScoringError`` on any violation.
+    """
+    if not isinstance(decoded_str, str) or decoded_str == "":
+        raise DetectorScoringError(
+            f"run_id={run_id}: GS decoded bits string is empty or "
+            f"non-string: {decoded_str!r}"
+        )
+    if any(ch not in ("0", "1") for ch in decoded_str):
+        raise DetectorScoringError(
+            f"run_id={run_id}: GS decoded bits string contains "
+            f"non-binary characters: {decoded_str[:64]!r}"
+        )
+    expected_len = int(message_width_in_bytes) * 8
+    if len(decoded_str) != expected_len:
+        raise DetectorScoringError(
+            f"run_id={run_id}: GS decoded bits length {len(decoded_str)} "
+            f"does not match message_width_in_bytes*8 = {expected_len}"
+        )
+
+
 def _validate_scoring_result(result: dict[str, Any], run_id: str) -> None:
     """Validate that *result* from ``evaluate_image`` contains required GS
     scoring outputs.  Raises ``DetectorScoringError`` on missing/illegal
@@ -449,8 +558,9 @@ def _validate_thresholds(
 ) -> dict[str, Any]:
     """Validate official thresholds and return canonical threshold record.
 
-    Raises ``DetectorScoringError`` if required thresholds are missing,
-    non-finite, or out of range.
+    ``tau_onebit`` and ``tau_bits`` must be finite and in [0, 1].  If a
+    comparison operator is present it must be one the provider officially
+    supports (">=" or ">").  Raises ``DetectorScoringError`` on violation.
     """
     tau_onebit = thresholds.get("tau_onebit")
     tau_bits = thresholds.get("tau_bits")
@@ -472,6 +582,18 @@ def _validate_thresholds(
         raise DetectorScoringError(
             f"run_id={run_id}: GS official thresholds non-finite: "
             f"tau_onebit={t1!r} tau_bits={tb!r}"
+        )
+    if not (0.0 <= t1 <= 1.0) or not (0.0 <= tb <= 1.0):
+        raise DetectorScoringError(
+            f"run_id={run_id}: GS official thresholds out of range [0,1]: "
+            f"tau_onebit={t1!r} tau_bits={tb!r}"
+        )
+
+    operator = thresholds.get("comparison_operator")
+    if operator is not None and str(operator) not in (">=", ">"):
+        raise DetectorScoringError(
+            f"run_id={run_id}: GS official threshold comparison operator "
+            f"unsupported: {operator!r}"
         )
 
     record = {
@@ -498,8 +620,10 @@ def load_state(records: list[dict[str, Any]], device: str,
     * ``device_obj`` — torch device
     * ``provider_cache`` — ``dict[(run_id, role), provider]`` (populated lazily)
     * ``metadata_index`` — ``dict[(run_id, role), resolved_metadata]``
-    * ``canonical_config`` — uniform provider config dict
-    * ``detector_provider_config_hash`` — SHA-256 of the canonical config
+    * ``canonical_config`` — uniform provider config dict (formal)
+    * ``detector_provider_config_hash`` — FORMAL ``require_uniform_provider_config`` hash
+    * ``detector_pipe_config_hash`` — separate pipe identity hash
+    * ``gs_detection_policy_hash`` — separate detection-policy hash
     * ``pipe_config`` — resolved pipe profile
     """
     import torch
@@ -521,12 +645,12 @@ def load_state(records: list[dict[str, Any]], device: str,
     # ---- metadata index ----
     metadata_index = _build_metadata_index(records)
 
-    # ---- provider config identity ----
-    canonical_config, detector_provider_hash = _validate_gs_provider_config(
-        records,
+    # ---- provider config identity (formal hash only) ----
+    canonical_config, detector_provider_hash, pipe_hash, detection_policy_hash = (
+        _validate_gs_provider_config(records)
     )
 
-    # Validate source provider_config_hash against detector hash
+    # Validate source provider_config_hash against formal detector hash
     for rec in records:
         run_id = str(rec.get("run_id", ""))
         source_hash = str(rec.get("provider_config_hash", ""))
@@ -548,8 +672,9 @@ def load_state(records: list[dict[str, Any]], device: str,
             "schedulers_name": pipe_cfg["scheduler"],
             "disable_tqdm": True,
         }
+        # The pipe helper's kwarg is ``revision``, not ``model_revision``.
         if pipe_cfg.get("model_revision"):
-            load_kwargs["model_revision"] = pipe_cfg["model_revision"]
+            load_kwargs["revision"] = pipe_cfg["model_revision"]
         pipe = pipe_utils.get_pipe_provider(**load_kwargs)
     except Exception as exc:
         raise DetectorProviderInitializationError(
@@ -564,6 +689,8 @@ def load_state(records: list[dict[str, Any]], device: str,
         "metadata_index": metadata_index,
         "canonical_config": canonical_config,
         "detector_provider_config_hash": detector_provider_hash,
+        "detector_pipe_config_hash": pipe_hash,
+        "gs_detection_policy_hash": detection_policy_hash,
         "pipe_config": pipe_cfg,
     }
 
@@ -581,7 +708,6 @@ def score_image(provider_info: dict[str, Any], image_path: str, *,
     """
     import torch
     from PIL import Image, ImageOps
-    from raven.eval_protocol import canonical_json_hash
     from raven.pairing_provenance import tensor_sha256
 
     _ensure_paths()
@@ -589,7 +715,6 @@ def score_image(provider_info: dict[str, Any], image_path: str, *,
         evaluate_image,
         raw_score as _canonical_raw_score,
         canonical_score as _canonical_canonical_score,
-        provider_kwargs as _canonical_gs_kwargs,
     )
 
     path = Path(image_path)
@@ -668,36 +793,45 @@ def score_image(provider_info: dict[str, Any], image_path: str, *,
         )
         cache[source_key] = (provider, provenance_record)
 
-    # ---- canonical scoring via formal extraction helpers ----
+    # ---- canonical scoring boundary — one try for the whole scoring path ----
+    message_width_in_bytes = int(
+        provider_info.get("canonical_config", {}).get(
+            "message_width_in_bytes", 32)
+    )
     try:
         result = evaluate_image(torch, provider, provider_info["pipe"],
                                 path, steps)
+        _validate_scoring_result(result, run_id)
+
+        raw = float(_canonical_raw_score("GS", result))
+        canonical = float(_canonical_canonical_score("GS", raw, result))
+
+        if not math.isfinite(raw):
+            raise ValueError("non-finite raw score")
+        if not math.isfinite(canonical):
+            raise ValueError("non-finite canonical score")
+
+        # Cross-validate: raw_score must equal bit accuracy
+        bit_val = float(result["bit_accuracies"][0])
+        if raw != bit_val:
+            raise ValueError(
+                f"raw_score ({raw}) != bit_accuracy ({bit_val})"
+            )
+
+        decoded_str = result["message_bits_str_list"][0]
+        _validate_decoded_bits(decoded_str, run_id, message_width_in_bytes)
+        decoded_sha = __import__("hashlib").sha256(
+            decoded_str.encode("ascii")
+        ).hexdigest()
     except FileNotFoundError:
+        raise
+    except DetectorScoringError:
         raise
     except Exception as exc:
         raise DetectorScoringError(
             f"GS scoring failed for {image_path}: "
             f"{type(exc).__name__}: {exc}"
         ) from exc
-
-    # Validate required scoring outputs
-    _validate_scoring_result(result, run_id)
-
-    raw = _canonical_raw_score("GS", result)
-    canonical = _canonical_canonical_score("GS", raw, result)
-
-    # Cross-validate: raw_score must equal bit_accuracy
-    bit_val = float(result["bit_accuracies"][0])
-    if raw != bit_val:
-        raise DetectorScoringError(
-            f"run_id={run_id}: raw_score ({raw}) != bit_accuracy "
-            f"({bit_val})"
-        )
-
-    decoded_str = result["message_bits_str_list"][0]
-    decoded_sha = __import__("hashlib").sha256(
-        decoded_str.encode("ascii")
-    ).hexdigest()
 
     # ---- official thresholds (fail closed) ----
     try:
@@ -712,6 +846,8 @@ def score_image(provider_info: dict[str, Any], image_path: str, *,
     # ---- provider config identity ----
     detector_config_hash = provider_info.get(
         "detector_provider_config_hash", "")
+    detector_pipe_hash = provider_info.get("detector_pipe_config_hash", "")
+    detection_policy_hash = provider_info.get("gs_detection_policy_hash", "")
     source_config_hash = str(canonical_metadata.get(
         "provider_config_hash", ""))
 
@@ -743,9 +879,11 @@ def score_image(provider_info: dict[str, Any], image_path: str, *,
             "detector_watermark_target_sha256"],
         "watermark_mask_sha256": provenance_record[
             "detector_watermark_mask_sha256"],
-        # provider config identity
+        # provider config identity — formal hash plus separate identities
         "source_provider_config_hash": source_config_hash,
         "detector_provider_config_hash": detector_config_hash,
+        "detector_pipe_config_hash": detector_pipe_hash,
+        "gs_detection_policy_hash": detection_policy_hash,
         # verification flags
         "gs_secret_verified": True,
         "gs_target_verified": True,

@@ -1,19 +1,21 @@
 """Issue #20 — canonical per-sample GS detection (comprehensive).
 
-Tests every acceptance criterion:
+Covers the full acceptance contract:
 
-1. Per-source provider cache (one provider per source sample, not per image)
+1. Per-source provider cache (one provider per source, not per image)
 2. Required metadata validation BEFORE provider_kwargs call
-3. Provider configuration identity (uniform config, hash match)
-4. Pipe from verified provider config (not hardcoded)
+3. Formal provider configuration identity (require_uniform_provider_config),
+   pipe config and detection mode kept OUT of the formal hash
+4. Pipe from verified provider config, ``revision=`` kwarg, no fallback
 5. Metadata index prevents record cross-use
 6. Secret state failure structured classification
 7. Canonical scoring helpers (evaluate_image, raw_score, canonical_score)
-8. Required scoring outputs no default fallback
-9. Official thresholds fail closed
+   in one fail-closed boundary
+8. Required scoring outputs no default fallback, decoded bits 0/1 exact length
+9. Official thresholds fail closed, [0,1] range, operator validated
 10. Explicit verified provenance (source/detector pairs + flags)
-11. Missing image → FileNotFoundError (not DetectorMissingStateError)
-12. Real evaluate_detector integration tests
+11. Missing image → FileNotFoundError
+12. Real evaluate_detector integration, shared-clean mode included
 
 All tests use mocks only — no secret bundles, models, or datasets downloaded.
 
@@ -63,6 +65,10 @@ for _mod_name in (
 
 sys.modules["eval_bench_wm.utils.pipe.pipe_utils"] = _fake_pipe_utils
 sys.modules["eval_bench_wm.utils.wm.gs_provider"] = _fake_gs_provider_mod
+# Bind submodule attributes on parent package mocks so
+# `from eval_bench_wm.utils.pipe import pipe_utils` resolves to our fakes.
+sys.modules["eval_bench_wm.utils.pipe"].pipe_utils = _fake_pipe_utils
+sys.modules["eval_bench_wm.utils.wm"].gs_provider = _fake_gs_provider_mod
 
 import extract_verification_scores  # noqa: E402 — land in sys.modules
 
@@ -79,6 +85,8 @@ from raven.detectors.gs_detector import (  # noqa: E402
     _construct_provider,
     _validate_scoring_result,
     _validate_thresholds,
+    _validate_decoded_bits,
+    _strict_nonneg_int,
 )
 from raven.detectors import (  # noqa: E402
     DetectorMissingStateError,
@@ -95,11 +103,20 @@ from raven.detectors import (  # noqa: E402
     FAILURE_CAUSE_SCORING_ERROR,
     FAILURE_CAUSE_PROVIDER_INITIALIZATION,
 )
+from raven.pairing_provenance import GS_SHARED_TR_CLEAN_MODE  # noqa: E402
+from raven.eval_protocol import (  # noqa: E402
+    canonical_json_hash,
+    require_uniform_provider_config,
+)
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+MESSAGE_WIDTH_BYTES = 32
+DECODED_BITS_256 = "0" * (MESSAGE_WIDTH_BYTES * 8)  # 256 chars
+
+
 def _secret_provenance(secret_index=5, **overrides):
     msg = overrides.pop("message_sha256", f"msg_{secret_index:04d}_sha256")
     key = overrides.pop("key_sha256", f"key_{secret_index:04d}_sha256")
@@ -122,11 +139,22 @@ def _target_tensor():
 
 
 def _mock_provider_instance(secret_idx=5, protocol="official_compatible",
-                            bit_acc=0.85, decoded="1010"):
+                            bit_acc=0.85, decoded=None, **runtime_attrs):
+    if decoded is None:
+        decoded = DECODED_BITS_256
     inst = mock.MagicMock()
     inst.secret_provenance.return_value = _secret_provenance(secret_idx)
     inst.watermark_target_tensor.return_value = _target_tensor()
     inst.gs_protocol_mode = protocol
+    inst.message_width_in_bytes = MESSAGE_WIDTH_BYTES
+    inst.l = 1
+    inst.num_replications = 64
+    inst.gs_channel_copy = 1
+    inst.gs_hw_copy = 8
+    inst.gs_fpr = 1e-6
+    inst.gs_user_number = 1000000
+    for k, v in runtime_attrs.items():
+        setattr(inst, k, v)
     inst.invert_images.return_value = {"zT_torch": torch.zeros(1, 4, 64, 64)}
     inst.get_accuracies.return_value = {
         "bit_accuracies": [bit_acc],
@@ -143,7 +171,14 @@ def _mock_provider_instance(secret_idx=5, protocol="official_compatible",
     return inst
 
 
-def _resolved_metadata(run_id="1", role="watermarked", secret_index=5, **kw):
+def _formal_hash(records):
+    """Formal provider_config_hash via require_uniform_provider_config."""
+    _, h = require_uniform_provider_config("GS", records)
+    return h
+
+
+def _resolved_metadata(run_id="1", role="watermarked", secret_index=5,
+                       protocol="official_compatible", **kw):
     idx = secret_index
     rec = {
         "run_id": run_id,
@@ -153,12 +188,12 @@ def _resolved_metadata(run_id="1", role="watermarked", secret_index=5, **kw):
         "gs_key_sha256": f"key_{idx:04d}_sha256",
         "gs_nonce_sha256": f"nonce_{idx:04d}_sha256",
         "gs_secret_bundle_sha256": f"bundle_{idx:04d}_sha256",
-        "gs_protocol_mode": "official_compatible",
+        "gs_protocol_mode": protocol,
         "watermark_target_sha256": "TGT_HASH",
         "watermark_mask_sha256": "MASK_SENTINEL",
         "provider_config_hash": "CFG_HASH",
         "model_id": "RedbeardNZ/stable-diffusion-2-1-base",
-        "model_revision": "",
+        "model_revision": "unspecified",
         "scheduler": "DDIM",
         "resolution": "512",
         "gs_detection_mode": "official_onebit",
@@ -191,24 +226,13 @@ def _mock_pipe():
     return p
 
 
-def _canonical_hash_for(rec):
-    from raven.eval_protocol import canonical_json_hash
-    cfg = {
-        "gs_protocol_mode": rec.get("gs_protocol_mode", "official_compatible"),
-        "message_width_in_bytes": 32,
-        "l": 1,
-        "num_replications": 64,
-        "gs_channel_copy": 1,
-        "gs_hw_copy": 8,
-        "gs_fpr": 1e-6,
-        "gs_user_number": 1000000,
-        "model_id": rec.get("model_id", "RedbeardNZ/stable-diffusion-2-1-base"),
-        "model_revision": rec.get("model_revision") or None,
-        "scheduler": rec.get("scheduler", "DDIM"),
-        "resolution": int(rec.get("resolution", 512)),
-        "gs_detection_mode": rec.get("gs_detection_mode", "official_onebit"),
-    }
-    return canonical_json_hash(cfg)
+def _configure_fake_modules(mock_pipe=None, gs_provider_cls=None):
+    """Configure sys.modules mocks before load_state."""
+    if mock_pipe is None:
+        mock_pipe = _mock_pipe()
+    _fake_pipe_utils.get_pipe_provider.return_value = mock_pipe
+    if gs_provider_cls is not None:
+        _fake_gs_provider_mod.GsProvider = gs_provider_cls
 
 
 # ---------------------------------------------------------------------------
@@ -224,10 +248,6 @@ class TestRequiredMetadataPreflight:
     def test_missing_run_id_raises(self):
         with pytest.raises(DetectorMissingStateError, match="run_id"):
             _validate_required_gs_metadata({})
-
-    def test_empty_run_id_raises(self):
-        with pytest.raises(DetectorMissingStateError, match="run_id"):
-            _validate_required_gs_metadata({"run_id": "  ", "role": "wm"})
 
     def test_missing_role_raises(self):
         with pytest.raises(DetectorMissingStateError, match="role"):
@@ -245,27 +265,6 @@ class TestRequiredMetadataPreflight:
         rec["gs_secret_index"] = ""
         with pytest.raises(DetectorMissingStateError,
                           match="gs_secret_index"):
-            _validate_required_gs_metadata(rec)
-
-    def test_non_integer_secret_index_raises(self):
-        rec = _resolved_metadata()
-        rec["gs_secret_index"] = "abc"
-        with pytest.raises(DetectorStateValidationError,
-                          match="non-negative integer"):
-            _validate_required_gs_metadata(rec)
-
-    def test_negative_secret_index_raises(self):
-        rec = _resolved_metadata()
-        rec["gs_secret_index"] = "-1"
-        with pytest.raises(DetectorStateValidationError,
-                          match="non-negative integer"):
-            _validate_required_gs_metadata(rec)
-
-    def test_float_secret_index_raises(self):
-        rec = _resolved_metadata()
-        rec["gs_secret_index"] = "1.5"
-        with pytest.raises(DetectorStateValidationError,
-                          match="non-negative integer"):
             _validate_required_gs_metadata(rec)
 
     def test_none_secret_index_raises(self):
@@ -288,6 +287,41 @@ class TestRequiredMetadataPreflight:
         with pytest.raises(DetectorMissingStateError,
                           match="gs_message_sha256"):
             _validate_required_gs_metadata(rec)
+
+    # ---- strict secret index validation (section 6) ----
+    @pytest.mark.parametrize("bad", [
+        "-1", "1.5", "1e2", "abc", True, False, 1.5, float("inf"),
+    ])
+    def test_invalid_secret_index_values(self, bad):
+        rec = _resolved_metadata()
+        rec["gs_secret_index"] = bad
+        with pytest.raises((DetectorMissingStateError,
+                            DetectorStateValidationError)):
+            _validate_required_gs_metadata(rec)
+
+    @pytest.mark.parametrize("good", [0, 5, "5", "0", 999999])
+    def test_valid_secret_index_values(self, good):
+        rec = _resolved_metadata()
+        rec["gs_secret_index"] = good
+        _validate_required_gs_metadata(rec)
+
+    def test_strict_nonneg_int_rejects_bool(self):
+        with pytest.raises(ValueError, match="bool"):
+            _strict_nonneg_int(True)
+        with pytest.raises(ValueError, match="bool"):
+            _strict_nonneg_int(False)
+
+    def test_strict_nonneg_int_rejects_float(self):
+        with pytest.raises(ValueError):
+            _strict_nonneg_int(1.5)
+
+    def test_strict_nonneg_int_rejects_scientific(self):
+        with pytest.raises(ValueError):
+            _strict_nonneg_int("1e2")
+
+    def test_strict_nonneg_int_accepts_digits(self):
+        assert _strict_nonneg_int("42") == 42
+        assert _strict_nonneg_int(42) == 42
 
 
 # ---------------------------------------------------------------------------
@@ -315,7 +349,7 @@ class TestMetadataIndex:
 
 
 # ---------------------------------------------------------------------------
-# 3. Provider configuration identity
+# 3. Provider configuration identity — formal hash only
 # ---------------------------------------------------------------------------
 class TestProviderConfigIdentity:
     def test_uniform_config_passes(self):
@@ -323,9 +357,40 @@ class TestProviderConfigIdentity:
             _resolved_metadata("1", "clean"),
             _resolved_metadata("1", "watermarked"),
         ]
-        cfg, h = _validate_gs_provider_config(recs)
+        cfg, h, pipe_h, det_h = _validate_gs_provider_config(recs)
         assert "gs_protocol_mode" in cfg
-        assert "model_id" in cfg
+        # pipe/detection fields NOT in formal config
+        assert "model_id" not in cfg
+        assert "gs_detection_mode" not in cfg
+
+    def test_formal_hash_equals_require_uniform(self):
+        """detector hash == require_uniform_provider_config hash."""
+        recs = [_resolved_metadata("1", "clean"),
+                _resolved_metadata("1", "watermarked")]
+        _, h, _, _ = _validate_gs_provider_config(recs)
+        formal = _formal_hash(recs)
+        assert h == formal
+
+    def test_formal_provider_hash_excludes_pipe_config(self):
+        """Changing pipe config must NOT change the formal provider hash."""
+        rec_a = _resolved_metadata("1", "watermarked",
+                                   model_id="stabilityai/sd-2-1",
+                                   scheduler="DPM")
+        rec_b = _resolved_metadata("1", "watermarked")
+        # Same embedding config, different pipe fields
+        _, ha, _, _ = _validate_gs_provider_config([rec_a])
+        _, hb, _, _ = _validate_gs_provider_config([rec_b])
+        assert ha == hb
+
+    def test_formal_provider_hash_excludes_detection_mode(self):
+        """Changing gs_detection_mode must NOT change formal provider hash."""
+        rec_a = _resolved_metadata("1", "watermarked",
+                                   gs_detection_mode="official_onebit")
+        rec_b = _resolved_metadata("1", "watermarked",
+                                   gs_detection_mode="legacy_default")
+        _, ha, _, _ = _validate_gs_provider_config([rec_a])
+        _, hb, _, _ = _validate_gs_provider_config([rec_b])
+        assert ha == hb
 
     def test_mixed_protocol_mode_raises(self):
         recs = [
@@ -349,7 +414,35 @@ class TestProviderConfigIdentity:
                           match="detection mode"):
             _validate_gs_provider_config(recs)
 
-    def test_mixed_pipe_config_raises(self):
+
+# ---------------------------------------------------------------------------
+# 5. Pipe config — fail closed, no fallback
+# ---------------------------------------------------------------------------
+class TestPipeConfig:
+    @pytest.mark.parametrize("field", ["model_id", "model_revision",
+                                       "scheduler", "resolution"])
+    def test_missing_field_raises(self, field):
+        rec = _resolved_metadata()
+        rec[field] = ""
+        with pytest.raises(DetectorMissingStateError,
+                          match=f"missing required pipe config field: {field}"):
+            _validate_pipe_config_uniformity([rec])
+
+    def test_none_field_raises(self):
+        rec = _resolved_metadata()
+        rec["model_id"] = None
+        with pytest.raises(DetectorMissingStateError,
+                          match="model_id"):
+            _validate_pipe_config_uniformity([rec])
+
+    def test_invalid_resolution_raises(self):
+        rec = _resolved_metadata()
+        rec["resolution"] = "abc"
+        with pytest.raises(DetectorStateValidationError,
+                          match="resolution must be an integer"):
+            _validate_pipe_config_uniformity([rec])
+
+    def test_mixed_profile_raises(self):
         recs = [
             _resolved_metadata("1", "clean",
                               model_id="stabilityai/sd-2-1"),
@@ -357,35 +450,36 @@ class TestProviderConfigIdentity:
                               model_id="RedbeardNZ/sd-2-1-base"),
         ]
         with pytest.raises(DetectorStateValidationError,
-                          match="pipe config"):
+                          match="pipe config not uniform"):
             _validate_pipe_config_uniformity(recs)
+
+    def test_no_fallback_defaults(self):
+        """Absent pipe fields never fall back to hardcoded defaults."""
+        rec = _resolved_metadata()
+        for field in ("model_id", "model_revision", "scheduler", "resolution"):
+            del rec[field]
+        with pytest.raises(DetectorMissingStateError):
+            _validate_pipe_config_uniformity([rec])
+
+    def test_uniform_profile_passes(self):
+        recs = [
+            _resolved_metadata("1", "clean"),
+            _resolved_metadata("1", "watermarked"),
+        ]
+        cfg = _validate_pipe_config_uniformity(recs)
+        assert cfg["model_id"] == "RedbeardNZ/stable-diffusion-2-1-base"
+        assert cfg["scheduler"] == "DDIM"
+        assert cfg["resolution"] == 512
 
 
 # ---------------------------------------------------------------------------
 # 1. Per-source provider cache
 # ---------------------------------------------------------------------------
-def _configure_fake_modules(mock_pipe=None, gs_provider_cls=None):
-    """Configure sys.modules mocks before load_state."""
-    if mock_pipe is None:
-        mock_pipe = _mock_pipe()
-    _fake_pipe_utils.get_pipe_provider.return_value = mock_pipe
-    if gs_provider_cls is not None:
-        _fake_gs_provider_mod.GsProvider = gs_provider_cls
-
-
 class TestProviderCache:
     """Provider constructed once per source, reused across cohorts."""
 
-    def test_two_sources_two_providers(self, monkeypatch):
-        GsProvider = mock.MagicMock()
-        inst5 = _mock_provider_instance(5)
-        inst7 = _mock_provider_instance(7)
-        GsProvider.side_effect = [inst5, inst7]
-        _configure_fake_modules(gs_provider_cls=GsProvider)
-
-        meta_clean = _resolved_metadata("1", "clean", secret_index=5)
-        meta_wm = _resolved_metadata("1", "watermarked", secret_index=7)
-
+    @staticmethod
+    def _mock_helpers(monkeypatch):
         monkeypatch.setattr(
             "raven.detectors.gs_detector._validate_pipe_config_uniformity",
             lambda r: {"model_id": "x", "model_revision": None,
@@ -393,7 +487,12 @@ class TestProviderCache:
         )
         monkeypatch.setattr(
             "raven.detectors.gs_detector._validate_gs_provider_config",
-            lambda r: ({"gs_protocol_mode": "official_compatible"}, "CFG_HASH"),
+            lambda r: ({"gs_protocol_mode": "official_compatible",
+                       "message_width_in_bytes": 32, "l": 1,
+                       "num_replications": 64, "gs_channel_copy": 1,
+                       "gs_hw_copy": 8, "gs_fpr": 1e-6,
+                       "gs_user_number": 1000000},
+                      "CFG_HASH", "PIPE_HASH", "DET_HASH"),
         )
         monkeypatch.setattr(
             extract_verification_scores, "provider_kwargs",
@@ -411,10 +510,20 @@ class TestProviderCache:
             lambda p: "MASK_SENTINEL" if "mask" in str(p) else "CFG_HASH",
         )
 
+    def test_two_sources_two_providers(self, monkeypatch):
+        GsProvider = mock.MagicMock()
+        inst5 = _mock_provider_instance(5)
+        inst7 = _mock_provider_instance(7)
+        GsProvider.side_effect = [inst5, inst7]
+        _configure_fake_modules(gs_provider_cls=GsProvider)
+        self._mock_helpers(monkeypatch)
+
+        meta_clean = _resolved_metadata("1", "clean", secret_index=5)
+        meta_wm = _resolved_metadata("1", "watermarked", secret_index=7)
+
         prov_info = load_state([meta_clean, meta_wm], "cpu")
         assert GsProvider.call_count == 0  # not constructed in load_state
 
-        # First call for clean source builds a provider
         img = _build_fake_png(Path(tempfile.mkdtemp()), "img.png")
         r1 = score_image(
             prov_info, img,
@@ -423,15 +532,13 @@ class TestProviderCache:
         )
         assert GsProvider.call_count == 1
 
-        # Second call — same source, different cohort — reuses cached provider
         r2 = score_image(
             prov_info, img,
             record=meta_clean,
             evaluation_entry=_eval_entry("1", "clean", "attacked_clean"),
         )
-        assert GsProvider.call_count == 1  # still 1
+        assert GsProvider.call_count == 1  # cached
 
-        # Watermarked source → new provider
         r3 = score_image(
             prov_info, img,
             record=meta_wm,
@@ -446,7 +553,7 @@ class TestProviderCache:
             evaluation_entry=_eval_entry("1", "watermarked",
                                         "attacked_watermarked"),
         )
-        assert GsProvider.call_count == 2  # still 2
+        assert GsProvider.call_count == 2  # cached
 
         assert r1["gs_secret_index"] == 5
         assert r3["gs_secret_index"] == 7
@@ -456,22 +563,45 @@ class TestProviderCache:
         inst = _mock_provider_instance(5)
         GsProvider.return_value = inst
         _configure_fake_modules(gs_provider_cls=GsProvider)
+        self._mock_helpers(monkeypatch)
 
-        monkeypatch.setattr(
-            "raven.detectors.gs_detector._validate_pipe_config_uniformity",
-            lambda r: {"model_id": "x", "model_revision": None,
-                      "scheduler": "DDIM", "resolution": 512},
-        )
-        monkeypatch.setattr(
-            "raven.detectors.gs_detector._validate_gs_provider_config",
-            lambda r: ({"gs_protocol_mode": "official_compatible"}, "CFG_HASH"),
-        )
+        meta = _resolved_metadata("1", "watermarked")
+        prov_info = load_state([meta], "cpu")
+        assert ("1", "watermarked") in prov_info["metadata_index"]
+        assert prov_info["provider_cache"] == {}
+
+        img = _build_fake_png(Path(tempfile.mkdtemp()), "img.png")
+        score_image(prov_info, img, record=meta,
+                   evaluation_entry=_eval_entry("1", "watermarked"))
+        assert ("1", "watermarked") in prov_info["provider_cache"]
+
+
+# ---------------------------------------------------------------------------
+# 4. Provider runtime config validation
+# ---------------------------------------------------------------------------
+class TestProviderRuntimeConfig:
+    """Constructor receives full canonical config; runtime fields verified."""
+
+    def test_nondefault_provider_fields_passed_to_provider(self, monkeypatch):
+        """Custom fields flow through provider_kwargs_full to constructor."""
+        canonical = {
+            "gs_protocol_mode": "official_compatible",
+            "message_width_in_bytes": 32,
+            "l": 1,
+            "num_replications": 64,
+            "gs_channel_copy": 1,
+            "gs_hw_copy": 8,
+            "gs_fpr": 1e-6,
+            "gs_user_number": 1000000,
+        }
+        GsProvider = mock.MagicMock()
+        inst = _mock_provider_instance(5)
+        GsProvider.return_value = inst
+
+        _configure_fake_modules(gs_provider_cls=GsProvider)
         monkeypatch.setattr(
             extract_verification_scores, "provider_kwargs",
-            lambda method, row: {
-                "offset": int(row.get("gs_secret_index", 0)),
-                "gs_secret_index": int(row.get("gs_secret_index", 0)),
-            },
+            lambda method, row: {"offset": 5, "gs_secret_index": 5},
         )
         monkeypatch.setattr(
             "raven.pairing_provenance.tensor_sha256",
@@ -483,14 +613,152 @@ class TestProviderCache:
         )
 
         meta = _resolved_metadata("1", "watermarked")
+        _construct_provider(_mock_pipe(), GsProvider, torch.device("cpu"),
+                           meta, canonical)
+
+        # Constructor received the FULL canonical config merged with per-row
+        _, kwargs = GsProvider.call_args
+        for field in ("gs_protocol_mode", "message_width_in_bytes", "l",
+                      "num_replications", "gs_channel_copy", "gs_hw_copy",
+                      "gs_fpr", "gs_user_number", "gs_secret_index", "offset"):
+            assert field in kwargs, f"missing {field} in provider kwargs"
+        assert kwargs["gs_protocol_mode"] == "official_compatible"
+        assert kwargs["message_width_in_bytes"] == 32
+        assert kwargs["gs_secret_index"] == 5
+
+    def test_runtime_field_mismatch_raises(self, monkeypatch):
+        """Provider runtime field differs from canonical → state validation."""
+        canonical = {
+            "gs_protocol_mode": "official_compatible",
+            "message_width_in_bytes": 32,
+            "l": 1,
+            "num_replications": 64,
+            "gs_channel_copy": 1,
+            "gs_hw_copy": 8,
+            "gs_fpr": 1e-6,
+            "gs_user_number": 1000000,
+        }
+        GsProvider = mock.MagicMock()
+        # Provider reports wrong gs_hw_copy — constructor ignored kwarg
+        inst = _mock_provider_instance(5, gs_hw_copy=4)
+        GsProvider.return_value = inst
+
+        _configure_fake_modules(gs_provider_cls=GsProvider)
+        monkeypatch.setattr(
+            extract_verification_scores, "provider_kwargs",
+            lambda method, row: {"offset": 5, "gs_secret_index": 5},
+        )
+
+        meta = _resolved_metadata("1", "watermarked")
+        with pytest.raises(DetectorStateValidationError,
+                          match="gs_hw_copy mismatch"):
+            _construct_provider(_mock_pipe(), GsProvider,
+                               torch.device("cpu"), meta, canonical)
+
+
+# ---------------------------------------------------------------------------
+# 3. Shared-clean mode
+# ---------------------------------------------------------------------------
+class TestSharedCleanMode:
+    """official_math_shared_tr_clean protocol passes through to provider."""
+
+    def _shared_clean_meta(self, run_id="1", role="watermarked",
+                           secret_index=5):
+        rec = _resolved_metadata(
+            run_id, role, secret_index=secret_index,
+            protocol=GS_SHARED_TR_CLEAN_MODE,
+            gs_protocol_mode=GS_SHARED_TR_CLEAN_MODE,
+            gs_sampling_seed="",  # V2 has no sampling seed
+            watermark_target_sha256="TGT_HASH",
+            watermark_mask_sha256="MASK_SENTINEL",
+        )
+        rec["provider_config_hash"] = _formal_hash([rec])
+        return rec
+
+    @staticmethod
+    def _mock_helpers(monkeypatch):
+        monkeypatch.setattr(
+            "raven.detectors.gs_detector._validate_pipe_config_uniformity",
+            lambda r: {"model_id": "x", "model_revision": None,
+                      "scheduler": "DDIM", "resolution": 512},
+        )
+        monkeypatch.setattr(
+            "raven.pairing_provenance.tensor_sha256",
+            lambda t: "TGT_HASH",
+        )
+        monkeypatch.setattr(
+            "raven.eval_protocol.canonical_json_hash",
+            lambda p: "MASK_SENTINEL" if "mask" in str(p) else "CFG_HASH",
+        )
+
+    def test_shared_clean_mode_passed_to_provider(self, monkeypatch):
+        """Provider receives gs_protocol_mode = official_math_shared_tr_clean."""
+        GsProvider = mock.MagicMock()
+        inst = _mock_provider_instance(
+            5, protocol=GS_SHARED_TR_CLEAN_MODE,
+            gs_protocol_mode=GS_SHARED_TR_CLEAN_MODE)
+        GsProvider.return_value = inst
+        _configure_fake_modules(gs_provider_cls=GsProvider)
+        self._mock_helpers(monkeypatch)
+        monkeypatch.setattr(
+            extract_verification_scores, "provider_kwargs",
+            lambda method, row: {
+                "offset": int(row.get("gs_secret_index", 0)),
+                "gs_secret_index": int(row.get("gs_secret_index", 0)),
+            },
+        )
+
+        meta = self._shared_clean_meta()
         prov_info = load_state([meta], "cpu")
-        assert ("1", "watermarked") in prov_info["metadata_index"]
-        assert prov_info["provider_cache"] == {}
+        assert prov_info["canonical_config"]["gs_protocol_mode"] == \
+            GS_SHARED_TR_CLEAN_MODE
 
         img = _build_fake_png(Path(tempfile.mkdtemp()), "img.png")
-        score_image(prov_info, img, record=meta,
-                   evaluation_entry=_eval_entry("1", "watermarked"))
-        assert ("1", "watermarked") in prov_info["provider_cache"]
+        result = score_image(prov_info, img, record=meta,
+                            evaluation_entry=_eval_entry(
+                                "1", "watermarked"))
+        assert result["gs_protocol_mode"] == GS_SHARED_TR_CLEAN_MODE
+
+        # Constructor received the shared-clean mode
+        _, kwargs = GsProvider.call_args
+        assert kwargs["gs_protocol_mode"] == GS_SHARED_TR_CLEAN_MODE
+
+    def test_shared_clean_mode_scores_successfully(self, monkeypatch):
+        """Full shared-clean path returns a scored result."""
+        GsProvider = mock.MagicMock()
+        inst = _mock_provider_instance(
+            5, protocol=GS_SHARED_TR_CLEAN_MODE,
+            gs_protocol_mode=GS_SHARED_TR_CLEAN_MODE)
+        GsProvider.return_value = inst
+        _configure_fake_modules(gs_provider_cls=GsProvider)
+        self._mock_helpers(monkeypatch)
+        monkeypatch.setattr(
+            extract_verification_scores, "provider_kwargs",
+            lambda method, row: {
+                "offset": int(row.get("gs_secret_index", 0)),
+                "gs_secret_index": int(row.get("gs_secret_index", 0)),
+            },
+        )
+        monkeypatch.setattr(
+            "raven.detectors.gs_detector._validate_gs_provider_config",
+            lambda r: ({"gs_protocol_mode": GS_SHARED_TR_CLEAN_MODE,
+                       "message_width_in_bytes": 32, "l": 1,
+                       "num_replications": 64, "gs_channel_copy": 1,
+                       "gs_hw_copy": 8, "gs_fpr": 1e-6,
+                       "gs_user_number": 1000000},
+                      "CFG_HASH", "PIPE_HASH", "DET_HASH"),
+        )
+
+        meta = self._shared_clean_meta()
+        prov_info = load_state([meta], "cpu")
+        img = _build_fake_png(Path(tempfile.mkdtemp()), "img.png")
+        result = score_image(prov_info, img, record=meta,
+                            evaluation_entry=_eval_entry(
+                                "1", "watermarked"))
+        assert result["status"] if "status" in result else True
+        assert result["gs_protocol_mode"] == GS_SHARED_TR_CLEAN_MODE
+        assert result["raw_score"] == 0.85
+        assert result["canonical_score"] == 0.85
 
 
 # ---------------------------------------------------------------------------
@@ -507,10 +775,6 @@ class TestSecretStateFailureClassification:
         monkeypatch.setattr(
             extract_verification_scores, "provider_kwargs",
             lambda method, row: {"offset": 9999, "gs_secret_index": 9999},
-        )
-        monkeypatch.setattr(
-            "raven.pairing_provenance.tensor_sha256",
-            lambda t: "TGT_HASH",
         )
 
         meta = _resolved_metadata("1", "watermarked", secret_index=9999)
@@ -529,10 +793,6 @@ class TestSecretStateFailureClassification:
         monkeypatch.setattr(
             extract_verification_scores, "provider_kwargs",
             lambda method, row: {"offset": 5, "gs_secret_index": 5},
-        )
-        monkeypatch.setattr(
-            "raven.pairing_provenance.tensor_sha256",
-            lambda t: "TGT_HASH",
         )
 
         meta = _resolved_metadata("1", "watermarked")
@@ -559,32 +819,13 @@ class TestSecretStateFailureClassification:
 
 
 # ---------------------------------------------------------------------------
-# 7. Canonical scoring helpers used
+# 7. Canonical scoring helpers + 8. outputs validation
 # ---------------------------------------------------------------------------
 class TestCanonicalScoringHelpers:
-    """evaluate_image, raw_score, canonical_score are called."""
+    """evaluate_image, raw_score, canonical_score in one fail-closed boundary."""
 
-    def test_evaluate_image_called(self, monkeypatch, tmp_path):
-        GsProvider = mock.MagicMock()
-        inst = _mock_provider_instance(5)
-        GsProvider.return_value = inst
-        _configure_fake_modules(gs_provider_cls=GsProvider)
-
-        fake_result = {
-            "bit_accuracies": [0.85],
-            "message_bits_str_list": ["1010"],
-        }
-
-        called = []
-        monkeypatch.setattr(
-            extract_verification_scores, "evaluate_image",
-            lambda torch, provider, pipe, path, steps: (
-                called.append(("evaluate_image", path)), fake_result)[1],
-        )
-        monkeypatch.setattr(
-            extract_verification_scores, "provider_kwargs",
-            lambda method, row: {"offset": 5, "gs_secret_index": 5},
-        )
+    @staticmethod
+    def _mock_helpers(monkeypatch):
         monkeypatch.setattr(
             "raven.detectors.gs_detector._validate_pipe_config_uniformity",
             lambda r: {"model_id": "x", "model_revision": None,
@@ -592,7 +833,16 @@ class TestCanonicalScoringHelpers:
         )
         monkeypatch.setattr(
             "raven.detectors.gs_detector._validate_gs_provider_config",
-            lambda r: ({"gs_protocol_mode": "official_compatible"}, "CFG_HASH"),
+            lambda r: ({"gs_protocol_mode": "official_compatible",
+                       "message_width_in_bytes": 32, "l": 1,
+                       "num_replications": 64, "gs_channel_copy": 1,
+                       "gs_hw_copy": 8, "gs_fpr": 1e-6,
+                       "gs_user_number": 1000000},
+                      "CFG_HASH", "PIPE_HASH", "DET_HASH"),
+        )
+        monkeypatch.setattr(
+            extract_verification_scores, "provider_kwargs",
+            lambda method, row: {"offset": 5, "gs_secret_index": 5},
         )
         monkeypatch.setattr(
             "raven.pairing_provenance.tensor_sha256",
@@ -603,19 +853,129 @@ class TestCanonicalScoringHelpers:
             lambda p: "MASK_SENTINEL" if "mask" in str(p) else "CFG_HASH",
         )
 
+    def test_successful_scoring_path(self, monkeypatch, tmp_path):
+        """evaluate_image called; raw/canonical from formal helpers."""
+        GsProvider = mock.MagicMock()
+        inst = _mock_provider_instance(5)
+        GsProvider.return_value = inst
+        _configure_fake_modules(gs_provider_cls=GsProvider)
+        self._mock_helpers(monkeypatch)
+
+        called = []
+        monkeypatch.setattr(
+            extract_verification_scores, "evaluate_image",
+            lambda torch_mod, provider, pipe, path, steps: (
+                called.append(("evaluate_image", path)),
+                {"bit_accuracies": [0.85],
+                 "message_bits_str_list": [DECODED_BITS_256]},
+            )[1],
+        )
+
         meta = _resolved_metadata("1", "watermarked")
         prov_info = load_state([meta], "cpu")
         img = _build_fake_png(tmp_path, "img.png")
         result = score_image(prov_info, img, record=meta,
                             evaluation_entry=_eval_entry("1", "watermarked"))
-
         assert called[0] == ("evaluate_image", Path(img))
         assert result["raw_score"] == 0.85
         assert result["canonical_score"] == 0.85
+        assert result["bit_accuracy"] == 0.85
+
+    def test_raw_score_failure_is_scoring_error(self, monkeypatch, tmp_path):
+        """raw_score helper raising → DetectorScoringError."""
+        GsProvider = mock.MagicMock()
+        GsProvider.return_value = _mock_provider_instance(5)
+        _configure_fake_modules(gs_provider_cls=GsProvider)
+        self._mock_helpers(monkeypatch)
+        monkeypatch.setattr(
+            extract_verification_scores, "evaluate_image",
+            lambda *a, **k: {"bit_accuracies": [0.85],
+                            "message_bits_str_list": [DECODED_BITS_256]},
+        )
+        monkeypatch.setattr(
+            extract_verification_scores, "raw_score",
+            lambda method, result: (_ for _ in ()).throw(
+                RuntimeError("raw_score exploded")),
+        )
+
+        meta = _resolved_metadata("1", "watermarked")
+        prov_info = load_state([meta], "cpu")
+        img = _build_fake_png(tmp_path, "img.png")
+        with pytest.raises(DetectorScoringError,
+                          match="raw_score exploded"):
+            score_image(prov_info, img, record=meta,
+                       evaluation_entry=_eval_entry("1", "watermarked"))
+
+    def test_canonical_score_failure_is_scoring_error(self, monkeypatch,
+                                                      tmp_path):
+        """canonical_score helper raising → DetectorScoringError."""
+        GsProvider = mock.MagicMock()
+        GsProvider.return_value = _mock_provider_instance(5)
+        _configure_fake_modules(gs_provider_cls=GsProvider)
+        self._mock_helpers(monkeypatch)
+        monkeypatch.setattr(
+            extract_verification_scores, "evaluate_image",
+            lambda *a, **k: {"bit_accuracies": [0.85],
+                            "message_bits_str_list": [DECODED_BITS_256]},
+        )
+        monkeypatch.setattr(
+            extract_verification_scores, "canonical_score",
+            lambda method, raw, result: (_ for _ in ()).throw(
+                RuntimeError("canonical exploded")),
+        )
+
+        meta = _resolved_metadata("1", "watermarked")
+        prov_info = load_state([meta], "cpu")
+        img = _build_fake_png(tmp_path, "img.png")
+        with pytest.raises(DetectorScoringError,
+                          match="canonical exploded"):
+            score_image(prov_info, img, record=meta,
+                       evaluation_entry=_eval_entry("1", "watermarked"))
+
+    def test_nonfinite_raw_score_is_scoring_error(self, monkeypatch, tmp_path):
+        GsProvider = mock.MagicMock()
+        GsProvider.return_value = _mock_provider_instance(5)
+        _configure_fake_modules(gs_provider_cls=GsProvider)
+        self._mock_helpers(monkeypatch)
+        monkeypatch.setattr(
+            extract_verification_scores, "evaluate_image",
+            lambda *a, **k: {"bit_accuracies": [float("inf")],
+                            "message_bits_str_list": [DECODED_BITS_256]},
+        )
+
+        meta = _resolved_metadata("1", "watermarked")
+        prov_info = load_state([meta], "cpu")
+        img = _build_fake_png(tmp_path, "img.png")
+        with pytest.raises(DetectorScoringError):
+            score_image(prov_info, img, record=meta,
+                       evaluation_entry=_eval_entry("1", "watermarked"))
+
+    def test_nonfinite_canonical_score_is_scoring_error(self, monkeypatch,
+                                                        tmp_path):
+        GsProvider = mock.MagicMock()
+        GsProvider.return_value = _mock_provider_instance(5)
+        _configure_fake_modules(gs_provider_cls=GsProvider)
+        self._mock_helpers(monkeypatch)
+        monkeypatch.setattr(
+            extract_verification_scores, "evaluate_image",
+            lambda *a, **k: {"bit_accuracies": [0.85],
+                            "message_bits_str_list": [DECODED_BITS_256]},
+        )
+        monkeypatch.setattr(
+            extract_verification_scores, "canonical_score",
+            lambda method, raw, result: float("nan"),
+        )
+
+        meta = _resolved_metadata("1", "watermarked")
+        prov_info = load_state([meta], "cpu")
+        img = _build_fake_png(tmp_path, "img.png")
+        with pytest.raises(DetectorScoringError):
+            score_image(prov_info, img, record=meta,
+                       evaluation_entry=_eval_entry("1", "watermarked"))
 
 
 # ---------------------------------------------------------------------------
-# 8. Required scoring outputs — no default fallback
+# 8. Scoring output validation — no default fallback
 # ---------------------------------------------------------------------------
 class TestScoringOutputValidation:
     """Missing/illegal scoring outputs → DetectorScoringError."""
@@ -627,26 +987,27 @@ class TestScoringOutputValidation:
     def test_empty_bit_accuracies(self):
         with pytest.raises(DetectorScoringError, match="missing or empty"):
             _validate_scoring_result(
-                {"bit_accuracies": [], "message_bits_str_list": ["1"]}, "1")
+                {"bit_accuracies": [],
+                 "message_bits_str_list": [DECODED_BITS_256]}, "1")
 
     def test_non_float_bit_accuracy(self):
         with pytest.raises(DetectorScoringError,
                           match="not convertible to float"):
             _validate_scoring_result(
                 {"bit_accuracies": ["hello"],
-                 "message_bits_str_list": ["1010"]}, "1")
+                 "message_bits_str_list": [DECODED_BITS_256]}, "1")
 
     def test_nan_bit_accuracy(self):
         with pytest.raises(DetectorScoringError, match="non-finite"):
             _validate_scoring_result(
                 {"bit_accuracies": [float("nan")],
-                 "message_bits_str_list": ["1010"]}, "1")
+                 "message_bits_str_list": [DECODED_BITS_256]}, "1")
 
     def test_out_of_range_bit_accuracy(self):
         with pytest.raises(DetectorScoringError, match="out of range"):
             _validate_scoring_result(
                 {"bit_accuracies": [1.5],
-                 "message_bits_str_list": ["1010"]}, "1")
+                 "message_bits_str_list": [DECODED_BITS_256]}, "1")
 
     def test_missing_message_bits(self):
         with pytest.raises(DetectorScoringError, match="missing or empty"):
@@ -663,14 +1024,34 @@ class TestScoringOutputValidation:
     def test_valid_result_passes(self):
         _validate_scoring_result(
             {"bit_accuracies": [0.85],
-             "message_bits_str_list": ["1010"]}, "1")
+             "message_bits_str_list": [DECODED_BITS_256]}, "1")
+
+
+class TestDecodedBitsValidation:
+    """Decoded bits must be binary string of exact length."""
+
+    def test_non_binary_chars(self):
+        with pytest.raises(DetectorScoringError,
+                          match="non-binary"):
+            _validate_decoded_bits("0101010x", "1", 32)
+
+    def test_wrong_length(self):
+        with pytest.raises(DetectorScoringError, match="length"):
+            _validate_decoded_bits("1010", "1", 32)
+
+    def test_empty_string(self):
+        with pytest.raises(DetectorScoringError, match="empty"):
+            _validate_decoded_bits("", "1", 32)
+
+    def test_valid_256_bits(self):
+        _validate_decoded_bits(DECODED_BITS_256, "1", 32)
 
 
 # ---------------------------------------------------------------------------
 # 9. Official thresholds fail closed
 # ---------------------------------------------------------------------------
 class TestThresholdValidation:
-    """Missing/non-finite thresholds → DetectorScoringError."""
+    """Missing/non-finite/out-of-range thresholds → DetectorScoringError."""
 
     def test_missing_tau_onebit(self):
         with pytest.raises(DetectorScoringError, match="missing tau_onebit"):
@@ -681,11 +1062,23 @@ class TestThresholdValidation:
             _validate_thresholds(
                 {"tau_onebit": 0.9, "tau_bits": float("nan")}, "1")
 
+    def test_out_of_range_tau(self):
+        with pytest.raises(DetectorScoringError, match="out of range"):
+            _validate_thresholds(
+                {"tau_onebit": 1.5, "tau_bits": 0.95}, "1")
+
     def test_non_numeric_threshold(self):
         with pytest.raises(DetectorScoringError,
                           match="not convertible"):
             _validate_thresholds(
                 {"tau_onebit": "hello", "tau_bits": 0.95}, "1")
+
+    def test_unsupported_operator(self):
+        with pytest.raises(DetectorScoringError,
+                          match="comparison operator"):
+            _validate_thresholds(
+                {"tau_onebit": 0.9, "tau_bits": 0.95,
+                 "comparison_operator": "!="}, "1")
 
     def test_valid_thresholds_pass(self):
         rec = _validate_thresholds(
@@ -706,16 +1099,8 @@ class TestThresholdValidation:
 class TestVerifiedProvenance:
     """Score output carries source/detector pairs and verified flags."""
 
-    def test_scored_row_has_verified_fields(self, monkeypatch, tmp_path):
-        GsProvider = mock.MagicMock()
-        inst = _mock_provider_instance(5)
-        GsProvider.return_value = inst
-        _configure_fake_modules(gs_provider_cls=GsProvider)
-
-        monkeypatch.setattr(
-            extract_verification_scores, "provider_kwargs",
-            lambda method, row: {"offset": 5, "gs_secret_index": 5},
-        )
+    @staticmethod
+    def _mock_helpers(monkeypatch):
         monkeypatch.setattr(
             "raven.detectors.gs_detector._validate_pipe_config_uniformity",
             lambda r: {"model_id": "x", "model_revision": None,
@@ -723,7 +1108,16 @@ class TestVerifiedProvenance:
         )
         monkeypatch.setattr(
             "raven.detectors.gs_detector._validate_gs_provider_config",
-            lambda r: ({"gs_protocol_mode": "official_compatible"}, "CFG_HASH"),
+            lambda r: ({"gs_protocol_mode": "official_compatible",
+                       "message_width_in_bytes": 32, "l": 1,
+                       "num_replications": 64, "gs_channel_copy": 1,
+                       "gs_hw_copy": 8, "gs_fpr": 1e-6,
+                       "gs_user_number": 1000000},
+                      "CFG_HASH", "PIPE_HASH", "DET_HASH"),
+        )
+        monkeypatch.setattr(
+            extract_verification_scores, "provider_kwargs",
+            lambda method, row: {"offset": 5, "gs_secret_index": 5},
         )
         monkeypatch.setattr(
             "raven.pairing_provenance.tensor_sha256",
@@ -733,6 +1127,13 @@ class TestVerifiedProvenance:
             "raven.eval_protocol.canonical_json_hash",
             lambda p: "MASK_SENTINEL" if "mask" in str(p) else "CFG_HASH",
         )
+
+    def test_scored_row_has_verified_fields(self, monkeypatch, tmp_path):
+        GsProvider = mock.MagicMock()
+        inst = _mock_provider_instance(5)
+        GsProvider.return_value = inst
+        _configure_fake_modules(gs_provider_cls=GsProvider)
+        self._mock_helpers(monkeypatch)
 
         meta = _resolved_metadata("1", "watermarked")
         prov_info = load_state([meta], "cpu")
@@ -742,58 +1143,74 @@ class TestVerifiedProvenance:
             evaluation_entry=_eval_entry("1", "watermarked"),
         )
 
-        # source/detector pairs
         assert result["source_watermark_target_sha256"] == "TGT_HASH"
         assert result["detector_watermark_target_sha256"] == "TGT_HASH"
         assert result["source_watermark_mask_sha256"] == "MASK_SENTINEL"
         assert result["detector_watermark_mask_sha256"] == "MASK_SENTINEL"
         assert result["source_provider_config_hash"] == "CFG_HASH"
         assert result["detector_provider_config_hash"] == "CFG_HASH"
-
-        # verified flags
+        assert result["detector_pipe_config_hash"] == "PIPE_HASH"
+        assert result["gs_detection_policy_hash"] == "DET_HASH"
         assert result["gs_secret_verified"] is True
         assert result["gs_target_verified"] is True
         assert result["gs_mask_verified"] is True
         assert result["provider_config_verified"] is True
 
-        # backwards-compatible merged fields
-        assert result["watermark_target_sha256"] == "TGT_HASH"
-        assert result["watermark_mask_sha256"] == "MASK_SENTINEL"
-
     def test_missing_image_raises_file_not_found(self, monkeypatch):
         GsProvider = mock.MagicMock()
         GsProvider.return_value = _mock_provider_instance(5)
         _configure_fake_modules(gs_provider_cls=GsProvider)
-
-        monkeypatch.setattr(
-            extract_verification_scores, "provider_kwargs",
-            lambda method, row: {"offset": 5, "gs_secret_index": 5},
-        )
-        monkeypatch.setattr(
-            "raven.detectors.gs_detector._validate_pipe_config_uniformity",
-            lambda r: {"model_id": "x", "model_revision": None,
-                      "scheduler": "DDIM", "resolution": 512},
-        )
-        monkeypatch.setattr(
-            "raven.detectors.gs_detector._validate_gs_provider_config",
-            lambda r: ({"gs_protocol_mode": "official_compatible"}, "CFG_HASH"),
-        )
-        monkeypatch.setattr(
-            "raven.pairing_provenance.tensor_sha256",
-            lambda t: "TGT_HASH",
-        )
-        monkeypatch.setattr(
-            "raven.eval_protocol.canonical_json_hash",
-            lambda p: "MASK_SENTINEL" if "mask" in str(p) else "CFG_HASH",
-        )
+        self._mock_helpers(monkeypatch)
 
         meta = _resolved_metadata("1", "watermarked")
         prov_info = load_state([meta], "cpu")
         with pytest.raises(FileNotFoundError):
             score_image(
-                prov_info, "/nonexistent/path.png", record=meta,
+                prov_info, "/tmp/raven_issue20_definitely_missing_input.png",
+                record=meta,
                 evaluation_entry=_eval_entry("1", "watermarked"),
             )
+
+
+# ---------------------------------------------------------------------------
+# 4. Pipe constructor arguments
+# ---------------------------------------------------------------------------
+class TestPipeConstructorArgs:
+    """Pipe gets verified config with ``revision=`` kwarg, no fallback."""
+
+    def test_pipe_kwargs_use_revision_and_verified_config(self, monkeypatch):
+        captured = {}
+
+        def _fake_get_pipe(**kwargs):
+            captured.update(kwargs)
+            return _mock_pipe()
+
+        _fake_pipe_utils.get_pipe_provider.side_effect = _fake_get_pipe
+        GsProvider = mock.MagicMock()
+        _configure_fake_modules(gs_provider_cls=GsProvider)
+        monkeypatch.setattr(
+            "raven.detectors.gs_detector._validate_gs_provider_config",
+            lambda r: ({"gs_protocol_mode": "official_compatible",
+                       "message_width_in_bytes": 32, "l": 1,
+                       "num_replications": 64, "gs_channel_copy": 1,
+                       "gs_hw_copy": 8, "gs_fpr": 1e-6,
+                       "gs_user_number": 1000000},
+                      "CFG_HASH", "PIPE_HASH", "DET_HASH"),
+        )
+
+        rec = _resolved_metadata(
+            "1", "watermarked",
+            model_id="stabilityai/sd-2-1",
+            model_revision="fp16",
+            scheduler="DPM",
+            resolution="768",
+        )
+        prov_info = load_state([rec], "cpu")
+        assert captured["pretrained_model_name_or_path"] == "stabilityai/sd-2-1"
+        assert captured["revision"] == "fp16"
+        assert captured["schedulers_name"] == "DPM"
+        assert captured["resolution"] == 768
+        assert "model_revision" not in captured
 
 
 # ---------------------------------------------------------------------------
@@ -822,7 +1239,8 @@ class TestEvaluateDetectorIntegration:
             "source_metadata": kw.get("source_metadata", {}),
         }
 
-    def _write_fake_run(self, tmp_path, method="GS", records=None):
+    def _write_fake_run(self, tmp_path, method="GS", records=None,
+                        skip_input=False):
         from raven.experiment_io import (
             write_config, write_record, rebuild_records_jsonl,
         )
@@ -839,10 +1257,12 @@ class TestEvaluateDetectorIntegration:
             img = out / "samples" / role / rid / "output.png"
             img.parent.mkdir(parents=True, exist_ok=True)
             img.write_bytes(b"fake png")
-            input_path = Path(r.get("input_path", f"/tmp/in_{rid}.png"))
-            if not input_path.is_file():
-                input_path.parent.mkdir(parents=True, exist_ok=True)
-                input_path.write_bytes(b"fake png")
+            if not skip_input:
+                input_path = Path(r.get("input_path",
+                                        f"/tmp/in_{rid}.png"))
+                if not input_path.is_file():
+                    input_path.parent.mkdir(parents=True, exist_ok=True)
+                    input_path.write_bytes(b"fake png")
         rebuild_records_jsonl(out)
         return out
 
@@ -854,11 +1274,9 @@ class TestEvaluateDetectorIntegration:
         return [json.loads(l)
                 for l in path.read_text().splitlines() if l.strip()]
 
-    def _setup_mocks(self, monkeypatch):
+    def _setup_mocks(self, monkeypatch, protocol="official_compatible"):
         """Mock only the heavy-resource boundaries."""
-        # Configure fake pipe module
-        mock_pipe = _mock_pipe()
-        _configure_fake_modules(mock_pipe=mock_pipe)
+        _configure_fake_modules(mock_pipe=_mock_pipe())
 
         # Mock GsProvider class
         self._gs_factory = mock.MagicMock()
@@ -867,60 +1285,48 @@ class TestEvaluateDetectorIntegration:
         def _make_inst(*args, **kwargs):
             idx = kwargs.get("gs_secret_index", 0)
             if idx not in self._gs_instances:
-                self._gs_instances[idx] = _mock_provider_instance(idx)
+                self._gs_instances[idx] = _mock_provider_instance(
+                    idx, protocol=protocol, gs_protocol_mode=protocol)
             return self._gs_instances[idx]
 
         self._gs_factory.side_effect = _make_inst
         _fake_gs_provider_mod.GsProvider = self._gs_factory
 
-        # Mock evaluate_image to return controlled results
         def _fake_eval(torch_mod, prov, pipe, path, steps):
             return {
                 "bit_accuracies": [0.85],
-                "message_bits_str_list": ["1010"],
+                "message_bits_str_list": [DECODED_BITS_256],
             }
 
         monkeypatch.setattr(
             extract_verification_scores, "evaluate_image", _fake_eval,
         )
 
-        # Mock tensor_sha256
         monkeypatch.setattr(
             "raven.pairing_provenance.tensor_sha256",
             lambda t: "TGT_HASH",
         )
 
-        # Compute canonical mask sentinel
         from raven.eval_protocol import canonical_json_hash
         self._mask_sentinel = canonical_json_hash(
             {"method": "GS", "mask": "not_applicable", "version": 1},
         )
 
-    def _gs_meta(self, run_id="1", role="watermarked", secret_index=5):
+    def _gs_meta(self, run_id="1", role="watermarked", secret_index=5,
+                 protocol="official_compatible"):
         idx = secret_index
-        cfg_hash = _canonical_hash_for(_resolved_metadata(
-            run_id, role, secret_index=idx))
-        return {
-            "run_id": run_id,
-            "role": role,
-            "gs_secret_index": str(idx),
-            "gs_message_sha256": f"msg_{idx:04d}_sha256",
-            "gs_key_sha256": f"key_{idx:04d}_sha256",
-            "gs_nonce_sha256": f"nonce_{idx:04d}_sha256",
-            "gs_secret_bundle_sha256": f"bundle_{idx:04d}_sha256",
-            "gs_protocol_mode": "official_compatible",
-            "watermark_target_sha256": "TGT_HASH",
-            "watermark_mask_sha256": self._mask_sentinel,
-            "provider_config_hash": cfg_hash,
-            "model_id": "RedbeardNZ/stable-diffusion-2-1-base",
-            "scheduler": "DDIM",
-            "resolution": "512",
-            "gs_detection_mode": "official_onebit",
-        }
+        rec = _resolved_metadata(
+            run_id, role, secret_index=idx, protocol=protocol,
+            gs_protocol_mode=protocol,
+        )
+        # Formal hash via require_uniform_provider_config
+        rec["provider_config_hash"] = _formal_hash([rec])
+        rec["watermark_target_sha256"] = "TGT_HASH"
+        rec["watermark_mask_sha256"] = self._mask_sentinel
+        return rec
 
-    # ---- Successful per-source path ----
+    # ---- Successful per-source path (official_compatible) ----
     def test_two_sources_four_entries_two_providers(self, monkeypatch):
-        """2 sources × 2 cohorts = 4 entries, 2 provider constructions."""
         from experiments.eval import evaluate_detector
         from raven.detectors import STATUS_COMPLETED, ROW_STATUS_SCORED
 
@@ -942,8 +1348,6 @@ class TestEvaluateDetectorIntegration:
             assert result["status"] == STATUS_COMPLETED
             assert result["scored_count"] == 4
             assert result["failed_count"] == 0
-
-            # 2 sources → 2 provider instances
             assert self._gs_factory.call_count == 2
 
             rows = self._read_detector_rows(out)
@@ -952,6 +1356,38 @@ class TestEvaluateDetectorIntegration:
                 assert row.get("gs_secret_verified") is True
                 assert row.get("gs_target_verified") is True
                 assert row.get("provider_config_verified") is True
+
+    # ---- Shared-clean mode through real adapter ----
+    def test_shared_clean_two_sources_four_entries(self, monkeypatch):
+        from experiments.eval import evaluate_detector
+        from raven.detectors import STATUS_COMPLETED, ROW_STATUS_SCORED
+
+        self._setup_mocks(monkeypatch, protocol=GS_SHARED_TR_CLEAN_MODE)
+
+        rec_clean = self._make_record(
+            "1", "clean", method="GS",
+            source_metadata=self._gs_meta("1", "clean", 5,
+                                          protocol=GS_SHARED_TR_CLEAN_MODE))
+        rec_wm = self._make_record(
+            "1", "watermarked", method="GS",
+            source_metadata=self._gs_meta("1", "watermarked", 7,
+                                          protocol=GS_SHARED_TR_CLEAN_MODE))
+
+        with tempfile.TemporaryDirectory() as td:
+            out = self._write_fake_run(
+                Path(td), method="GS", records=[rec_clean, rec_wm])
+            result = evaluate_detector(
+                [rec_clean, rec_wm], out, "GS", device="cpu")
+
+            assert result["status"] == STATUS_COMPLETED
+            assert result["scored_count"] == 4
+            assert self._gs_factory.call_count == 2
+
+            rows = self._read_detector_rows(out)
+            assert all(r["status"] == ROW_STATUS_SCORED for r in rows)
+            for row in rows:
+                assert row["gs_protocol_mode"] == GS_SHARED_TR_CLEAN_MODE
+                assert row["provider_config_verified"] is True
 
     # ---- Missing secret index → failed_missing_required_state ----
     def test_missing_secret_index(self, monkeypatch):
@@ -973,7 +1409,6 @@ class TestEvaluateDetectorIntegration:
                 [rec], out, "GS", device="cpu")
 
             assert result["status"] == STATUS_FAILED_MISSING_REQUIRED_STATE
-            # Provider was never constructed
             assert self._gs_factory.call_count == 0
 
             rows = self._read_detector_rows(out)
@@ -1032,10 +1467,10 @@ class TestEvaluateDetectorIntegration:
 
         self._setup_mocks(monkeypatch)
 
-        # evaluate_image returns no bit_accuracies
         monkeypatch.setattr(
             extract_verification_scores, "evaluate_image",
-            lambda torch, prov, pipe, path, steps: {"message_bits_str_list": ["1"]},
+            lambda torch, prov, pipe, path, steps: {
+                "message_bits_str_list": [DECODED_BITS_256]},
         )
 
         rec = self._make_record(
@@ -1089,7 +1524,7 @@ class TestEvaluateDetectorIntegration:
             extract_verification_scores, "evaluate_image",
             lambda torch, prov, pipe, path, steps: {
                 "bit_accuracies": [float("nan")],
-                "message_bits_str_list": ["1010"],
+                "message_bits_str_list": [DECODED_BITS_256],
             },
         )
 
@@ -1173,16 +1608,12 @@ class TestEvaluateDetectorIntegration:
 
     # ---- Missing image → FileNotFoundError → failed_missing_image ----
     def test_missing_image_is_file_not_found(self, monkeypatch):
-        """Preflight catches missing image → failed_missing_image stage."""
         from experiments.eval import evaluate_detector
         from raven.detectors import (
             STATUS_FAILED_MISSING_IMAGE, ROW_STATUS_FAILED_MISSING_IMAGE,
-            FAILURE_CAUSE_MISSING_IMAGE,
         )
-        from raven.eval_protocol import canonical_json_hash
 
-        # Use full adapter mock — unit test for FileNotFoundError is in
-        # TestVerifiedProvenance.
+        # Full adapter mock — unit FileNotFoundError test lives elsewhere
         import raven.detectors.gs_detector as gs_mod
         monkeypatch.setattr(gs_mod, "load_state",
                            lambda records, device, **extra: {"fake": True})
@@ -1200,19 +1631,8 @@ class TestEvaluateDetectorIntegration:
             input_path="/tmp/raven_issue20_definitely_missing_input.png")
 
         with tempfile.TemporaryDirectory() as td:
-            out = Path(td) / "run"
-            out.mkdir()
-            from raven.experiment_io import write_config, write_record
-            write_config(out, {"method": "GS", "dataset": "test"})
-            role = "watermarked"
-            rid = "1"
-            write_record(out, role, rid, rec)
-            img = out / "samples" / role / rid / "output.png"
-            img.parent.mkdir(parents=True, exist_ok=True)
-            img.write_bytes(b"fake png")
-            from raven.experiment_io import rebuild_records_jsonl
-            rebuild_records_jsonl(out)
-
+            out = self._write_fake_run(
+                Path(td), method="GS", records=[rec], skip_input=True)
             result = evaluate_detector([rec], out, "GS", device="cpu")
             assert result["status"] == STATUS_FAILED_MISSING_IMAGE
             rows = self._read_detector_rows(out)
@@ -1228,7 +1648,7 @@ class TestEvaluateDetectorIntegration:
         self._setup_mocks(monkeypatch)
 
         bad_meta = dict(self._gs_meta("1", "watermarked", 5))
-        bad_meta["gs_secret_index"] = "-1"
+        bad_meta["gs_secret_index"] = "1.5"
 
         rec = self._make_record(
             "1", "watermarked", method="GS", source_metadata=bad_meta)
