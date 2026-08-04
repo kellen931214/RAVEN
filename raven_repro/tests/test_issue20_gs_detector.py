@@ -1750,38 +1750,83 @@ class TestDecodedBitsValidation:
 class TestThresholdValidation:
     """Missing/non-finite/out-of-range thresholds → DetectorScoringError."""
 
+    @staticmethod
+    def _full():
+        return {"tau_onebit": 0.9, "tau_bits": 0.95,
+                "fpr": 1e-6, "user_number": 1000000,
+                "comparison_operator": ">=", "source": "test"}
+
     def test_missing_tau_onebit(self):
-        with pytest.raises(DetectorScoringError, match="missing tau_onebit"):
+        with pytest.raises(DetectorScoringError,
+                          match="missing required fields"):
             _validate_thresholds({"tau_bits": 0.95}, "1")
 
     def test_nan_tau_bits(self):
         with pytest.raises(DetectorScoringError, match="non-finite"):
             _validate_thresholds(
-                {"tau_onebit": 0.9, "tau_bits": float("nan")}, "1")
+                {**self._full(), "tau_bits": float("nan")}, "1")
 
     def test_out_of_range_tau(self):
         with pytest.raises(DetectorScoringError, match="out of range"):
             _validate_thresholds(
-                {"tau_onebit": 1.5, "tau_bits": 0.95}, "1")
+                {**self._full(), "tau_onebit": 1.5}, "1")
 
     def test_non_numeric_threshold(self):
         with pytest.raises(DetectorScoringError,
                           match="not convertible"):
             _validate_thresholds(
-                {"tau_onebit": "hello", "tau_bits": 0.95}, "1")
+                {**self._full(), "tau_onebit": "hello"}, "1")
+
+    def test_thresholds_not_a_dict(self):
+        with pytest.raises(DetectorScoringError, match="must be a dict"):
+            _validate_thresholds(None, "1")
+        with pytest.raises(DetectorScoringError, match="must be a dict"):
+            _validate_thresholds([0.9, 0.95], "1")
+
+    @pytest.mark.parametrize("field", ["fpr", "user_number",
+                                       "comparison_operator", "source"])
+    def test_missing_required_field(self, field):
+        d = self._full()
+        del d[field]
+        with pytest.raises(DetectorScoringError,
+                          match="missing required fields"):
+            _validate_thresholds(d, "1")
+
+    def test_invalid_fpr_zero(self):
+        with pytest.raises(DetectorScoringError, match="0 < fpr <= 1"):
+            _validate_thresholds({**self._full(), "fpr": 0.0}, "1")
+
+    def test_invalid_fpr_negative(self):
+        with pytest.raises(DetectorScoringError, match="0 < fpr <= 1"):
+            _validate_thresholds({**self._full(), "fpr": -1e-6}, "1")
+
+    def test_invalid_fpr_nan(self):
+        with pytest.raises(DetectorScoringError, match="non-finite"):
+            _validate_thresholds({**self._full(), "fpr": float("nan")}, "1")
+
+    @pytest.mark.parametrize("bad", [1.5, True, "1000000.0", -5, "abc"])
+    def test_invalid_user_number(self, bad):
+        with pytest.raises(DetectorScoringError,
+                          match="positive integer"):
+            _validate_thresholds({**self._full(), "user_number": bad}, "1")
 
     def test_unsupported_operator(self):
         with pytest.raises(DetectorScoringError,
-                          match="comparison operator"):
+                          match="must be '>='"):
             _validate_thresholds(
-                {"tau_onebit": 0.9, "tau_bits": 0.95,
-                 "comparison_operator": "!="}, "1")
+                {**self._full(), "comparison_operator": "!="}, "1")
+        with pytest.raises(DetectorScoringError,
+                          match="must be '>='"):
+            _validate_thresholds(
+                {**self._full(), "comparison_operator": ">"}, "1")
+
+    def test_empty_source(self):
+        with pytest.raises(DetectorScoringError,
+                          match="non-empty string"):
+            _validate_thresholds({**self._full(), "source": ""}, "1")
 
     def test_valid_thresholds_pass(self):
-        rec = _validate_thresholds(
-            {"tau_onebit": 0.9, "tau_bits": 0.95,
-             "fpr": 1e-6, "user_number": 1000000,
-             "comparison_operator": ">=", "source": "test"}, "1")
+        rec = _validate_thresholds(self._full(), "1")
         assert rec["gs_official_tau_onebit"] == 0.9
         assert rec["gs_official_tau_bits"] == 0.95
         assert rec["gs_official_fpr"] == 1e-6
@@ -2337,6 +2382,74 @@ class TestEvaluateDetectorIntegration:
             assert ("original_watermarked",
                     ROW_STATUS_FAILED_MISSING_IMAGE) in statuses
 
+    # ---- Aggregate failure propagates to detector stage status ----
+    def test_aggregate_failure_propagates_to_detector_stage(self, monkeypatch):
+        """Malformed policy rows → aggregate failure → stage
+        STATUS_FAILED_STATE_VALIDATION, not completed."""
+        from experiments.eval import evaluate_detector
+        from raven.detectors import STATUS_FAILED_STATE_VALIDATION
+
+        self._setup_mocks(monkeypatch)
+        self._mask_sentinel = canonical_json_hash(
+            {"method": "GS", "mask": "not_applicable", "version": 1})
+
+        import raven.detectors.gs_detector as gs_mod
+        monkeypatch.setattr(gs_mod, "load_state",
+                           lambda records, device, **extra: {"fake": True})
+
+        def _bad_policy_score(*a, **kw):
+            return {
+                "raw_score": 0.85,
+                "canonical_score": 0.85,
+                "gs_detection_mode": "official_onebit",
+                "gs_active_threshold": None,  # invalid value
+                "gs_active_threshold_type": "official_beta_tail_tau_onebit",
+                "gs_active_comparison_operator": ">=",
+                "gs_active_nominal_fpr": 1e-6,
+                "gs_active_calibrated_from_current_clean_negatives": False,
+                "gs_detection_success": True,
+                "gs_official_tau_onebit": 0.9,
+                "gs_official_tau_bits": 0.95,
+                "gs_official_fpr": 1e-6,
+                "gs_official_user_number": 1000000,
+                "gs_official_comparison_operator": ">=",
+                "gs_official_source": "test",
+                "gs_detection_policy_hash": "POLICY_HASH",
+            }
+
+        monkeypatch.setattr(gs_mod, "score_image", _bad_policy_score)
+
+        rec = self._make_record(
+            "1", "watermarked", method="GS",
+            source_metadata=self._gs_meta("1", "watermarked", 5))
+
+        with tempfile.TemporaryDirectory() as td:
+            out = self._write_fake_run(
+                Path(td), method="GS", records=[rec])
+            result = evaluate_detector(
+                [rec], out, "GS", device="cpu")
+
+            # Aggregate failed closed on the malformed policy value...
+            assert result.get("gs_official_detection_summary_status") == \
+                "failed_state_validation"
+            assert result.get("aggregate_failure_cause") == \
+                FAILURE_CAUSE_STATE_VALIDATION
+            # ...and that failure determines the final detector stage status.
+            assert result["status"] == STATUS_FAILED_STATE_VALIDATION
+            assert result["dominant_failure_cause"] == \
+                FAILURE_CAUSE_STATE_VALIDATION
+            assert result["available"] is True  # scored output exists
+            # Nonzero exit code (determine_exit_code).
+            from raven.detectors import determine_exit_code
+            exit_code = determine_exit_code(
+                {"stages": {"detector": result}},
+                allow_missing_metrics=False)
+            assert exit_code == 2
+            exit_code_allow = determine_exit_code(
+                {"stages": {"detector": result}},
+                allow_missing_metrics=True)
+            assert exit_code_allow == 2
+
     # ---- Non-integer secret index → state_validation (preflight) ----
     def test_invalid_secret_index_is_state_validation(self, monkeypatch):
         from experiments.eval import evaluate_detector
@@ -2415,6 +2528,7 @@ class TestAggregate:
             "gs_official_fpr": fpr,
             "gs_official_user_number": user_number,
             "gs_official_comparison_operator": op,
+            "gs_official_source": "test",
             "gs_detection_policy_hash": policy_hash,
         }
         row.update(overrides)
@@ -2454,6 +2568,81 @@ class TestAggregate:
         assert result["gs_official_detection_summary_status"] == \
             "failed_state_validation"
         assert "gs_official_detection_summary" not in result
+        assert result["aggregate_failure_cause"] == \
+            FAILURE_CAUSE_STATE_VALIDATION
+
+    def test_aggregate_calibrated_string_false_fails_closed(self):
+        """calibrated='false' (string) → failed_state_validation."""
+        rows = [
+            self._policy_row("original_watermarked", True),
+            self._policy_row("attacked_watermarked", True,
+                             gs_active_calibrated_from_current_clean_negatives="false"),
+        ]
+        result = aggregate(rows)
+        assert result["gs_official_detection_summary_status"] == \
+            "failed_state_validation"
+        assert result["aggregate_failure_cause"] == \
+            FAILURE_CAUSE_STATE_VALIDATION
+
+    def test_aggregate_threshold_none_fails_closed(self):
+        rows = [
+            self._policy_row("original_watermarked", True,
+                             threshold=None),
+            self._policy_row("attacked_watermarked", True),
+        ]
+        result = aggregate(rows)
+        assert result["gs_official_detection_summary_status"] == \
+            "failed_state_validation"
+
+    def test_aggregate_threshold_nan_fails_closed(self):
+        rows = [
+            self._policy_row("original_watermarked", True,
+                             threshold=float("nan")),
+            self._policy_row("attacked_watermarked", True),
+        ]
+        result = aggregate(rows)
+        assert result["gs_official_detection_summary_status"] == \
+            "failed_state_validation"
+
+    def test_aggregate_invalid_operator_fails_closed(self):
+        """official_onebit with '>' operator in a scored row → fail."""
+        rows = [
+            self._policy_row("original_watermarked", True, op=">"),
+            self._policy_row("attacked_watermarked", True),
+        ]
+        result = aggregate(rows)
+        assert result["gs_official_detection_summary_status"] == \
+            "failed_state_validation"
+
+    def test_aggregate_invalid_threshold_type_fails_closed(self):
+        rows = [
+            self._policy_row("original_watermarked", True,
+                             gs_active_threshold_type="legacy_default_threshold"),
+            self._policy_row("attacked_watermarked", True),
+        ]
+        result = aggregate(rows)
+        assert result["gs_official_detection_summary_status"] == \
+            "failed_state_validation"
+
+    def test_aggregate_invalid_user_number_fails_closed(self):
+        rows = [
+            self._policy_row("original_watermarked", True,
+                             user_number=1.5),
+            self._policy_row("attacked_watermarked", True),
+        ]
+        result = aggregate(rows)
+        assert result["gs_official_detection_summary_status"] == \
+            "failed_state_validation"
+
+    def test_aggregate_missing_official_source_fails_closed(self):
+        rows = [
+            self._policy_row("original_watermarked", True),
+            dict(self._policy_row("attacked_watermarked", True),
+                 **{"gs_official_source": ""}),
+        ]
+        result = aggregate(rows)
+        assert result["gs_official_detection_summary_status"] == \
+            "failed_state_validation"
 
     def test_aggregate_mixed_official_tau_fails_closed(self):
         rows = [

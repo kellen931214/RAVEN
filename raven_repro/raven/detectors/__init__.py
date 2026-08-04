@@ -200,6 +200,7 @@ def reduce_detector_stage_status(
     detector_rows: list[dict[str, Any]],
     *,
     setup_failure: str | None = None,
+    aggregate_failure: str | None = None,
     primary_report_available: bool = False,
     primary_metrics_complete: bool = False,
     optional_failed_count: int = 0,
@@ -227,8 +228,10 @@ def reduce_detector_stage_status(
     8. completed_with_errors
     9. completed
 
-    ``setup_failure`` participates in the same precedence pool as row-level
-    failures — it does NOT unconditionally override row causes.
+    ``setup_failure`` and ``aggregate_failure`` participate in the same
+    precedence pool as row-level failures — neither unconditionally
+    overrides row causes.  An adapter aggregate failure (e.g. GS official
+    policy rows that fail validation) must keep the stage from completing.
     """
     # Count row statuses and failure causes
     row_status_counts: dict[str, int] = {}
@@ -252,6 +255,13 @@ def reduce_detector_stage_status(
         # Use a distinct key to track "setup" vs "row" origin when needed.
         failure_cause_counts[normalized_setup] = (
             failure_cause_counts.get(normalized_setup, 0) + 1)
+
+    # Normalize aggregate failure and add to cause counts.  Unknown causes
+    # fail closed as internal_error.
+    if aggregate_failure is not None:
+        normalized_aggregate = _normalize_failure_cause(aggregate_failure)
+        failure_cause_counts[normalized_aggregate] = (
+            failure_cause_counts.get(normalized_aggregate, 0) + 1)
 
     # Find highest-precedence failure cause across BOTH setup and rows
     effective_failure: str | None = None

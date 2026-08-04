@@ -32,6 +32,7 @@ from . import (
     DetectorProviderInitializationError,
     DetectorStateValidationError,
     DetectorScoringError,
+    FAILURE_CAUSE_STATE_VALIDATION,
 )
 
 REQUIRED_METADATA_FIELDS: frozenset[str] = frozenset({
@@ -120,6 +121,7 @@ _OFFICIAL_POLICY_ROW_FIELDS: tuple[str, ...] = (
     "gs_official_fpr",
     "gs_official_user_number",
     "gs_official_comparison_operator",
+    "gs_official_source",
     "gs_detection_policy_hash",
 )
 
@@ -743,56 +745,93 @@ def _finite_float(value: Any, label: str, run_id: str) -> float:
 
 
 def _validate_thresholds(
-    thresholds: dict[str, Any], run_id: str,
+    thresholds: Any, run_id: str,
 ) -> dict[str, Any]:
-    """Validate official thresholds and return canonical threshold record.
+    """Strictly validate ``official_thresholds()`` output, fail closed.
 
-    ``tau_onebit`` and ``tau_bits`` must be finite and in [0, 1].  If a
-    comparison operator is present it must be one the provider officially
-    supports (">=" or ">").  Raises ``DetectorScoringError`` on violation.
+    Requires a dict carrying:
+
+    * ``tau_onebit`` / ``tau_bits``: finite floats in [0, 1]
+    * ``fpr``: finite float with 0 < fpr <= 1
+    * ``user_number``: strictly positive integer (bool/float rejected)
+    * ``comparison_operator``: exactly ``>=`` (official family)
+    * ``source``: non-empty string
+
+    Every malformed value is classified ``DetectorScoringError`` — no
+    AttributeError / TypeError / ValueError escapes.
     """
-    tau_onebit = thresholds.get("tau_onebit")
-    tau_bits = thresholds.get("tau_bits")
-
-    if tau_onebit is None or tau_bits is None:
-        raise DetectorScoringError(
-            f"run_id={run_id}: GS official_thresholds missing tau_onebit "
-            f"or tau_bits"
-        )
     try:
-        t1 = float(tau_onebit)
-        tb = float(tau_bits)
-    except (ValueError, TypeError):
-        raise DetectorScoringError(
-            f"run_id={run_id}: GS official thresholds not convertible to "
-            f"float: tau_onebit={tau_onebit!r} tau_bits={tau_bits!r}"
-        )
-    if not math.isfinite(t1) or not math.isfinite(tb):
-        raise DetectorScoringError(
-            f"run_id={run_id}: GS official thresholds non-finite: "
-            f"tau_onebit={t1!r} tau_bits={tb!r}"
-        )
-    if not (0.0 <= t1 <= 1.0) or not (0.0 <= tb <= 1.0):
-        raise DetectorScoringError(
-            f"run_id={run_id}: GS official thresholds out of range [0,1]: "
-            f"tau_onebit={t1!r} tau_bits={tb!r}"
-        )
+        if not isinstance(thresholds, dict):
+            raise DetectorScoringError(
+                f"run_id={run_id}: GS official_thresholds must be a dict, "
+                f"got {type(thresholds).__name__}"
+            )
 
-    operator = thresholds.get("comparison_operator")
-    if operator is not None and str(operator) not in _GS_OPERATORS:
-        raise DetectorScoringError(
-            f"run_id={run_id}: GS official threshold comparison operator "
-            f"unsupported: {operator!r}"
-        )
+        missing = [
+            key for key in ("tau_onebit", "tau_bits", "fpr", "user_number",
+                            "comparison_operator", "source")
+            if key not in thresholds
+        ]
+        if missing:
+            raise DetectorScoringError(
+                f"run_id={run_id}: GS official_thresholds missing "
+                f"required fields: {missing}"
+            )
 
-    record = {
+        t1 = _finite_float(thresholds["tau_onebit"], "tau_onebit", run_id)
+        tb = _finite_float(thresholds["tau_bits"], "tau_bits", run_id)
+        if not (0.0 <= t1 <= 1.0) or not (0.0 <= tb <= 1.0):
+            raise DetectorScoringError(
+                f"run_id={run_id}: GS official thresholds out of range "
+                f"[0,1]: tau_onebit={t1!r} tau_bits={tb!r}"
+            )
+
+        fpr = _finite_float(thresholds["fpr"], "fpr", run_id)
+        if not (0.0 < fpr <= 1.0):
+            raise DetectorScoringError(
+                f"run_id={run_id}: GS official threshold fpr must satisfy "
+                f"0 < fpr <= 1, got {fpr!r}"
+            )
+
+        try:
+            user_number = _strict_positive_int(thresholds["user_number"],
+                                               "user_number")
+        except ValueError as exc:
+            raise DetectorScoringError(
+                f"run_id={run_id}: GS official threshold user_number must "
+                f"be a strictly positive integer, got "
+                f"{thresholds['user_number']!r}"
+            ) from exc
+
+        operator = thresholds["comparison_operator"]
+        if operator != ">=":
+            raise DetectorScoringError(
+                f"run_id={run_id}: GS official threshold comparison "
+                f"operator must be '>=', got {operator!r}"
+            )
+
+        source = thresholds["source"]
+        if not isinstance(source, str) or not source.strip():
+            raise DetectorScoringError(
+                f"run_id={run_id}: GS official threshold source must be a "
+                f"non-empty string, got {source!r}"
+            )
+    except DetectorScoringError:
+        raise
+    except Exception as exc:
+        raise DetectorScoringError(
+            f"run_id={run_id}: GS official_thresholds malformed: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
+
+    return {
         "gs_official_tau_onebit": t1,
         "gs_official_tau_bits": tb,
+        "gs_official_fpr": fpr,
+        "gs_official_user_number": user_number,
+        "gs_official_comparison_operator": operator,
+        "gs_official_source": source,
     }
-    for extra_key in ("fpr", "user_number", "comparison_operator", "source"):
-        if extra_key in thresholds:
-            record[f"gs_official_{extra_key}"] = thresholds[extra_key]
-    return record
 
 
 def _validate_active_policy(
@@ -1293,6 +1332,130 @@ def score_image(provider_info: dict[str, Any], image_path: str, *,
     return scored
 
 
+def _validate_policy_row_values(row: dict[str, Any]) -> None:
+    """Validate a complete scored row's policy VALUES, fail closed.
+
+    Field presence is not enough: every value must be legal (mode valid,
+    threshold/tau/fpr finite in range, user number a positive integer,
+    calibrated and detection success real bools, threshold type/operator
+    matching the mode binding, policy hash and official source non-empty
+    strings).  Raises ``DetectorStateValidationError`` on any violation.
+    """
+    run_id = str(row.get("run_id", ""))
+
+    mode = _normalize_detection_mode(row["gs_detection_mode"])
+
+    threshold = _finite_float(row["gs_active_threshold"], "threshold", run_id)
+    tau_onebit = _finite_float(row["gs_official_tau_onebit"],
+                               "official_tau_onebit", run_id)
+    tau_bits = _finite_float(row["gs_official_tau_bits"],
+                             "official_tau_bits", run_id)
+    fpr = _finite_float(row["gs_official_fpr"], "official_fpr", run_id)
+    nominal_fpr = _finite_float(row["gs_active_nominal_fpr"],
+                                "nominal_fpr", run_id)
+
+    if not (0.0 <= tau_onebit <= 1.0) or not (0.0 <= tau_bits <= 1.0):
+        raise DetectorStateValidationError(
+            f"run_id={run_id}: GS policy row official tau out of range "
+            f"[0,1]: onebit={tau_onebit!r} bits={tau_bits!r}"
+        )
+    if not (0.0 < fpr <= 1.0):
+        raise DetectorStateValidationError(
+            f"run_id={run_id}: GS policy row official fpr must satisfy "
+            f"0 < fpr <= 1, got {fpr!r}"
+        )
+    if not (0.0 < nominal_fpr <= 1.0):
+        raise DetectorStateValidationError(
+            f"run_id={run_id}: GS policy row nominal_fpr must satisfy "
+            f"0 < nominal_fpr <= 1, got {nominal_fpr!r}"
+        )
+
+    try:
+        _strict_positive_int(row["gs_official_user_number"], "user_number")
+    except ValueError as exc:
+        raise DetectorStateValidationError(
+            f"run_id={run_id}: GS policy row user_number must be a "
+            f"strictly positive integer, got "
+            f"{row['gs_official_user_number']!r}"
+        ) from exc
+
+    calibrated = row["gs_active_calibrated_from_current_clean_negatives"]
+    if not isinstance(calibrated, bool):
+        raise DetectorStateValidationError(
+            f"run_id={run_id}: GS policy row "
+            "calibrated_from_current_clean_negatives must be a real bool, "
+            f"got {type(calibrated).__name__}: {calibrated!r}"
+        )
+    decision = row["gs_detection_success"]
+    if not isinstance(decision, bool):
+        raise DetectorStateValidationError(
+            f"run_id={run_id}: GS policy row gs_detection_success must be "
+            f"a real bool, got {type(decision).__name__}: {decision!r}"
+        )
+
+    threshold_type = row["gs_active_threshold_type"]
+    operator = row["gs_active_comparison_operator"]
+    if not isinstance(threshold_type, str) or not threshold_type.strip():
+        raise DetectorStateValidationError(
+            f"run_id={run_id}: GS policy row threshold_type must be a "
+            f"non-empty string, got {threshold_type!r}"
+        )
+    if not isinstance(operator, str):
+        raise DetectorStateValidationError(
+            f"run_id={run_id}: GS policy row comparison_operator must be "
+            f"a string, got {type(operator).__name__}"
+        )
+
+    binding = EXPECTED_POLICY[mode]
+    if threshold_type != binding["threshold_type"]:
+        raise DetectorStateValidationError(
+            f"run_id={run_id}: GS policy row threshold_type "
+            f"{threshold_type!r} does not match mode {mode!r} "
+            f"(expected {binding['threshold_type']!r})"
+        )
+    if operator != binding["comparison_operator"]:
+        raise DetectorStateValidationError(
+            f"run_id={run_id}: GS policy row comparison_operator "
+            f"{operator!r} does not match mode {mode!r} "
+            f"(expected {binding['comparison_operator']!r})"
+        )
+    if binding["threshold_source"] == "tau_onebit":
+        if not math.isclose(threshold, tau_onebit,
+                            rel_tol=0.0, abs_tol=1e-12):
+            raise DetectorStateValidationError(
+                f"run_id={run_id}: official_onebit row must use "
+                f"tau_onebit, got threshold={threshold!r} "
+                f"tau_onebit={tau_onebit!r}"
+            )
+    elif binding["threshold_source"] == "tau_bits":
+        if not math.isclose(threshold, tau_bits,
+                            rel_tol=0.0, abs_tol=1e-12):
+            raise DetectorStateValidationError(
+                f"run_id={run_id}: official_traceability row must use "
+                f"tau_bits, got threshold={threshold!r} "
+                f"tau_bits={tau_bits!r}"
+            )
+    if mode in ("official_onebit", "official_traceability"):
+        if not math.isclose(nominal_fpr, fpr, rel_tol=1e-9, abs_tol=1e-12):
+            raise DetectorStateValidationError(
+                f"run_id={run_id}: GS policy row nominal_fpr "
+                f"({nominal_fpr!r}) disagrees with official fpr ({fpr!r})"
+            )
+
+    policy_hash = row["gs_detection_policy_hash"]
+    source = row["gs_official_source"]
+    if not isinstance(policy_hash, str) or not policy_hash.strip():
+        raise DetectorStateValidationError(
+            f"run_id={run_id}: GS policy row gs_detection_policy_hash must "
+            f"be a non-empty string, got {policy_hash!r}"
+        )
+    if not isinstance(source, str) or not source.strip():
+        raise DetectorStateValidationError(
+            f"run_id={run_id}: GS policy row gs_official_source must be a "
+            f"non-empty string, got {source!r}"
+        )
+
+
 def _official_policy_identity(row: dict[str, Any]) -> tuple[Any, ...]:
     """Tuple identity of a scored row's detection policy, fail closed."""
     mode = _normalize_detection_mode(row["gs_detection_mode"])
@@ -1308,6 +1471,7 @@ def _official_policy_identity(row: dict[str, Any]) -> tuple[Any, ...]:
         row["gs_official_fpr"],
         row["gs_official_user_number"],
         str(row["gs_official_comparison_operator"]),
+        str(row["gs_official_source"]),
         str(row["gs_detection_policy_hash"]),
     )
 
@@ -1382,6 +1546,7 @@ def aggregate(detector_rows: list[dict[str, Any]], **extra) -> dict[str, Any]:
             result["gs_official_detection_summary_error"] = (
                 "scored rows have incomplete or mixed GS policy fields; "
                 "no detection rates computed")
+            result["aggregate_failure_cause"] = FAILURE_CAUSE_STATE_VALIDATION
             # Never emit a summary dict here — downstream must not mistake
             # an error payload for a real official summary.
         elif not complete:
@@ -1389,8 +1554,11 @@ def aggregate(detector_rows: list[dict[str, Any]], **extra) -> dict[str, Any]:
             result["gs_official_detection_summary_status"] = (
                 "unavailable_legacy_rows")
         else:
-            # Every scored row carries full policy fields.
+            # Every scored row carries full policy fields — validate the
+            # VALUES, not just presence.
             try:
+                for row in complete:
+                    _validate_policy_row_values(row)
                 identities = {_official_policy_identity(row)
                               for row in complete}
             except (DetectorMissingStateError,
@@ -1399,24 +1567,18 @@ def aggregate(detector_rows: list[dict[str, Any]], **extra) -> dict[str, Any]:
                 result["gs_official_detection_summary_status"] = (
                     "failed_state_validation")
                 result["gs_official_detection_summary_error"] = str(exc)
+                result["aggregate_failure_cause"] = (
+                    FAILURE_CAUSE_STATE_VALIDATION)
             else:
-                bad_decision = [
-                    row for row in complete
-                    if not isinstance(row["gs_detection_success"], bool)
-                ]
-                if bad_decision:
-                    result["gs_official_detection_summary_status"] = (
-                        "failed_state_validation")
-                    result["gs_official_detection_summary_error"] = (
-                        "gs_detection_success must be a real bool in every "
-                        "scored row; no detection rates computed")
-                elif len(identities) != 1:
+                if len(identities) != 1:
                     result["gs_official_detection_summary_status"] = (
                         "failed_state_validation")
                     result["gs_official_detection_summary_error"] = (
                         f"detection policy not uniform across scored rows "
                         f"({len(identities)} distinct identities); no "
                         "detection rates computed")
+                    result["aggregate_failure_cause"] = (
+                        FAILURE_CAUSE_STATE_VALIDATION)
                 else:
                     first = complete[0]
                     official_summary: dict[str, Any] = {
