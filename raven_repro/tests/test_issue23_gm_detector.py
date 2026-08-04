@@ -1307,6 +1307,8 @@ class TestOrchestratorFailureStatuses:
         result = evaluate_detector(records, out_dir, "GM", device="cpu")
 
         assert result["status"] == STATUS_FAILED_PROVIDER_INITIALIZATION
+        assert not stage_status_is_allowable(
+            STATUS_FAILED_PROVIDER_INITIALIZATION, allow_missing_metrics=True)
 
 
 # ============================================================================
@@ -1715,46 +1717,6 @@ class TestCanonicalProviderIdentityFields:
 
 class TestMixedCanonicalIdentityRejectedBeforeProvider:
 
-    def test_mixed_identity_provider_not_constructed(
-        self, mock_deps, bundle_dir, monkeypatch):
-        """Two rows with different gm_use_gnr produce different canonical
-        identities → rejected before provider construction."""
-        import raven.detectors.gm_detector as gm_mod
-        counter = [0]
-
-        class CountingProvider(StubGmProvider):
-            def __init__(self, **kw):
-                counter[0] += 1
-                super().__init__(**kw)
-
-        fake_gm = sys.modules.get("eval_bench_wm.utils.wm.gm_provider")
-        fake_gm.GmProvider = CountingProvider
-
-        # Create two bundles with different profiles to produce different kwargs.
-        bundle2 = _make_bundle_dir(bundle_dir.parent / "bundle2",
-                                   profile="different_profile")
-        try:
-            records = [
-                _gm_record("0", gm_bundle_dir=str(bundle_dir),
-                           gm_protocol_mode=GM_SHARED_TR_CLEAN_MODE),
-                _gm_record("1", gm_bundle_dir=str(bundle2),
-                           gm_protocol_mode=GM_SHARED_TR_CLEAN_MODE,
-                           gm_bundle_config_sha256="a" * 64,
-                           gm_w1_file_sha256="b" * 64,
-                           gm_w2_file_sha256="c" * 64,
-                           gm_m_sha256="m" * 64,
-                           gm_watermark_sha256="n" * 64,
-                           gm_target_sha256="o" * 64),
-            ]
-            # The second bundle's manifest has profile="different_profile" which
-            # won't match GM_SHARED_TR_CLEAN_MODE from the protocol, so it fails
-            # at protocol validation.  Let me instead test with same protocol
-            # but different identity via a custom extract module that returns
-            # different kwargs per row.
-            pass  # see next test
-        finally:
-            fake_gm.GmProvider = StubGmProvider
-
     def test_mixed_identity_via_custom_extract(
         self, mock_deps, bundle_dir, monkeypatch):
         """Custom extract module returns different kwargs for row 1 → mixed identity."""
@@ -1769,16 +1731,12 @@ class TestMixedCanonicalIdentityRejectedBeforeProvider:
         fake_gm = sys.modules.get("eval_bench_wm.utils.wm.gm_provider")
         fake_gm.GmProvider = CountingProvider
 
-        row1_kwargs = None
         class RowVaryingExtract(_StubExtractModule):
             def gm_provider_kwargs(self, row, identifier):
-                nonlocal row1_kwargs
-                bd, mf = self.gm_bundle_manifest(row, identifier)
+                _bd, _mf = self.gm_bundle_manifest(row, identifier)
                 kw = super().gm_provider_kwargs(row, identifier)
                 if str(row.get("run_id")) == "1":
                     kw = dict(kw, gm_use_gnr=not kw.get("gm_use_gnr", False))
-                else:
-                    row1_kwargs = dict(kw)
                 return kw
 
         monkeypatch.setattr(gm_mod, "_get_extract_module",
@@ -1891,5 +1849,168 @@ class TestCanonicalHelperDelegationFull:
             watermark_mask_sha256=info["provider_mask_hash"])
         with pytest.raises(DetectorScoringError, match="scoring failed"):
             score_image(info, str(fake), record=record)
-        assert not stage_status_is_allowable(
-            STATUS_FAILED_PROVIDER_INITIALIZATION, allow_missing_metrics=True)
+
+
+# ============================================================================
+# Canonical identity — gm_create_bundle / gm_allow_in_memory_state
+# ============================================================================
+
+class TestStateControlFieldsInIdentity:
+
+    def test_gm_create_bundle_changes_identity(self):
+        k1 = {f: "val" for f in _CANONICAL_KWARGS_FIELDS}
+        k2 = dict(k1)
+        k2["gm_create_bundle"] = not k1.get("gm_create_bundle", False)
+        assert _canonical_provider_identity(k1) != _canonical_provider_identity(k2)
+
+    def test_gm_allow_in_memory_state_changes_identity(self):
+        k1 = {f: "val" for f in _CANONICAL_KWARGS_FIELDS}
+        k2 = dict(k1)
+        k2["gm_allow_in_memory_state"] = not k1.get("gm_allow_in_memory_state", False)
+        assert _canonical_provider_identity(k1) != _canonical_provider_identity(k2)
+
+    def test_create_bundle_mixed_across_rows_rejected(
+        self, mock_deps, bundle_dir, monkeypatch):
+        import raven.detectors.gm_detector as gm_mod
+        counter = [0]
+
+        class CountingProvider(StubGmProvider):
+            def __init__(self, **kw):
+                counter[0] += 1
+                super().__init__(**kw)
+        fake_gm = sys.modules.get("eval_bench_wm.utils.wm.gm_provider")
+        fake_gm.GmProvider = CountingProvider
+
+        class CreateBundleVarying(_StubExtractModule):
+            def gm_provider_kwargs(self, row, identifier):
+                _bd, _mf = self.gm_bundle_manifest(row, identifier)
+                kw = super().gm_provider_kwargs(row, identifier)
+                if str(row.get("run_id")) == "1":
+                    kw = dict(kw, gm_create_bundle=True)
+                return kw
+
+        monkeypatch.setattr(gm_mod, "_get_extract_module",
+                            lambda: CreateBundleVarying())
+        try:
+            records = [
+                _gm_record("0", gm_bundle_dir=str(bundle_dir)),
+                _gm_record("1", gm_bundle_dir=str(bundle_dir)),
+            ]
+            with pytest.raises(DetectorStateValidationError,
+                               match="mixed canonical"):
+                load_state(records, "cpu")
+            assert counter[0] == 0
+        finally:
+            fake_gm.GmProvider = StubGmProvider
+
+    def test_allow_in_memory_mixed_across_rows_rejected(
+        self, mock_deps, bundle_dir, monkeypatch):
+        import raven.detectors.gm_detector as gm_mod
+        counter = [0]
+
+        class CountingProvider(StubGmProvider):
+            def __init__(self, **kw):
+                counter[0] += 1
+                super().__init__(**kw)
+        fake_gm = sys.modules.get("eval_bench_wm.utils.wm.gm_provider")
+        fake_gm.GmProvider = CountingProvider
+
+        class MemoryStateVarying(_StubExtractModule):
+            def gm_provider_kwargs(self, row, identifier):
+                _bd, _mf = self.gm_bundle_manifest(row, identifier)
+                kw = super().gm_provider_kwargs(row, identifier)
+                if str(row.get("run_id")) == "1":
+                    kw = dict(kw, gm_allow_in_memory_state=True)
+                return kw
+
+        monkeypatch.setattr(gm_mod, "_get_extract_module",
+                            lambda: MemoryStateVarying())
+        try:
+            records = [
+                _gm_record("0", gm_bundle_dir=str(bundle_dir)),
+                _gm_record("1", gm_bundle_dir=str(bundle_dir)),
+            ]
+            with pytest.raises(DetectorStateValidationError,
+                               match="mixed canonical"):
+                load_state(records, "cpu")
+            assert counter[0] == 0
+        finally:
+            fake_gm.GmProvider = StubGmProvider
+
+
+# ============================================================================
+# Canonical config — non-bool rejection and true fallback
+# ============================================================================
+
+class TestCanonicalConfigStrictBool:
+
+    def _make_stub_result(self, **overrides):
+        result = {
+            "gm_raw_bit_accuracy": 0.85, "gm_raw_ring_l1": 0.12,
+            "gm_restored_bit_accuracy": None, "gm_classifier_probability": None,
+            "gm_report_label": "x", "gm_score_definition": "x",
+            "gm_threshold_source": "x", "gm_comparison_operator": ">=",
+            "gm_used_gnr": False, "gm_used_classifier": False,
+        }
+        result.update(overrides)
+        return result
+
+    def test_canonical_gnr_string_false_rejected(self, provider_info, fake_image):
+        import raven.detectors.gm_detector as gm_mod
+        stub = _StubExtractModule()
+        stub.evaluate_image = lambda *a, **kw: self._make_stub_result()
+        provider_info["_canonical_kwargs"] = {
+            "gm_use_gnr": "false", "gm_use_classifier": False}
+        provider_info["extract_module"] = stub
+
+        record = _gm_record("0",
+            watermark_target_sha256=provider_info["provider_target_hash"],
+            watermark_mask_sha256=provider_info["provider_mask_hash"])
+        with pytest.raises(DetectorStateValidationError,
+                           match="must be bool"):
+            score_image(provider_info, fake_image, record=record)
+
+    def test_canonical_classifier_int_rejected(self, provider_info, fake_image):
+        import raven.detectors.gm_detector as gm_mod
+        stub = _StubExtractModule()
+        stub.evaluate_image = lambda *a, **kw: self._make_stub_result()
+        provider_info["_canonical_kwargs"] = {
+            "gm_use_gnr": False, "gm_use_classifier": 0}
+        provider_info["extract_module"] = stub
+
+        record = _gm_record("0",
+            watermark_target_sha256=provider_info["provider_target_hash"],
+            watermark_mask_sha256=provider_info["provider_mask_hash"])
+        with pytest.raises(DetectorStateValidationError,
+                           match="must be bool"):
+            score_image(provider_info, fake_image, record=record)
+
+    def test_canonical_gnr_true_fallback(self, provider_info, fake_image):
+        import raven.detectors.gm_detector as gm_mod
+        stub = _StubExtractModule()
+        stub.evaluate_image = lambda *a, **kw: self._make_stub_result(
+            gm_used_gnr=None)
+        provider_info["_canonical_kwargs"] = {
+            "gm_use_gnr": True, "gm_use_classifier": False}
+        provider_info["extract_module"] = stub
+
+        record = _gm_record("0",
+            watermark_target_sha256=provider_info["provider_target_hash"],
+            watermark_mask_sha256=provider_info["provider_mask_hash"])
+        score = score_image(provider_info, fake_image, record=record)
+        assert score["gm_gnr_used"] is True
+
+    def test_canonical_classifier_true_fallback(self, provider_info, fake_image):
+        import raven.detectors.gm_detector as gm_mod
+        stub = _StubExtractModule()
+        stub.evaluate_image = lambda *a, **kw: self._make_stub_result(
+            gm_used_classifier=None)
+        provider_info["_canonical_kwargs"] = {
+            "gm_use_gnr": False, "gm_use_classifier": True}
+        provider_info["extract_module"] = stub
+
+        record = _gm_record("0",
+            watermark_target_sha256=provider_info["provider_target_hash"],
+            watermark_mask_sha256=provider_info["provider_mask_hash"])
+        score = score_image(provider_info, fake_image, record=record)
+        assert score["gm_classifier_used"] is True

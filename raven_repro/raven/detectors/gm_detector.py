@@ -52,6 +52,8 @@ REQUIRED_METADATA_FIELDS: frozenset[str] = frozenset(_GM_REQUIRED_METADATA_FIELD
 _CANONICAL_KWARGS_FIELDS: tuple[str, ...] = (
     "gm_profile",
     "gm_bundle_dir",
+    "gm_create_bundle",
+    "gm_allow_in_memory_state",
     "gm_torch_dtype",
     "gm_channel_copy",
     "gm_w_copy",
@@ -576,6 +578,35 @@ def _validate_scorer_outputs(result: dict[str, Any]) -> None:
                 )
 
 
+def _canonical_bool_config(
+    provider_info: dict[str, Any],
+    key: str,
+) -> bool | None:
+    """Return the canonical provider config value for *key* as a strict ``bool``.
+
+    Returns ``None`` if the canonical kwargs are absent or the key is not set.
+    Raises ``DetectorStateValidationError`` if the value exists but is not
+    a Python ``bool``.
+    """
+    canonical_kwargs = provider_info.get("_canonical_kwargs")
+    if canonical_kwargs is None:
+        return None
+    if not isinstance(canonical_kwargs, dict):
+        raise DetectorStateValidationError(
+            "_canonical_kwargs must be a dict, got "
+            f"{type(canonical_kwargs).__name__}"
+        )
+    value = canonical_kwargs.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, bool):
+        raise DetectorStateValidationError(
+            f"canonical provider config {key!r} must be bool, "
+            f"got {type(value).__name__}: {value!r}"
+        )
+    return value
+
+
 def _resolve_gnr_classifier_usage(
     result: dict[str, Any],
     provider_info: dict[str, Any],
@@ -590,7 +621,8 @@ def _resolve_gnr_classifier_usage(
     3. Both alias keys present → values must agree.
     4. Scorer value contradicts canonical provider config →
        ``DetectorScoringError``.
-    5. No scorer output → fall back to canonical provider kwargs.
+    5. No scorer output → fall back to canonical provider kwargs
+       (validated as strict ``bool`` via ``_canonical_bool_config``).
     6. No canonical kwargs → fall back to ``False``.
     """
     if kind not in _VALID_GNR_CLASSIFIER_KINDS:
@@ -618,11 +650,8 @@ def _resolve_gnr_classifier_usage(
             )
         scorer_values.append(val)
 
-    # ── Resolve canonical provider-config value ──
-    canonical_kwargs = provider_info.get("_canonical_kwargs", {})
-    provider_value = canonical_kwargs.get(provider_key)
-    # provider_value is not bool-validated here — it comes from the validated
-    # canonical kwargs, which were already cross-checked across all rows.
+    # ── Resolve canonical provider-config value (strict bool) ──
+    provider_value = _canonical_bool_config(provider_info, provider_key)
 
     # ── Decision ──
     if len(scorer_values) >= 1:
@@ -636,7 +665,7 @@ def _resolve_gnr_classifier_usage(
             )
 
         # Contradiction check: scorer vs canonical provider config.
-        if provider_value is not None and declared != bool(provider_value):
+        if provider_value is not None and declared != provider_value:
             raise DetectorScoringError(
                 f"GM {kind} usage contradiction: scorer reports "
                 f"{kind}={declared} but canonical provider config has "
@@ -647,7 +676,7 @@ def _resolve_gnr_classifier_usage(
 
     # No scorer output — fall back to canonical provider config.
     if provider_value is not None:
-        return bool(provider_value)
+        return provider_value
     return False
 
 
