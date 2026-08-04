@@ -5,6 +5,9 @@ Does NOT reimplement FFT / non-central chi-square / -log10(p) math.
 
 All TR provider parameters MUST come from metadata.  Silent fallback to
 defaults is forbidden — missing fields cause ``DetectorMissingStateError``.
+Mixed provider configurations across records are rejected before scoring with
+``DetectorStateValidationError``.  A uniform cohort constructs exactly one
+provider.
 """
 
 from __future__ import annotations
@@ -19,6 +22,7 @@ from . import (
     DetectorDependencyError,
     DetectorProviderInitializationError,
     DetectorScoringError,
+    DetectorStateValidationError,
 )
 
 REQUIRED_METADATA_FIELDS: frozenset[str] = frozenset({
@@ -30,6 +34,18 @@ REQUIRED_METADATA_FIELDS: frozenset[str] = frozenset({
     "w_measurement",
     "w_injection",
 })
+
+# Fields that must be uniform across all evaluated records when present.
+# Mixed values cause ``DetectorStateValidationError``.
+UNIFORM_IDENTITY_FIELDS: tuple[str, ...] = (
+    "model_id",
+    "model_revision",
+    "scheduler",
+    "inverse_scheduler",
+    "watermark_target_sha256",
+    "watermark_mask_sha256",
+    "provider_config_hash",
+)
 
 _extract_module = None
 
@@ -66,7 +82,12 @@ def describe_required_artifacts() -> list[str]:
 
 def load_state(records: list[dict[str, Any]], device: str,
                **extra) -> dict[str, Any]:
-    """Load TR provider and pipe.  Raises on missing/bad state, never swallows."""
+    """Load TR provider and pipe.  Raises on missing/bad state, never swallows.
+
+    Validates every record — not just the first — so a mixed-key or
+    mixed-profile cohort is rejected before any scoring happens.  A uniform
+    cohort constructs exactly one provider.
+    """
     import torch
 
     try:
@@ -84,14 +105,74 @@ def load_state(records: list[dict[str, Any]], device: str,
             f"TR dependencies not available: {exc}"
         ) from exc
 
-    # Validate required metadata
-    first = records[0] if records else {}
-    missing = sorted(f for f in REQUIRED_METADATA_FIELDS
-                     if not str(first.get(f, "")).strip())
-    if missing:
+    if not records:
         raise DetectorMissingStateError(
-            f"TR provider fields missing from metadata: {missing}. "
-            "All required: " + ", ".join(sorted(REQUIRED_METADATA_FIELDS))
+            "TR provider requires at least one record with metadata. "
+            "All required fields: " + ", ".join(sorted(REQUIRED_METADATA_FIELDS))
+        )
+
+    # ---- validate every record has all required metadata fields ----
+    for idx, record in enumerate(records):
+        missing = sorted(f for f in REQUIRED_METADATA_FIELDS
+                         if not str(record.get(f, "")).strip())
+        if missing:
+            raise DetectorMissingStateError(
+                f"TR provider fields missing from metadata at record index "
+                f"{idx} (run_id={record.get('run_id', '?')}): {missing}. "
+                "All required: " + ", ".join(sorted(REQUIRED_METADATA_FIELDS))
+            )
+
+    # ---- validate uniform TR provider config via canonical helpers ----
+    from raven.eval_protocol import provider_config_hash, canonical_json_hash
+
+    provider_hashes: dict[str, dict[str, Any]] = {}
+    for idx, record in enumerate(records):
+        try:
+            h = provider_config_hash("TR", record)
+            # Also compute the raw config dict for later provider construction
+            cfg = _tr_provider_config(record)
+            provider_hashes.setdefault(h, cfg)
+        except (ValueError, TypeError) as exc:
+            raise DetectorMissingStateError(
+                f"TR provider config invalid at record index {idx} "
+                f"(run_id={record.get('run_id', '?')}): {exc}"
+            ) from exc
+
+    if len(provider_hashes) != 1:
+        raise DetectorStateValidationError(
+            f"Mixed TR provider configurations in cohort: "
+            f"{len(provider_hashes)} distinct configs across "
+            f"{len(records)} records. All records must share the same "
+            f"w_seed, w_channel, w_radius, w_pattern, w_mask_shape, "
+            f"w_measurement, and w_injection."
+        )
+
+    config_hash, uniform_cfg = next(iter(provider_hashes.items()))
+
+    # ---- validate uniform identity fields across all records ----
+    for field in UNIFORM_IDENTITY_FIELDS:
+        values: set[str] = set()
+        for record in records:
+            val = str(record.get(field, "")).strip()
+            if val:
+                values.add(val)
+        if len(values) > 1:
+            raise DetectorStateValidationError(
+                f"Mixed {field} across TR cohort: {sorted(values)}. "
+                f"All {len(records)} records must agree on detector identity "
+                f"fields."
+            )
+
+    # ---- validate provider_config_hash recorded vs computed ----
+    recorded_hashes: set[str] = set()
+    for record in records:
+        rh = str(record.get("provider_config_hash", "")).strip()
+        if rh:
+            recorded_hashes.add(rh)
+    if recorded_hashes and recorded_hashes != {config_hash}:
+        raise DetectorStateValidationError(
+            f"Recorded provider_config_hash {sorted(recorded_hashes)} does not "
+            f"match canonical computed hash {config_hash}"
         )
 
     try:
@@ -106,20 +187,11 @@ def load_state(records: list[dict[str, Any]], device: str,
         )
         latent_shape = pipe.get_latent_shape()
 
-        kwargs = {
-            "w_seed": int(first["w_seed"]),
-            "w_channel": int(first["w_channel"]),
-            "w_radius": int(first["w_radius"]),
-            "w_pattern": str(first["w_pattern"]),
-            "w_mask_shape": str(first["w_mask_shape"]),
-            "w_measurement": str(first["w_measurement"]),
-            "w_injection": str(first["w_injection"]),
-        }
         provider = TrProvider(
             latent_shape=latent_shape,
             dtype=pipe.get_dtype(),
             device=device_obj,
-            **kwargs,
+            **uniform_cfg,
         )
     except DetectorMissingStateError:
         raise
@@ -136,8 +208,27 @@ def load_state(records: list[dict[str, Any]], device: str,
         "provider": provider,
         "pipe": pipe,
         "extract_module": mod,
-        "provider_kwargs": kwargs,
+        "provider_kwargs": uniform_cfg,
         "device_obj": device_obj,
+        "provider_config_hash": config_hash,
+    }
+
+
+def _tr_provider_config(record: dict[str, Any]) -> dict[str, Any]:
+    """Extract TR provider kwargs from one record with no implicit defaults.
+
+    Every required field must be present and non-empty; raises ValueError
+    otherwise.  This is the fail-closed counterpart of
+    ``eval_protocol.provider_config`` for the TR-specific adapter.
+    """
+    return {
+        "w_seed": int(record["w_seed"]),
+        "w_channel": int(record["w_channel"]),
+        "w_radius": int(record["w_radius"]),
+        "w_pattern": str(record["w_pattern"]),
+        "w_mask_shape": str(record["w_mask_shape"]),
+        "w_measurement": str(record["w_measurement"]),
+        "w_injection": str(record["w_injection"]),
     }
 
 
