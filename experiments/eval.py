@@ -879,6 +879,13 @@ def evaluate_detector(
             "aggregate_stage_status": _error_to_stage_status(exc),
         }
 
+    # ---- Adapter aggregate failure → stage-status reducer ----
+    # Adapters may signal a structured aggregate-level failure (e.g. GS
+    # official policy rows that fail validation).  It participates in the
+    # same precedence pool as row/setup failures, so the final detector
+    # stage status is never completed when the aggregate failed closed.
+    aggregate_failure_cause = aggregate.get("aggregate_failure_cause")
+
     # ---- Issue #25: orchestrator is count source of truth ----
     # Adapter only receives detector_rows; it cannot know about entries
     # that were never scored due to setup failure.  Compute final counts
@@ -927,6 +934,7 @@ def evaluate_detector(
     reducer_result = reduce_detector_stage_status(
         detector_rows,
         setup_failure=setup_failure_cause,
+        aggregate_failure=aggregate_failure_cause,
         primary_report_available=primary_available,
         primary_metrics_complete=primary_available,
         optional_failed_count=optional_failed,
