@@ -141,15 +141,39 @@ class StubGmProvider:
         self.state_source = kwargs.get("_state_source", "bundle")
         self.gt_patch = kwargs.get("_gt_patch", _fake_gt_patch())
         self.watermarking_mask = kwargs.get("_wm_mask", _fake_wm_mask())
-        self.profile = kwargs.get("gm_profile", "legacy")
-        self.profile_is_official = bool(kwargs.get("gm_profile_is_official", False))
-        self.inversion_steps = kwargs.get("gm_inversion_steps", 50)
-        self.vae_sample = kwargs.get("gm_vae_sample", True)
-        self.model_nf = kwargs.get("gm_model_nf", 128)
-        self.classifier_type = kwargs.get("gm_classifier_type", 0)
-        self.use_gnr = kwargs.get("gm_use_gnr", False)
-        self.use_classifier = kwargs.get("gm_use_classifier", False)
-        self.w_seed = kwargs.get("w_seed", 42)
+        self.profile = kwargs["gm_profile"]
+        self.profile_is_official = kwargs["gm_profile_is_official"]
+        self.gm_torch_dtype = kwargs["gm_torch_dtype"]
+        self.inversion_steps = kwargs["gm_inversion_steps"]
+        self.inversion_seed = kwargs["gm_inversion_seed"]
+        self.inversion_prompt = kwargs["gm_inversion_prompt"]
+        self.inversion_guidance = kwargs["gm_inversion_guidance"]
+        self.vae_sample = kwargs["gm_vae_sample"]
+        self.vae_scaling_factor = kwargs["gm_vae_scaling_factor"]
+        self.model_nf = kwargs["gm_model_nf"]
+        self.classifier_type = kwargs["gm_classifier_type"]
+        self.use_gnr = kwargs["gm_use_gnr"]
+        self.use_classifier = kwargs["gm_use_classifier"]
+        self.model_id = kwargs["modelid_target"]
+        self.model_revision = kwargs["model_revision"]
+        self.scheduler_name = kwargs["scheduler_target"]
+        self.resolution = kwargs["resolution"]
+        self.ch = kwargs["gm_channel_copy"]
+        self.w = kwargs["gm_w_copy"]
+        self.h = kwargs["gm_h_copy"]
+        self.watermark_bits_seed = kwargs["gm_watermark_bits_seed"]
+        self.w_seed = kwargs["w_seed"]
+        self.w_channel = kwargs["w_channel"]
+        self.w_pattern = kwargs["w_pattern"]
+        self.w_mask_shape = kwargs["w_mask_shape"]
+        self.w_radius = kwargs["w_radius"]
+        self.w_measurement = kwargs["w_measurement"]
+        self.w_injection = kwargs["w_injection"]
+        if self.bundle is not None:
+            self.bundle.manifest = {
+                "profile": kwargs["gm_profile"],
+                "profile_is_official": kwargs["gm_profile_is_official"],
+            }
 
 
 def _fake_gt_patch():
@@ -359,7 +383,7 @@ class TestProtocolProfileSeparation:
         manifest = {"profile": "legacy"}
         kwargs = {"gm_profile": "custom"}
         with pytest.raises(DetectorStateValidationError,
-                           match="provider profile mismatch"):
+                           match="profile mismatch"):
             _validate_gm_provider_profile(manifest, kwargs)
 
     def test_provider_actual_profile_mismatch_rejected(self):
@@ -371,7 +395,7 @@ class TestProtocolProfileSeparation:
             profile = "custom"
             bundle = None
         with pytest.raises(DetectorStateValidationError,
-                           match="provider profile mismatch"):
+                           match="profile mismatch"):
             _validate_gm_provider_profile(
                 manifest, kwargs, provider=WrongProfileProvider())
 
@@ -512,32 +536,32 @@ class TestTargetMaskFailClosed:
     def test_missing_source_target_is_missing_state(self, provider_info, fake_image):
         record = _gm_record("0")
         del record["watermark_target_sha256"]
-        with pytest.raises(DetectorMissingStateError, match="watermark_target_sha256"):
+        with pytest.raises(DetectorMissingStateError, match="target missing"):
             score_image(provider_info, fake_image, record=record)
 
     def test_missing_source_mask_is_missing_state(self, provider_info, fake_image):
         record = _gm_record("0")
         del record["watermark_mask_sha256"]
-        with pytest.raises(DetectorMissingStateError, match="watermark_mask_sha256"):
+        with pytest.raises(DetectorMissingStateError, match="mask missing"):
             score_image(provider_info, fake_image, record=record)
 
     def test_missing_detector_target_is_state_validation(
         self, provider_info, fake_image):
         provider_info["provider_target_hash"] = ""
         record = _gm_record("0")
-        with pytest.raises(DetectorStateValidationError, match="target hash"):
+        with pytest.raises(DetectorStateValidationError, match="target missing"):
             score_image(provider_info, fake_image, record=record)
 
     def test_missing_detector_mask_is_state_validation(
         self, provider_info, fake_image):
         provider_info["provider_mask_hash"] = ""
         record = _gm_record("0")
-        with pytest.raises(DetectorStateValidationError, match="mask hash"):
+        with pytest.raises(DetectorStateValidationError, match="mask missing"):
             score_image(provider_info, fake_image, record=record)
 
     def test_source_target_mismatch(self, provider_info, fake_image):
         record = _gm_record("0", watermark_target_sha256="wrong" * 8)
-        with pytest.raises(DetectorStateValidationError, match="target SHA mismatch"):
+        with pytest.raises(DetectorStateValidationError, match="target SHA"):
             score_image(provider_info, fake_image, record=record)
 
     def test_source_mask_mismatch(self, provider_info, fake_image):
@@ -751,7 +775,7 @@ class TestMalformedBundle:
 
         records = [_gm_record("0", gm_bundle_dir=str(bundle_dir))]
         with pytest.raises(DetectorStateValidationError,
-                           match="manifest validation failed"):
+                           match="bundle manifest failed"):
             load_state(records, "cpu")
 
     def test_manifest_missing_required_key_is_state_validation(
@@ -767,7 +791,7 @@ class TestMalformedBundle:
 
         records = [_gm_record("0", gm_bundle_dir=str(bundle_dir))]
         with pytest.raises(DetectorStateValidationError,
-                           match="manifest validation failed"):
+                           match="bundle manifest failed"):
             load_state(records, "cpu")
 
     def test_invalid_manifest_value_type_is_state_validation(
@@ -783,7 +807,7 @@ class TestMalformedBundle:
 
         records = [_gm_record("0", gm_bundle_dir=str(bundle_dir))]
         with pytest.raises(DetectorStateValidationError,
-                           match="manifest validation failed"):
+                           match="bundle manifest failed"):
             load_state(records, "cpu")
 
     def test_provider_kwargs_exception_is_state_validation(
@@ -799,7 +823,7 @@ class TestMalformedBundle:
 
         records = [_gm_record("0", gm_bundle_dir=str(bundle_dir))]
         with pytest.raises(DetectorStateValidationError,
-                           match="provider kwargs validation failed"):
+                           match="provider kwargs failed"):
             load_state(records, "cpu")
 
 
@@ -2345,7 +2369,7 @@ class TestLoadTimeCanonicalValidation:
         try:
             records = [_gm_record("0", gm_bundle_dir=str(bundle_dir))]
             with pytest.raises(DetectorStateValidationError,
-                               match="must be a dict"):
+                               match="must be dict"):
                 load_state(records, "cpu")
             assert provider_calls[0] == 0
         finally:
@@ -2391,7 +2415,7 @@ class TestCanonicalKeyPresence:
         try:
             records = [_gm_record("0", gm_bundle_dir=str(bundle_dir))]
             with pytest.raises(DetectorStateValidationError,
-                               match="missing required keys"):
+                               match="missing keys"):
                 load_state(records, "cpu")
             assert provider_calls[0] == 0
         finally:
@@ -2484,7 +2508,7 @@ class TestExtraKwargsRejected:
                 _gm_record("1", gm_bundle_dir=str(bundle_dir)),
             ]
             with pytest.raises(DetectorStateValidationError,
-                               match="unexpected keys"):
+                               match="unexpected canonical keys"):
                 load_state(records, "cpu")
             assert provider_calls[0] == 0
         finally:

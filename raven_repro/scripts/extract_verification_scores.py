@@ -271,6 +271,18 @@ def gm_provider_kwargs(row: dict[str, str], identifier: str) -> dict:
             )
         return val
 
+    def _optional_strict_int(key: str) -> int | None:
+        val = manifest.get(key)
+        if val is None:
+            return None
+        if isinstance(val, bool) or not isinstance(val, int):
+            raise RuntimeError(
+                f"run_id={identifier}: GM bundle manifest {key!r} "
+                f"must be int or None, got "
+                f"{type(val).__name__}: {val!r}"
+            )
+        return val
+
     # ── inversion_prompt_sha256 validation ──
     prompt_sha = _require_str("inversion_prompt_sha256")
     empty_sha = hashlib.sha256(b"").hexdigest()
@@ -307,7 +319,7 @@ def gm_provider_kwargs(row: dict[str, str], identifier: str) -> dict:
         "gm_channel_copy": _require_int("channel_copy"),
         "gm_w_copy": _require_int("w_copy"),
         "gm_h_copy": _require_int("h_copy"),
-        "gm_watermark_bits_seed": manifest.get("watermark_bits_seed"),
+        "gm_watermark_bits_seed": _optional_strict_int("watermark_bits_seed"),
         "gm_use_gnr": False,
         "gm_gnr_path": None,
         "gm_model_nf": _require_int("model_nf"),
