@@ -229,25 +229,37 @@ _PERSISTED_BUNDLE_FALSE_KWARGS: frozenset[str] = frozenset({
 
 
 def _validate_canonical_provider_kwargs(
-    kwargs: dict[str, Any],
+    kwargs: Any,
     *,
     run_id: str,
 ) -> None:
     """Validate canonical provider kwargs at load time.
 
-    1. Every key in ``_STRICT_BOOL_KWARGS`` must be a Python ``bool``
-       if present — ``"false"``, ``0``, ``[]`` etc. are rejected.
-    2. ``gm_create_bundle`` and ``gm_allow_in_memory_state`` must
+    1. *kwargs* must be a ``dict``.
+    2. Every field in ``_STRICT_BOOL_KWARGS`` must be PRESENT and be a
+       Python ``bool`` — ``None``, ``"false"``, ``0``, missing key
+       are all rejected.  ``GmProvider`` defaults GNR/classifier to
+       ``True``, so omission is a configuration error.
+    3. ``gm_create_bundle`` and ``gm_allow_in_memory_state`` must
        be ``False`` — the unified detector requires a persisted bundle.
 
     Raises ``DetectorStateValidationError`` on first violation.
     This is called BEFORE provider construction so malformed config
     never reaches ``GmProvider``.
     """
+    if not isinstance(kwargs, dict):
+        raise DetectorStateValidationError(
+            f"run_id={run_id}: canonical GM provider kwargs must be a "
+            f"dict, got {type(kwargs).__name__}"
+        )
+
     for field in _STRICT_BOOL_KWARGS:
-        value = kwargs.get(field)
-        if value is None:
-            continue
+        if field not in kwargs or kwargs[field] is None:
+            raise DetectorStateValidationError(
+                f"run_id={run_id}: canonical GM provider config "
+                f"{field!r} is missing — must be present and bool"
+            )
+        value = kwargs[field]
         if not isinstance(value, bool):
             raise DetectorStateValidationError(
                 f"run_id={run_id}: canonical GM provider config "
@@ -256,7 +268,7 @@ def _validate_canonical_provider_kwargs(
             )
 
     for field in _PERSISTED_BUNDLE_FALSE_KWARGS:
-        value = kwargs.get(field)
+        value = kwargs[field]  # already known present from loop above
         if value is not False:
             raise DetectorStateValidationError(
                 f"run_id={run_id}: GM unified detector requires "

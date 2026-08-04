@@ -2156,15 +2156,116 @@ class TestLoadTimeCanonicalValidation:
     def test_canonical_four_bool_valid_and_false_loads(
         self, mock_deps, bundle_dir):
         """All four canonical bool fields are valid False → load_state succeeds,
-        one provider constructed."""
-        records = [
-            _gm_record("0", gm_bundle_dir=str(bundle_dir)),
-            _gm_record("1", gm_bundle_dir=str(bundle_dir)),
-        ]
-        info = load_state(records, "cpu")
-        assert info["provider"] is not None
-        ck = info["_canonical_kwargs"]
-        assert ck["gm_use_gnr"] is False
-        assert ck["gm_use_classifier"] is False
-        assert ck["gm_create_bundle"] is False
-        assert ck["gm_allow_in_memory_state"] is False
+        exactly one provider constructed."""
+        provider_calls = [0]
+
+        class CountingProvider(StubGmProvider):
+            def __init__(self, **kw):
+                provider_calls[0] += 1
+                super().__init__(**kw)
+        fake_gm = sys.modules.get("eval_bench_wm.utils.wm.gm_provider")
+        fake_gm.GmProvider = CountingProvider
+        try:
+            records = [
+                _gm_record("0", gm_bundle_dir=str(bundle_dir)),
+                _gm_record("1", gm_bundle_dir=str(bundle_dir)),
+            ]
+            info = load_state(records, "cpu")
+            assert info["provider"] is not None
+            assert provider_calls[0] == 1
+            ck = info["_canonical_kwargs"]
+            assert ck["gm_use_gnr"] is False
+            assert ck["gm_use_classifier"] is False
+            assert ck["gm_create_bundle"] is False
+            assert ck["gm_allow_in_memory_state"] is False
+        finally:
+            fake_gm.GmProvider = StubGmProvider
+
+    def test_missing_gm_use_gnr_rejected_before_provider(
+        self, mock_deps, bundle_dir, monkeypatch):
+        """gm_provider_kwargs omits gm_use_gnr → DetectorStateValidationError."""
+        import raven.detectors.gm_detector as gm_mod
+        provider_calls = [0]
+
+        class CountingProvider(StubGmProvider):
+            def __init__(self, **kw):
+                provider_calls[0] += 1
+                super().__init__(**kw)
+        fake_gm = sys.modules.get("eval_bench_wm.utils.wm.gm_provider")
+        fake_gm.GmProvider = CountingProvider
+
+        class MissingGnrExtract(_StubExtractModule):
+            def gm_provider_kwargs(self, row, identifier):
+                kw = super().gm_provider_kwargs(row, identifier)
+                del kw["gm_use_gnr"]
+                return kw
+
+        monkeypatch.setattr(gm_mod, "_get_extract_module",
+                            lambda: MissingGnrExtract())
+        try:
+            records = [_gm_record("0", gm_bundle_dir=str(bundle_dir))]
+            with pytest.raises(DetectorStateValidationError,
+                               match="gm_use_gnr.*missing"):
+                load_state(records, "cpu")
+            assert provider_calls[0] == 0
+        finally:
+            fake_gm.GmProvider = StubGmProvider
+
+    def test_missing_gm_use_classifier_rejected_before_provider(
+        self, mock_deps, bundle_dir, monkeypatch):
+        """gm_provider_kwargs omits gm_use_classifier → DetectorStateValidationError."""
+        import raven.detectors.gm_detector as gm_mod
+        provider_calls = [0]
+
+        class CountingProvider(StubGmProvider):
+            def __init__(self, **kw):
+                provider_calls[0] += 1
+                super().__init__(**kw)
+        fake_gm = sys.modules.get("eval_bench_wm.utils.wm.gm_provider")
+        fake_gm.GmProvider = CountingProvider
+
+        class MissingClfExtract(_StubExtractModule):
+            def gm_provider_kwargs(self, row, identifier):
+                kw = super().gm_provider_kwargs(row, identifier)
+                del kw["gm_use_classifier"]
+                return kw
+
+        monkeypatch.setattr(gm_mod, "_get_extract_module",
+                            lambda: MissingClfExtract())
+        try:
+            records = [_gm_record("0", gm_bundle_dir=str(bundle_dir))]
+            with pytest.raises(DetectorStateValidationError,
+                               match="gm_use_classifier.*missing"):
+                load_state(records, "cpu")
+            assert provider_calls[0] == 0
+        finally:
+            fake_gm.GmProvider = StubGmProvider
+
+    def test_non_dict_provider_kwargs_rejected_before_provider(
+        self, mock_deps, bundle_dir, monkeypatch):
+        """gm_provider_kwargs returns a list → DetectorStateValidationError
+        before provider construction."""
+        import raven.detectors.gm_detector as gm_mod
+        provider_calls = [0]
+
+        class CountingProvider(StubGmProvider):
+            def __init__(self, **kw):
+                provider_calls[0] += 1
+                super().__init__(**kw)
+        fake_gm = sys.modules.get("eval_bench_wm.utils.wm.gm_provider")
+        fake_gm.GmProvider = CountingProvider
+
+        class NonDictExtract(_StubExtractModule):
+            def gm_provider_kwargs(self, row, identifier):
+                return ["not", "a", "dict"]
+
+        monkeypatch.setattr(gm_mod, "_get_extract_module",
+                            lambda: NonDictExtract())
+        try:
+            records = [_gm_record("0", gm_bundle_dir=str(bundle_dir))]
+            with pytest.raises(DetectorStateValidationError,
+                               match="must be a dict"):
+                load_state(records, "cpu")
+            assert provider_calls[0] == 0
+        finally:
+            fake_gm.GmProvider = StubGmProvider
