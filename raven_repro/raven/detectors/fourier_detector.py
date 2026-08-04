@@ -5,6 +5,11 @@ Delegates to the canonical bundle loading and scoring in
 helpers (rid_provider_kwargs_from_bundle, hstr_provider_kwargs_from_bundle,
 hsqr_provider_from_bundle).
 
+Method-specific state gates (Issue #24):
+  - RID/HSTR: require persisted bundle AND ``state_source == "bundle"``.
+  - HSQR: require valid persisted bundle WITHOUT imposing an unsupported
+    ``state_source`` contract.
+
 Canonical score = ``-raw_l1`` (higher is watermarked).
 """
 
@@ -58,9 +63,86 @@ def _get_extract_module():
     return mod
 
 
+# ---------------------------------------------------------------------------
+# Per-row target / mask SHA helpers (delegated, not rewritten)
+# ---------------------------------------------------------------------------
+def _compute_detector_target_hash(provider, method: str, manifest: dict) -> str:
+    """Compute the detector-side target hash for a row, method-specific."""
+    from raven.pairing_provenance import tensor_sha256
+
+    if method in {"RID", "HSTR"}:
+        if hasattr(provider, "selected_pattern_sha256") and provider.selected_pattern_sha256:
+            return str(provider.selected_pattern_sha256)
+        if manifest.get("selected_pattern_sha256"):
+            return str(manifest["selected_pattern_sha256"])
+        return tensor_sha256(provider.gt_patch)
+
+    # HSQR
+    return str(provider.bundle.manifest.get("selected_pattern_sha256", ""))
+
+
+def _compute_detector_mask_hash(provider, method: str, manifest: dict,
+                                record: dict[str, Any] | None = None) -> str:
+    """Compute the detector-side mask hash for a row, method-specific."""
+    from raven.pairing_provenance import tensor_sha256
+
+    if method in {"RID", "HSTR"}:
+        if hasattr(provider, "watermark_mask_sha256") and provider.watermark_mask_sha256:
+            return str(provider.watermark_mask_sha256)
+        if manifest.get("mask_sha256"):
+            return str(manifest["mask_sha256"])
+        if hasattr(provider, "watermarking_mask"):
+            return tensor_sha256(provider.watermarking_mask)
+        # HSTR fallback
+        if hasattr(provider, "watermark_region_mask_hstr"):
+            return tensor_sha256(provider.watermark_region_mask_hstr)
+        return ""
+
+    # HSQR
+    if hasattr(provider, "watermark_mask_sha256"):
+        return str(provider.watermark_mask_sha256)
+    if record is not None:
+        return str(record.get("hsqr_mask_sha256", ""))
+    return ""
+
+
+def _validate_row_target_mask(provider, method: str, record: dict[str, Any],
+                               manifest: dict) -> None:
+    """Validate source target/mask SHA against detector-computed values.
+
+    Raises DetectorStateValidationError on mismatch.
+    """
+    prefix = method.lower()
+    source_target = str(record.get("watermark_target_sha256", ""))
+    source_mask = str(record.get("watermark_mask_sha256", ""))
+
+    detector_target = _compute_detector_target_hash(provider, method, manifest)
+    detector_mask = _compute_detector_mask_hash(provider, method, manifest, record)
+
+    if source_target and source_target != detector_target:
+        raise DetectorStateValidationError(
+            f"{method}: detector/source target SHA mismatch for "
+            f"run_id={record.get('run_id', 'unknown')}: "
+            f"source={source_target!r} detector={detector_target!r}"
+        )
+    if source_mask and source_mask != detector_mask:
+        raise DetectorStateValidationError(
+            f"{method}: detector/source mask SHA mismatch for "
+            f"run_id={record.get('run_id', 'unknown')}: "
+            f"source={source_mask!r} detector={detector_mask!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
 def load_state(records: list[dict[str, Any]], device: str,
                method: str = "RID", **extra) -> dict[str, Any]:
-    """Load Fourier provider via canonical bundle helpers from extract script."""
+    """Load Fourier provider via canonical bundle helpers from extract script.
+
+    Validates every row for cohort consistency (same bundle_dir, key_index,
+    protocol_mode) and rejects mixed cohorts before any scoring.
+    """
     import torch
 
     _ensure_paths()
@@ -76,7 +158,12 @@ def load_state(records: list[dict[str, Any]], device: str,
             f"Fourier dependencies not available: {exc}"
         ) from exc
 
-    first = records[0] if records else {}
+    if not records:
+        raise DetectorMissingStateError(
+            f"{method}: no records provided to load_state"
+        )
+
+    first = records[0]
     bundle_dir = first.get(f"{prefix}_bundle_dir", "")
     if not bundle_dir or not Path(bundle_dir).is_dir():
         raise DetectorMissingStateError(
@@ -92,13 +179,20 @@ def load_state(records: list[dict[str, Any]], device: str,
 
     identifier = str(first.get("run_id", "0"))
 
-    # Use canonical bundle manifest and provider kwargs
+    # -----------------------------------------------------------------------
+    # Validate first row's bundle and build provider from it
+    # -----------------------------------------------------------------------
     try:
         bundle_dir_path, manifest = mod.fourier_bundle_manifest(
             first, str(identifier), method)
     except Exception as exc:
+        msg = f"{type(exc).__name__}: {exc}"
+        if "not found" in str(exc).lower() or "not a directory" in str(exc).lower():
+            raise DetectorMissingStateError(
+                f"{method} bundle not found for run_id={identifier}: {msg}"
+            ) from exc
         raise DetectorStateValidationError(
-            f"{method} bundle validation failed: {type(exc).__name__}: {exc}"
+            f"{method} bundle validation failed for run_id={identifier}: {msg}"
         ) from exc
 
     try:
@@ -111,7 +205,7 @@ def load_state(records: list[dict[str, Any]], device: str,
 
         device_obj = torch.device(device)
         model_id = kwargs.get("modelid_target",
-                               "RedbeardNZ/stable-diffusion-2-1-base")
+                              "RedbeardNZ/stable-diffusion-2-1-base")
         resolution = kwargs.get("resolution", 512)
 
         pipe = pipe_utils.get_pipe_provider(
@@ -149,22 +243,95 @@ def load_state(records: list[dict[str, Any]], device: str,
                 f"Unknown Fourier method: {method}"
             )
 
-        # Validate state_source
-        if getattr(provider, "bundle", None) is None:
-            raise DetectorStateValidationError(
-                f"{method} provider has no persisted bundle"
-            )
-        if getattr(provider, "state_source", "") != "bundle":
-            raise DetectorStateValidationError(
-                f"{method}: state_source is not 'bundle': "
-                f"{getattr(provider, 'state_source', 'unknown')}"
-            )
+        # -------------------------------------------------------------------
+        # Method-specific state gates (Issue #24)
+        # -------------------------------------------------------------------
+        if method in {"RID", "HSTR"}:
+            if getattr(provider, "bundle", None) is None:
+                raise DetectorStateValidationError(
+                    f"{method} provider has no persisted bundle"
+                )
+            if getattr(provider, "state_source", "") != "bundle":
+                raise DetectorStateValidationError(
+                    f"{method}: state_source is not 'bundle': "
+                    f"{getattr(provider, 'state_source', 'unknown')}"
+                )
+        elif method == "HSQR":
+            # HSQR: require valid bundle but do NOT impose state_source contract
+            if getattr(provider, "bundle", None) is None:
+                raise DetectorStateValidationError(
+                    f"{method} provider has no persisted bundle"
+                )
     except (DetectorStateValidationError, DetectorMissingStateError):
         raise
     except TypeError as exc:
         raise DetectorProviderInitializationError(
             f"{method} provider construction failed: {exc}"
         ) from exc
+
+    # -------------------------------------------------------------------
+    # Cohort consistency: validate every row against the canonical bundle
+    # Reject mixed bundle_dir / key_index / protocol_mode before scoring.
+    # -------------------------------------------------------------------
+    cohort_bundle_dir = str(first.get(f"{prefix}_bundle_dir", ""))
+    cohort_key_index = str(first.get(f"{prefix}_key_index", ""))
+    cohort_protocol = str(first.get(f"{prefix}_protocol_mode", ""))
+    cohort_bundle_config = str(first.get(f"{prefix}_bundle_config_sha256", ""))
+    cohort_selected_pattern = str(first.get(f"{prefix}_selected_pattern_sha256", ""))
+    cohort_mask = str(first.get(f"{prefix}_mask_sha256", ""))
+
+    for i, record in enumerate(records):
+        row_id = str(record.get("run_id", i))
+        row_prefix = f"{method} run_id={row_id}"
+
+        # Validate bundle identity via canonical helper for this row
+        try:
+            mod.fourier_bundle_manifest(record, row_id, method)
+        except Exception as exc:
+            msg = f"{type(exc).__name__}: {exc}"
+            if "not found" in str(exc).lower():
+                raise DetectorMissingStateError(
+                    f"{row_prefix}: bundle not found: {msg}"
+                ) from exc
+            raise DetectorStateValidationError(
+                f"{row_prefix}: bundle validation failed: {msg}"
+            ) from exc
+
+        # Check cohort consistency — mixed cohorts are rejected
+        row_bundle_dir = str(record.get(f"{prefix}_bundle_dir", ""))
+        row_key_index = str(record.get(f"{prefix}_key_index", ""))
+        row_protocol = str(record.get(f"{prefix}_protocol_mode", ""))
+
+        if row_bundle_dir != cohort_bundle_dir:
+            raise DetectorStateValidationError(
+                f"{row_prefix}: mixed bundle_dir in cohort: "
+                f"expected={cohort_bundle_dir!r} got={row_bundle_dir!r}"
+            )
+        if row_key_index != cohort_key_index:
+            raise DetectorStateValidationError(
+                f"{row_prefix}: mixed key_index in cohort: "
+                f"expected={cohort_key_index!r} got={row_key_index!r}"
+            )
+        if row_protocol != cohort_protocol:
+            raise DetectorStateValidationError(
+                f"{row_prefix}: mixed protocol_mode in cohort: "
+                f"expected={cohort_protocol!r} got={row_protocol!r}"
+            )
+
+        # Validate required metadata fields are present (non-empty)
+        for field_name, field_value in (
+            (f"{prefix}_bundle_dir", row_bundle_dir),
+            (f"{prefix}_bundle_config_sha256",
+             str(record.get(f"{prefix}_bundle_config_sha256", ""))),
+            (f"{prefix}_selected_pattern_sha256",
+             str(record.get(f"{prefix}_selected_pattern_sha256", ""))),
+            (f"{prefix}_key_index", row_key_index),
+            (f"{prefix}_protocol_mode", row_protocol),
+        ):
+            if not field_value:
+                raise DetectorMissingStateError(
+                    f"{row_prefix}: missing required field {field_name}"
+                )
 
     return {
         "provider": provider,
@@ -173,6 +340,13 @@ def load_state(records: list[dict[str, Any]], device: str,
         "device_obj": device_obj,
         "method": method,
         "score_definition": f"{prefix}_score = -raw_l1",
+        "_cohort_bundle_dir": cohort_bundle_dir,
+        "_cohort_key_index": cohort_key_index,
+        "_cohort_protocol": cohort_protocol,
+        "_cohort_bundle_config": cohort_bundle_config,
+        "_cohort_selected_pattern": cohort_selected_pattern,
+        "_cohort_mask": cohort_mask,
+        "_manifest": manifest,
     }
 
 
@@ -182,7 +356,12 @@ def score_image(provider_info: dict[str, Any], image_path: str, *,
                 steps: int = 50) -> dict[str, Any]:
     """Score one image using the Fourier provider via canonical evaluate_image.
 
-    Canonical score = ``-raw_l1`` (delegates to extract module's canonical_score).
+    Per-row target/mask SHA validation (Issue #24): when ``record`` is
+    provided, validates source watermarked target/mask identity against the
+    detector's computed values before scoring.
+
+    Canonical score = ``-raw_l1`` (delegates to extract module's
+    canonical_score).
     """
     import torch
 
@@ -193,7 +372,17 @@ def score_image(provider_info: dict[str, Any], image_path: str, *,
     provider = provider_info["provider"]
     method = provider_info["method"]
     mod = provider_info["extract_module"]
+    manifest = provider_info.get("_manifest", {})
 
+    # -------------------------------------------------------------------
+    # Per-row target/mask identity validation (Issue #24)
+    # -------------------------------------------------------------------
+    if record is not None:
+        _validate_row_target_mask(provider, method, record, manifest)
+
+    # -------------------------------------------------------------------
+    # Delegate scoring to canonical helpers — no watermark maths rewritten
+    # -------------------------------------------------------------------
     try:
         result = mod.evaluate_image(
             torch, provider, provider_info["pipe"], path, steps)
