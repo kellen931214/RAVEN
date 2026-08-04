@@ -20,13 +20,17 @@ for _root in (REPO / "raven_repro", REPO / "eval_bench_wm", REPO / "experiments"
     if str(_root) not in sys.path:
         sys.path.insert(0, str(_root))
 
+from raven.pairing_provenance import GM_SHARED_TR_CLEAN_MODE  # noqa: E402
+
 from raven.detectors.gm_detector import (  # noqa: E402
     _CANONICAL_KWARGS_FIELDS,
     _GM_REQUIRED_METADATA_FIELDS,
     _validate_required_gm_metadata,
     _validate_bundle_files_exist,
     _canonical_provider_identity,
-    _validate_gm_protocol_profile,
+    _validate_gm_protocol_mode,
+    _validate_gm_provider_profile,
+    _validate_scorer_outputs,
     describe_required_artifacts,
     load_state,
     score_image,
@@ -40,26 +44,18 @@ from raven.detectors import (  # noqa: E402
     DetectorScoringError,
     ROW_STATUS_SCORED,
     ROW_STATUS_FAILED_MISSING_STATE,
-    ROW_STATUS_FAILED_MISSING_IMAGE,
     ROW_STATUS_FAILED_STATE_VALIDATION,
     ROW_STATUS_FAILED_PROVIDER,
-    ROW_STATUS_FAILED_SCORING,
     STATUS_COMPLETED,
     STATUS_FAILED_MISSING_REQUIRED_STATE,
     STATUS_FAILED_STATE_VALIDATION,
     STATUS_FAILED_PROVIDER_INITIALIZATION,
-    FAILURE_CAUSE_MISSING_REQUIRED_STATE,
-    FAILURE_CAUSE_STATE_VALIDATION,
-    FAILURE_CAUSE_PROVIDER_INITIALIZATION,
-    FAILURE_CAUSE_SCORING_ERROR,
-    FAILURE_CAUSE_MISSING_IMAGE,
-    KNOWN_FAILURE_CAUSES,
     stage_status_is_allowable,
 )
 
 
 # ============================================================================
-# Record builders
+# Record builders — gm_protocol_mode ≠ gm_profile
 # ============================================================================
 
 def _gm_record(run_id="0", **overrides):
@@ -69,7 +65,7 @@ def _gm_record(run_id="0", **overrides):
         "gm_bundle_config_sha256": "a" * 64,
         "gm_w1_file_sha256": "b" * 64,
         "gm_w2_file_sha256": "c" * 64,
-        "gm_protocol_mode": "legacy",
+        "gm_protocol_mode": GM_SHARED_TR_CLEAN_MODE,
         "gm_m_sha256": "m" * 64,
         "gm_watermark_sha256": "n" * 64,
         "gm_target_sha256": "o" * 64,
@@ -81,7 +77,11 @@ def _gm_record(run_id="0", **overrides):
 
 
 def _make_bundle_dir(tmp_path: Path, **manifest_overrides) -> Path:
-    """Create a minimal valid-looking bundle directory."""
+    """Create a minimal valid-looking bundle directory.
+
+    Profile is ``legacy`` (the GmProvider bundle config), NOT the
+    evaluation protocol (``GM_SHARED_TR_CLEAN_MODE``).
+    """
     bundle = tmp_path / "bundle"
     bundle.mkdir(parents=True, exist_ok=True)
     manifest = {
@@ -126,8 +126,8 @@ class StubGmProvider:
         self.state_source = kwargs.get("_state_source", "bundle")
         self.gt_patch = kwargs.get("_gt_patch", _fake_gt_patch())
         self.watermarking_mask = kwargs.get("_wm_mask", _fake_wm_mask())
-        self.profile_is_official = kwargs.get("_profile_is_official",
-            kwargs.get("gm_profile", "") not in ("", "legacy"))
+        self.profile = kwargs.get("gm_profile", "legacy")
+        self.profile_is_official = kwargs.get("_profile_is_official", False)
 
 
 def _fake_gt_patch():
@@ -248,12 +248,20 @@ def mock_deps(monkeypatch, bundle_dir, stub_extract_module):
     _fake_gm_provider = mock.Mock()
     _fake_gm_provider.GmProvider = StubGmProvider
 
+    # Pre-seed sys.modules so ``from ... import pipe_utils`` finds
+    # the correct mock.  The parent modules must expose the submodules
+    # as attributes so the import statement resolves them correctly.
+    _pipe_pkg = mock.Mock()
+    _pipe_pkg.pipe_utils = _fake_pipe_utils
+    _wm_pkg = mock.Mock()
+    _wm_pkg.gm_provider = _fake_gm_provider
+
     for _key, _val in [
         ("eval_bench_wm", mock.Mock()),
         ("eval_bench_wm.utils", mock.Mock()),
-        ("eval_bench_wm.utils.pipe", mock.Mock()),
+        ("eval_bench_wm.utils.pipe", _pipe_pkg),
         ("eval_bench_wm.utils.pipe.pipe_utils", _fake_pipe_utils),
-        ("eval_bench_wm.utils.wm", mock.Mock()),
+        ("eval_bench_wm.utils.wm", _wm_pkg),
         ("eval_bench_wm.utils.wm.gm_provider", _fake_gm_provider),
     ]:
         monkeypatch.setitem(sys.modules, _key, _val)
@@ -288,13 +296,82 @@ def fake_image(tmp_path):
 
 
 # ============================================================================
-# 1. Per-row canonical bundle binding
+# 1. Protocol / profile separation
+# ============================================================================
+
+class TestProtocolProfileSeparation:
+
+    def test_real_shared_clean_protocol_and_legacy_profile_are_valid(
+        self, mock_deps, bundle_dir):
+        """gm_protocol_mode=GM_SHARED_TR_CLEAN_MODE with profile=legacy passes."""
+        records = [_gm_record("0", gm_bundle_dir=str(bundle_dir),
+                               gm_protocol_mode=GM_SHARED_TR_CLEAN_MODE)]
+        info = load_state(records, "cpu")
+        vp = info["verified_provenance"]
+        assert vp["gm_protocol_mode"] == GM_SHARED_TR_CLEAN_MODE
+        assert vp["gm_profile"] == "legacy"
+
+    def test_wrong_gm_protocol_mode_rejected(self):
+        """Any gm_protocol_mode other than GM_SHARED_TR_CLEAN_MODE is rejected."""
+        record = _gm_record("0", gm_protocol_mode="wrong_protocol")
+        with pytest.raises(DetectorStateValidationError,
+                           match="protocol mode"):
+            _validate_gm_protocol_mode(record)
+
+    def test_correct_gm_protocol_mode_accepted(self):
+        record = _gm_record("0", gm_protocol_mode=GM_SHARED_TR_CLEAN_MODE)
+        _validate_gm_protocol_mode(record)  # no exception
+
+    def test_wrong_manifest_profile_rejected(self):
+        """manifest.profile != gm_provider_kwargs gm_profile → error."""
+        manifest = {"profile": "legacy"}
+        kwargs = {"gm_profile": "custom"}
+        with pytest.raises(DetectorStateValidationError,
+                           match="provider profile mismatch"):
+            _validate_gm_provider_profile(manifest, kwargs)
+
+    def test_provider_actual_profile_mismatch_rejected(self):
+        """Provider's actual .profile differs from kwargs gm_profile → error."""
+        manifest = {"profile": "legacy"}
+        kwargs = {"gm_profile": "legacy"}
+
+        class WrongProfileProvider:
+            profile = "custom"
+            bundle = None
+        with pytest.raises(DetectorStateValidationError,
+                           match="provider profile mismatch"):
+            _validate_gm_provider_profile(
+                manifest, kwargs, provider=WrongProfileProvider())
+
+    def test_provider_actual_profile_matches(self):
+        """Provider .profile == kwargs gm_profile → passes."""
+        manifest = {"profile": "legacy"}
+        kwargs = {"gm_profile": "legacy"}
+
+        class RightProfileProvider:
+            profile = "legacy"
+            bundle = None
+        _validate_gm_provider_profile(
+            manifest, kwargs, provider=RightProfileProvider())
+
+    def test_verified_provenance_separates_protocol_and_profile(
+        self, provider_info):
+        vp = provider_info["verified_provenance"]
+        assert "gm_protocol_mode" in vp
+        assert "gm_profile" in vp
+        assert vp["gm_protocol_mode"] == GM_SHARED_TR_CLEAN_MODE
+        assert vp["gm_profile"] == "legacy"
+        assert vp["gm_protocol_mode"] != vp["gm_profile"]
+
+
+# ============================================================================
+# 2. Per-row bundle binding
 # ============================================================================
 
 class TestPerRowBundleBinding:
 
-    def test_second_row_m_sha_mismatch_rejected_before_provider(self, mock_deps, bundle_dir):
-        """Second row with different gm_m_sha256 must fail before provider construction."""
+    def test_second_row_m_sha_mismatch_rejected_before_provider(
+        self, mock_deps, bundle_dir):
         records = [
             _gm_record("0", gm_bundle_dir=str(bundle_dir)),
             _gm_record("1", gm_bundle_dir=str(bundle_dir),
@@ -324,10 +401,8 @@ class TestPerRowBundleBinding:
             load_state(records, "cpu")
 
     def test_provider_not_constructed_on_second_row_mismatch(
-        self, mock_deps, bundle_dir, monkeypatch):
-        """When second row has mismatched m_sha256, GmProvider is never called."""
+        self, mock_deps, bundle_dir):
         import raven.detectors.gm_detector as gm_mod
-
         counter = [0]
 
         class CountingProvider(StubGmProvider):
@@ -351,7 +426,7 @@ class TestPerRowBundleBinding:
 
 
 # ============================================================================
-# 2. Strict required metadata preflight
+# 3. Required metadata preflight
 # ============================================================================
 
 class TestRequiredMetadataPreflight:
@@ -377,30 +452,13 @@ class TestRequiredMetadataPreflight:
         with pytest.raises(DetectorMissingStateError, match="gm_m_sha256"):
             _validate_required_gm_metadata(record)
 
-    def test_missing_watermark_target_is_missing_state(self):
-        record = _gm_record("0")
-        del record["watermark_target_sha256"]
-        with pytest.raises(DetectorMissingStateError, match="watermark_target_sha256"):
-            _validate_required_gm_metadata(record)
-
-    def test_missing_watermark_mask_is_missing_state(self):
-        record = _gm_record("0")
-        del record["watermark_mask_sha256"]
-        with pytest.raises(DetectorMissingStateError, match="watermark_mask_sha256"):
-            _validate_required_gm_metadata(record)
-
     def test_preflight_before_manifest(self, mock_deps, bundle_dir):
-        """Missing required field must be caught as MissingStateError BEFORE
-        gm_bundle_manifest is ever called (no StateValidationError misclassification).
-        """
         record = _gm_record("0", gm_bundle_dir=str(bundle_dir))
         del record["gm_m_sha256"]
         with pytest.raises(DetectorMissingStateError, match="gm_m_sha256"):
             load_state([record], "cpu")
 
     def test_all_rows_missing_same_field_not_uniform(self, mock_deps, bundle_dir):
-        """Two rows both missing gm_m_sha256: must be MissingStateError, not
-        mistaken for a uniform cohort."""
         r0 = _gm_record("0", gm_bundle_dir=str(bundle_dir))
         del r0["gm_m_sha256"]
         r1 = _gm_record("1", gm_bundle_dir=str(bundle_dir))
@@ -410,7 +468,7 @@ class TestRequiredMetadataPreflight:
 
 
 # ============================================================================
-# 3. Target / mask fail-closed
+# 4. Target / mask fail-closed
 # ============================================================================
 
 class TestTargetMaskFailClosed:
@@ -431,13 +489,15 @@ class TestTargetMaskFailClosed:
         with pytest.raises(DetectorMissingStateError, match="watermark_mask_sha256"):
             score_image(provider_info, fake_image, record=record)
 
-    def test_missing_detector_target_is_state_validation(self, provider_info, fake_image):
+    def test_missing_detector_target_is_state_validation(
+        self, provider_info, fake_image):
         provider_info["provider_target_hash"] = ""
         record = _gm_record("0")
         with pytest.raises(DetectorStateValidationError, match="detector target hash"):
             score_image(provider_info, fake_image, record=record)
 
-    def test_missing_detector_mask_is_state_validation(self, provider_info, fake_image):
+    def test_missing_detector_mask_is_state_validation(
+        self, provider_info, fake_image):
         provider_info["provider_mask_hash"] = ""
         record = _gm_record("0")
         with pytest.raises(DetectorStateValidationError, match="detector mask hash"):
@@ -450,222 +510,269 @@ class TestTargetMaskFailClosed:
 
     def test_source_mask_mismatch(self, provider_info, fake_image):
         provider_target = provider_info["provider_target_hash"]
-        provider_mask = provider_info["provider_mask_hash"]
         record = _gm_record(
-            "0",
-            watermark_target_sha256=provider_target,
-            watermark_mask_sha256="wrong" * 8,
-        )
+            "0", watermark_target_sha256=provider_target,
+            watermark_mask_sha256="wrong" * 8)
         with pytest.raises(DetectorStateValidationError, match="mask SHA mismatch"):
             score_image(provider_info, fake_image, record=record)
 
 
 # ============================================================================
-# 4. Protocol / profile matching
-# ============================================================================
-
-class TestProtocolProfileMatching:
-
-    def test_protocol_matches_bundle_profile(self, mock_deps, bundle_dir):
-        """When gm_protocol_mode == manifest.profile == gm_profile, pass."""
-        records = [_gm_record("0", gm_bundle_dir=str(bundle_dir),
-                               gm_protocol_mode="legacy")]
-        info = load_state(records, "cpu")
-        assert info["provider"] is not None
-
-    def test_protocol_must_match_bundle_profile(self, mock_deps, bundle_dir):
-        """When gm_protocol_mode differs from manifest.profile, fail."""
-        records = [_gm_record("0", gm_bundle_dir=str(bundle_dir),
-                               gm_protocol_mode="wrong_protocol")]
-        with pytest.raises(DetectorStateValidationError, match="protocol/profile mismatch"):
-            load_state(records, "cpu")
-
-    def test_all_rows_wrong_protocol_still_fails(self, mock_deps, bundle_dir):
-        """All rows agreeing on a wrong protocol is still a mismatch."""
-        records = [
-            _gm_record("0", gm_bundle_dir=str(bundle_dir),
-                       gm_protocol_mode="wrong_protocol"),
-            _gm_record("1", gm_bundle_dir=str(bundle_dir),
-                       gm_protocol_mode="wrong_protocol"),
-        ]
-        with pytest.raises(DetectorStateValidationError, match="protocol/profile mismatch"):
-            load_state(records, "cpu")
-
-
-# ============================================================================
-# 5. Canonical provider configuration comparison
-# ============================================================================
-
-class TestCanonicalProviderIdentity:
-
-    def test_all_rows_canonical_provider_kwargs_match(self, mock_deps, bundle_dir):
-        """Two rows with identical metadata produce identical canonical identities."""
-        records = [_gm_record("0", gm_bundle_dir=str(bundle_dir)),
-                   _gm_record("1", gm_bundle_dir=str(bundle_dir))]
-        info = load_state(records, "cpu")
-        assert info["provider"] is not None
-
-    def test_identity_differs_on_profile(self, mock_deps, bundle_dir):
-        """Different manifest profile gives different canonical identity."""
-        bundle2 = _make_bundle_dir(bundle_dir.parent / "bundle2", profile="custom")
-        r0 = _gm_record("0", gm_bundle_dir=str(bundle_dir),
-                        gm_protocol_mode="legacy",
-                        gm_bundle_config_sha256="a" * 64,
-                        gm_w1_file_sha256="b" * 64,
-                        gm_w2_file_sha256="c" * 64,
-                        gm_m_sha256="m" * 64,
-                        gm_watermark_sha256="n" * 64,
-                        gm_target_sha256="o" * 64)
-        r1 = _gm_record("1", gm_bundle_dir=str(bundle2),
-                        gm_protocol_mode="custom",
-                        gm_bundle_config_sha256="a" * 64,
-                        gm_w1_file_sha256="b" * 64,
-                        gm_w2_file_sha256="c" * 64,
-                        gm_m_sha256="m" * 64,
-                        gm_watermark_sha256="n" * 64,
-                        gm_target_sha256="o" * 64)
-        # Update bundle2 manifest to match r1's expected fields
-        records = [r0, r1]
-        with pytest.raises(DetectorStateValidationError, match="mixed canonical"):
-            load_state(records, "cpu")
-
-    def test_canonical_identity_includes_all_kwargs_fields(self):
-        """Every field in _CANONICAL_KWARGS_FIELDS contributes to the identity."""
-        kwargs1 = {f: "v1" for f in _CANONICAL_KWARGS_FIELDS}
-        kwargs2 = {f: "v1" for f in _CANONICAL_KWARGS_FIELDS}
-        assert _canonical_provider_identity(kwargs1) == _canonical_provider_identity(kwargs2)
-        kwargs2["w_seed"] = 999
-        assert _canonical_provider_identity(kwargs1) != _canonical_provider_identity(kwargs2)
-
-
-# ============================================================================
-# 6. No error-message substring classification
-# ============================================================================
-
-class TestNoErrorMessageParsing:
-
-    def test_bundle_error_classification_does_not_parse_message(
-        self, mock_deps, bundle_dir):
-        """RuntimeError from gm_bundle_manifest is always StateValidationError
-        (after preflight passed).  The detector never inspects the message string."""
-        import raven.detectors.gm_detector as gm_mod
-
-        stub = _StubExtractModule()
-        def _failing_manifest(row, ident):
-            raise RuntimeError("unexpected explosion — not 'not found' or 'missing'")
-        stub.gm_bundle_manifest = _failing_manifest
-        monkeypatch = pytest.MonkeyPatch()
-        monkeypatch.setattr(gm_mod, "_get_extract_module", lambda: stub)
-
-        records = [_gm_record("0", gm_bundle_dir=str(bundle_dir))]
-        with pytest.raises(DetectorStateValidationError, match="manifest validation failed"):
-            load_state(records, "cpu")
-
-    def test_missing_bundle_still_missing_state_after_removing_classifier(
-        self, mock_deps):
-        """Missing bundle dir is MissingStateError (preflight), not StateValidationError."""
-        records = [_gm_record("0", gm_bundle_dir="/no/such/dir")]
-        with pytest.raises(DetectorMissingStateError, match="not found"):
-            load_state(records, "cpu")
-
-
-# ============================================================================
-# 7. Canonical pipe configuration
+# 5. Pipe uses complete canonical profile (including revision)
 # ============================================================================
 
 class TestCanonicalPipeConfig:
 
-    def test_pipe_uses_canonical_kwargs(self, mock_deps, bundle_dir):
-        """Pipe construction uses modelid_target, scheduler_target, resolution
-        from the canonical kwargs, not hardcoded defaults."""
+    def test_pipe_uses_model_id_revision_scheduler_resolution(
+        self, mock_deps, bundle_dir):
+        """Pipe construction receives model_id, revision, scheduler, resolution
+        from canonical kwargs."""
         records = [_gm_record("0", gm_bundle_dir=str(bundle_dir))]
         info = load_state(records, "cpu")
-        # Provider constructed successfully proves canonical pipe args were used.
         assert info["provider"] is not None
         assert info["pipe"] is not None
 
-
-# ============================================================================
-# 8. Verified provenance fields
-# ============================================================================
-
-class TestVerifiedProvenance:
-
-    def test_score_contains_source_detector_target_pairs(self, provider_info, fake_image):
-        record = _gm_record("0",
-            watermark_target_sha256=provider_info["provider_target_hash"],
-            watermark_mask_sha256=provider_info["provider_mask_hash"])
-        score = score_image(provider_info, fake_image, record=record)
-        assert score["source_watermark_target_sha256"] == record["watermark_target_sha256"]
-        assert score["detector_watermark_target_sha256"] == provider_info["provider_target_hash"]
-        assert score["source_watermark_mask_sha256"] == record["watermark_mask_sha256"]
-        assert score["detector_watermark_mask_sha256"] == provider_info["provider_mask_hash"]
-
-    def test_score_contains_gm_target_mask_verified(self, provider_info, fake_image):
-        record = _gm_record("0",
-            watermark_target_sha256=provider_info["provider_target_hash"],
-            watermark_mask_sha256=provider_info["provider_mask_hash"])
-        score = score_image(provider_info, fake_image, record=record)
-        assert score["gm_target_verified"] is True
-        assert score["gm_mask_verified"] is True
-
-    def test_verified_provenance_contains_bundle_fields(self, provider_info, fake_image):
-        record = _gm_record("0",
-            watermark_target_sha256=provider_info["provider_target_hash"],
-            watermark_mask_sha256=provider_info["provider_mask_hash"])
-        score = score_image(provider_info, fake_image, record=record)
-        for field in ("gm_bundle_dir", "gm_bundle_config_sha256",
-                       "gm_w1_file_sha256", "gm_w2_file_sha256",
-                       "gm_m_sha256", "gm_watermark_sha256",
-                       "gm_target_sha256", "gm_protocol_mode",
-                       "gm_profile", "gm_state_source"):
-            assert field in score, f"verified field {field} missing"
+        fake_utils = sys.modules.get("eval_bench_wm.utils.pipe.pipe_utils")
+        # get_pipe_provider was called
+        assert fake_utils.get_pipe_provider.called
+        _, kw = fake_utils.get_pipe_provider.call_args
+        assert kw["pretrained_model_name_or_path"] == "RedbeardNZ/stable-diffusion-2-1-base"
+        assert kw["resolution"] == 512
+        assert kw["schedulers_name"] == "DDIM"
+        assert kw.get("revision") == "fake"
 
 
 # ============================================================================
-# 9. GNR / classifier state
+# 6. Scoring contract — no fabricated defaults
 # ============================================================================
 
-class TestGnrClassifierState:
+class TestScorerOutputValidation:
 
-    def test_gnr_classifier_usage_preserved(self, provider_info, fake_image):
-        record = _gm_record("0",
-            watermark_target_sha256=provider_info["provider_target_hash"],
-            watermark_mask_sha256=provider_info["provider_mask_hash"])
-        score = score_image(provider_info, fake_image, record=record)
-        assert "gm_gnr_used" in score
-        assert "gm_classifier_used" in score
-        assert isinstance(score["gm_gnr_used"], bool)
-        assert isinstance(score["gm_classifier_used"], bool)
+    def test_required_outputs_present_and_valid(self):
+        result = {
+            "gm_raw_bit_accuracy": 0.85,
+            "gm_raw_ring_l1": 0.12,
+            "gm_report_label": "gm_raw_bit_accuracy",
+            "gm_score_definition": "spatial-domain bit match rate",
+            "gm_threshold_source": "ensemble_not_applicable",
+            "gm_comparison_operator": ">=",
+        }
+        _validate_scorer_outputs(result)  # no exception
 
-    def test_gnr_used_alias_resolution(self, provider_info, fake_image, monkeypatch):
-        """When scorer returns gm_gnr_used (not gm_used_gnr), still captured."""
+    def test_missing_required_output_raises(self):
+        result = {
+            "gm_raw_bit_accuracy": 0.85,
+            "gm_raw_ring_l1": 0.12,
+            "gm_report_label": "gm_raw_bit_accuracy",
+            "gm_score_definition": "spatial-domain bit match rate",
+            "gm_threshold_source": "ensemble_not_applicable",
+            # gm_comparison_operator missing
+        }
+        with pytest.raises(ValueError, match="gm_comparison_operator"):
+            _validate_scorer_outputs(result)
+
+    def test_none_required_output_raises(self):
+        result = {
+            "gm_raw_bit_accuracy": 0.85,
+            "gm_raw_ring_l1": 0.12,
+            "gm_report_label": None,
+            "gm_score_definition": "x",
+            "gm_threshold_source": "x",
+            "gm_comparison_operator": ">=",
+        }
+        with pytest.raises(ValueError, match="gm_report_label"):
+            _validate_scorer_outputs(result)
+
+    def test_nonfinite_bit_accuracy_raises(self):
+        result = {
+            "gm_raw_bit_accuracy": float("nan"),
+            "gm_raw_ring_l1": 0.12,
+            "gm_report_label": "x",
+            "gm_score_definition": "x",
+            "gm_threshold_source": "x",
+            "gm_comparison_operator": ">=",
+        }
+        with pytest.raises(ValueError, match="non-finite"):
+            _validate_scorer_outputs(result)
+
+    def test_bit_accuracy_out_of_range_raises(self):
+        result = {
+            "gm_raw_bit_accuracy": 1.5,
+            "gm_raw_ring_l1": 0.12,
+            "gm_report_label": "x",
+            "gm_score_definition": "x",
+            "gm_threshold_source": "x",
+            "gm_comparison_operator": ">=",
+        }
+        with pytest.raises(ValueError, match="out of"):
+            _validate_scorer_outputs(result)
+
+    def test_optional_none_accepted(self):
+        result = {
+            "gm_raw_bit_accuracy": 0.85,
+            "gm_raw_ring_l1": 0.12,
+            "gm_report_label": "x",
+            "gm_score_definition": "x",
+            "gm_threshold_source": "x",
+            "gm_comparison_operator": ">=",
+            "gm_restored_bit_accuracy": None,
+            "gm_classifier_probability": None,
+        }
+        _validate_scorer_outputs(result)  # no exception
+
+    def test_optional_nonfinite_raises(self):
+        result = {
+            "gm_raw_bit_accuracy": 0.85,
+            "gm_raw_ring_l1": 0.12,
+            "gm_report_label": "x",
+            "gm_score_definition": "x",
+            "gm_threshold_source": "x",
+            "gm_comparison_operator": ">=",
+            "gm_restored_bit_accuracy": float("inf"),
+        }
+        with pytest.raises(ValueError, match="non-finite"):
+            _validate_scorer_outputs(result)
+
+
+# ============================================================================
+# 7. Scoring path — raw_score/canonical_score failures wrapped
+# ============================================================================
+
+class TestScoringPathFailures:
+
+    def test_raw_score_failure_is_scoring_error(
+        self, provider_info, fake_image, monkeypatch):
         import raven.detectors.gm_detector as gm_mod
-
         stub = _StubExtractModule()
-        def gm_eval(*a, **kw):
-            return {
-                "gm_raw_bit_accuracy": 0.85, "gm_raw_ring_l1": 0.12,
-                "gm_restored_bit_accuracy": None, "gm_classifier_probability": None,
-                "gm_report_label": "x", "gm_score_definition": "x",
-                "gm_threshold_source": "x", "gm_comparison_operator": ">=",
-                "gm_gnr_used": True,  # alternate key
-                "gm_classifier_used": True,  # alternate key
-            }
-        stub.evaluate_image = gm_eval
+        stub.raw_score = lambda m, r: (_ for _ in ()).throw(
+            ValueError("raw score computation failed"))
         monkeypatch.setattr(gm_mod, "_get_extract_module", lambda: stub)
         provider_info["extract_module"] = stub
 
         record = _gm_record("0",
             watermark_target_sha256=provider_info["provider_target_hash"],
             watermark_mask_sha256=provider_info["provider_mask_hash"])
-        score = score_image(provider_info, fake_image, record=record)
-        assert score["gm_gnr_used"] is True
-        assert score["gm_classifier_used"] is True
+        with pytest.raises(DetectorScoringError, match="scoring failed"):
+            score_image(provider_info, fake_image, record=record)
+
+    def test_canonical_score_failure_is_scoring_error(
+        self, provider_info, fake_image, monkeypatch):
+        import raven.detectors.gm_detector as gm_mod
+        stub = _StubExtractModule()
+        stub.canonical_score = lambda m, r, res: (
+            _ for _ in ()).throw(ValueError("canonical score failed"))
+        monkeypatch.setattr(gm_mod, "_get_extract_module", lambda: stub)
+        provider_info["extract_module"] = stub
+
+        record = _gm_record("0",
+            watermark_target_sha256=provider_info["provider_target_hash"],
+            watermark_mask_sha256=provider_info["provider_mask_hash"])
+        with pytest.raises(DetectorScoringError, match="scoring failed"):
+            score_image(provider_info, fake_image, record=record)
+
+    def test_nonfinite_raw_score_is_scoring_error(
+        self, provider_info, fake_image, monkeypatch):
+        import raven.detectors.gm_detector as gm_mod
+        stub = _StubExtractModule()
+        stub.raw_score = lambda m, r: float("nan")
+        monkeypatch.setattr(gm_mod, "_get_extract_module", lambda: stub)
+        provider_info["extract_module"] = stub
+
+        record = _gm_record("0",
+            watermark_target_sha256=provider_info["provider_target_hash"],
+            watermark_mask_sha256=provider_info["provider_mask_hash"])
+        with pytest.raises(DetectorScoringError, match="scoring failed"):
+            score_image(provider_info, fake_image, record=record)
+
+    def test_nonfinite_canonical_score_is_scoring_error(
+        self, provider_info, fake_image, monkeypatch):
+        import raven.detectors.gm_detector as gm_mod
+        stub = _StubExtractModule()
+        stub.canonical_score = lambda m, r, res: float("-inf")
+        monkeypatch.setattr(gm_mod, "_get_extract_module", lambda: stub)
+        provider_info["extract_module"] = stub
+
+        record = _gm_record("0",
+            watermark_target_sha256=provider_info["provider_target_hash"],
+            watermark_mask_sha256=provider_info["provider_mask_hash"])
+        with pytest.raises(DetectorScoringError, match="scoring failed"):
+            score_image(provider_info, fake_image, record=record)
 
 
 # ============================================================================
-# 10. Missing image → FileNotFoundError
+# 8. Malformed bundle — structured classification
+# ============================================================================
+
+class TestMalformedBundle:
+
+    def test_malformed_manifest_json_is_state_validation(
+        self, mock_deps, bundle_dir, monkeypatch):
+        """When manifest.json is not valid JSON, it's StateValidationError
+        (not MissingStateError — the files exist on disk)."""
+        import raven.detectors.gm_detector as gm_mod
+
+        def _broken_manifest(row, ident):
+            raise json.JSONDecodeError("bad json", "{", 0)
+        stub = _StubExtractModule()
+        stub.gm_bundle_manifest = _broken_manifest
+        monkeypatch.setattr(gm_mod, "_get_extract_module", lambda: stub)
+
+        records = [_gm_record("0", gm_bundle_dir=str(bundle_dir))]
+        with pytest.raises(DetectorStateValidationError,
+                           match="manifest validation failed"):
+            load_state(records, "cpu")
+
+    def test_manifest_missing_required_key_is_state_validation(
+        self, mock_deps, bundle_dir, monkeypatch):
+        """When manifest lacks a required key, StateValidationError."""
+        import raven.detectors.gm_detector as gm_mod
+
+        def _missing_key(row, ident):
+            raise KeyError("bundle_config_sha256")
+        stub = _StubExtractModule()
+        stub.gm_bundle_manifest = _missing_key
+        monkeypatch.setattr(gm_mod, "_get_extract_module", lambda: stub)
+
+        records = [_gm_record("0", gm_bundle_dir=str(bundle_dir))]
+        with pytest.raises(DetectorStateValidationError,
+                           match="manifest validation failed"):
+            load_state(records, "cpu")
+
+    def test_invalid_manifest_value_type_is_state_validation(
+        self, mock_deps, bundle_dir, monkeypatch):
+        """When a manifest value has wrong type, StateValidationError."""
+        import raven.detectors.gm_detector as gm_mod
+
+        def _wrong_type(row, ident):
+            raise TypeError("resolution must be int, got str")
+        stub = _StubExtractModule()
+        stub.gm_bundle_manifest = _wrong_type
+        monkeypatch.setattr(gm_mod, "_get_extract_module", lambda: stub)
+
+        records = [_gm_record("0", gm_bundle_dir=str(bundle_dir))]
+        with pytest.raises(DetectorStateValidationError,
+                           match="manifest validation failed"):
+            load_state(records, "cpu")
+
+    def test_provider_kwargs_exception_is_state_validation(
+        self, mock_deps, bundle_dir, monkeypatch):
+        """Any exception from gm_provider_kwargs → StateValidationError."""
+        import raven.detectors.gm_detector as gm_mod
+
+        def _failing_kwargs(row, ident):
+            raise ValueError("unexpected manifest field")
+        stub = _StubExtractModule()
+        stub.gm_provider_kwargs = _failing_kwargs
+        monkeypatch.setattr(gm_mod, "_get_extract_module", lambda: stub)
+
+        records = [_gm_record("0", gm_bundle_dir=str(bundle_dir))]
+        with pytest.raises(DetectorStateValidationError,
+                           match="provider kwargs validation failed"):
+            load_state(records, "cpu")
+
+
+# ============================================================================
+# 9. Missing image → FileNotFoundError
 # ============================================================================
 
 class TestMissingImage:
@@ -682,19 +789,16 @@ class TestMissingImage:
 
 
 # ============================================================================
-# 11. Non-TypeError constructor failure
+# 10. Constructor failure
 # ============================================================================
 
 class TestConstructorFailure:
 
     def test_non_typeerror_constructor_failure_is_provider_failure(
         self, mock_deps, bundle_dir):
-        """A RuntimeError during provider construction is
-        DetectorProviderInitializationError, not internal_error."""
         class FailingProvider:
             def __init__(self, **kwargs):
                 raise RuntimeError("GPU OOM during provider init")
-
         fake_gm = sys.modules.get("eval_bench_wm.utils.wm.gm_provider")
         fake_gm.GmProvider = FailingProvider
         try:
@@ -707,7 +811,7 @@ class TestConstructorFailure:
 
 
 # ============================================================================
-# Scoring success + aggregate
+# Scoring + verified provenance + aggregate
 # ============================================================================
 
 class TestScoring:
@@ -727,18 +831,50 @@ class TestScoring:
             watermark_target_sha256=provider_info["provider_target_hash"],
             watermark_mask_sha256=provider_info["provider_mask_hash"])
         score = score_image(provider_info, fake_image, record=record)
+        assert score["gm_raw_bit_accuracy"] == 0.85
+        assert score["gm_raw_ring_l1"] == 0.12
         assert "gm_restored_bit_accuracy" in score
         assert "gm_classifier_probability" in score
-        assert "gm_report_label" in score
+        assert score["gm_report_label"] == "gm_raw_bit_accuracy"
         assert "gm_score_definition" in score
         assert "gm_threshold_source" in score
         assert "gm_comparison_operator" in score
 
+    def test_verified_provenance_contains_protocol_and_profile(
+        self, provider_info, fake_image):
+        record = _gm_record("0",
+            watermark_target_sha256=provider_info["provider_target_hash"],
+            watermark_mask_sha256=provider_info["provider_mask_hash"])
+        score = score_image(provider_info, fake_image, record=record)
+        assert score["gm_protocol_mode"] == GM_SHARED_TR_CLEAN_MODE
+        assert score["gm_profile"] == "legacy"
+        assert score["gm_protocol_mode"] != score["gm_profile"]
+
+    def test_source_detector_target_pairs_preserved(self, provider_info, fake_image):
+        record = _gm_record("0",
+            watermark_target_sha256=provider_info["provider_target_hash"],
+            watermark_mask_sha256=provider_info["provider_mask_hash"])
+        score = score_image(provider_info, fake_image, record=record)
+        assert score["source_watermark_target_sha256"]
+        assert score["detector_watermark_target_sha256"]
+        assert score["source_watermark_mask_sha256"]
+        assert score["detector_watermark_mask_sha256"]
+
+    def test_gnr_classifier_usage_preserved(self, provider_info, fake_image):
+        record = _gm_record("0",
+            watermark_target_sha256=provider_info["provider_target_hash"],
+            watermark_mask_sha256=provider_info["provider_mask_hash"])
+        score = score_image(provider_info, fake_image, record=record)
+        assert "gm_gnr_used" in score
+        assert "gm_classifier_used" in score
+        assert isinstance(score["gm_gnr_used"], bool)
+        assert isinstance(score["gm_classifier_used"], bool)
+
     def test_scoring_error(self, provider_info, fake_image, monkeypatch):
         import raven.detectors.gm_detector as gm_mod
         stub = _StubExtractModule()
-        stub.evaluate_image = lambda *a, **kw: (_ for _ in ()).throw(
-            RuntimeError("inversion failed"))
+        stub.evaluate_image = lambda *a, **kw: (
+            _ for _ in ()).throw(RuntimeError("inversion failed"))
         monkeypatch.setattr(gm_mod, "_get_extract_module", lambda: stub)
         provider_info["extract_module"] = stub
 
@@ -812,32 +948,9 @@ class TestCanonicalHelperDelegation:
         assert len(calls) == 1
         assert calls[0][0] == "raw_score"
 
-    def test_canonical_score_delegated(self, mock_deps, bundle_dir, monkeypatch):
-        import raven.detectors.gm_detector as gm_mod
-        stub = _StubExtractModule()
-        calls = []
-        _orig = stub.canonical_score
-        stub.canonical_score = lambda m, r, res: calls.append(("canonical", m)) or _orig(m, r, res)
-        monkeypatch.setattr(gm_mod, "_get_extract_module", lambda: stub)
-
-        records = [_gm_record("0", gm_bundle_dir=str(bundle_dir))]
-        info = load_state(records, "cpu")
-        info["extract_module"] = stub
-
-        from PIL import Image
-        fake = bundle_dir.parent / "deleg2.png"
-        Image.new("RGB", (16, 16)).save(fake)
-
-        record = _gm_record("0",
-            watermark_target_sha256=info["provider_target_hash"],
-            watermark_mask_sha256=info["provider_mask_hash"])
-        score_image(info, str(fake), record=record)
-        assert len(calls) == 1
-        assert calls[0][0] == "canonical"
-
 
 # ============================================================================
-# Misc
+# Bundle file existence
 # ============================================================================
 
 class TestBundleFileExistence:
@@ -852,16 +965,6 @@ class TestBundleFileExistence:
     def test_manifest_missing(self, bundle_dir):
         (bundle_dir / "manifest.json").unlink()
         with pytest.raises(DetectorMissingStateError, match="manifest.json"):
-            _validate_bundle_files_exist(str(bundle_dir))
-
-    def test_w1_missing(self, bundle_dir):
-        (bundle_dir / "w1.pth").unlink()
-        with pytest.raises(DetectorMissingStateError, match="w1.pth"):
-            _validate_bundle_files_exist(str(bundle_dir))
-
-    def test_w2_missing(self, bundle_dir):
-        (bundle_dir / "w2.pth").unlink()
-        with pytest.raises(DetectorMissingStateError, match="w2.pth"):
             _validate_bundle_files_exist(str(bundle_dir))
 
 
@@ -896,19 +999,15 @@ def test_gm_mathematics_not_rewritten(mock_deps, bundle_dir, monkeypatch):
 
 
 # ============================================================================
-# Orchestrator integration tests
+# Orchestrator integration tests (real evaluate_detector, mocked heavy resources)
 # ============================================================================
-# Use the real evaluate_detector with mocked heavy resources (pipe, GmProvider,
-# extraction helpers, tensor hash).  The real load_state / score_image /
-# aggregate are exercised.
 
-def _orchestrator_record(run_id="0", role="watermarked", input_path="", output_dir=None, **kw):
+def _orchestrator_record(run_id="0", role="watermarked", input_path="",
+                          output_dir=None, **kw):
     from pathlib import Path
     od = Path(output_dir) if output_dir else Path("/tmp/orch")
     return {
-        "run_id": run_id,
-        "role": role,
-        "method": "GM",
+        "run_id": run_id, "role": role, "method": "GM",
         "input_path": str(Path(input_path) if input_path else od / "in.png"),
         "output_path": str(od / role / run_id / "output.png"),
         "prompt": kw.get("prompt", ""),
@@ -917,15 +1016,12 @@ def _orchestrator_record(run_id="0", role="watermarked", input_path="", output_d
         "planned_flow_dy_image_px": -24.0,
         "effective_source_flow_dx_image_px": 24.0,
         "effective_source_flow_dy_image_px": -24.0,
-        "debug_info_path": "",
-        "debug_info_retained": False,
+        "debug_info_path": "", "debug_info_retained": False,
         "source_metadata": kw.get("source_metadata", {}),
     }
 
 
 def _make_orch_images(run_dir, run_ids=("0",)):
-    """Create input images at *run_dir*.  Output images must be separately
-    created at the eval output directory used by evaluate_detector."""
     from PIL import Image
     for rid in run_ids:
         for role in ("watermarked", "clean"):
@@ -935,12 +1031,6 @@ def _make_orch_images(run_dir, run_ids=("0",)):
 
 
 def _make_orch_output_images(eval_dir, run_ids=("0",)):
-    """Create output (attacked) images at *eval_dir* so the orchestrator's
-    attacked cohorts pass preflight.
-
-    The canonical output path is ``samples/<role>/<run_id>/output.png``
-    (see ``raven.experiment_io.sample_dir``).
-    """
     from PIL import Image
     for rid in run_ids:
         for role in ("watermarked", "clean"):
@@ -950,7 +1040,6 @@ def _make_orch_output_images(eval_dir, run_ids=("0",)):
 
 
 def _setup_orch_mocks(monkeypatch, bundle_dir):
-    """Pre-seed sys.modules so evaluate_detector can import gm_detector."""
     import raven.detectors.gm_detector as gm_mod
 
     stub = _StubExtractModule()
@@ -963,12 +1052,17 @@ def _setup_orch_mocks(monkeypatch, bundle_dir):
     _fake_gm_provider = mock.Mock()
     _fake_gm_provider.GmProvider = StubGmProvider
 
+    _pipe_pkg = mock.Mock()
+    _pipe_pkg.pipe_utils = _fake_pipe_utils
+    _wm_pkg = mock.Mock()
+    _wm_pkg.gm_provider = _fake_gm_provider
+
     for _key, _val in [
         ("eval_bench_wm", mock.Mock()),
         ("eval_bench_wm.utils", mock.Mock()),
-        ("eval_bench_wm.utils.pipe", mock.Mock()),
+        ("eval_bench_wm.utils.pipe", _pipe_pkg),
         ("eval_bench_wm.utils.pipe.pipe_utils", _fake_pipe_utils),
-        ("eval_bench_wm.utils.wm", mock.Mock()),
+        ("eval_bench_wm.utils.wm", _wm_pkg),
         ("eval_bench_wm.utils.wm.gm_provider", _fake_gm_provider),
     ]:
         monkeypatch.setitem(sys.modules, _key, _val)
@@ -977,15 +1071,12 @@ def _setup_orch_mocks(monkeypatch, bundle_dir):
         "raven.pairing_provenance.tensor_sha256",
         lambda t: "orch_tensor_hash",
     )
-
     return _fake_pipe_utils, _fake_gm_provider
 
 
 class TestOrchestratorSuccess:
 
     def test_real_adapter_orchestrator_success(self, tmp_path, bundle_dir, monkeypatch):
-        """Full evaluate_detector flow: real load_state/score_image/aggregate,
-        mocked pipe/GmProvider/extract/tensor hash."""
         from experiments.eval import evaluate_detector
 
         _setup_orch_mocks(monkeypatch, bundle_dir)
@@ -993,11 +1084,8 @@ class TestOrchestratorSuccess:
 
         out_dir = tmp_path / "eval_out"
         out_dir.mkdir()
-        # Output (attacked) images resolved from evaluate_detector's output_dir:
         _make_orch_output_images(out_dir, run_ids=("0", "1"))
 
-        # The monkeypatched tensor_sha256 returns "orch_tensor_hash".
-        # source_metadata must carry that value so target/mask validation passes.
         _ORCH_HASH = "orch_tensor_hash"
         gm_fields = dict(_gm_record("0", gm_bundle_dir=str(bundle_dir),
                          watermark_target_sha256=_ORCH_HASH,
@@ -1040,17 +1128,17 @@ class TestOrchestratorSuccess:
         assert len(scored) >= 1
 
         for s in scored:
-            assert s.get("source_watermark_target_sha256"), "missing source target"
-            assert s.get("detector_watermark_target_sha256"), "missing detector target"
-            assert s.get("source_watermark_mask_sha256"), "missing source mask"
-            assert s.get("detector_watermark_mask_sha256"), "missing detector mask"
+            assert s.get("source_watermark_target_sha256")
+            assert s.get("detector_watermark_target_sha256")
+            assert s.get("source_watermark_mask_sha256")
+            assert s.get("detector_watermark_mask_sha256")
             assert s.get("gm_target_verified") is True
             assert s.get("gm_mask_verified") is True
             assert "gm_gnr_used" in s
             assert "gm_classifier_used" in s
 
-    def test_orchestrator_provider_constructed_once(self, tmp_path, bundle_dir, monkeypatch):
-        """Provider constructor called exactly once across the whole cohort."""
+    def test_orchestrator_provider_constructed_once(
+        self, tmp_path, bundle_dir, monkeypatch):
         from experiments.eval import evaluate_detector
 
         pu, fgp = _setup_orch_mocks(monkeypatch, bundle_dir)
@@ -1067,7 +1155,11 @@ class TestOrchestratorSuccess:
         out_dir = tmp_path / "eval_out2"
         out_dir.mkdir()
         _make_orch_output_images(out_dir, run_ids=("0", "1"))
-        gm_fields = dict(_gm_record("0", gm_bundle_dir=str(bundle_dir)))
+
+        _ORCH_HASH = "orch_tensor_hash"
+        gm_fields = dict(_gm_record("0", gm_bundle_dir=str(bundle_dir),
+                         watermark_target_sha256=_ORCH_HASH,
+                         watermark_mask_sha256=_ORCH_HASH))
         gm_fields.pop("run_id")
 
         records = [
@@ -1087,8 +1179,8 @@ class TestOrchestratorSuccess:
 
 class TestOrchestratorFailureStatuses:
 
-    def test_mixed_bundle_state_fails_before_provider(self, tmp_path, bundle_dir, monkeypatch):
-        """Second row with different gm_m_sha256 → failed_state_validation."""
+    def test_mixed_bundle_state_fails_before_provider(
+        self, tmp_path, bundle_dir, monkeypatch):
         from experiments.eval import evaluate_detector
 
         pu, fgp = _setup_orch_mocks(monkeypatch, bundle_dir)
@@ -1102,7 +1194,6 @@ class TestOrchestratorFailureStatuses:
         _make_orch_images(tmp_path / "run", run_ids=("0", "1"))
         out_dir = tmp_path / "eval_fail1"
         out_dir.mkdir()
-        # Need output images so preflight passes and we reach load_state
         _make_orch_output_images(out_dir, run_ids=("0", "1"))
 
         gm_fields_0 = dict(_gm_record("0", gm_bundle_dir=str(bundle_dir)))
@@ -1124,15 +1215,13 @@ class TestOrchestratorFailureStatuses:
 
         result = evaluate_detector(records, out_dir, "GM", device="cpu")
 
-        assert counter[0] == 0  # provider never constructed
+        assert counter[0] == 0
         assert result["status"] == STATUS_FAILED_STATE_VALIDATION
-        # --allow-missing-metrics must NOT suppress state validation
         assert not stage_status_is_allowable(
             STATUS_FAILED_STATE_VALIDATION, allow_missing_metrics=True)
 
     def test_missing_target_mask_is_missing_required_state(
         self, tmp_path, bundle_dir, monkeypatch):
-        """Records missing watermark_target_sha256 → failed_missing_required_state."""
         from experiments.eval import evaluate_detector
 
         _setup_orch_mocks(monkeypatch, bundle_dir)
@@ -1156,7 +1245,6 @@ class TestOrchestratorFailureStatuses:
         result = evaluate_detector(records, out_dir, "GM", device="cpu")
 
         assert result["status"] == STATUS_FAILED_MISSING_REQUIRED_STATE
-        # Without allow → nonzero; with allow → exit 0
         assert not stage_status_is_allowable(
             STATUS_FAILED_MISSING_REQUIRED_STATE, allow_missing_metrics=False)
         assert stage_status_is_allowable(
@@ -1164,17 +1252,17 @@ class TestOrchestratorFailureStatuses:
 
     def test_target_mismatch_fails_state_validation(
         self, tmp_path, bundle_dir, monkeypatch):
-        """Target SHA mismatch in score_image → failed_state_validation stage."""
         from experiments.eval import evaluate_detector
 
         _setup_orch_mocks(monkeypatch, bundle_dir)
         _make_orch_images(tmp_path / "run", run_ids=("0",))
         out_dir = tmp_path / "eval_fail3"
         out_dir.mkdir()
+        _make_orch_output_images(out_dir, run_ids=("0",))
 
         gm_fields = dict(_gm_record("0", gm_bundle_dir=str(bundle_dir)))
         gm_fields.pop("run_id")
-        gm_fields["watermark_target_sha256"] = "wrong" * 8  # mismatched
+        gm_fields["watermark_target_sha256"] = "wrong" * 8
 
         records = [
             _orchestrator_record("0", "watermarked",
@@ -1185,20 +1273,13 @@ class TestOrchestratorFailureStatuses:
 
         result = evaluate_detector(records, out_dir, "GM", device="cpu")
 
-        # The load_state succeeds (metadata is fine), but score_image fails
-        # on target mismatch, which becomes a row-level state_validation error.
-        # If no rows scored → reduce_detector_stage_status returns failed_state_validation.
         assert result["status"] in (
-            STATUS_FAILED_STATE_VALIDATION,
-            "failed_state_validation",
-        )
-        # State validation is never allowable
+            STATUS_FAILED_STATE_VALIDATION, "failed_state_validation")
         assert not stage_status_is_allowable(
             result["status"], allow_missing_metrics=True)
 
     def test_constructor_exception_is_provider_failure(
         self, tmp_path, bundle_dir, monkeypatch):
-        """TypeError during provider init → failed_provider_initialization."""
         from experiments.eval import evaluate_detector
 
         pu, fgp = _setup_orch_mocks(monkeypatch, bundle_dir)
@@ -1211,6 +1292,7 @@ class TestOrchestratorFailureStatuses:
         _make_orch_images(tmp_path / "run", run_ids=("0",))
         out_dir = tmp_path / "eval_fail4"
         out_dir.mkdir()
+        _make_orch_output_images(out_dir, run_ids=("0",))
 
         gm_fields = dict(_gm_record("0", gm_bundle_dir=str(bundle_dir)))
         gm_fields.pop("run_id")

@@ -5,6 +5,12 @@ Every row is validated through ``gm_bundle_manifest`` and
 ``gm_provider_kwargs`` from ``extract_verification_scores.py`` before
 any provider is constructed.  Mixed bundles, missing provenance, and
 protocol/profile mismatches all fail closed.
+
+``gm_protocol_mode`` and ``gm_profile`` are distinct concepts:
+*protocol* names the shared-clean evaluation protocol (e.g.
+``GM_SHARED_TR_CLEAN_MODE``); *profile* names the GmProvider bundle
+configuration (e.g. ``legacy``).  They are validated independently
+and never compared to each other.
 """
 
 from __future__ import annotations
@@ -42,8 +48,6 @@ REQUIRED_METADATA_FIELDS: frozenset[str] = frozenset(_GM_REQUIRED_METADATA_FIELD
 
 # ---------------------------------------------------------------------------
 # Canonical provider-kwargs identity — every row must produce the same set.
-# Excludes runtime objects; includes only the scalar/string keys that define
-# the detector configuration.
 # ---------------------------------------------------------------------------
 _CANONICAL_KWARGS_FIELDS: tuple[str, ...] = (
     "gm_profile",
@@ -68,6 +72,18 @@ _CANONICAL_KWARGS_FIELDS: tuple[str, ...] = (
     "w_radius",
     "w_measurement",
     "w_injection",
+)
+
+# ---------------------------------------------------------------------------
+# Required scorer-output field names.
+# ---------------------------------------------------------------------------
+_REQUIRED_SCORER_OUTPUTS: tuple[str, ...] = (
+    "gm_raw_bit_accuracy",
+    "gm_raw_ring_l1",
+    "gm_report_label",
+    "gm_score_definition",
+    "gm_threshold_source",
+    "gm_comparison_operator",
 )
 
 
@@ -110,8 +126,6 @@ def _validate_required_gm_metadata(record: dict[str, Any]) -> None:
     """Every required field must be present, non-None, and non-whitespace.
 
     Raises ``DetectorMissingStateError`` on the first missing field.
-    Must be called BEFORE any canonical manifest helper so a missing
-    field is never misclassified as a state mismatch.
     """
     run_id = str(record.get("run_id", "?"))
     for field in _GM_REQUIRED_METADATA_FIELDS:
@@ -124,17 +138,12 @@ def _validate_required_gm_metadata(record: dict[str, Any]) -> None:
 
 
 def _canonical_provider_identity(kwargs: dict[str, Any]) -> str:
-    """Deterministic hash of the canonical provider configuration.
-
-    Only the fields in ``_CANONICAL_KWARGS_FIELDS`` are included.
-    Paths are resolved before hashing to eliminate normalization noise.
-    """
+    """Deterministic hash of the canonical provider configuration."""
     from raven.eval_protocol import canonical_json_hash
 
     payload: dict[str, Any] = {}
     for field in _CANONICAL_KWARGS_FIELDS:
         value = kwargs.get(field)
-        # Resolve bundle-dir paths so /x/./y equals /x/y.
         if field in ("gm_bundle_dir", "gm_gnr_path", "gm_classifier_path"):
             if isinstance(value, str) and value:
                 value = str(Path(value).resolve())
@@ -142,34 +151,67 @@ def _canonical_provider_identity(kwargs: dict[str, Any]) -> str:
     return canonical_json_hash(payload)
 
 
-def _validate_gm_protocol_profile(
-    record_protocol: str,
+# ---------------------------------------------------------------------------
+# Protocol validation (gm_protocol_mode ≠ gm_profile)
+# ---------------------------------------------------------------------------
+
+def _validate_gm_protocol_mode(record: dict[str, Any]) -> None:
+    """Validate the row's ``gm_protocol_mode`` against the known shared-clean
+    evaluation protocol.
+
+    Protocol names the generation/evaluation contract the cohort follows;
+    it is NOT the bundle profile name.
+    """
+    from raven.pairing_provenance import GM_SHARED_TR_CLEAN_MODE
+
+    actual = str(record.get("gm_protocol_mode", ""))
+    if actual != GM_SHARED_TR_CLEAN_MODE:
+        raise DetectorStateValidationError(
+            f"GM protocol mode {actual!r} does not match expected "
+            f"{GM_SHARED_TR_CLEAN_MODE!r}"
+        )
+
+
+def _validate_gm_provider_profile(
     manifest: dict[str, Any],
     provider_kwargs: dict[str, Any],
+    provider: Any | None = None,
 ) -> None:
-    """Verify the row protocol, bundle manifest profile, and provider kwargs
-    profile are consistent.
+    """Validate that manifest profile, provider kwargs profile, and actual
+    provider profile identity are consistent.
 
-    ``gm_protocol_mode`` is the protocol label the cohort records.
-    The manifest ``profile`` is the bundle's own declared mode.
-    ``gm_profile`` in provider kwargs is what gets passed to GmProvider.
-    All three must agree (exact string match).
+    Profile names the GmProvider bundle configuration (e.g. ``legacy``);
+    it is NOT the evaluation protocol.
     """
     manifest_profile = str(manifest.get("profile", ""))
     kwargs_profile = str(provider_kwargs.get("gm_profile", ""))
 
-    if record_protocol != manifest_profile:
+    if manifest_profile != kwargs_profile:
         raise DetectorStateValidationError(
-            f"GM protocol/profile mismatch: row gm_protocol_mode="
-            f"{record_protocol!r} but bundle manifest profile="
-            f"{manifest_profile!r}"
-        )
-    if record_protocol != kwargs_profile:
-        raise DetectorStateValidationError(
-            f"GM protocol/profile mismatch: row gm_protocol_mode="
-            f"{record_protocol!r} but provider kwargs gm_profile="
+            f"GM provider profile mismatch: manifest profile="
+            f"{manifest_profile!r} but provider kwargs gm_profile="
             f"{kwargs_profile!r}"
         )
+
+    if provider is not None:
+        # Resolve the actual provider's profile from whichever attribute it exposes.
+        actual_provider_profile = ""
+        for attr in ("profile", "gm_profile", "profile_name"):
+            val = getattr(provider, attr, None)
+            if val is not None and str(val).strip():
+                actual_provider_profile = str(val)
+                break
+        # Fall back to bundle manifest.
+        if not actual_provider_profile and getattr(provider, "bundle", None) is not None:
+            bundle_manifest = getattr(provider.bundle, "manifest", {})
+            actual_provider_profile = str(bundle_manifest.get("profile", ""))
+
+        if actual_provider_profile and actual_provider_profile != kwargs_profile:
+            raise DetectorStateValidationError(
+                f"GM provider profile mismatch: provider reports "
+                f"{actual_provider_profile!r} but kwargs gm_profile="
+                f"{kwargs_profile!r}"
+            )
 
 
 def _validate_bundle_files_exist(bundle_dir: str) -> Path:
@@ -200,13 +242,13 @@ def load_state(records: list[dict[str, Any]], device: str,
 
     Every row is validated:
     1. Required metadata preflight (missing → ``DetectorMissingStateError``).
-    2. ``gm_bundle_manifest(row, run_id)`` — SHA/config mismatches
+    2. Protocol mode validated independently.
+    3. ``gm_bundle_manifest(row, run_id)`` — any exception after preflight
        → ``DetectorStateValidationError``.
-    3. ``gm_provider_kwargs(row, run_id)`` — failure → ``DetectorStateValidationError``.
-    4. Protocol/profile validated against manifest and kwargs.
-    5. All rows must produce the same canonical provider identity.
-
-    Only after all rows pass is the provider constructed.
+    4. ``gm_provider_kwargs(row, run_id)`` — any exception
+       → ``DetectorStateValidationError``.
+    5. Provider profile validated across manifest / kwargs / actual provider.
+    6. All rows must produce the same canonical provider identity.
     """
     import torch
 
@@ -227,7 +269,11 @@ def load_state(records: list[dict[str, Any]], device: str,
     for row in records:
         _validate_required_gm_metadata(row)
 
-    # 2. Load the canonical extraction module.
+    # 2. Validate protocol mode (independent of profile).
+    for row in records:
+        _validate_gm_protocol_mode(row)
+
+    # 3. Load the canonical extraction module.
     try:
         mod = _get_extract_module()
     except Exception as exc:
@@ -235,17 +281,19 @@ def load_state(records: list[dict[str, Any]], device: str,
             f"Cannot load extract_verification_scores: {exc}"
         ) from exc
 
-    # 3. Per-row canonical binding: gm_bundle_manifest + gm_provider_kwargs.
+    # 4. Per-row canonical binding: gm_bundle_manifest + gm_provider_kwargs.
     row_bindings: list[dict[str, Any]] = []
     for row in records:
         run_id = str(row.get("run_id", "0"))
 
         # Bundle files must exist on disk.
-        bundle_dir = _validate_bundle_files_exist(str(row["gm_bundle_dir"]))
+        _validate_bundle_files_exist(str(row["gm_bundle_dir"]))
 
+        # Any exception (not just RuntimeError) → StateValidationError
+        # after the file-existence preflight has passed.
         try:
             bundle_dir_path, manifest = mod.gm_bundle_manifest(row, run_id)
-        except RuntimeError as exc:
+        except Exception as exc:
             raise DetectorStateValidationError(
                 f"run_id={run_id}: GM bundle manifest validation failed: "
                 f"{type(exc).__name__}: {exc}"
@@ -253,16 +301,14 @@ def load_state(records: list[dict[str, Any]], device: str,
 
         try:
             kwargs = mod.gm_provider_kwargs(row, run_id)
-        except RuntimeError as exc:
+        except Exception as exc:
             raise DetectorStateValidationError(
                 f"run_id={run_id}: GM provider kwargs validation failed: "
                 f"{type(exc).__name__}: {exc}"
             ) from exc
 
-        # 4. Validate protocol/profile consistency.
-        _validate_gm_protocol_profile(
-            str(row["gm_protocol_mode"]), manifest, kwargs,
-        )
+        # 5. Validate provider profile (manifest ↔ kwargs, provider checked later).
+        _validate_gm_provider_profile(manifest, kwargs)
 
         row_bindings.append({
             "run_id": run_id,
@@ -271,7 +317,7 @@ def load_state(records: list[dict[str, Any]], device: str,
             "kwargs": kwargs,
         })
 
-    # 5. All rows must share the same canonical provider identity.
+    # 6. All rows must share the same canonical provider identity.
     identities: set[str] = set()
     for binding in row_bindings:
         identities.add(_canonical_provider_identity(binding["kwargs"]))
@@ -281,7 +327,7 @@ def load_state(records: list[dict[str, Any]], device: str,
             f"{sorted(identities)}"
         )
 
-    # 6. Construct pipe and provider from the validated canonical kwargs.
+    # 7. Construct pipe and provider from the validated canonical kwargs.
     first_kwargs = row_bindings[0]["kwargs"]
     first_bundle_dir = Path(row_bindings[0]["bundle_dir"])
 
@@ -294,6 +340,7 @@ def load_state(records: list[dict[str, Any]], device: str,
         device_obj = torch.device(device)
         pipe = pipe_utils.get_pipe_provider(
             pretrained_model_name_or_path=model_id,
+            revision=model_revision,
             resolution=resolution,
             device=device_obj,
             eager_loading=False,
@@ -317,39 +364,37 @@ def load_state(records: list[dict[str, Any]], device: str,
             f"GM provider/pipe construction failed: {type(exc).__name__}: {exc}"
         ) from exc
 
-    # 7. Require persisted bundle as the state source.
+    # 8. Final profile validation against the actual constructed provider.
+    _validate_gm_provider_profile(
+        row_bindings[0]["manifest"], first_kwargs, provider=provider,
+    )
+
+    # 9. Require persisted bundle as the state source.
     if provider.bundle is None or getattr(provider, "state_source", "") != "bundle":
         raise DetectorStateValidationError(
             "GM provider requires persisted bundle; "
             f"state_source={getattr(provider, 'state_source', 'unknown')}"
         )
 
-    # 8. Derive provider-side target and mask hashes.
+    # 10. Derive provider-side target and mask hashes.
     from raven.pairing_provenance import tensor_sha256
 
-    provider_target_hash: str = ""
-    provider_mask_hash: str = ""
-
-    if provider.gt_patch is not None:
-        provider_target_hash = tensor_sha256(
-            provider.gt_patch.real.contiguous()
-        )
-    else:
+    if provider.gt_patch is None:
         raise DetectorStateValidationError(
             "GM provider has no gt_patch — cannot derive detector target hash"
         )
+    provider_target_hash = tensor_sha256(provider.gt_patch.real.contiguous())
 
-    if getattr(provider, "watermarking_mask", None) is not None:
-        provider_mask_hash = tensor_sha256(
-            provider.watermarking_mask.contiguous()
-        )
-    else:
+    if getattr(provider, "watermarking_mask", None) is None:
         raise DetectorStateValidationError(
             "GM provider has no watermarking_mask — cannot derive detector mask hash"
         )
+    provider_mask_hash = tensor_sha256(provider.watermarking_mask.contiguous())
 
-    # 9. Build verified provenance from the canonical bundle binding.
+    # 11. Build verified provenance.
     first_manifest = row_bindings[0]["manifest"]
+    from raven.pairing_provenance import GM_SHARED_TR_CLEAN_MODE
+
     verified_provenance: dict[str, Any] = {
         "gm_bundle_dir": str(first_bundle_dir),
         "gm_bundle_config_sha256": str(first_manifest.get("bundle_config_sha256", "")),
@@ -358,7 +403,7 @@ def load_state(records: list[dict[str, Any]], device: str,
         "gm_m_sha256": str(first_manifest.get("m_sha256", "")),
         "gm_watermark_sha256": str(first_manifest.get("watermark_sha256", "")),
         "gm_target_sha256": str(first_manifest.get("w2_tensor_sha256", "")),
-        "gm_protocol_mode": str(first_kwargs["gm_profile"]),
+        "gm_protocol_mode": GM_SHARED_TR_CLEAN_MODE,
         "gm_profile": str(first_kwargs.get("gm_profile", "")),
         "gm_state_source": str(getattr(provider, "state_source", "bundle")),
     }
@@ -400,7 +445,6 @@ def score_image(provider_info: dict[str, Any], image_path: str, *,
     mod = provider_info["extract_module"]
 
     # ── Four-stage target/mask validation ──
-
     source_target = str(record.get("watermark_target_sha256", ""))
     source_mask = str(record.get("watermark_mask_sha256", ""))
 
@@ -446,44 +490,48 @@ def score_image(provider_info: dict[str, Any], image_path: str, *,
             f"detector={detector_mask!r}"
         )
 
-    # ── Scoring via canonical extraction path ──
+    # ── Canonical scoring path (single try boundary) ──
     try:
         result = mod.evaluate_image(torch, provider, provider_info["pipe"],
                                      path, steps)
+        raw = float(mod.raw_score("GM", result))
+        canonical = float(mod.canonical_score("GM", raw, result))
+
+        if not math.isfinite(raw):
+            raise ValueError("non-finite GM raw score")
+        if not math.isfinite(canonical):
+            raise ValueError("non-finite GM canonical score")
+
+        # ── Validate required scorer outputs ──
+        _validate_scorer_outputs(result)
+
     except Exception as exc:
         raise DetectorScoringError(
             f"GM scoring failed for {image_path}: {type(exc).__name__}: {exc}"
         ) from exc
 
-    raw = mod.raw_score("GM", result)
-    canonical = mod.canonical_score("GM", raw, result)
-
-    # ── Resolve GNR / classifier usage from scorer output ──
-    gnr_used = bool(
-        result.get("gm_used_gnr", result.get("gm_gnr_used", False))
+    # ── Resolve GNR / classifier usage ──
+    gnr_used = _resolve_gnr_classifier_usage(
+        result, provider_info, kind="gnr",
     )
-    classifier_used = bool(
-        result.get("gm_used_classifier", result.get("gm_classifier_used", False))
+    classifier_used = _resolve_gnr_classifier_usage(
+        result, provider_info, kind="classifier",
     )
 
     # ── Build score record with verified provenance ──
     score: dict[str, Any] = {
         "raw_score": raw,
         "canonical_score": canonical,
-        # GM domain scores.
-        "gm_raw_bit_accuracy": float(result.get("gm_raw_bit_accuracy", raw)),
-        "gm_raw_ring_l1": float(result.get("gm_raw_ring_l1", 0)),
+        "gm_raw_bit_accuracy": float(result["gm_raw_bit_accuracy"]),
+        "gm_raw_ring_l1": float(result["gm_raw_ring_l1"]),
         "gm_restored_bit_accuracy": result.get("gm_restored_bit_accuracy"),
         "gm_classifier_probability": result.get("gm_classifier_probability"),
-        # Detector self-description.
-        "gm_report_label": str(result.get("gm_report_label", "")),
-        "gm_score_definition": str(result.get("gm_score_definition", "")),
-        "gm_threshold_source": str(result.get("gm_threshold_source", "")),
-        "gm_comparison_operator": str(result.get("gm_comparison_operator", "")),
-        # GNR / classifier usage (fixed schema).
+        "gm_report_label": str(result["gm_report_label"]),
+        "gm_score_definition": str(result["gm_score_definition"]),
+        "gm_threshold_source": str(result["gm_threshold_source"]),
+        "gm_comparison_operator": str(result["gm_comparison_operator"]),
         "gm_gnr_used": gnr_used,
         "gm_classifier_used": classifier_used,
-        # Four-pair target/mask provenance.
         "source_watermark_target_sha256": source_target,
         "detector_watermark_target_sha256": detector_target,
         "source_watermark_mask_sha256": source_mask,
@@ -492,10 +540,123 @@ def score_image(provider_info: dict[str, Any], image_path: str, *,
         "gm_mask_verified": True,
     }
 
-    # Attach verified provenance from the provider (canonically validated).
     score.update(provider_info.get("verified_provenance", {}))
-
     return score
+
+
+# ---------------------------------------------------------------------------
+# Scorer-output validation
+# ---------------------------------------------------------------------------
+
+def _validate_scorer_outputs(result: dict[str, Any]) -> None:
+    """Every required scorer output must be present, correct type, and finite.
+
+    Raises ``ValueError`` (→ ``DetectorScoringError``) on first violation.
+    """
+    for field in _REQUIRED_SCORER_OUTPUTS:
+        value = result.get(field)
+        if value is None:
+            raise ValueError(
+                f"required GM scorer output {field!r} is None"
+            )
+        if field in ("gm_raw_bit_accuracy", "gm_raw_ring_l1"):
+            if not isinstance(value, (int, float)):
+                raise ValueError(
+                    f"GM scorer output {field!r} has wrong type "
+                    f"{type(value).__name__!r}, expected numeric"
+                )
+            fval = float(value)
+            if not math.isfinite(fval):
+                raise ValueError(
+                    f"GM scorer output {field!r} is non-finite: {value!r}"
+                )
+            if field == "gm_raw_bit_accuracy" and not (0.0 <= fval <= 1.0):
+                raise ValueError(
+                    f"GM scorer output {field!r} out of [0,1]: {fval!r}"
+                )
+        elif field in ("gm_report_label", "gm_score_definition",
+                        "gm_threshold_source", "gm_comparison_operator"):
+            if not isinstance(value, str) or value.strip() == "":
+                raise ValueError(
+                    f"GM scorer output {field!r} is empty or wrong type: "
+                    f"{type(value).__name__!r}"
+                )
+
+    # Optional fields: if present, must be finite and (for accuracy/probability)
+    # in [0, 1].
+    for opt_field in ("gm_restored_bit_accuracy", "gm_classifier_probability"):
+        opt_val = result.get(opt_field)
+        if opt_val is not None:
+            if not isinstance(opt_val, (int, float)):
+                raise ValueError(
+                    f"GM scorer output {opt_field!r} has wrong type "
+                    f"{type(opt_val).__name__!r}, expected numeric or None"
+                )
+            fopt = float(opt_val)
+            if not math.isfinite(fopt):
+                raise ValueError(
+                    f"GM scorer output {opt_field!r} is non-finite: {opt_val!r}"
+                )
+            if not (0.0 <= fopt <= 1.0):
+                raise ValueError(
+                    f"GM scorer output {opt_field!r} out of [0,1]: {fopt!r}"
+                )
+
+
+def _resolve_gnr_classifier_usage(
+    result: dict[str, Any],
+    provider_info: dict[str, Any],
+    *,
+    kind: str,
+) -> bool:
+    """Resolve whether GNR or classifier was actually used.
+
+    1. Scorer-reported flags (``gm_used_gnr`` / ``gm_gnr_used`` etc.) take
+       priority.
+    2. If scorer reports nothing, fall back to the canonical provider kwargs
+       (``gm_use_gnr`` / ``gm_use_classifier``).
+    3. If scorer and provider config contradict, raise
+       ``DetectorScoringError``.
+    """
+    if kind == "gnr":
+        scorer_keys = ("gm_used_gnr", "gm_gnr_used")
+        provider_key = "gm_use_gnr"
+    else:
+        scorer_keys = ("gm_used_classifier", "gm_classifier_used")
+        provider_key = "gm_use_classifier"
+
+    scorer_values = []
+    for key in scorer_keys:
+        val = result.get(key)
+        if val is not None:
+            scorer_values.append(bool(val))
+
+    # Resolve provider-config value.
+    verified = provider_info.get("verified_provenance", {})
+    provider_value = verified.get(provider_key)
+    if provider_value is None:
+        # Fall back to the first row's kwargs stored in provider_info.
+        provider_value = provider_info.get("_canonical_kwargs", {}).get(provider_key)
+
+    if len(scorer_values) >= 1:
+        declared = scorer_values[0]
+        # Check all scorer-reported values agree.
+        if len(set(scorer_values)) != 1:
+            raise DetectorScoringError(
+                f"GM scorer reported conflicting {kind} values: "
+                f"{scorer_values}"
+            )
+        if provider_value is not None and declared != bool(provider_value):
+            raise DetectorScoringError(
+                f"GM {kind} usage contradiction: scorer reports "
+                f"{declared} but provider config has {provider_value}"
+            )
+        return declared
+
+    # No scorer output — fall back to provider config.
+    if provider_value is not None:
+        return bool(provider_value)
+    return False
 
 
 def aggregate(detector_rows: list[dict[str, Any]], **extra) -> dict[str, Any]:
