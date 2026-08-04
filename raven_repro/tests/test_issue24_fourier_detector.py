@@ -111,14 +111,17 @@ def _default_profile(method="RID") -> str:
     return _METHOD_PROFILES[method][0]
 
 
-def _make_manifest(method="RID", **overrides):
+def _make_manifest(method_name="RID", **overrides):
     """Manifest matching real provider/bundle schema for each method.
 
-    ``profile_name`` is the provider profile; ``schema`` is the bundle
-    schema; ``model_revision`` is mandatory (no pipe fallback).
+    Both canonical bundle formats (RidBundle and SfwBundle) write a
+    ``method`` tag into their manifests — the fixture always carries the
+    canonical per-method ``method`` value unless overridden.
     """
+    method = method_name
     profile = _default_profile(method)
     base = {
+        "method": method,
         "bundle_config_sha256": "abc123_bundle",
         "selected_pattern_sha256": "abc123_pattern",
         "mask_sha256": "abc123_mask",
@@ -147,7 +150,6 @@ def _make_manifest(method="RID", **overrides):
     elif method == "HSTR":
         base.update({
             "schema": "sfw_bundle_v1",
-            "methods": ["HSTR", "HSQR"],
             "latent_shape": [1, 4, 64, 64],
             "center_slice": [1, 3], "wm_capacity": 256,
             "scheduler_type": "DDIM",
@@ -155,7 +157,6 @@ def _make_manifest(method="RID", **overrides):
     elif method == "HSQR":
         base.update({
             "schema": "sfw_bundle_v1",
-            "methods": ["HSTR", "HSQR"],
             "scheduler_type": "DDIM",
         })
     base.update(overrides)
@@ -661,6 +662,30 @@ class TestPipeProfileNoFallback:
         assert kwargs.get("revision") == "my-revision-abc"
 
     @pytest.mark.parametrize("method", FOURIER_METHODS)
+    def test_malformed_resolution_is_state_validation(self, method, monkeypatch,
+                                                       bundle_dir):
+        """Non-integer or non-positive resolution → DetectorStateValidationError,
+        never internal error."""
+        from raven.detectors import fourier_detector
+        from raven.detectors import DetectorStateValidationError
+
+        for bad_resolution in ("abc", 0, -512, "12.5"):
+            manifest = _make_manifest(method, resolution=bad_resolution)
+            provider = _make_provider(method)
+            extract_mod = _build_extract_module(method, provider=provider,
+                                                 manifest=manifest,
+                                                 bundle_dir=bundle_dir)
+            _setup_adapter_mocks(monkeypatch, method, provider, extract_mod)
+
+            record = _make_record(bundle_dir, "1", method=method)
+
+            with pytest.raises(DetectorStateValidationError,
+                               match="resolution"):
+                fourier_detector.load_state([record], "cpu", method=method)
+
+            assert _MOCK_PIPE_UTILS.get_pipe_provider.call_count == 0
+
+    @pytest.mark.parametrize("method", FOURIER_METHODS)
     def test_pipe_receives_bundle_scheduler_and_resolution(self, method,
                                                             monkeypatch,
                                                             bundle_dir):
@@ -955,6 +980,227 @@ class TestManifestSchemaFailClosed:
         with pytest.raises(DetectorStateValidationError,
                            match="unsupported SFW bundle schema"):
             fourier_detector.load_state([record], "cpu", method="HSTR")
+
+    @pytest.mark.parametrize("method", FOURIER_METHODS)
+    def test_missing_schema_is_state_validation(self, method, monkeypatch,
+                                                 bundle_dir):
+        """Manifest without schema → DetectorStateValidationError, no pipe."""
+        from raven.detectors import fourier_detector
+        from raven.detectors import DetectorStateValidationError
+
+        manifest = _make_manifest(method)
+        manifest.pop("schema", None)
+
+        provider = _make_provider(method)
+        extract_mod = _build_extract_module(method, provider=provider,
+                                             manifest=manifest,
+                                             bundle_dir=bundle_dir)
+        _setup_adapter_mocks(monkeypatch, method, provider, extract_mod)
+
+        record = _make_record(bundle_dir, "1", method=method)
+
+        with pytest.raises(DetectorStateValidationError,
+                           match="no schema"):
+            fourier_detector.load_state([record], "cpu", method=method)
+
+        assert _MOCK_PIPE_UTILS.get_pipe_provider.call_count == 0
+        assert _MOCK_RINGID.call_count == 0
+        assert _MOCK_HSTR.call_count == 0
+
+
+# ===========================================================================
+# 8b. Manifest method identity — canonical method tag
+# ===========================================================================
+class TestManifestMethodIdentity:
+
+    @pytest.mark.parametrize("method", FOURIER_METHODS)
+    def test_manifest_method_matches_is_valid(self, method, monkeypatch,
+                                               bundle_dir):
+        """Canonical manifest method tag → load_state succeeds."""
+        from raven.detectors import fourier_detector
+
+        manifest = _make_manifest(method, **{"method": method})
+        provider = _make_provider(method)
+        extract_mod = _build_extract_module(method, provider=provider,
+                                             manifest=manifest,
+                                             bundle_dir=bundle_dir)
+        _setup_adapter_mocks(monkeypatch, method, provider, extract_mod)
+
+        record = _make_record(bundle_dir, "1", method=method)
+        result = fourier_detector.load_state([record], "cpu", method=method)
+        assert result["method"] == method
+
+    def test_hstr_manifest_method_hstr_is_valid(self, monkeypatch, bundle_dir):
+        """HSTR manifest method=HSTR → valid."""
+        from raven.detectors import fourier_detector
+
+        manifest = _make_manifest("HSTR", **{"method": "HSTR"})
+        provider = _make_provider("HSTR")
+        extract_mod = _build_extract_module("HSTR", provider=provider,
+                                             manifest=manifest,
+                                             bundle_dir=bundle_dir)
+        _setup_adapter_mocks(monkeypatch, "HSTR", provider, extract_mod)
+
+        record = _make_record(bundle_dir, "1", method="HSTR")
+        result = fourier_detector.load_state([record], "cpu", method="HSTR")
+        assert result["method"] == "HSTR"
+
+    def test_hsqr_manifest_method_hsqr_is_valid(self, monkeypatch, bundle_dir):
+        """HSQR manifest method=HSQR → valid."""
+        from raven.detectors import fourier_detector
+
+        manifest = _make_manifest("HSQR", **{"method": "HSQR"})
+        provider = _make_provider("HSQR")
+        extract_mod = _build_extract_module("HSQR", provider=provider,
+                                             manifest=manifest,
+                                             bundle_dir=bundle_dir)
+        _setup_adapter_mocks(monkeypatch, "HSQR", provider, extract_mod)
+
+        record = _make_record(bundle_dir, "1", method="HSQR")
+        result = fourier_detector.load_state([record], "cpu", method="HSQR")
+        assert result["method"] == "HSQR"
+
+    @pytest.mark.parametrize("requested,wrong", [
+        ("HSTR", "HSQR"),
+        ("HSQR", "HSTR"),
+    ])
+    def test_wrong_method_tag_rejected_before_provider(self, requested, wrong,
+                                                        monkeypatch, bundle_dir):
+        """Wrong manifest method tag → DetectorStateValidationError, zero
+        pipe/provider constructions."""
+        from raven.detectors import fourier_detector
+        from raven.detectors import DetectorStateValidationError
+
+        manifest = _make_manifest(requested, **{"method": wrong})
+        provider = _make_provider(requested)
+        extract_mod = _build_extract_module(requested, provider=provider,
+                                             manifest=manifest,
+                                             bundle_dir=bundle_dir)
+        _setup_adapter_mocks(monkeypatch, requested, provider, extract_mod)
+
+        record = _make_record(bundle_dir, "1", method=requested)
+
+        with pytest.raises(DetectorStateValidationError,
+                           match="manifest method"):
+            fourier_detector.load_state([record], "cpu", method=requested)
+
+        assert _MOCK_PIPE_UTILS.get_pipe_provider.call_count == 0
+        assert _MOCK_RINGID.call_count == 0
+        assert _MOCK_HSTR.call_count == 0
+        assert _MOCK_HSQR.call_count == 0
+        assert extract_mod.hsqr_provider_from_bundle.call_count == 0
+
+    def test_hstr_rejects_hsqr_tagged_bundle_before_provider(self, monkeypatch,
+                                                              bundle_dir):
+        """HSQR-tagged manifest under HSTR request → state validation."""
+        from raven.detectors import fourier_detector
+        from raven.detectors import DetectorStateValidationError
+
+        manifest = _make_manifest("HSTR", **{"method": "HSQR"})
+        provider = _make_provider("HSTR")
+        extract_mod = _build_extract_module("HSTR", provider=provider,
+                                             manifest=manifest,
+                                             bundle_dir=bundle_dir)
+        _setup_adapter_mocks(monkeypatch, "HSTR", provider, extract_mod)
+
+        record = _make_record(bundle_dir, "1", method="HSTR")
+
+        with pytest.raises(DetectorStateValidationError,
+                           match="manifest method"):
+            fourier_detector.load_state([record], "cpu", method="HSTR")
+
+        assert _MOCK_PIPE_UTILS.get_pipe_provider.call_count == 0
+        assert _MOCK_HSTR.call_count == 0
+
+    def test_hsqr_rejects_hstr_tagged_bundle_before_provider(self, monkeypatch,
+                                                              bundle_dir):
+        """HSTR-tagged manifest under HSQR request → state validation,
+        never hsqr_provider_from_bundle."""
+        from raven.detectors import fourier_detector
+        from raven.detectors import DetectorStateValidationError
+
+        manifest = _make_manifest("HSQR", **{"method": "HSTR"})
+        provider = _make_provider("HSQR")
+        extract_mod = _build_extract_module("HSQR", provider=provider,
+                                             manifest=manifest,
+                                             bundle_dir=bundle_dir)
+        _setup_adapter_mocks(monkeypatch, "HSQR", provider, extract_mod)
+
+        record = _make_record(bundle_dir, "1", method="HSQR")
+
+        with pytest.raises(DetectorStateValidationError,
+                           match="manifest method"):
+            fourier_detector.load_state([record], "cpu", method="HSQR")
+
+        assert _MOCK_PIPE_UTILS.get_pipe_provider.call_count == 0
+        assert extract_mod.hsqr_provider_from_bundle.call_count == 0
+
+    @pytest.mark.parametrize("method", ["HSTR", "HSQR"])
+    def test_sfw_manifest_missing_method_is_state_validation(self, method,
+                                                              monkeypatch,
+                                                              bundle_dir):
+        """SFW manifest without method tag → DetectorStateValidationError."""
+        from raven.detectors import fourier_detector
+        from raven.detectors import DetectorStateValidationError
+
+        manifest = _make_manifest(method)
+        manifest.pop("method", None)
+
+        provider = _make_provider(method)
+        extract_mod = _build_extract_module(method, provider=provider,
+                                             manifest=manifest,
+                                             bundle_dir=bundle_dir)
+        _setup_adapter_mocks(monkeypatch, method, provider, extract_mod)
+
+        record = _make_record(bundle_dir, "1", method=method)
+
+        with pytest.raises(DetectorStateValidationError,
+                           match="no method tag"):
+            fourier_detector.load_state([record], "cpu", method=method)
+
+        assert _MOCK_PIPE_UTILS.get_pipe_provider.call_count == 0
+
+    @pytest.mark.parametrize("requested,wrong", [
+        ("HSTR", "HSQR"),
+        ("HSQR", "HSTR"),
+    ])
+    def test_mixed_manifest_method_rejected_before_pipe(self, requested, wrong,
+                                                         monkeypatch,
+                                                         bundle_dir):
+        """Row 1 manifest method HSTR + row 2 HSQR → rejected before pipe."""
+        from raven.detectors import fourier_detector
+        from raven.detectors import DetectorStateValidationError
+
+        # Row 1 manifest is correct for requested method
+        manifest_ok = _make_manifest(requested, **{"method": requested})
+        # Row 2 manifest disagrees — wrong method tag
+        manifest_bad = _make_manifest(requested, **{"method": wrong})
+
+        provider = _make_provider(requested)
+        extract_mod = _build_extract_module(requested, provider=provider,
+                                             manifest=manifest_ok,
+                                             bundle_dir=bundle_dir)
+
+        def _selective_fbm(row, identifier, m):
+            if str(row.get("run_id", "")) == "2":
+                return bundle_dir, manifest_bad
+            return bundle_dir, manifest_ok
+
+        extract_mod.fourier_bundle_manifest = mock.MagicMock(
+            side_effect=_selective_fbm)
+        _setup_adapter_mocks(monkeypatch, requested, provider, extract_mod)
+
+        r1 = _make_record(bundle_dir, "1", method=requested)
+        r2 = _make_record(bundle_dir, "2", method=requested)
+
+        with pytest.raises(DetectorStateValidationError,
+                           match="manifest method"):
+            fourier_detector.load_state([r1, r2], "cpu", method=requested)
+
+        assert _MOCK_PIPE_UTILS.get_pipe_provider.call_count == 0
+        assert _MOCK_RINGID.call_count == 0
+        assert _MOCK_HSTR.call_count == 0
+        assert _MOCK_HSQR.call_count == 0
 
 
 # ===========================================================================
@@ -1463,6 +1709,61 @@ class TestOrchestratorFailures:
                                    config=eval_config)
 
         assert result["status"] == "failed_state_validation"
+
+    @pytest.mark.parametrize("requested,wrong", [
+        ("HSTR", "HSQR"),
+        ("HSQR", "HSTR"),
+    ])
+    def test_orchestrator_wrong_manifest_method_is_failed_state_validation(
+            self, requested, wrong, monkeypatch, tmp_path):
+        """Wrong manifest method → failed_state_validation, exit 2 always."""
+        from experiments.eval import evaluate_detector
+        from experiments.eval import determine_exit_code
+        from raven.experiment_io import write_config, write_record
+
+        (out_dir, records, extract_mod, provider, manifest,
+         metadata_csv, _bundle_dir) = \
+            _OrchestratorFixtures._build_orchestrator_env(
+                tmp_path, requested, monkeypatch)
+
+        # Manifest carries the WRONG method tag — the canonical bundle helper
+        # (mocked here) must return it so the adapter's method-identity
+        # validation rejects it before any pipe/provider construction.
+        bad_manifest = dict(manifest)
+        bad_manifest["method"] = wrong
+        (tmp_path / "bundle" / "manifest.json").write_text(
+            json.dumps(bad_manifest))
+
+        # Rebuild the extract module mock bound to the bad manifest
+        from test_issue24_fourier_detector import (
+            _build_extract_module as _rebuild_extract,
+            _setup_adapter_mocks as _rebuild_mocks,
+        )
+        bad_extract = _rebuild_extract(
+            requested, provider=provider, manifest=bad_manifest,
+            bundle_dir=tmp_path / "bundle")
+        _rebuild_mocks(monkeypatch, requested, provider, bad_extract)
+
+        write_config(out_dir, {"method": requested, "dataset": "test",
+                               "metadata_path": str(metadata_csv)})
+        for rec in records:
+            write_record(out_dir, rec["role"], rec["run_id"], rec)
+
+        eval_config = {"method": requested, "dataset": "test",
+                       "metadata_path": str(metadata_csv)}
+        result = evaluate_detector(records, out_dir, requested, device="cpu",
+                                   config=eval_config)
+
+        assert result["status"] == "failed_state_validation"
+        # Provider must never be constructed
+        assert _MOCK_RINGID.call_count == 0
+        assert _MOCK_HSTR.call_count == 0
+
+        # Exit code policy: never allowable
+        assert determine_exit_code(
+            {"stages": {"detector": result}}, allow_missing_metrics=False) == 2
+        assert determine_exit_code(
+            {"stages": {"detector": result}}, allow_missing_metrics=True) == 2
 
     @pytest.mark.parametrize("method", FOURIER_METHODS)
     def test_raw_score_failure_fails_stage(self, method, monkeypatch, tmp_path):

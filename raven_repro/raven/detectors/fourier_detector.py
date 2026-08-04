@@ -197,12 +197,15 @@ def _validate_manifest_schema(
     """Fail closed on bundle schema identity.
 
     RID must be a repository-supported RidBundle schema; HSTR/HSQR must be a
-    repository-supported SfwBundle schema.  Unknown non-empty schemas are
-    rejected.  A missing schema is left to the canonical bundle loader.
+    repository-supported SfwBundle schema.  Missing and unknown schemas are
+    both rejected here — the adapter never delegates schema classification
+    to a later provider constructor.
     """
     schema = str(manifest.get("schema", manifest.get("bundle_schema", ""))).strip()
     if not schema:
-        return
+        raise DetectorStateValidationError(
+            f"{row_label}: bundle manifest has no schema"
+        )
     if method == "RID" and schema not in _RID_BUNDLE_SCHEMAS:
         raise DetectorStateValidationError(
             f"{row_label}: unsupported RID bundle schema {schema!r}; "
@@ -212,6 +215,30 @@ def _validate_manifest_schema(
         raise DetectorStateValidationError(
             f"{row_label}: unsupported SFW bundle schema {schema!r}; "
             f"supported: {sorted(_SFW_BUNDLE_SCHEMAS)}"
+        )
+
+
+def _validate_manifest_method_identity(
+    manifest: dict[str, Any],
+    method: str,
+    row_label: str,
+) -> None:
+    """Verify the manifest's canonical method tag matches the requested method.
+
+    Both canonical bundle formats (RidBundle and SfwBundle) write a ``method``
+    field into their manifests.  A missing or mismatched tag is a state
+    validation failure and must be caught before any pipe/provider
+    construction — never classified as provider initialization.
+    """
+    manifest_method = str(manifest.get("method", "")).strip()
+    if not manifest_method:
+        raise DetectorStateValidationError(
+            f"{row_label}: bundle manifest has no method tag"
+        )
+    if manifest_method != method:
+        raise DetectorStateValidationError(
+            f"{row_label}: bundle manifest method={manifest_method!r} does not "
+            f"match requested method {method!r}"
         )
 
 
@@ -311,7 +338,7 @@ def _validate_pipe_profile_fields(
     """
     model_id = str(manifest.get("model_id", "")).strip()
     model_revision = str(manifest.get("model_revision", "")).strip()
-    resolution = manifest.get("resolution")
+    resolution_raw = manifest.get("resolution")
     scheduler = str(
         manifest.get("scheduler_type", manifest.get("scheduler", ""))
     ).strip()
@@ -328,11 +355,23 @@ def _validate_pipe_profile_fields(
         raise DetectorStateValidationError(
             f"{row_label}: bundle manifest has no scheduler/scheduler_type"
         )
-    if resolution is None or not str(resolution).strip():
+    if resolution_raw is None or not str(resolution_raw).strip():
         raise DetectorStateValidationError(
             f"{row_label}: bundle manifest has no resolution"
         )
-    return model_id, model_revision, scheduler, int(resolution)
+    try:
+        resolution = int(resolution_raw)
+    except (ValueError, TypeError) as exc:
+        raise DetectorStateValidationError(
+            f"{row_label}: bundle manifest resolution is not an integer: "
+            f"{resolution_raw!r}"
+        ) from exc
+    if resolution <= 0:
+        raise DetectorStateValidationError(
+            f"{row_label}: bundle manifest resolution must be positive: "
+            f"{resolution}"
+        )
+    return model_id, model_revision, scheduler, resolution
 
 
 # ---------------------------------------------------------------------------
@@ -541,6 +580,7 @@ def load_state(records: list[dict[str, Any]], device: str,
             ) from exc
         row_manifests.append(manifest)
         _validate_manifest_schema(manifest, method, row_label)
+        _validate_manifest_method_identity(manifest, method, row_label)
         _validate_protocol_mode(record, method, row_label)
 
     manifest = row_manifests[0]
@@ -569,8 +609,10 @@ def load_state(records: list[dict[str, Any]], device: str,
                     f"expected={expected!r} got={actual!r}"
                 )
 
-    # Manifest-level identity must be uniform across rows too.
-    for manifest_field in ("bundle_config_sha256", "selected_pattern_sha256",
+    # Manifest-level identity must be uniform across rows too, including the
+    # method tag — a mixed manifest method cohort must fail before pipe.
+    for manifest_field in ("method", "bundle_config_sha256",
+                           "selected_pattern_sha256",
                            "mask_sha256", "selected_key_index",
                            "profile_name", "model_id", "model_revision",
                            "scheduler", "scheduler_type", "resolution"):
