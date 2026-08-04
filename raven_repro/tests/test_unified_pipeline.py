@@ -376,19 +376,34 @@ class TestDetectorEndToEndMock:
 # GS per-row provider (High 1 verification)
 # ===========================================================================
 class TestGSPerRow:
-    def test_gs_score_requires_record(self):
-        """GS score_image raises if record is None."""
+    def test_gs_score_requires_record(self, tmp_path):
+        """GS score_image raises if evaluation_entry is None (after file check)."""
         from raven.detectors.gs_detector import score_image
         from raven.detectors import DetectorMissingStateError
+        from PIL import Image
+        img = tmp_path / "test.png"
+        Image.new("RGB", (8, 8)).save(img)
         with pytest.raises(DetectorMissingStateError):
-            score_image({"fake": True}, "/tmp/fake.png", record=None)
+            score_image({"fake": True}, str(img),
+                        record=None, evaluation_entry=None)
 
-    def test_gs_missing_secret_index_raises(self):
+    def test_gs_missing_secret_index_raises(self, tmp_path):
         from raven.detectors.gs_detector import score_image
         from raven.detectors import DetectorMissingStateError
+        from PIL import Image
+        img = tmp_path / "test.png"
+        Image.new("RGB", (8, 8)).save(img)
         with pytest.raises(DetectorMissingStateError):
-            score_image({"fake": True}, "/tmp/fake.png",
-                        record={"run_id": "1", "role": "watermarked"})
+            score_image({"fake": True}, str(img),
+                        record={"run_id": "1", "role": "watermarked"},
+                        evaluation_entry=None)
+
+    def test_gs_missing_image_raises_file_not_found(self):
+        """Missing image raises FileNotFoundError, not DetectorMissingStateError."""
+        from raven.detectors.gs_detector import score_image
+        with pytest.raises(FileNotFoundError):
+            score_image({"fake": True}, "/tmp/raven_issue20_definitely_missing_input.png",
+                        record={"run_id": "1"}, evaluation_entry={"run_id": "1", "source_role": "wm"})
 
 
 # ===========================================================================
