@@ -468,6 +468,8 @@ def load_state(records: list[dict[str, Any]], device: str,
         "detector_dtype": pipe_dtype,
         "vae_id": profile["vae_id"],
         "vae_scaling_factor": vae_scaling,
+        # The actual value passed to TrProvider — never a default.
+        "w_pattern_const": uniform_cfg["w_pattern_const"],
     }
 
     return {
@@ -585,6 +587,8 @@ def score_image(provider_info: dict[str, Any], image_path: str, *,
     score["tr_steps"] = verified_profile.get("steps", "")
     score["tr_resolution"] = verified_profile.get("resolution", "")
     score["tr_detector_dtype"] = verified_profile.get("detector_dtype", "")
+    # The provider's actual w_pattern_const, verified against metadata.
+    score["tr_w_pattern_const"] = verified_profile.get("w_pattern_const")
 
     return score
 

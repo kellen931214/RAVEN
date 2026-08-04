@@ -174,23 +174,36 @@ def _patch_tensor_sha256(monkeypatch, *sha_values):
 # 1 — w_pattern_const contract
 # ===========================================================================
 class TestWPatternConst:
-    def test_field_in_required_set(self):
+    def test_w_pattern_const_in_required_set(self):
         from raven.detectors.tr_detector import REQUIRED_METADATA_FIELDS
         assert "w_pattern_const" in REQUIRED_METADATA_FIELDS
 
-    def test_missing_raises_missing_state(self, monkeypatch):
+    def test_w_pattern_const_missing_raises_missing_state(self, monkeypatch):
         from raven.detectors.tr_detector import load_state, DetectorMissingStateError
 
         meta = dict(TR_META_COMPLETE)
         del meta["w_pattern_const"]
         records = [_make_record("1", provider_meta=meta)]
 
-        with _mock_load_state_deps(monkeypatch):
+        with _mock_load_state_deps(monkeypatch) as (_pipe, tr_cls):
             with pytest.raises(DetectorMissingStateError,
                                match="w_pattern_const"):
                 load_state(records, "cpu")
+            assert tr_cls.call_count == 0
 
-    def test_value_passed_to_provider(self, monkeypatch):
+    def test_w_pattern_const_blank_raises_missing_state(self, monkeypatch):
+        from raven.detectors.tr_detector import load_state, DetectorMissingStateError
+
+        meta = dict(TR_META_COMPLETE, w_pattern_const="")
+        records = [_make_record("1", provider_meta=meta)]
+
+        with _mock_load_state_deps(monkeypatch) as (_pipe, tr_cls):
+            with pytest.raises(DetectorMissingStateError,
+                               match="w_pattern_const"):
+                load_state(records, "cpu")
+            assert tr_cls.call_count == 0
+
+    def test_w_pattern_const_value_passed_to_provider(self, monkeypatch):
         from raven.detectors.tr_detector import load_state
 
         meta = dict(TR_META_COMPLETE, w_pattern_const="0.75")
@@ -199,10 +212,23 @@ class TestWPatternConst:
         with _mock_load_state_deps(monkeypatch) as (_pipe, tr_cls):
             _patch_tensor_sha256(monkeypatch)
             load_state(records, "cpu")
+            assert tr_cls.call_count == 1
             call_kwargs = tr_cls.call_args.kwargs
             assert call_kwargs["w_pattern_const"] == 0.75
 
-    def test_mixed_rejected(self, monkeypatch):
+    def test_w_pattern_const_negative_value_allowed(self, monkeypatch):
+        """TrProvider accepts any finite const — negatives are not restricted."""
+        from raven.detectors.tr_detector import load_state
+
+        meta = dict(TR_META_COMPLETE, w_pattern_const="-1.5")
+        records = [_make_record("1", provider_meta=meta)]
+
+        with _mock_load_state_deps(monkeypatch) as (_pipe, tr_cls):
+            _patch_tensor_sha256(monkeypatch)
+            load_state(records, "cpu")
+            assert tr_cls.call_args.kwargs["w_pattern_const"] == -1.5
+
+    def test_w_pattern_const_mixed_rejected(self, monkeypatch):
         from raven.detectors.tr_detector import load_state, DetectorStateValidationError
 
         records = [
@@ -212,12 +238,32 @@ class TestWPatternConst:
                                                   w_pattern_const="0.75")),
         ]
 
-        with _mock_load_state_deps(monkeypatch):
+        with _mock_load_state_deps(monkeypatch) as (_pipe, tr_cls):
             with pytest.raises(DetectorStateValidationError,
                                match="Mixed TR provider"):
                 load_state(records, "cpu")
+            assert tr_cls.call_count == 0
 
-    def test_nan_rejected(self, monkeypatch):
+    def test_w_pattern_const_hash_0_0_but_metadata_0_75_rejected(self, monkeypatch):
+        """A hash recorded under w_pattern_const=0.0 must not validate a
+        metadata row that says 0.75 — the hash is re-derived, not copied."""
+        from raven.detectors.tr_detector import load_state
+        from raven.detectors import DetectorStateValidationError
+        from raven.eval_protocol import provider_config_hash
+
+        meta_0 = dict(TR_META_COMPLETE, w_pattern_const="0.0")
+        hash_0 = provider_config_hash("TR", meta_0)
+        record = _make_record("1", provider_meta=dict(
+            TR_META_COMPLETE, w_pattern_const="0.75"))
+        record["provider_config_hash"] = hash_0
+
+        with _mock_load_state_deps(monkeypatch) as (_pipe, tr_cls):
+            with pytest.raises(DetectorStateValidationError,
+                               match="provider_config_hash"):
+                load_state([record], "cpu")
+            assert tr_cls.call_count == 0
+
+    def test_w_pattern_const_nan_rejected(self, monkeypatch):
         from raven.detectors.tr_detector import load_state, DetectorStateValidationError
 
         meta = dict(TR_META_COMPLETE, w_pattern_const=str(float("nan")))
@@ -228,7 +274,7 @@ class TestWPatternConst:
                                match="w_pattern_const"):
                 load_state(records, "cpu")
 
-    def test_inf_rejected(self, monkeypatch):
+    def test_w_pattern_const_inf_rejected(self, monkeypatch):
         from raven.detectors.tr_detector import load_state, DetectorStateValidationError
 
         meta = dict(TR_META_COMPLETE, w_pattern_const=str(float("inf")))
@@ -794,7 +840,7 @@ def _patch_integration(monkeypatch,
 class TestIntegrationSuccess:
     """Successful uniform cohort — real evaluate_detector path."""
 
-    def test_three_cohort_primary_report(self, monkeypatch):
+    def test_orchestrator_three_cohort_primary_report(self, monkeypatch):
         from experiments.eval import evaluate_detector
         from raven.detectors import STATUS_COMPLETED
 
@@ -814,20 +860,41 @@ class TestIntegrationSuccess:
                 result = evaluate_detector(
                     [rec_clean, rec_wm, rec_wm2], out, "TR", device="cpu")
 
-        assert result["status"] == STATUS_COMPLETED
-        assert result["scored_count"] > 0
-        assert result["failed_count"] == 0
-        ma = result["metric_availability"]
-        assert ma["primary_report_available"] is True
-        assert ma["threshold_report_available"] is True
-        # clean records auto-populate attacked_clean entries in orchestrator,
-        # so recalibrated is available when all entries score successfully
-        assert ma["recalibrated_report_available"] is True
+                assert result["status"] == STATUS_COMPLETED
+                assert result["scored_count"] > 0
+                assert result["failed_count"] == 0
+                assert result["count_invariant_satisfied"] is True
+                ma = result["metric_availability"]
+                assert ma["primary_report_available"] is True
+                assert ma["threshold_report_available"] is True
+                # clean records auto-populate attacked_clean entries in
+                # orchestrator, so recalibrated is available when all entries
+                # score successfully
+                assert ma["recalibrated_report_available"] is True
 
-        rows = _read_detector_rows(out)
-        assert all(r["status"] == "scored" for r in rows)
+                rows = _read_detector_rows(out)
+                assert rows, (
+                    "detector_records.jsonl must exist and be non-empty")
+                assert all(r["status"] == "scored" for r in rows)
+                # Scored rows carry verified provenance — provider-derived,
+                # never a copied metadata claim
+                from raven.eval_protocol import provider_config_hash
+                expected_hash = provider_config_hash("TR", TR_META_COMPLETE)
+                for row in rows:
+                    assert row["tr_provider_config_hash"] == expected_hash
+                    assert row["tr_provider_config_verified"] is True
+                    assert row["tr_w_pattern_const"] == 0.0
+                    assert row["tr_target_verified"] is True
+                    assert row["tr_detector_watermark_target_sha256"] == (
+                        "ok_target")
+                    assert row["tr_mask_verified"] is True
+                    assert row["tr_detector_watermark_mask_sha256"] == (
+                        "ok_mask")
+                    assert row["tr_model_id"] == TR_PROFILE["model_id"]
+                    assert row["tr_inverse_scheduler"] == (
+                        TR_PROFILE["inverse_scheduler"])
 
-    def test_four_cohort_recalibration(self, monkeypatch):
+    def test_orchestrator_four_cohort_recalibration(self, monkeypatch):
         from experiments.eval import evaluate_detector
         from raven.detectors import STATUS_COMPLETED
 
@@ -850,7 +917,7 @@ class TestIntegrationSuccess:
         ma = result["metric_availability"]
         assert ma["recalibrated_report_available"] is True
 
-    def test_provider_constructed_once(self, monkeypatch):
+    def test_orchestrator_provider_constructed_once(self, monkeypatch):
         """Exactly one TrProvider constructed for a uniform cohort."""
         from experiments.eval import evaluate_detector
 
