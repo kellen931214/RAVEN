@@ -197,47 +197,141 @@ def gm_bundle_manifest(row: dict[str, str], identifier: str) -> tuple[Path, dict
 
 
 def gm_provider_kwargs(row: dict[str, str], identifier: str) -> dict:
-    """Constructor kwargs derived from the bundle the cohort was embedded with."""
+    """Constructor kwargs derived from the bundle the cohort was embedded with.
+
+    All detector-compatibility fields are read from the manifest without
+    defaults.  Types are validated strictly — no ``bool()``, ``int()``,
+    ``float()``, or ``str()`` conversion of mismatched values.
+    """
+    import hashlib
+
     bundle_dir, manifest = gm_bundle_manifest(row, identifier)
     if manifest.get("gnr_sha256") is not None or manifest.get("classifier_sha256") is not None:
-        # This bundle would produce the official ensemble score; supporting it
-        # means loading those checkpoints, which this cohort does not have.
         raise RuntimeError(
             f"run_id={identifier}: GM bundle declares GNR/classifier artifacts; "
             "ensemble-score detection is not wired up for this cohort"
         )
+
+    # ── Strict type extraction from manifest ──
+
+    def _require_str(key: str) -> str:
+        val = manifest.get(key)
+        if val is None or (isinstance(val, str) and val.strip() == ""):
+            raise RuntimeError(
+                f"run_id={identifier}: GM bundle manifest missing or empty {key!r}"
+            )
+        if not isinstance(val, str):
+            raise RuntimeError(
+                f"run_id={identifier}: GM bundle manifest {key!r} must be str, "
+                f"got {type(val).__name__}"
+            )
+        return val
+
+    def _require_int(key: str) -> int:
+        val = manifest.get(key)
+        if val is None:
+            raise RuntimeError(
+                f"run_id={identifier}: GM bundle manifest missing {key!r}"
+            )
+        if isinstance(val, bool) or not isinstance(val, int):
+            raise RuntimeError(
+                f"run_id={identifier}: GM bundle manifest {key!r} must be int, "
+                f"got {type(val).__name__}: {val!r}"
+            )
+        return int(val)
+
+    def _require_float(key: str) -> float:
+        val = manifest.get(key)
+        if val is None:
+            raise RuntimeError(
+                f"run_id={identifier}: GM bundle manifest missing {key!r}"
+            )
+        if isinstance(val, bool) or not isinstance(val, (int, float)):
+            raise RuntimeError(
+                f"run_id={identifier}: GM bundle manifest {key!r} must be "
+                f"numeric, got {type(val).__name__}: {val!r}"
+            )
+        f = float(val)
+        if not _math.isfinite(f):
+            raise RuntimeError(
+                f"run_id={identifier}: GM bundle manifest {key!r} must be finite"
+            )
+        return f
+
+    def _require_bool(key: str) -> bool:
+        val = manifest.get(key)
+        if val is None:
+            raise RuntimeError(
+                f"run_id={identifier}: GM bundle manifest missing {key!r}"
+            )
+        if not isinstance(val, bool):
+            raise RuntimeError(
+                f"run_id={identifier}: GM bundle manifest {key!r} must be bool, "
+                f"got {type(val).__name__}: {val!r}"
+            )
+        return val
+
+    # ── inversion_prompt_sha256 validation ──
+    prompt_sha = _require_str("inversion_prompt_sha256")
+    empty_sha = hashlib.sha256(b"").hexdigest()
+    if prompt_sha != empty_sha:
+        raise RuntimeError(
+            f"run_id={identifier}: GM bundle manifest inversion_prompt_sha256 "
+            f"is non-empty, which this detector does not support: "
+            f"{prompt_sha!r} (expected {empty_sha!r})"
+        )
+
+    import math as _math
+
+    inversion_guidance_val = _require_float("inversion_guidance_scale")
+    if not (0.0 < inversion_guidance_val <= 100.0) or not _math.isfinite(
+        inversion_guidance_val):
+        raise RuntimeError(
+            f"run_id={identifier}: GM bundle manifest inversion_guidance_scale "
+            f"out of range: {inversion_guidance_val!r}"
+        )
+
+    vae_scaling_val = _require_float("vae_scaling_factor")
+    if vae_scaling_val <= 0.0 or not _math.isfinite(vae_scaling_val):
+        raise RuntimeError(
+            f"run_id={identifier}: GM bundle manifest vae_scaling_factor "
+            f"must be > 0: {vae_scaling_val!r}"
+        )
+
     return {
-        "gm_profile": str(manifest["profile"]),
+        "gm_profile": _require_str("profile"),
         "gm_bundle_dir": str(bundle_dir),
         "gm_create_bundle": False,
         "gm_allow_in_memory_state": False,
-        "gm_torch_dtype": str(manifest["torch_dtype"]),
-        "gm_channel_copy": int(manifest["channel_copy"]),
-        "gm_w_copy": int(manifest["w_copy"]),
-        "gm_h_copy": int(manifest["h_copy"]),
+        "gm_torch_dtype": _require_str("torch_dtype"),
+        "gm_channel_copy": _require_int("channel_copy"),
+        "gm_w_copy": _require_int("w_copy"),
+        "gm_h_copy": _require_int("h_copy"),
         "gm_watermark_bits_seed": manifest.get("watermark_bits_seed"),
         "gm_use_gnr": False,
         "gm_gnr_path": None,
-        "gm_model_nf": manifest.get("model_nf", 128),
-        "gm_classifier_type": manifest.get("classifier_type", 0),
+        "gm_model_nf": _require_int("model_nf"),
+        "gm_classifier_type": _require_int("classifier_type"),
         "gm_use_classifier": False,
         "gm_classifier_path": None,
-        "modelid_target": str(manifest["model_id"]),
-        "model_revision": str(manifest["model_revision"]),
-        "scheduler_target": str(manifest["scheduler"]),
-        "resolution": int(manifest["resolution"]),
-        "gm_inversion_guidance": float(manifest.get("inversion_guidance", 1.0)),
-        "gm_inversion_steps": int(manifest.get("inversion_steps", 50)),
-        "gm_vae_sample": bool(manifest.get("vae_sample", True)),
-        "gm_vae_scaling_factor": float(manifest.get("vae_scaling_factor", 0.18215)),
-        "gm_profile_is_official": manifest.get("profile_is_official"),
-        "w_seed": int(manifest["w_seed"]),
-        "w_channel": int(manifest["w_channel"]),
-        "w_pattern": str(manifest["w_pattern"]),
-        "w_mask_shape": str(manifest["w_mask_shape"]),
-        "w_radius": int(manifest["w_radius"]),
-        "w_measurement": str(manifest["w_measurement"]),
-        "w_injection": str(manifest["w_injection"]),
+        "modelid_target": _require_str("model_id"),
+        "model_revision": _require_str("model_revision"),
+        "scheduler_target": _require_str("scheduler"),
+        "resolution": _require_int("resolution"),
+        "gm_inversion_guidance": inversion_guidance_val,
+        "gm_inversion_steps": _require_int("inversion_steps"),
+        "gm_inversion_seed": 0,
+        "gm_inversion_prompt": "",
+        "gm_vae_sample": _require_bool("vae_sample"),
+        "gm_vae_scaling_factor": vae_scaling_val,
+        "gm_profile_is_official": _require_bool("profile_is_official"),
+        "w_seed": _require_int("w_seed"),
+        "w_channel": _require_int("w_channel"),
+        "w_pattern": _require_str("w_pattern"),
+        "w_mask_shape": _require_str("w_mask_shape"),
+        "w_radius": _require_int("w_radius"),
+        "w_measurement": _require_str("w_measurement"),
+        "w_injection": _require_str("w_injection"),
     }
 
 

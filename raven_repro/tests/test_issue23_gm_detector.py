@@ -114,7 +114,9 @@ def _make_bundle_dir(tmp_path: Path, **manifest_overrides) -> Path:
         "watermark_sha256": "n" * 64,
         "w2_tensor_sha256": "o" * 64,
         "watermark_bits_seed": 7,
-        "inversion_guidance": 1.0,
+        "inversion_prompt_sha256":
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "inversion_guidance_scale": 1.0,
         "inversion_steps": 50,
         "vae_sample": True,
         "vae_scaling_factor": 0.18215,
@@ -140,7 +142,14 @@ class StubGmProvider:
         self.gt_patch = kwargs.get("_gt_patch", _fake_gt_patch())
         self.watermarking_mask = kwargs.get("_wm_mask", _fake_wm_mask())
         self.profile = kwargs.get("gm_profile", "legacy")
-        self.profile_is_official = kwargs.get("_profile_is_official", False)
+        self.profile_is_official = bool(kwargs.get("gm_profile_is_official", False))
+        self.inversion_steps = kwargs.get("gm_inversion_steps", 50)
+        self.vae_sample = kwargs.get("gm_vae_sample", True)
+        self.model_nf = kwargs.get("gm_model_nf", 128)
+        self.classifier_type = kwargs.get("gm_classifier_type", 0)
+        self.use_gnr = kwargs.get("gm_use_gnr", False)
+        self.use_classifier = kwargs.get("gm_use_classifier", False)
+        self.w_seed = kwargs.get("w_seed", 42)
 
 
 def _fake_gt_patch():
@@ -197,22 +206,24 @@ class _StubExtractModule:
             "gm_channel_copy": 1,
             "gm_w_copy": 1,
             "gm_h_copy": 1,
-            "gm_watermark_bits_seed": manifest.get("watermark_bits_seed", 7),
+            "gm_watermark_bits_seed": manifest.get("watermark_bits_seed"),
             "gm_use_gnr": False,
             "gm_gnr_path": None,
-            "gm_model_nf": manifest.get("model_nf", 128),
-            "gm_classifier_type": manifest.get("classifier_type", 0),
+            "gm_model_nf": int(manifest["model_nf"]),
+            "gm_classifier_type": int(manifest["classifier_type"]),
             "gm_use_classifier": False,
             "gm_classifier_path": None,
             "modelid_target": str(manifest["model_id"]),
             "model_revision": str(manifest["model_revision"]),
             "scheduler_target": str(manifest["scheduler"]),
             "resolution": int(manifest["resolution"]),
-            "gm_inversion_guidance": float(manifest.get("inversion_guidance", 1.0)),
-            "gm_inversion_steps": int(manifest.get("inversion_steps", 50)),
-            "gm_vae_sample": bool(manifest.get("vae_sample", True)),
-            "gm_vae_scaling_factor": float(manifest.get("vae_scaling_factor", 0.18215)),
-            "gm_profile_is_official": manifest.get("profile_is_official"),
+            "gm_inversion_guidance": float(manifest["inversion_guidance_scale"]),
+            "gm_inversion_steps": int(manifest["inversion_steps"]),
+            "gm_inversion_seed": 0,
+            "gm_inversion_prompt": "",
+            "gm_vae_sample": True,
+            "gm_vae_scaling_factor": float(manifest["vae_scaling_factor"]),
+            "gm_profile_is_official": manifest.get("profile_is_official", False),
             "w_seed": int(manifest["w_seed"]),
             "w_channel": int(manifest["w_channel"]),
             "w_pattern": str(manifest["w_pattern"]),
@@ -514,14 +525,14 @@ class TestTargetMaskFailClosed:
         self, provider_info, fake_image):
         provider_info["provider_target_hash"] = ""
         record = _gm_record("0")
-        with pytest.raises(DetectorStateValidationError, match="detector target hash"):
+        with pytest.raises(DetectorStateValidationError, match="target hash"):
             score_image(provider_info, fake_image, record=record)
 
     def test_missing_detector_mask_is_state_validation(
         self, provider_info, fake_image):
         provider_info["provider_mask_hash"] = ""
         record = _gm_record("0")
-        with pytest.raises(DetectorStateValidationError, match="detector mask hash"):
+        with pytest.raises(DetectorStateValidationError, match="mask hash"):
             score_image(provider_info, fake_image, record=record)
 
     def test_source_target_mismatch(self, provider_info, fake_image):
@@ -1019,6 +1030,47 @@ def test_gm_mathematics_not_rewritten(mock_deps, bundle_dir, monkeypatch):
     assert score["gm_raw_ring_l1"] == 0.12
 
 
+def _full_canonical_kwargs(**overrides):
+    """Return a dict of all _CANONICAL_KWARGS_FIELDS with valid defaults."""
+    base = {
+        "gm_profile": "legacy",
+        "gm_bundle_dir": "/fake/bundle",
+        "gm_create_bundle": False,
+        "gm_allow_in_memory_state": False,
+        "gm_torch_dtype": "float32",
+        "gm_channel_copy": 1,
+        "gm_w_copy": 1,
+        "gm_h_copy": 1,
+        "gm_watermark_bits_seed": 7,
+        "gm_use_gnr": False,
+        "gm_gnr_path": None,
+        "gm_model_nf": 128,
+        "gm_classifier_type": 0,
+        "gm_use_classifier": False,
+        "gm_classifier_path": None,
+        "modelid_target": "RedbeardNZ/stable-diffusion-2-1-base",
+        "model_revision": "fake",
+        "scheduler_target": "DDIM",
+        "resolution": 512,
+        "gm_inversion_guidance": 1.0,
+        "gm_inversion_steps": 50,
+        "gm_inversion_seed": 0,
+        "gm_inversion_prompt": "",
+        "gm_vae_sample": True,
+        "gm_vae_scaling_factor": 0.18215,
+        "gm_profile_is_official": False,
+        "w_seed": 42,
+        "w_channel": 3,
+        "w_pattern": "ring",
+        "w_mask_shape": "circle",
+        "w_radius": 10,
+        "w_measurement": "l1_complex",
+        "w_injection": "complex",
+    }
+    base.update(overrides)
+    return base
+
+
 # ============================================================================
 # Orchestrator integration tests (real evaluate_detector, mocked heavy resources)
 # ============================================================================
@@ -1341,8 +1393,8 @@ class TestGnrUsage:
     @pytest.fixture
     def gnr_provider_info(self, provider_info):
         """provider_info with _canonical_kwargs gm_use_gnr=False."""
-        provider_info["_canonical_kwargs"] = {"gm_use_gnr": False,
-                                                "gm_use_classifier": False}
+        provider_info["_canonical_kwargs"] = _full_canonical_kwargs(
+            gm_use_gnr=False, gm_use_classifier=False)
         return provider_info
 
     def test_canonical_false_scorer_true_contradiction(
@@ -1481,8 +1533,8 @@ class TestClassifierUsage:
 
     @pytest.fixture
     def clf_provider_info(self, provider_info):
-        provider_info["_canonical_kwargs"] = {"gm_use_gnr": False,
-                                                "gm_use_classifier": False}
+        provider_info["_canonical_kwargs"] = _full_canonical_kwargs(
+            gm_use_gnr=False, gm_use_classifier=False)
         return provider_info
 
     def test_canonical_false_scorer_true_contradiction(
@@ -1983,8 +2035,8 @@ class TestCanonicalConfigStrictBool:
         import raven.detectors.gm_detector as gm_mod
         stub = _StubExtractModule()
         stub.evaluate_image = lambda *a, **kw: self._make_stub_result()
-        provider_info["_canonical_kwargs"] = {
-            "gm_use_gnr": "false", "gm_use_classifier": False}
+        provider_info["_canonical_kwargs"] = _full_canonical_kwargs(
+            gm_use_gnr="false", gm_use_classifier=False)
         provider_info["extract_module"] = stub
 
         record = _gm_record("0",
@@ -1998,8 +2050,8 @@ class TestCanonicalConfigStrictBool:
         import raven.detectors.gm_detector as gm_mod
         stub = _StubExtractModule()
         stub.evaluate_image = lambda *a, **kw: self._make_stub_result()
-        provider_info["_canonical_kwargs"] = {
-            "gm_use_gnr": False, "gm_use_classifier": 0}
+        provider_info["_canonical_kwargs"] = _full_canonical_kwargs(
+            gm_use_gnr=False, gm_use_classifier=0)
         provider_info["extract_module"] = stub
 
         record = _gm_record("0",
@@ -2014,8 +2066,8 @@ class TestCanonicalConfigStrictBool:
         stub = _StubExtractModule()
         stub.evaluate_image = lambda *a, **kw: self._make_stub_result(
             gm_used_gnr=None, gm_restored_bit_accuracy=0.90)
-        provider_info["_canonical_kwargs"] = {
-            "gm_use_gnr": True, "gm_use_classifier": False}
+        provider_info["_canonical_kwargs"] = _full_canonical_kwargs(
+            gm_use_gnr=True, gm_use_classifier=False)
         provider_info["extract_module"] = stub
 
         record = _gm_record("0",
@@ -2034,8 +2086,8 @@ class TestCanonicalConfigStrictBool:
             gm_used_classifier=None,
             gm_restored_bit_accuracy=0.90,
             gm_classifier_probability=0.85)
-        provider_info["_canonical_kwargs"] = {
-            "gm_use_gnr": True, "gm_use_classifier": True}
+        provider_info["_canonical_kwargs"] = _full_canonical_kwargs(
+            gm_use_gnr=True, gm_use_classifier=True)
         provider_info["extract_module"] = stub
 
         record = _gm_record("0",
@@ -2421,7 +2473,7 @@ class TestExtraKwargsRejected:
             def gm_provider_kwargs(self, row, identifier):
                 kw = super().gm_provider_kwargs(row, identifier)
                 if str(row.get("run_id")) == "1":
-                    kw["gm_inversion_seed"] = 999
+                    kw["gm_extra_field"] = 999
                 return kw
 
         monkeypatch.setattr(gm_mod, "_get_extract_module",
@@ -2524,7 +2576,7 @@ class TestGnrClassifierSemanticConsistency:
         record = _gm_record("0",
             watermark_target_sha256=provider_info["provider_target_hash"],
             watermark_mask_sha256=provider_info["provider_mask_hash"])
-        with pytest.raises(DetectorScoringError, match="classifier_probability"):
+        with pytest.raises(DetectorScoringError, match="probability present"):
             score_image(provider_info, fake_image, record=record)
 
     def test_classifier_true_gnr_false_rejected(
@@ -2541,8 +2593,8 @@ class TestGnrClassifierSemanticConsistency:
             "gm_threshold_source": "x", "gm_comparison_operator": ">=",
             "gm_used_gnr": False, "gm_used_classifier": True,
         }
-        provider_info["_canonical_kwargs"] = {
-            "gm_use_gnr": False, "gm_use_classifier": True}
+        provider_info["_canonical_kwargs"] = _full_canonical_kwargs(
+            gm_use_gnr=False, gm_use_classifier=True)
         monkeypatch.setattr(gm_mod, "_get_extract_module", lambda: stub)
         provider_info["extract_module"] = stub
         record = _gm_record("0",
@@ -2564,8 +2616,8 @@ class TestGnrClassifierSemanticConsistency:
             "gm_threshold_source": "x", "gm_comparison_operator": ">=",
             "gm_used_gnr": True, "gm_used_classifier": False,
         }
-        provider_info["_canonical_kwargs"] = {
-            "gm_use_gnr": True, "gm_use_classifier": False}
+        provider_info["_canonical_kwargs"] = _full_canonical_kwargs(
+            gm_use_gnr=True, gm_use_classifier=False)
         monkeypatch.setattr(gm_mod, "_get_extract_module", lambda: stub)
         provider_info["extract_module"] = stub
         record = _gm_record("0",
@@ -2631,7 +2683,10 @@ class TestRealExtractScript:
             "w_pattern": "ring", "w_mask_shape": "circle",
             "w_radius": 10, "w_measurement": "l1_complex",
             "w_injection": "complex",
-            "inversion_guidance": 1.0, "inversion_steps": 50,
+            "inversion_prompt_sha256":
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "inversion_guidance_scale": 1.0,
+            "inversion_steps": 50,
             "vae_sample": True, "vae_scaling_factor": 0.18215,
             "model_nf": 128, "classifier_type": 0,
             "profile_is_official": False,
