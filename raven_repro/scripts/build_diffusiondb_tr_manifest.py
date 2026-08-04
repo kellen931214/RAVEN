@@ -13,6 +13,50 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from raven.pairing_provenance import PAIRING_REQUIRED_FIELDS, audit_pairing_rows
 
+# Manifest schema.  Must retain every source-identity field the TR detector
+# adapter needs — dropping one would make a built manifest unusable for
+# fail-closed detection.
+MANIFEST_FIELDS: list[str] = [
+    "protocol",
+    "dataset",
+    "run_id",
+    "prompt_id",
+    "prompt",
+    "prompt_sha256",
+    "source",
+    "clean_path",
+    "clean_sha256",
+    "watermarked_path",
+    "watermarked_sha256",
+    "base_latent_seed",
+    "generation_seed",
+    "base_latent_sha256",
+    "clean_base_latent_sha256",
+    "watermarked_base_latent_sha256",
+    "watermarked_latent_sha256",
+    "watermark_target_sha256",
+    "watermark_mask_sha256",
+    "generation_config_sha256",
+    "watermark_config_sha256",
+    "pairing_sha256",
+    "injection_only_difference_verified",
+    "injection_max_abs_error",
+    "attack_seed",
+    "w_seed",
+    "w_channel",
+    "w_pattern",
+    "w_mask_shape",
+    "w_radius",
+    "w_measurement",
+    "w_injection",
+    "w_pattern_const",
+    "model_id",
+    "model_revision",
+    "scheduler_target",
+    "num_inference_steps_target",
+    "resolution",
+]
+
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -31,42 +75,7 @@ def main() -> int:
         rows = list(csv.DictReader(handle))
     audit = audit_pairing_rows(rows, expected_count=args.expected_count, verify_files=True)
 
-    fields = [
-        "protocol",
-        "dataset",
-        "run_id",
-        "prompt_id",
-        "prompt",
-        "prompt_sha256",
-        "source",
-        "clean_path",
-        "clean_sha256",
-        "watermarked_path",
-        "watermarked_sha256",
-        "base_latent_seed",
-        "generation_seed",
-        "base_latent_sha256",
-        "clean_base_latent_sha256",
-        "watermarked_base_latent_sha256",
-        "watermarked_latent_sha256",
-        "watermark_target_sha256",
-        "watermark_mask_sha256",
-        "generation_config_sha256",
-        "watermark_config_sha256",
-        "pairing_sha256",
-        "injection_only_difference_verified",
-        "injection_max_abs_error",
-        "attack_seed",
-        "w_seed",
-        "w_channel",
-        "w_pattern",
-        "w_mask_shape",
-        "w_radius",
-        "w_measurement",
-        "w_injection",
-        "model_id",
-        "model_revision",
-    ]
+    fields = MANIFEST_FIELDS
     missing = set(PAIRING_REQUIRED_FIELDS) - set(fields)
     if missing:
         raise AssertionError(f"manifest schema missing required fields: {sorted(missing)}")

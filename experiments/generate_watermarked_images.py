@@ -669,6 +669,7 @@ def run_method(args: argparse.Namespace, wm_type: str, prompt_rows: List[Dict[st
                     "w_radius": int(args.w_radius),
                     "w_measurement": str(args.w_measurement),
                     "w_injection": str(args.w_injection),
+                    "w_pattern_const": float(args.w_pattern_const),
                 })
             else:
                 row.update({

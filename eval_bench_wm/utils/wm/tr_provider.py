@@ -84,6 +84,18 @@ class TrProvider(WmProvider):
         return "TR"
 
 
+    def _wchannel_view(self, tensor: torch.Tensor) -> torch.tensor:
+        """Select the watermark channel for visualization output.
+
+        ``w_channel == -1`` watermarks every channel, so the visualization
+        must return the full tensor — slicing ``[:, -1:0]`` would produce an
+        empty tensor and break ``torch_to_PIL`` downstream.  This is purely a
+        visualization selection; it never feeds the p-value / scoring math.
+        """
+        if self.w_channel == -1:
+            return tensor
+        return tensor[:, self.w_channel:self.w_channel + 1]
+
     def fft_get_wchannel(self, images: torch.Tensor) -> torch.tensor:
         """
         Do fft, return only the important channel, and return it as numpy array
@@ -94,9 +106,10 @@ class TrProvider(WmProvider):
         """
         if len(images.shape) < 4:
             images = images.unsqueeze(0)
-        images = torch.fft.fftshift(torch.fft.fft2(images), dim=(-1, -2))[:, self.w_channel].real
-    
-        return images
+        images = torch.fft.fftshift(torch.fft.fft2(images), dim=(-1, -2)).real
+        if self.w_channel == -1:
+            return images
+        return images[:, self.w_channel]
 
 
     def __circle_mask(self, size=64, r=10, x_offset=0, y_offset=0) -> np.ndarray:
@@ -260,7 +273,7 @@ class TrProvider(WmProvider):
         latents_clean_fft_torch = torch.fft.fftshift(torch.fft.fft2(latents_clean.to(torch.float32)), dim=(-1, -2)).real.to(self.device)
         latents_clean_fft_PIL = torch_to_PIL(latents_clean_fft_torch)
         # clean fft wchannel
-        latents_clean_fft_wchannel_torch = latents_clean_fft_torch[:, self.w_channel: self.w_channel + 1]
+        latents_clean_fft_wchannel_torch = self._wchannel_view(latents_clean_fft_torch)
         latents_clean_fft_wchannel_PIL = torch_to_PIL(latents_clean_fft_wchannel_torch)
 
 
@@ -271,13 +284,13 @@ class TrProvider(WmProvider):
         latents_w_fft_torch = torch.fft.fftshift(torch.fft.fft2(latents_w_torch), dim=(-1, -2)).real.to(self.device)
         latents_w_fft_PIL = torch_to_PIL(latents_w_fft_torch)
         # watermarked fft wchannel
-        latents_w_fft_wchannel_torch = latents_w_fft_torch[:, self.w_channel: self.w_channel + 1].to(self.device)
+        latents_w_fft_wchannel_torch = self._wchannel_view(latents_w_fft_torch).to(self.device)
         latents_w_fft_wchannel_PIL = torch_to_PIL(latents_w_fft_wchannel_torch)
         # watermarked fft pristine
         pristine_latents_w_fft_torch = pristine_latents_w_fft.to(self.device)
         pristine_latents_w_fft_PIL = torch_to_PIL(pristine_latents_w_fft_torch)
         # watermarked fft wchannel pristine
-        pristine_latents_w_fft_wchannel_torch = pristine_latents_w_fft[:, self.w_channel: self.w_channel + 1].to(self.device)
+        pristine_latents_w_fft_wchannel_torch = self._wchannel_view(pristine_latents_w_fft).to(self.device)
         pristine_latents_w_fft_wchannel_PIL = torch_to_PIL(pristine_latents_w_fft_wchannel_torch)
 
         return {
@@ -355,7 +368,7 @@ class TrProvider(WmProvider):
         latents_fft_torch = latents_fft.real
         latents_fft_PIL = torch_to_PIL(latents_fft_torch)
 
-        latents_fft_wchannel_torch = latents_fft_torch[:, self.w_channel: self.w_channel + 1]
+        latents_fft_wchannel_torch = self._wchannel_view(latents_fft_torch)
         latents_fft_wchannel_PIL = torch_to_PIL(latents_fft_wchannel_torch)
     
         return {"p_values": p_values,
