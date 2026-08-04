@@ -38,16 +38,31 @@ from raven.detectors import (  # noqa: E402
     ROW_STATUS_FAILED_MISSING_STATE,
     ROW_STATUS_FAILED_PROVIDER,
     ROW_STATUS_FAILED_SCORING,
+    ROW_STATUS_FAILED_STATE_VALIDATION,
+    ROW_STATUS_FAILED_MISSING_DEPENDENCY,
     STATUS_COMPLETED,
     STATUS_COMPLETED_WITH_ERRORS,
     STATUS_SKIPPED_INSUFFICIENT_DATA,
     STATUS_FAILED_MISSING_REQUIRED_STATE,
     STATUS_FAILED_MISSING_DEPENDENCY,
+    STATUS_FAILED_MISSING_IMAGE,
     STATUS_FAILED_PROVIDER_INITIALIZATION,
     STATUS_FAILED_STATE_VALIDATION,
     STATUS_FAILED_SCORING,
     STATUS_FAILED_INTERNAL_ERROR,
     STAGE_NONZERO_STATUSES,
+    FAILURE_CAUSE_INTERNAL_ERROR,
+    FAILURE_CAUSE_STATE_VALIDATION,
+    FAILURE_CAUSE_PROVIDER_INITIALIZATION,
+    FAILURE_CAUSE_SCORING_ERROR,
+    FAILURE_CAUSE_MISSING_IMAGE,
+    FAILURE_CAUSE_MISSING_REQUIRED_STATE,
+    FAILURE_CAUSE_MISSING_DEPENDENCY,
+    _ROW_STATUS_TO_FAILURE_CAUSE,
+    _FAILURE_CAUSE_TO_STAGE_STATUS,
+    reduce_detector_stage_status,
+    stage_status_is_allowable,
+    determine_exit_code,
     DetectorMissingStateError,
     DetectorDependencyError,
     DetectorProviderInitializationError,
@@ -494,25 +509,45 @@ def evaluate_quality(
 # Detector stage
 # ===========================================================================
 def _error_to_row_status(exc: Exception) -> str:
+    """Map exception type to row status.  Used when an exception escapes
+    ``score_image`` — the scoring loop adds ``failure_cause`` and
+    ``error_type`` fields for structured downstream consumption."""
     if isinstance(exc, DetectorMissingStateError):
         return ROW_STATUS_FAILED_MISSING_STATE
     if isinstance(exc, DetectorProviderInitializationError):
         return ROW_STATUS_FAILED_PROVIDER
     if isinstance(exc, DetectorStateValidationError):
-        return ROW_STATUS_FAILED_MISSING_STATE
+        return ROW_STATUS_FAILED_STATE_VALIDATION
+    if isinstance(exc, DetectorScoringError):
+        return ROW_STATUS_FAILED_SCORING
+    if isinstance(exc, FileNotFoundError):
+        return ROW_STATUS_FAILED_MISSING_IMAGE
     return ROW_STATUS_FAILED_SCORING
 
 
-def _error_to_stage_status(exc: Exception) -> str:
+def _error_to_failure_cause(exc: Exception) -> str:
+    """Map exception type to structured failure cause."""
     if isinstance(exc, DetectorMissingStateError):
-        return STATUS_FAILED_MISSING_REQUIRED_STATE
+        return FAILURE_CAUSE_MISSING_REQUIRED_STATE
     if isinstance(exc, DetectorDependencyError):
-        return STATUS_FAILED_MISSING_DEPENDENCY
+        return FAILURE_CAUSE_MISSING_DEPENDENCY
     if isinstance(exc, DetectorProviderInitializationError):
-        return STATUS_FAILED_PROVIDER_INITIALIZATION
+        return FAILURE_CAUSE_PROVIDER_INITIALIZATION
     if isinstance(exc, DetectorStateValidationError):
-        return STATUS_FAILED_STATE_VALIDATION
-    return STATUS_FAILED_INTERNAL_ERROR
+        return FAILURE_CAUSE_STATE_VALIDATION
+    if isinstance(exc, FileNotFoundError):
+        return FAILURE_CAUSE_MISSING_IMAGE
+    if isinstance(exc, DetectorScoringError):
+        return FAILURE_CAUSE_SCORING_ERROR
+    if isinstance(exc, ImportError):
+        return FAILURE_CAUSE_MISSING_DEPENDENCY
+    return FAILURE_CAUSE_INTERNAL_ERROR
+
+
+def _error_to_stage_status(exc: Exception) -> str:
+    """Map exception type to stage status (for orchestration-level catches)."""
+    cause = _error_to_failure_cause(exc)
+    return _FAILURE_CAUSE_TO_STAGE_STATUS.get(cause, STATUS_FAILED_INTERNAL_ERROR)
 
 
 def evaluate_detector(
@@ -668,6 +703,8 @@ def evaluate_detector(
 
         score = None
         row_status = ROW_STATUS_FAILED_SCORING
+        failure_cause = FAILURE_CAUSE_SCORING_ERROR
+        error_type = ""
         error_msg = ""
         try:
             score = det_mod.score_image(
@@ -678,9 +715,13 @@ def evaluate_detector(
             # ---- Issue #19: validate score contract ----
             if score is None:
                 row_status = ROW_STATUS_FAILED_SCORING
+                failure_cause = FAILURE_CAUSE_SCORING_ERROR
+                error_type = "NoneReturn"
                 error_msg = "score_image returned None"
             elif not isinstance(score, dict):
                 row_status = ROW_STATUS_FAILED_SCORING
+                failure_cause = FAILURE_CAUSE_SCORING_ERROR
+                error_type = "NonDictReturn"
                 error_msg = (
                     f"score_image returned non-dict: {type(score).__name__}"
                 )
@@ -688,24 +729,42 @@ def evaluate_detector(
                 valid, validation_error = _validate_score(score, method)
                 if valid:
                     row_status = ROW_STATUS_SCORED
+                    failure_cause = ""
+                    error_type = ""
                 else:
                     row_status = ROW_STATUS_FAILED_SCORING
+                    failure_cause = FAILURE_CAUSE_SCORING_ERROR
+                    error_type = "ScoreContractViolation"
                     error_msg = f"score validation failed: {validation_error}"
         except DetectorMissingStateError as exc:
             row_status = ROW_STATUS_FAILED_MISSING_STATE
+            failure_cause = FAILURE_CAUSE_MISSING_REQUIRED_STATE
+            error_type = type(exc).__name__
             error_msg = str(exc)
-        except (DetectorProviderInitializationError,
-                DetectorStateValidationError) as exc:
+        except DetectorProviderInitializationError as exc:
             row_status = ROW_STATUS_FAILED_PROVIDER
+            failure_cause = FAILURE_CAUSE_PROVIDER_INITIALIZATION
+            error_type = type(exc).__name__
+            error_msg = str(exc)
+        except DetectorStateValidationError as exc:
+            row_status = ROW_STATUS_FAILED_STATE_VALIDATION
+            failure_cause = FAILURE_CAUSE_STATE_VALIDATION
+            error_type = type(exc).__name__
             error_msg = str(exc)
         except DetectorScoringError as exc:
             row_status = ROW_STATUS_FAILED_SCORING
+            failure_cause = FAILURE_CAUSE_SCORING_ERROR
+            error_type = type(exc).__name__
             error_msg = str(exc)
         except FileNotFoundError:
             row_status = ROW_STATUS_FAILED_MISSING_IMAGE
+            failure_cause = FAILURE_CAUSE_MISSING_IMAGE
+            error_type = "FileNotFoundError"
             error_msg = f"Image not found: {entry['image_path']}"
         except Exception as exc:
             row_status = ROW_STATUS_FAILED_SCORING
+            failure_cause = FAILURE_CAUSE_INTERNAL_ERROR
+            error_type = type(exc).__name__
             error_msg = f"{type(exc).__name__}: {exc}"
 
         row = {
@@ -718,6 +777,10 @@ def evaluate_detector(
         }
         if isinstance(score, dict) and row_status == ROW_STATUS_SCORED:
             row.update(score)
+        if failure_cause:
+            row["failure_cause"] = failure_cause
+        if error_type:
+            row["error_type"] = error_type
         if error_msg:
             row["error"] = error_msg
         detector_rows.append(row)
@@ -757,31 +820,35 @@ def evaluate_detector(
     primary_optional = _compute_primary_optional_counts(detector_rows, method)
     aggregate.update(primary_optional)
 
-    # ---- Issue #19: stage status semantics ----
+    # ---- Issue #25: single stage-status reducer ----
     primary_available = metric_availability.get("primary_report_available", False)
-    any_available = metric_availability.get("any_report_available", False)
-    primary_failed = primary_optional.get("primary_failed_count", 0)
     optional_failed = primary_optional.get("optional_failed_count", 0)
 
-    if scored_count == 0:
-        stage_status = STATUS_FAILED_SCORING
-    elif primary_available and primary_failed == 0:
-        stage_status = STATUS_COMPLETED
-    elif any_available:
-        stage_status = STATUS_COMPLETED_WITH_ERRORS
-    elif scored_count > 0:
-        stage_status = STATUS_COMPLETED_WITH_ERRORS
-    else:
-        stage_status = STATUS_FAILED_SCORING
+    reducer_result = reduce_detector_stage_status(
+        detector_rows,
+        primary_report_available=primary_available,
+        primary_metrics_complete=primary_available,
+        optional_failed_count=optional_failed,
+    )
+    stage_status = reducer_result["status"]
 
     # Optional cohort failures must not downgrade primary completion
     if stage_status == STATUS_COMPLETED and optional_failed > 0:
         aggregate["optional_metrics_incomplete"] = True
 
+    # Merge reducer diagnostics into aggregate
+    aggregate["dominant_failure_cause"] = reducer_result.get(
+        "dominant_failure_cause")
+    aggregate["status_reducer_reason"] = reducer_result.get(
+        "status_reducer_reason")
+    aggregate["row_status_counts"] = reducer_result.get("row_status_counts", {})
+    aggregate["failure_cause_counts"] = reducer_result.get(
+        "failure_cause_counts", {})
+
     aggregate["stage"] = "detector"
     aggregate["method"] = method
     aggregate["status"] = stage_status
-    aggregate["available"] = any_available
+    aggregate["available"] = reducer_result["available"]
     return aggregate
 
 
@@ -943,6 +1010,7 @@ def run_evaluation(
                 "error": f"{type(exc).__name__}: {exc}",
             }
 
+    # ---- Issue #25: unified exit code policy ----
     stage_statuses = {
         s: info.get("status", STATUS_FAILED_INTERNAL_ERROR)
         for s, info in result["stages"].items()}
@@ -951,11 +1019,27 @@ def run_evaluation(
     failed_allowable = {s for s, st in stage_statuses.items()
                         if st in ALLOWABLE_STATUSES}
 
+    # Preserve original stage statuses — allow flag must NOT rewrite them
     result["failed_stages"] = sorted(failed)
     result["skipped_stages"] = sorted(failed_allowable)
-    result["overall_status"] = (
-        STATUS_COMPLETED if not (failed or (failed_allowable and not allow_missing_metrics))
-        else STATUS_SKIPPED_INSUFFICIENT_DATA)
+
+    # Mark whether each nonzero stage is allowable under current policy
+    allowable_map: dict[str, bool] = {}
+    for stage_name, stage_info in result["stages"].items():
+        st = stage_info.get("status", STATUS_FAILED_INTERNAL_ERROR)
+        allowable_map[stage_name] = stage_status_is_allowable(
+            st, allow_missing_metrics=allow_missing_metrics)
+    result["stages_allowable"] = allowable_map
+
+    # Overall status reflects worst non-allowable stage, or completed
+    exit_code = determine_exit_code(
+        result, allow_missing_metrics=allow_missing_metrics)
+    if exit_code == 0:
+        result["overall_status"] = STATUS_COMPLETED
+    else:
+        result["overall_status"] = STATUS_COMPLETED_WITH_ERRORS
+
+    result["allowed_by_policy"] = allow_missing_metrics
 
     return result
 
@@ -1006,11 +1090,10 @@ def main(argv: list[str] | None = None) -> int:
         logger.error("Failed stages: %s", ", ".join(failed))
     if skipped:
         logger.warning("Skipped required stages: %s", ", ".join(skipped))
-    if failed:
-        return 2
-    if skipped and not args.allow_missing_metrics:
-        return 3
-    return 0
+
+    # ---- Issue #25: unified exit-code policy ----
+    return determine_exit_code(
+        result, allow_missing_metrics=args.allow_missing_metrics)
 
 
 if __name__ == "__main__":

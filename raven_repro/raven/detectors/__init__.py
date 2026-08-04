@@ -54,13 +54,36 @@ ROW_STATUS_FAILED_MISSING_IMAGE = "failed_missing_image"
 ROW_STATUS_FAILED_MISSING_STATE = "failed_missing_state"
 ROW_STATUS_FAILED_PROVIDER = "failed_provider"
 ROW_STATUS_FAILED_SCORING = "failed_scoring"
+ROW_STATUS_FAILED_STATE_VALIDATION = "failed_state_validation"
+ROW_STATUS_FAILED_MISSING_DEPENDENCY = "failed_missing_dependency"
 
 ROW_NONZERO_STATUSES = frozenset({
     ROW_STATUS_FAILED_MISSING_IMAGE,
     ROW_STATUS_FAILED_MISSING_STATE,
     ROW_STATUS_FAILED_PROVIDER,
     ROW_STATUS_FAILED_SCORING,
+    ROW_STATUS_FAILED_STATE_VALIDATION,
+    ROW_STATUS_FAILED_MISSING_DEPENDENCY,
 })
+
+# Row failure causes — structured, never derived from error strings
+FAILURE_CAUSE_INTERNAL_ERROR = "internal_error"
+FAILURE_CAUSE_STATE_VALIDATION = "state_validation_error"
+FAILURE_CAUSE_PROVIDER_INITIALIZATION = "provider_initialization_error"
+FAILURE_CAUSE_SCORING_ERROR = "scoring_error"
+FAILURE_CAUSE_MISSING_IMAGE = "missing_image"
+FAILURE_CAUSE_MISSING_REQUIRED_STATE = "missing_required_state"
+FAILURE_CAUSE_MISSING_DEPENDENCY = "missing_dependency"
+
+# Map row status → failure cause
+_ROW_STATUS_TO_FAILURE_CAUSE: dict[str, str] = {
+    ROW_STATUS_FAILED_MISSING_IMAGE: FAILURE_CAUSE_MISSING_IMAGE,
+    ROW_STATUS_FAILED_MISSING_STATE: FAILURE_CAUSE_MISSING_REQUIRED_STATE,
+    ROW_STATUS_FAILED_PROVIDER: FAILURE_CAUSE_PROVIDER_INITIALIZATION,
+    ROW_STATUS_FAILED_SCORING: FAILURE_CAUSE_SCORING_ERROR,
+    ROW_STATUS_FAILED_STATE_VALIDATION: FAILURE_CAUSE_STATE_VALIDATION,
+    ROW_STATUS_FAILED_MISSING_DEPENDENCY: FAILURE_CAUSE_MISSING_DEPENDENCY,
+}
 
 # Stage-level status
 STATUS_COMPLETED = "completed"
@@ -68,6 +91,7 @@ STATUS_COMPLETED_WITH_ERRORS = "completed_with_errors"
 STATUS_SKIPPED_INSUFFICIENT_DATA = "skipped_insufficient_data"
 STATUS_FAILED_MISSING_REQUIRED_STATE = "failed_missing_required_state"
 STATUS_FAILED_MISSING_DEPENDENCY = "failed_missing_dependency"
+STATUS_FAILED_MISSING_IMAGE = "failed_missing_image"
 STATUS_FAILED_PROVIDER_INITIALIZATION = "failed_provider_initialization"
 STATUS_FAILED_STATE_VALIDATION = "failed_state_validation"
 STATUS_FAILED_SCORING = "failed_scoring"
@@ -80,8 +104,9 @@ ALLOWABLE_STATUSES = frozenset({
     STATUS_FAILED_MISSING_DEPENDENCY,
 })
 
-# Never allowable — always nonzero
+# Never allowable — always nonzero regardless of --allow-missing-metrics
 NONZERO_STATUSES = frozenset({
+    STATUS_FAILED_MISSING_IMAGE,
     STATUS_FAILED_PROVIDER_INITIALIZATION,
     STATUS_FAILED_STATE_VALIDATION,
     STATUS_FAILED_SCORING,
@@ -90,6 +115,263 @@ NONZERO_STATUSES = frozenset({
 })
 
 STAGE_NONZERO_STATUSES = frozenset({*NONZERO_STATUSES, *ALLOWABLE_STATUSES})
+
+# Failure cause → stage status (for setup failures that skip scoring loop)
+_FAILURE_CAUSE_TO_STAGE_STATUS: dict[str, str] = {
+    FAILURE_CAUSE_INTERNAL_ERROR: STATUS_FAILED_INTERNAL_ERROR,
+    FAILURE_CAUSE_STATE_VALIDATION: STATUS_FAILED_STATE_VALIDATION,
+    FAILURE_CAUSE_PROVIDER_INITIALIZATION: STATUS_FAILED_PROVIDER_INITIALIZATION,
+    FAILURE_CAUSE_SCORING_ERROR: STATUS_FAILED_SCORING,
+    FAILURE_CAUSE_MISSING_IMAGE: STATUS_FAILED_MISSING_IMAGE,
+    FAILURE_CAUSE_MISSING_REQUIRED_STATE: STATUS_FAILED_MISSING_REQUIRED_STATE,
+    FAILURE_CAUSE_MISSING_DEPENDENCY: STATUS_FAILED_MISSING_DEPENDENCY,
+}
+
+# Precedence order for stage-status reduction (highest first).
+# Each entry is (failure_cause, stage_status_when_dominant).
+_STAGE_PRECEDENCE: list[tuple[str, str]] = [
+    (FAILURE_CAUSE_INTERNAL_ERROR, STATUS_FAILED_INTERNAL_ERROR),
+    (FAILURE_CAUSE_STATE_VALIDATION, STATUS_FAILED_STATE_VALIDATION),
+    (FAILURE_CAUSE_PROVIDER_INITIALIZATION, STATUS_FAILED_PROVIDER_INITIALIZATION),
+    (FAILURE_CAUSE_SCORING_ERROR, STATUS_FAILED_SCORING),
+    (FAILURE_CAUSE_MISSING_IMAGE, STATUS_FAILED_MISSING_IMAGE),
+    (FAILURE_CAUSE_MISSING_REQUIRED_STATE, STATUS_FAILED_MISSING_REQUIRED_STATE),
+    (FAILURE_CAUSE_MISSING_DEPENDENCY, STATUS_FAILED_MISSING_DEPENDENCY),
+]
+
+
+# ---------------------------------------------------------------------------
+# Stage-status reducer — single deterministic entry point
+# ---------------------------------------------------------------------------
+def _failure_cause_for_row(row: dict[str, Any]) -> str | None:
+    """Return the structured failure cause for a detector row, or None if scored."""
+    status = row.get("status", "")
+    if status == ROW_STATUS_SCORED:
+        return None
+    return _ROW_STATUS_TO_FAILURE_CAUSE.get(status)
+
+
+def reduce_detector_stage_status(
+    detector_rows: list[dict[str, Any]],
+    *,
+    setup_failure: str | None = None,
+    primary_report_available: bool = False,
+    primary_metrics_complete: bool = False,
+    optional_failed_count: int = 0,
+) -> dict[str, Any]:
+    """Determine detector stage status from row-level failure causes.
+
+    Returns a dict with:
+
+    - ``status``: stage-level status string
+    - ``dominant_failure_cause``: highest-precedence failure cause (or None)
+    - ``status_reducer_reason``: human-readable explanation
+    - ``available``: whether any usable output exists
+    - ``failure_cause_counts``: count of rows per failure cause
+    - ``row_status_counts``: count of rows per row status
+
+    Precedence (highest first):
+
+    1. internal_error
+    2. state_validation_error
+    3. provider_initialization_error
+    4. scoring_error
+    5. missing_image
+    6. missing_required_state
+    7. missing_dependency
+    8. completed_with_errors
+    9. completed
+    """
+    # Count row statuses and failure causes
+    row_status_counts: dict[str, int] = {}
+    failure_cause_counts: dict[str, int] = {}
+    scored_count = 0
+
+    for row in detector_rows:
+        st = row.get("status", ROW_STATUS_FAILED_SCORING)
+        row_status_counts[st] = row_status_counts.get(st, 0) + 1
+        cause = _failure_cause_for_row(row)
+        if cause is not None:
+            failure_cause_counts[cause] = failure_cause_counts.get(cause, 0) + 1
+        elif st == ROW_STATUS_SCORED:
+            scored_count += 1
+
+    # If setup failure was provided, it takes precedence over row-level causes
+    effective_failure: str | None = setup_failure
+
+    # Find highest-precedence row-level failure cause
+    if not effective_failure:
+        for cause, _stage_status in _STAGE_PRECEDENCE:
+            if failure_cause_counts.get(cause, 0) > 0:
+                effective_failure = cause
+                break
+
+    # Determine stage status
+    if effective_failure is not None:
+        # If all failures are in optional cohorts and primary metrics are
+        # complete, the stage is still ``completed`` — optional failures
+        # must never downgrade the primary report (Issue #19 / #25 D.5).
+        total_failed = sum(failure_cause_counts.values())
+        primary_failed = total_failed - optional_failed_count
+        if primary_failed <= 0 and primary_metrics_complete and scored_count > 0:
+            reason_parts = []
+            for cause, _st in _STAGE_PRECEDENCE:
+                cnt = failure_cause_counts.get(cause, 0)
+                if cnt > 0:
+                    reason_parts.append(f"{cnt} {cause}")
+            reason = ", ".join(reason_parts)
+            return {
+                "status": STATUS_COMPLETED,
+                "dominant_failure_cause": effective_failure,
+                "status_reducer_reason": (
+                    f"all {total_failed} failure(s) in optional cohorts; "
+                    f"primary metrics complete: {reason}"
+                ),
+                "available": True,
+                "failure_cause_counts": failure_cause_counts,
+                "row_status_counts": row_status_counts,
+            }
+
+        # missing_required_state softens to completed_with_errors when
+        # there are valid scores AND the primary report is complete.
+        if (effective_failure == FAILURE_CAUSE_MISSING_REQUIRED_STATE
+                and scored_count > 0
+                and primary_metrics_complete):
+            reason_parts: list[str] = []
+            for cause, _st in _STAGE_PRECEDENCE:
+                cnt = failure_cause_counts.get(cause, 0)
+                if cnt > 0:
+                    reason_parts.append(f"{cnt} {cause}")
+            reason = ", ".join(reason_parts)
+            return {
+                "status": STATUS_COMPLETED_WITH_ERRORS,
+                "dominant_failure_cause": effective_failure,
+                "status_reducer_reason": (
+                    f"primary metrics complete with {scored_count} valid "
+                    f"score(s); {failure_cause_counts.get(FAILURE_CAUSE_MISSING_REQUIRED_STATE, 0)} "
+                    f"missing_required_state failure(s) softened to "
+                    f"completed_with_errors: {reason}"
+                ),
+                "available": True,
+                "failure_cause_counts": failure_cause_counts,
+                "row_status_counts": row_status_counts,
+            }
+
+        stage_status = _FAILURE_CAUSE_TO_STAGE_STATUS[effective_failure]
+        reason_parts = []
+        for cause, _st in _STAGE_PRECEDENCE:
+            cnt = failure_cause_counts.get(cause, 0)
+            if cnt > 0:
+                reason_parts.append(f"{cnt} {cause}")
+        reason = ", ".join(reason_parts)
+        dominant = failure_cause_counts.get(effective_failure, 0)
+        other = sum(
+            v for k, v in failure_cause_counts.items()
+            if k != effective_failure
+        )
+        if other > 0:
+            reason = (
+                f"{dominant} {effective_failure} takes precedence "
+                f"over {other} other failure(s): {reason}"
+            )
+        else:
+            reason = f"{dominant} {effective_failure}: {reason}"
+        return {
+            "status": stage_status,
+            "dominant_failure_cause": effective_failure,
+            "status_reducer_reason": reason,
+            "available": scored_count > 0,
+            "failure_cause_counts": failure_cause_counts,
+            "row_status_counts": row_status_counts,
+        }
+
+    # No failures — check completeness
+    if scored_count == 0:
+        return {
+            "status": STATUS_SKIPPED_INSUFFICIENT_DATA,
+            "dominant_failure_cause": None,
+            "status_reducer_reason": "no rows scored and no failures recorded",
+            "available": False,
+            "failure_cause_counts": failure_cause_counts,
+            "row_status_counts": row_status_counts,
+        }
+
+    if not primary_report_available:
+        if primary_metrics_complete:
+            return {
+                "status": STATUS_COMPLETED_WITH_ERRORS,
+                "dominant_failure_cause": None,
+                "status_reducer_reason": (
+                    "primary report not available but primary metrics "
+                    "complete — completed_with_errors"
+                ),
+                "available": True,
+                "failure_cause_counts": failure_cause_counts,
+                "row_status_counts": row_status_counts,
+            }
+        return {
+            "status": STATUS_COMPLETED_WITH_ERRORS,
+            "dominant_failure_cause": None,
+            "status_reducer_reason": (
+                "scores exist but primary report not available"
+            ),
+            "available": True,
+            "failure_cause_counts": failure_cause_counts,
+            "row_status_counts": row_status_counts,
+        }
+
+    return {
+        "status": STATUS_COMPLETED,
+        "dominant_failure_cause": None,
+        "status_reducer_reason": "all required rows scored, primary report complete",
+        "available": True,
+        "failure_cause_counts": failure_cause_counts,
+        "row_status_counts": row_status_counts,
+    }
+
+
+# ---------------------------------------------------------------------------
+# CLI exit-code policy — single deterministic entry point
+# ---------------------------------------------------------------------------
+def stage_status_is_allowable(
+    status: str,
+    *,
+    allow_missing_metrics: bool,
+) -> bool:
+    """Return True if *status* permits exit 0 under the given allow policy.
+
+    ``--allow-missing-metrics`` only suppresses:
+
+    - ``skipped_insufficient_data``
+    - ``failed_missing_required_state``
+    - ``failed_missing_dependency``
+
+    All other nonzero statuses remain nonzero regardless of the flag.
+    """
+    if status == STATUS_COMPLETED:
+        return True
+    if allow_missing_metrics and status in ALLOWABLE_STATUSES:
+        return True
+    return False
+
+
+def determine_exit_code(
+    evaluation_result: dict[str, Any],
+    *,
+    allow_missing_metrics: bool,
+) -> int:
+    """Compute CLI exit code from evaluation result.
+
+    0 = all required stages completed or allowable under policy.
+    Nonzero = at least one stage failed with a non-allowable status.
+    """
+    stages = evaluation_result.get("stages", {})
+    for stage_name, stage_info in stages.items():
+        status = stage_info.get("status", STATUS_FAILED_INTERNAL_ERROR)
+        if not stage_status_is_allowable(status,
+                                         allow_missing_metrics=allow_missing_metrics):
+            return 2
+    return 0
 
 
 # ---------------------------------------------------------------------------

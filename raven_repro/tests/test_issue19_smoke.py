@@ -660,9 +660,17 @@ class TestStageStatus:
             assert result["status"] == STATUS_FAILED_SCORING
 
     def test_partial_failure_with_sufficient_data_is_completed_with_errors(self, monkeypatch):
-        """Some scores fail but enough remain for primary metrics."""
+        """Some scores fail (missing state) but enough remain for primary metrics.
+
+        Uses DetectorMissingStateError so failures are ``missing_required_state``
+        which softens to ``completed_with_errors`` when primary report is
+        available (Issue #25 D.4).  Scoring errors (None return) would NOT
+        soften and would produce ``failed_scoring`` instead.
+        """
         from experiments.eval import evaluate_detector
-        from raven.detectors import STATUS_COMPLETED_WITH_ERRORS
+        from raven.detectors import (
+            STATUS_COMPLETED_WITH_ERRORS, DetectorMissingStateError,
+        )
 
         rec_clean = _make_record("1", "clean", method="TR",
                                   source_metadata=TR_META)
@@ -675,8 +683,8 @@ class TestStageStatus:
 
         def partial_fail(*a, **kw):
             call_count[0] += 1
-            if call_count[0] >= 5:  # Fail some entries
-                return None
+            if call_count[0] >= 5:  # Fail some entries → missing state
+                raise DetectorMissingStateError("missing state for this row")
             return {"raw_score": 0.001, "canonical_score": 10.0}
 
         self._patch_tr(monkeypatch, partial_fail)
