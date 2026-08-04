@@ -212,6 +212,58 @@ def _validate_gm_provider_profile(
             )
 
 
+# Canonical boolean kwargs that must be strict Python ``bool``.
+_STRICT_BOOL_KWARGS: frozenset[str] = frozenset({
+    "gm_use_gnr",
+    "gm_use_classifier",
+    "gm_create_bundle",
+    "gm_allow_in_memory_state",
+})
+
+# Persisted-bundle safety controls — the unified detector MUST NOT
+# create bundles or fall back to in-memory state.
+_PERSISTED_BUNDLE_FALSE_KWARGS: frozenset[str] = frozenset({
+    "gm_create_bundle",
+    "gm_allow_in_memory_state",
+})
+
+
+def _validate_canonical_provider_kwargs(
+    kwargs: dict[str, Any],
+    *,
+    run_id: str,
+) -> None:
+    """Validate canonical provider kwargs at load time.
+
+    1. Every key in ``_STRICT_BOOL_KWARGS`` must be a Python ``bool``
+       if present — ``"false"``, ``0``, ``[]`` etc. are rejected.
+    2. ``gm_create_bundle`` and ``gm_allow_in_memory_state`` must
+       be ``False`` — the unified detector requires a persisted bundle.
+
+    Raises ``DetectorStateValidationError`` on first violation.
+    This is called BEFORE provider construction so malformed config
+    never reaches ``GmProvider``.
+    """
+    for field in _STRICT_BOOL_KWARGS:
+        value = kwargs.get(field)
+        if value is None:
+            continue
+        if not isinstance(value, bool):
+            raise DetectorStateValidationError(
+                f"run_id={run_id}: canonical GM provider config "
+                f"{field!r} must be bool, got {type(value).__name__}: "
+                f"{value!r}"
+            )
+
+    for field in _PERSISTED_BUNDLE_FALSE_KWARGS:
+        value = kwargs.get(field)
+        if value is not False:
+            raise DetectorStateValidationError(
+                f"run_id={run_id}: GM unified detector requires "
+                f"{field}=False, got {value!r}"
+            )
+
+
 def _validate_bundle_files_exist(bundle_dir: str) -> Path:
     resolved = Path(bundle_dir).resolve()
     if not resolved.is_dir():
@@ -284,6 +336,9 @@ def load_state(records: list[dict[str, Any]], device: str,
                 f"run_id={run_id}: GM provider kwargs validation failed: "
                 f"{type(exc).__name__}: {exc}"
             ) from exc
+
+        # Validate canonical kwargs before any downstream use.
+        _validate_canonical_provider_kwargs(kwargs, run_id=run_id)
 
         _validate_gm_provider_profile(manifest, kwargs)
 

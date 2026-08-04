@@ -1733,7 +1733,6 @@ class TestMixedCanonicalIdentityRejectedBeforeProvider:
 
         class RowVaryingExtract(_StubExtractModule):
             def gm_provider_kwargs(self, row, identifier):
-                _bd, _mf = self.gm_bundle_manifest(row, identifier)
                 kw = super().gm_provider_kwargs(row, identifier)
                 if str(row.get("run_id")) == "1":
                     kw = dict(kw, gm_use_gnr=not kw.get("gm_use_gnr", False))
@@ -1883,7 +1882,6 @@ class TestStateControlFieldsInIdentity:
 
         class CreateBundleVarying(_StubExtractModule):
             def gm_provider_kwargs(self, row, identifier):
-                _bd, _mf = self.gm_bundle_manifest(row, identifier)
                 kw = super().gm_provider_kwargs(row, identifier)
                 if str(row.get("run_id")) == "1":
                     kw = dict(kw, gm_create_bundle=True)
@@ -1897,7 +1895,7 @@ class TestStateControlFieldsInIdentity:
                 _gm_record("1", gm_bundle_dir=str(bundle_dir)),
             ]
             with pytest.raises(DetectorStateValidationError,
-                               match="mixed canonical"):
+                               match="gm_create_bundle"):
                 load_state(records, "cpu")
             assert counter[0] == 0
         finally:
@@ -1917,7 +1915,6 @@ class TestStateControlFieldsInIdentity:
 
         class MemoryStateVarying(_StubExtractModule):
             def gm_provider_kwargs(self, row, identifier):
-                _bd, _mf = self.gm_bundle_manifest(row, identifier)
                 kw = super().gm_provider_kwargs(row, identifier)
                 if str(row.get("run_id")) == "1":
                     kw = dict(kw, gm_allow_in_memory_state=True)
@@ -1931,7 +1928,7 @@ class TestStateControlFieldsInIdentity:
                 _gm_record("1", gm_bundle_dir=str(bundle_dir)),
             ]
             with pytest.raises(DetectorStateValidationError,
-                               match="mixed canonical"):
+                               match="gm_allow_in_memory_state"):
                 load_state(records, "cpu")
             assert counter[0] == 0
         finally:
@@ -1939,7 +1936,11 @@ class TestStateControlFieldsInIdentity:
 
 
 # ============================================================================
-# Canonical config — non-bool rejection and true fallback
+# Canonical config — score-time defense-in-depth
+#
+# These tests validate that a tampered or fabricated provider_info dict
+# is caught at score time.  The primary canonical validation happens
+# during load_state (see TestLoadTimeCanonicalValidation below).
 # ============================================================================
 
 class TestCanonicalConfigStrictBool:
@@ -2014,3 +2015,156 @@ class TestCanonicalConfigStrictBool:
             watermark_mask_sha256=provider_info["provider_mask_hash"])
         score = score_image(provider_info, fake_image, record=record)
         assert score["gm_classifier_used"] is True
+
+
+# ============================================================================
+# Load-time canonical validation — malformed kwargs rejected BEFORE provider
+# ============================================================================
+
+class TestLoadTimeCanonicalValidation:
+
+    def test_load_state_rejects_non_bool_gnr_before_provider(
+        self, mock_deps, bundle_dir, monkeypatch):
+        """gm_provider_kwargs returns gm_use_gnr='false' (string) →
+        DetectorStateValidationError before provider construction."""
+        import raven.detectors.gm_detector as gm_mod
+        provider_calls = [0]
+
+        class CountingProvider(StubGmProvider):
+            def __init__(self, **kw):
+                provider_calls[0] += 1
+                super().__init__(**kw)
+        fake_gm = sys.modules.get("eval_bench_wm.utils.wm.gm_provider")
+        fake_gm.GmProvider = CountingProvider
+
+        class MalformedGnrExtract(_StubExtractModule):
+            def gm_provider_kwargs(self, row, identifier):
+                kw = super().gm_provider_kwargs(row, identifier)
+                kw["gm_use_gnr"] = "false"
+                return kw
+
+        monkeypatch.setattr(gm_mod, "_get_extract_module",
+                            lambda: MalformedGnrExtract())
+        try:
+            records = [_gm_record("0", gm_bundle_dir=str(bundle_dir))]
+            with pytest.raises(DetectorStateValidationError,
+                               match="gm_use_gnr.*must be bool"):
+                load_state(records, "cpu")
+            assert provider_calls[0] == 0
+        finally:
+            fake_gm.GmProvider = StubGmProvider
+
+    def test_load_state_rejects_non_bool_classifier_before_provider(
+        self, mock_deps, bundle_dir, monkeypatch):
+        """gm_provider_kwargs returns gm_use_classifier=0 (int) →
+        DetectorStateValidationError before provider construction."""
+        import raven.detectors.gm_detector as gm_mod
+        provider_calls = [0]
+
+        class CountingProvider(StubGmProvider):
+            def __init__(self, **kw):
+                provider_calls[0] += 1
+                super().__init__(**kw)
+        fake_gm = sys.modules.get("eval_bench_wm.utils.wm.gm_provider")
+        fake_gm.GmProvider = CountingProvider
+
+        class MalformedClfExtract(_StubExtractModule):
+            def gm_provider_kwargs(self, row, identifier):
+                kw = super().gm_provider_kwargs(row, identifier)
+                kw["gm_use_classifier"] = 0
+                return kw
+
+        monkeypatch.setattr(gm_mod, "_get_extract_module",
+                            lambda: MalformedClfExtract())
+        try:
+            records = [_gm_record("0", gm_bundle_dir=str(bundle_dir))]
+            with pytest.raises(DetectorStateValidationError,
+                               match="gm_use_classifier.*must be bool"):
+                load_state(records, "cpu")
+            assert provider_calls[0] == 0
+        finally:
+            fake_gm.GmProvider = StubGmProvider
+
+    def test_uniform_create_bundle_true_rejected_before_provider(
+        self, mock_deps, bundle_dir, monkeypatch):
+        """All rows have gm_create_bundle=True (uniform, not mixed) →
+        DetectorStateValidationError, provider never constructed."""
+        import raven.detectors.gm_detector as gm_mod
+        provider_calls = [0]
+
+        class CountingProvider(StubGmProvider):
+            def __init__(self, **kw):
+                provider_calls[0] += 1
+                super().__init__(**kw)
+        fake_gm = sys.modules.get("eval_bench_wm.utils.wm.gm_provider")
+        fake_gm.GmProvider = CountingProvider
+
+        class CreateBundleExtract(_StubExtractModule):
+            def gm_provider_kwargs(self, row, identifier):
+                kw = super().gm_provider_kwargs(row, identifier)
+                kw["gm_create_bundle"] = True
+                return kw
+
+        monkeypatch.setattr(gm_mod, "_get_extract_module",
+                            lambda: CreateBundleExtract())
+        try:
+            records = [
+                _gm_record("0", gm_bundle_dir=str(bundle_dir)),
+                _gm_record("1", gm_bundle_dir=str(bundle_dir)),
+            ]
+            with pytest.raises(DetectorStateValidationError,
+                               match="gm_create_bundle"):
+                load_state(records, "cpu")
+            assert provider_calls[0] == 0
+        finally:
+            fake_gm.GmProvider = StubGmProvider
+
+    def test_uniform_allow_in_memory_true_rejected_before_provider(
+        self, mock_deps, bundle_dir, monkeypatch):
+        """All rows have gm_allow_in_memory_state=True (uniform) →
+        DetectorStateValidationError, provider never constructed."""
+        import raven.detectors.gm_detector as gm_mod
+        provider_calls = [0]
+
+        class CountingProvider(StubGmProvider):
+            def __init__(self, **kw):
+                provider_calls[0] += 1
+                super().__init__(**kw)
+        fake_gm = sys.modules.get("eval_bench_wm.utils.wm.gm_provider")
+        fake_gm.GmProvider = CountingProvider
+
+        class MemoryStateExtract(_StubExtractModule):
+            def gm_provider_kwargs(self, row, identifier):
+                kw = super().gm_provider_kwargs(row, identifier)
+                kw["gm_allow_in_memory_state"] = True
+                return kw
+
+        monkeypatch.setattr(gm_mod, "_get_extract_module",
+                            lambda: MemoryStateExtract())
+        try:
+            records = [
+                _gm_record("0", gm_bundle_dir=str(bundle_dir)),
+                _gm_record("1", gm_bundle_dir=str(bundle_dir)),
+            ]
+            with pytest.raises(DetectorStateValidationError,
+                               match="gm_allow_in_memory_state"):
+                load_state(records, "cpu")
+            assert provider_calls[0] == 0
+        finally:
+            fake_gm.GmProvider = StubGmProvider
+
+    def test_canonical_four_bool_valid_and_false_loads(
+        self, mock_deps, bundle_dir):
+        """All four canonical bool fields are valid False → load_state succeeds,
+        one provider constructed."""
+        records = [
+            _gm_record("0", gm_bundle_dir=str(bundle_dir)),
+            _gm_record("1", gm_bundle_dir=str(bundle_dir)),
+        ]
+        info = load_state(records, "cpu")
+        assert info["provider"] is not None
+        ck = info["_canonical_kwargs"]
+        assert ck["gm_use_gnr"] is False
+        assert ck["gm_use_classifier"] is False
+        assert ck["gm_create_bundle"] is False
+        assert ck["gm_allow_in_memory_state"] is False
