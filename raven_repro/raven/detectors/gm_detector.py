@@ -1,8 +1,13 @@
 """GaussMarker detector adapter.
 
-Delegates to the canonical GM provider construction in
-``extract_verification_scores.py`` (gm_bundle_manifest, gm_provider_kwargs,
-evaluate_image, raw_score, canonical_score).
+Bind GM evaluation to the canonical persisted bundle and provenance.
+Delegates to the formal extraction path in ``extract_verification_scores.py``
+(``gm_bundle_manifest``, ``gm_provider_kwargs``, ``evaluate_image``,
+``raw_score``, ``canonical_score``).
+
+Before constructing the provider every row is validated to share the same
+bundle directory, bundle-config SHA, w1/w2 SHA, protocol/profile and
+provider configuration.  Mixed bundles are rejected before scoring.
 """
 
 from __future__ import annotations
@@ -28,6 +33,26 @@ REQUIRED_METADATA_FIELDS: frozenset[str] = frozenset({
     "gm_protocol_mode",
 })
 
+# ---------------------------------------------------------------------------
+# Cohort-uniform bundle identity fields – every row must agree on these.
+# ---------------------------------------------------------------------------
+_COHORT_UNIFORM_FIELDS: tuple[str, ...] = (
+    "gm_bundle_dir",
+    "gm_bundle_config_sha256",
+    "gm_w1_file_sha256",
+    "gm_w2_file_sha256",
+    "gm_protocol_mode",
+)
+
+# Per-row bundle-artifact identity carried through to the score record.
+_VERIFIED_PROVENANCE_FIELDS: tuple[str, ...] = (
+    "gm_bundle_dir",
+    "gm_bundle_config_sha256",
+    "gm_w1_file_sha256",
+    "gm_w2_file_sha256",
+    "gm_protocol_mode",
+)
+
 
 def describe_required_artifacts() -> list[str]:
     return [
@@ -47,6 +72,7 @@ def _ensure_paths():
 
 
 def _get_extract_module():
+    """Import ``extract_verification_scores.py`` as a module (canonical helpers)."""
     repo = Path(__file__).resolve().parents[3]
     scripts_dir = repo / "raven_repro" / "scripts"
     import importlib.util
@@ -59,9 +85,75 @@ def _get_extract_module():
     return mod
 
 
+# ---------------------------------------------------------------------------
+# Cross-row validation helpers
+# ---------------------------------------------------------------------------
+
+def _validate_cohort_uniform(records: list[dict[str, Any]]) -> dict[str, str]:
+    """Every row must agree on bundle identity fields; return the single value set.
+
+    Raises ``DetectorStateValidationError`` when rows disagree, before any
+    provider is constructed.
+    """
+    values: dict[str, set[str]] = {field: set() for field in _COHORT_UNIFORM_FIELDS}
+    for row in records:
+        for field in _COHORT_UNIFORM_FIELDS:
+            values[field].add(str(row.get(field, "")))
+
+    mismatched = sorted(
+        field for field, vset in values.items() if len(vset) != 1
+    )
+    if mismatched:
+        details = "; ".join(
+            f"{f}={sorted(values[f])}" for f in mismatched
+        )
+        raise DetectorStateValidationError(
+            f"GM cohort is not uniform — mixed {details}"
+        )
+    return {field: next(iter(vset)) for field, vset in values.items()}
+
+
+def _validate_bundle_files_exist(bundle_dir: str) -> Path:
+    """Check the three bundle artifacts exist on disk.
+
+    Returns the resolved ``Path``.  Missing files → ``DetectorMissingStateError``.
+    """
+    resolved = Path(bundle_dir).resolve()
+    if not resolved.is_dir():
+        raise DetectorMissingStateError(
+            f"GM bundle directory not found: {resolved}"
+        )
+    for name in ("manifest.json", "w1.pth", "w2.pth"):
+        if not (resolved / name).is_file():
+            raise DetectorMissingStateError(
+                f"GM bundle artifact missing: {resolved / name}"
+            )
+    return resolved
+
+
+def _classify_bundle_error(exc: Exception) -> type:
+    """Distinguish missing-artifact errors from provenance mismatches.
+
+    ``gm_bundle_manifest`` raises ``RuntimeError`` for both cases;
+    inspect the message to route to the correct detector exception.
+    """
+    msg = str(exc)
+    if "not found" in msg or "missing" in msg.lower():
+        return DetectorMissingStateError
+    return DetectorStateValidationError
+
+
+# ---------------------------------------------------------------------------
+# Public detector contract
+# ---------------------------------------------------------------------------
+
 def load_state(records: list[dict[str, Any]], device: str,
                **extra) -> dict[str, Any]:
-    """Load GM provider via canonical gm_provider_kwargs from extract script."""
+    """Load GM provider via canonical ``gm_provider_kwargs`` from extract script.
+
+    Validates cohort uniformity and bundle integrity before constructing
+    the provider.  Returns a ``provider_info`` dict for ``score_image``.
+    """
     import torch
 
     _ensure_paths()
@@ -74,13 +166,16 @@ def load_state(records: list[dict[str, Any]], device: str,
             f"GM dependencies not available: {exc}"
         ) from exc
 
-    first = records[0] if records else {}
-    bundle_dir = first.get("gm_bundle_dir", "")
-    if not bundle_dir or not Path(bundle_dir).is_dir():
-        raise DetectorMissingStateError(
-            "gm_bundle_dir not found or not a directory"
-        )
+    if not records:
+        raise DetectorMissingStateError("GM detector requires at least one record")
 
+    # 1. Validate cohort uniformity — mixed bundles/configs fail before scoring.
+    uniform = _validate_cohort_uniform(records)
+
+    # 2. Bundle files must exist on disk (missing → failed_missing_required_state).
+    bundle_dir = _validate_bundle_files_exist(uniform["gm_bundle_dir"])
+
+    # 3. Load the canonical extraction module.
     try:
         mod = _get_extract_module()
     except Exception as exc:
@@ -88,18 +183,29 @@ def load_state(records: list[dict[str, Any]], device: str,
             f"Cannot load extract_verification_scores: {exc}"
         ) from exc
 
+    first = records[0]
     identifier = str(first.get("run_id", "0"))
 
-    # Use canonical gm_bundle_manifest and gm_provider_kwargs
+    # 4. Bind the bundle to the row's recorded digests via gm_bundle_manifest.
+    #    SHA/config mismatches → DetectorStateValidationError.
+    #    Missing artifacts inside the bundle dir → DetectorMissingStateError.
     try:
         bundle_dir_path, manifest = mod.gm_bundle_manifest(
             first, str(identifier))
         kwargs = mod.gm_provider_kwargs(first, str(identifier))
+    except (DetectorMissingStateError, DetectorStateValidationError):
+        raise
+    except RuntimeError as exc:
+        error_cls = _classify_bundle_error(exc)
+        raise error_cls(
+            f"GM bundle validation failed: {type(exc).__name__}: {exc}"
+        ) from exc
     except Exception as exc:
         raise DetectorStateValidationError(
             f"GM bundle validation failed: {type(exc).__name__}: {exc}"
         ) from exc
 
+    # 5. Construct the provider via the same canonical path as the extract script.
     try:
         device_obj = torch.device(device)
         pipe = pipe_utils.get_pipe_provider(
@@ -124,24 +230,36 @@ def load_state(records: list[dict[str, Any]], device: str,
             f"GM provider construction failed: {exc}"
         ) from exc
 
+    # 6. Require persisted bundle as the state source.
     if provider.bundle is None or getattr(provider, "state_source", "") != "bundle":
         raise DetectorStateValidationError(
             "GM provider requires persisted bundle; "
             f"state_source={getattr(provider, 'state_source', 'unknown')}"
         )
 
+    # 7. Derive the provider-side target and mask hashes for cross-validation.
     from raven.pairing_provenance import tensor_sha256
-    target_hash = tensor_sha256(
+
+    provider_target_hash = tensor_sha256(
         provider.gt_patch.real.contiguous()
     ) if provider.gt_patch is not None else ""
+
+    provider_mask_hash = tensor_sha256(
+        provider.watermarking_mask.contiguous()
+    ) if getattr(provider, "watermarking_mask", None) is not None else ""
 
     return {
         "provider": provider,
         "pipe": pipe,
         "extract_module": mod,
         "device_obj": device_obj,
-        "target_hash": target_hash,
+        "provider_target_hash": provider_target_hash,
+        "provider_mask_hash": provider_mask_hash,
         "bundle_dir": str(bundle_dir_path),
+        # Verified provenance — every row already agrees on these.
+        "verified_provenance": {
+            field: uniform[field] for field in _VERIFIED_PROVENANCE_FIELDS
+        },
     }
 
 
@@ -149,7 +267,12 @@ def score_image(provider_info: dict[str, Any], image_path: str, *,
                 record: dict[str, Any] | None = None,
                 evaluation_entry: dict[str, Any] | None = None,
                 steps: int = 50) -> dict[str, Any]:
-    """Score one image using GaussMarker provider via canonical evaluate_image."""
+    """Score one image using GaussMarker provider via canonical ``evaluate_image``.
+
+    Validates that the source target/mask recorded in the row match the
+    provider-derived values.  Only verified provenance is saved into the
+    score record — nothing is copied blindly from the input row.
+    """
     import torch
 
     path = Path(image_path)
@@ -159,6 +282,27 @@ def score_image(provider_info: dict[str, Any], image_path: str, *,
     provider = provider_info["provider"]
     mod = provider_info["extract_module"]
 
+    # Validate source target/mask against provider-derived values.
+    if record is not None:
+        source_target = str(record.get("watermark_target_sha256", ""))
+        detector_target = provider_info["provider_target_hash"]
+        if source_target and detector_target and source_target != detector_target:
+            raise DetectorStateValidationError(
+                f"run_id={record.get('run_id')}: GM detector/source "
+                f"target SHA mismatch: source={source_target!r} "
+                f"detector={detector_target!r}"
+            )
+
+        source_mask = str(record.get("watermark_mask_sha256", ""))
+        detector_mask = provider_info["provider_mask_hash"]
+        if source_mask and detector_mask and source_mask != detector_mask:
+            raise DetectorStateValidationError(
+                f"run_id={record.get('run_id')}: GM detector/source "
+                f"mask SHA mismatch: source={source_mask!r} "
+                f"detector={detector_mask!r}"
+            )
+
+    # Score via the canonical extraction path.
     try:
         result = mod.evaluate_image(torch, provider, provider_info["pipe"],
                                      path, steps)
@@ -170,21 +314,29 @@ def score_image(provider_info: dict[str, Any], image_path: str, *,
     raw = mod.raw_score("GM", result)
     canonical = mod.canonical_score("GM", raw, result)
 
+    # Build score record — only verified provenance, no blind copies.
     score: dict[str, Any] = {
         "raw_score": raw,
         "canonical_score": canonical,
+        # GM domain scores.
         "gm_raw_bit_accuracy": float(result.get("gm_raw_bit_accuracy", raw)),
         "gm_raw_ring_l1": float(result.get("gm_raw_ring_l1", 0)),
         "gm_restored_bit_accuracy": result.get("gm_restored_bit_accuracy"),
         "gm_classifier_probability": result.get("gm_classifier_probability"),
+        # Detector self-description (from the scorer, not the row).
         "gm_report_label": str(result.get("gm_report_label", "")),
         "gm_score_definition": str(result.get("gm_score_definition", "")),
         "gm_threshold_source": str(result.get("gm_threshold_source", "")),
         "gm_comparison_operator": str(result.get("gm_comparison_operator", "")),
-        "gm_bundle_config_sha256": record.get("gm_bundle_config_sha256", "") if record else "",
-        "gm_w1_file_sha256": record.get("gm_w1_file_sha256", "") if record else "",
-        "gm_w2_file_sha256": record.get("gm_w2_file_sha256", "") if record else "",
     }
+
+    # Attach verified provenance from the provider (cohort-uniform, validated).
+    score.update(provider_info.get("verified_provenance", {}))
+
+    # Attach provider-side target/mask hashes (verified in this call).
+    score["watermark_target_sha256"] = provider_info.get("provider_target_hash", "")
+    score["watermark_mask_sha256"] = provider_info.get("provider_mask_hash", "")
+
     return score
 
 
