@@ -2269,3 +2269,61 @@ class TestLoadTimeCanonicalValidation:
             assert provider_calls[0] == 0
         finally:
             fake_gm.GmProvider = StubGmProvider
+
+
+# ============================================================================
+# Canonical key presence — all _CANONICAL_KWARGS_FIELDS must be present
+# ============================================================================
+
+_MISSING_KEY_CASES = [
+    "gm_torch_dtype",
+    "gm_channel_copy",
+    "gm_gnr_path",
+    "model_revision",
+    "w_pattern",
+]
+
+
+class TestCanonicalKeyPresence:
+
+    @pytest.mark.parametrize("missing_key", _MISSING_KEY_CASES)
+    def test_missing_canonical_key_rejected_before_provider(
+        self, mock_deps, bundle_dir, monkeypatch, missing_key):
+        import raven.detectors.gm_detector as gm_mod
+        provider_calls = [0]
+
+        class CountingProvider(StubGmProvider):
+            def __init__(self, **kw):
+                provider_calls[0] += 1
+                super().__init__(**kw)
+        fake_gm = sys.modules.get("eval_bench_wm.utils.wm.gm_provider")
+        fake_gm.GmProvider = CountingProvider
+
+        class MissingKeyExtract(_StubExtractModule):
+            def gm_provider_kwargs(self, row, identifier):
+                kw = super().gm_provider_kwargs(row, identifier)
+                del kw[missing_key]
+                return kw
+
+        monkeypatch.setattr(gm_mod, "_get_extract_module",
+                            lambda: MissingKeyExtract())
+        try:
+            records = [_gm_record("0", gm_bundle_dir=str(bundle_dir))]
+            with pytest.raises(DetectorStateValidationError,
+                               match="missing required keys"):
+                load_state(records, "cpu")
+            assert provider_calls[0] == 0
+        finally:
+            fake_gm.GmProvider = StubGmProvider
+
+    def test_explicit_none_allowed_for_nullable_fields(
+        self, mock_deps, bundle_dir):
+        """gm_gnr_path and gm_classifier_path may be explicitly None.
+        gm_watermark_bits_seed is NOT nullable (comes from manifest)."""
+        records = [_gm_record("0", gm_bundle_dir=str(bundle_dir))]
+        info = load_state(records, "cpu")
+        ck = info["_canonical_kwargs"]
+        assert ck["gm_gnr_path"] is None
+        assert ck["gm_classifier_path"] is None
+        assert ck["gm_watermark_bits_seed"] is not None
+        assert info["provider"] is not None

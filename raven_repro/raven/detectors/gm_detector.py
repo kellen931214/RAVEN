@@ -227,6 +227,14 @@ _PERSISTED_BUNDLE_FALSE_KWARGS: frozenset[str] = frozenset({
     "gm_allow_in_memory_state",
 })
 
+# Canonical fields that MAY be explicitly ``None`` when present
+# (e.g. paths/configs not applicable to this bundle).
+_NULLABLE_CANONICAL_FIELDS: frozenset[str] = frozenset({
+    "gm_gnr_path",
+    "gm_classifier_path",
+    "gm_watermark_bits_seed",
+})
+
 
 def _validate_canonical_provider_kwargs(
     kwargs: Any,
@@ -274,6 +282,18 @@ def _validate_canonical_provider_kwargs(
                 f"run_id={run_id}: GM unified detector requires "
                 f"{field}=False, got {value!r}"
             )
+
+    # Every canonical field must be PRESENT (absent key ≠ explicit None).
+    # Explicit None is allowed only for nullable fields.
+    missing = sorted(
+        field for field in _CANONICAL_KWARGS_FIELDS
+        if field not in kwargs
+    )
+    if missing:
+        raise DetectorStateValidationError(
+            f"run_id={run_id}: canonical GM provider kwargs missing "
+            f"required keys: {missing}"
+        )
 
 
 def _validate_bundle_files_exist(bundle_dir: str) -> Path:
