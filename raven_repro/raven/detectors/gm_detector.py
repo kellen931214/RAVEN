@@ -229,6 +229,9 @@ _PERSISTED_BUNDLE_FALSE_KWARGS: frozenset[str] = frozenset({
 
 # Canonical fields that MAY be explicitly ``None`` when present
 # (e.g. paths/configs not applicable to this bundle).
+# Canonical fields that explicitly allow None (paths not configured,
+# or optional manifest values).  All other canonical keys must be
+# non-None once present.
 _NULLABLE_CANONICAL_FIELDS: frozenset[str] = frozenset({
     "gm_gnr_path",
     "gm_classifier_path",
@@ -284,7 +287,6 @@ def _validate_canonical_provider_kwargs(
             )
 
     # Every canonical field must be PRESENT (absent key ≠ explicit None).
-    # Explicit None is allowed only for nullable fields.
     missing = sorted(
         field for field in _CANONICAL_KWARGS_FIELDS
         if field not in kwargs
@@ -293,6 +295,17 @@ def _validate_canonical_provider_kwargs(
         raise DetectorStateValidationError(
             f"run_id={run_id}: canonical GM provider kwargs missing "
             f"required keys: {missing}"
+        )
+
+    # Explicit None is allowed only for nullable fields.
+    null_violations = sorted(
+        field for field in _CANONICAL_KWARGS_FIELDS
+        if kwargs[field] is None and field not in _NULLABLE_CANONICAL_FIELDS
+    )
+    if null_violations:
+        raise DetectorStateValidationError(
+            f"run_id={run_id}: canonical GM provider config fields "
+            f"must not be None: {null_violations}"
         )
 
 

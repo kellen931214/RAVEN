@@ -2318,12 +2318,53 @@ class TestCanonicalKeyPresence:
 
     def test_explicit_none_allowed_for_nullable_fields(
         self, mock_deps, bundle_dir):
-        """gm_gnr_path and gm_classifier_path may be explicitly None.
-        gm_watermark_bits_seed is NOT nullable (comes from manifest)."""
+        """gm_gnr_path, gm_classifier_path, gm_watermark_bits_seed
+        may be explicitly None (nullable by canonical helper contract)."""
         records = [_gm_record("0", gm_bundle_dir=str(bundle_dir))]
         info = load_state(records, "cpu")
         ck = info["_canonical_kwargs"]
         assert ck["gm_gnr_path"] is None
         assert ck["gm_classifier_path"] is None
-        assert ck["gm_watermark_bits_seed"] is not None
+        # watermark_bits_seed is present (from manifest) but allowed to be None
+        # per canonical helper contract (manifest.get(key) may return None)
         assert info["provider"] is not None
+
+
+_NON_NULLABLE_NONE_CASES = [
+    "gm_torch_dtype",
+    "model_revision",
+    "w_pattern",
+]
+
+
+class TestNonNullableFieldsRejectNone:
+
+    @pytest.mark.parametrize("bad_field", _NON_NULLABLE_NONE_CASES)
+    def test_non_nullable_field_none_rejected_before_provider(
+        self, mock_deps, bundle_dir, monkeypatch, bad_field):
+        import raven.detectors.gm_detector as gm_mod
+        provider_calls = [0]
+
+        class CountingProvider(StubGmProvider):
+            def __init__(self, **kw):
+                provider_calls[0] += 1
+                super().__init__(**kw)
+        fake_gm = sys.modules.get("eval_bench_wm.utils.wm.gm_provider")
+        fake_gm.GmProvider = CountingProvider
+
+        class NullFieldExtract(_StubExtractModule):
+            def gm_provider_kwargs(self, row, identifier):
+                kw = super().gm_provider_kwargs(row, identifier)
+                kw[bad_field] = None
+                return kw
+
+        monkeypatch.setattr(gm_mod, "_get_extract_module",
+                            lambda: NullFieldExtract())
+        try:
+            records = [_gm_record("0", gm_bundle_dir=str(bundle_dir))]
+            with pytest.raises(DetectorStateValidationError,
+                               match="must not be None"):
+                load_state(records, "cpu")
+            assert provider_calls[0] == 0
+        finally:
+            fake_gm.GmProvider = StubGmProvider
