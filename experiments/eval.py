@@ -575,142 +575,13 @@ def evaluate_detector(
                 "status": STATUS_SKIPPED_INSUFFICIENT_DATA,
                 "reason": "No images to score."}
 
-    # Resolve metadata BEFORE loading provider.  CSV is canonical; only
-    # FileNotFoundError triggers legacy embedded fallback.  All other
-    # metadata errors (duplicates, missing rows, conflicts) fail closed.
-    from raven.metadata_resolver import (
-        MetadataResolver, MetadataResolverError, MetadataConflictError,
-        DuplicateMetadataError, AmbiguousMetadataError,
-    )
-    csv_path = config.get("metadata_path", "") if config else ""
-    if csv_path:
-        path = Path(csv_path)
-        if not path.exists():
-            # CSV genuinely missing — use legacy embedded fallback
-            resolver = MetadataResolver.from_records_fallback(records)
-            if resolver is None:
-                return {
-                    "stage": "detector", "method": method,
-                    "status": STATUS_FAILED_MISSING_REQUIRED_STATE,
-                    "reason": (
-                        f"No metadata CSV found at {csv_path} "
-                        "and no embedded source_metadata in records."
-                    ),
-                }
-        elif not path.is_file():
-            return {
-                "stage": "detector", "method": method,
-                "status": STATUS_FAILED_INTERNAL_ERROR,
-                "reason": (
-                    f"metadata_path exists but is not a regular file: {csv_path}. "
-                    "Expected a CSV file."
-                ),
-            }
-        else:
-            try:
-                resolver = MetadataResolver.from_path(csv_path)
-            except (DuplicateMetadataError, AmbiguousMetadataError,
-                    MetadataResolverError) as exc:
-                return {
-                    "stage": "detector", "method": method,
-                    "status": STATUS_FAILED_INTERNAL_ERROR,
-                    "reason": f"Metadata validation failed: {type(exc).__name__}: {exc}",
-                }
-            except ValueError as exc:
-                return {
-                    "stage": "detector", "method": method,
-                    "status": STATUS_FAILED_INTERNAL_ERROR,
-                    "reason": f"Metadata CSV invalid: {exc}",
-                }
-    else:
-        # No metadata path configured — use legacy embedded fallback
-        resolver = MetadataResolver.from_records_fallback(records)
-        if resolver is None:
-            return {
-                "stage": "detector", "method": method,
-                "status": STATUS_FAILED_MISSING_REQUIRED_STATE,
-                "reason": (
-                    "No metadata_path in config.json "
-                    "and no embedded source_metadata in records."
-                ),
-            }
-
-    # Enrich all records with resolved metadata
-    enriched_records: list[dict[str, Any]] = []
-    for rec in records:
-        try:
-            enriched_records.append(
-                resolver.enrich_record(rec, csv_path=csv_path or None)
-            )
-        except MetadataResolverError as exc:
-            return {
-                "stage": "detector", "method": method,
-                "status": STATUS_FAILED_INTERNAL_ERROR,
-                "reason": f"Metadata resolution failed for "
-                         f"run_id={rec.get('run_id')}: {exc}",
-            }
-
-    # Load provider state with resolved (enriched) records
-    provider_info = None
-    load_error_type = STATUS_FAILED_MISSING_REQUIRED_STATE
-    load_error_detail = ""
-    try:
-        if method in {"RID", "HSTR", "HSQR"}:
-            provider_info = det_mod.load_state(enriched_records, device, method=method)
-        else:
-            provider_info = det_mod.load_state(enriched_records, device)
-    except DetectorMissingStateError as exc:
-        load_error_type = STATUS_FAILED_MISSING_REQUIRED_STATE
-        load_error_detail = str(exc)
-    except DetectorDependencyError as exc:
-        load_error_type = STATUS_FAILED_MISSING_DEPENDENCY
-        load_error_detail = str(exc)
-    except DetectorProviderInitializationError as exc:
-        load_error_type = STATUS_FAILED_PROVIDER_INITIALIZATION
-        load_error_detail = str(exc)
-    except DetectorStateValidationError as exc:
-        load_error_type = STATUS_FAILED_STATE_VALIDATION
-        load_error_detail = str(exc)
-    except ImportError as exc:
-        load_error_type = STATUS_FAILED_MISSING_DEPENDENCY
-        load_error_detail = str(exc)
-    except TypeError as exc:
-        # Raw TypeError during provider setup is a provider initialization
-        # failure (bad constructor arguments, wrong type, etc.).
-        load_error_type = STATUS_FAILED_PROVIDER_INITIALIZATION
-        load_error_detail = f"{type(exc).__name__}: {exc}"
-    except Exception as exc:
-        load_error_type = STATUS_FAILED_INTERNAL_ERROR
-        load_error_detail = f"{type(exc).__name__}: {exc}"
-
-    if provider_info is None and not load_error_detail:
-        load_error_detail = f"Provider state for {method} is not available."
-        load_error_type = STATUS_FAILED_MISSING_REQUIRED_STATE
-
-    if provider_info is None:
-        return {
-            "stage": "detector", "method": method,
-            "status": load_error_type,
-            "reason": load_error_detail,
-            "required_artifacts": det_mod.describe_required_artifacts(),
-        }
-
-    # Build record lookup from enriched records: (run_id, source_role) -> record
-    record_index: dict[tuple[str, str], dict[str, Any]] = {}
-    for rec in enriched_records:
-        key = (str(rec["run_id"]), rec.get("role", "watermarked"))
-        record_index[key] = rec
-
-    # Score every image
-    detector_rows: list[dict[str, Any]] = []
+    # ---- Issue #25: image preflight BEFORE metadata/provider setup ----
+    preflight_rows: list[dict[str, Any]] = []
+    valid_entries: list[dict[str, Any]] = []
     for entry in image_index:
-        key = (entry["run_id"], entry["source_role"])
-        matched_record = record_index.get(key, {})
-
-        # ---- Issue #25: image path preflight ----
         image_path_obj = Path(entry["image_path"])
         if not image_path_obj.is_file():
-            row = {
+            preflight_rows.append({
                 "run_id": entry["run_id"],
                 "source_role": entry["source_role"],
                 "evaluation_cohort": entry["evaluation_cohort"],
@@ -723,113 +594,263 @@ def evaluate_detector(
                     "Image file does not exist or is not a regular file: "
                     f"{entry['image_path']}"
                 ),
-            }
-            detector_rows.append(row)
-            continue
+            })
+        else:
+            valid_entries.append(entry)
 
-        score = None
-        row_status = ROW_STATUS_FAILED_SCORING
-        failure_cause = FAILURE_CAUSE_SCORING_ERROR
-        error_type = ""
-        error_msg = ""
-        try:
-            score = det_mod.score_image(
-                provider_info, entry["image_path"],
-                record=matched_record,
-                evaluation_entry=entry,
-            )
-            # ---- Issue #19: validate score contract ----
-            if score is None:
-                row_status = ROW_STATUS_FAILED_SCORING
-                failure_cause = FAILURE_CAUSE_SCORING_ERROR
-                error_type = "NoneReturn"
-                error_msg = "score_image returned None"
-            elif not isinstance(score, dict):
-                row_status = ROW_STATUS_FAILED_SCORING
-                failure_cause = FAILURE_CAUSE_SCORING_ERROR
-                error_type = "NonDictReturn"
-                error_msg = (
-                    f"score_image returned non-dict: {type(score).__name__}"
+    # ---- Setup phase: metadata + provider state ----
+    setup_failure_cause: str | None = None
+    setup_failure_status: str | None = None
+    setup_error_type: str | None = None
+    setup_error_message: str | None = None
+    enriched_records: list[dict[str, Any]] = []
+    provider_info = None
+
+    # Resolve metadata
+    from raven.metadata_resolver import (
+        MetadataResolver, MetadataResolverError, MetadataConflictError,
+        DuplicateMetadataError, AmbiguousMetadataError,
+    )
+    csv_path = config.get("metadata_path", "") if config else ""
+    resolver = None
+    if csv_path:
+        path = Path(csv_path)
+        if not path.exists():
+            resolver = MetadataResolver.from_records_fallback(records)
+            if resolver is None:
+                setup_failure_cause = FAILURE_CAUSE_MISSING_REQUIRED_STATE
+                setup_failure_status = STATUS_FAILED_MISSING_REQUIRED_STATE
+                setup_error_type = "MetadataMissingStateError"
+                setup_error_message = (
+                    f"No metadata CSV found at {csv_path} "
+                    "and no embedded source_metadata in records."
                 )
+        elif not path.is_file():
+            setup_failure_cause = FAILURE_CAUSE_INTERNAL_ERROR
+            setup_failure_status = STATUS_FAILED_INTERNAL_ERROR
+            setup_error_type = "MetadataInternalError"
+            setup_error_message = (
+                f"metadata_path exists but is not a regular file: {csv_path}. "
+                "Expected a CSV file."
+            )
+        else:
+            try:
+                resolver = MetadataResolver.from_path(csv_path)
+            except (DuplicateMetadataError, AmbiguousMetadataError,
+                    MetadataResolverError) as exc:
+                setup_failure_cause = FAILURE_CAUSE_INTERNAL_ERROR
+                setup_failure_status = STATUS_FAILED_INTERNAL_ERROR
+                setup_error_type = type(exc).__name__
+                setup_error_message = (
+                    f"Metadata validation failed: {type(exc).__name__}: {exc}"
+                )
+            except ValueError as exc:
+                setup_failure_cause = FAILURE_CAUSE_INTERNAL_ERROR
+                setup_failure_status = STATUS_FAILED_INTERNAL_ERROR
+                setup_error_type = type(exc).__name__
+                setup_error_message = f"Metadata CSV invalid: {exc}"
+    else:
+        resolver = MetadataResolver.from_records_fallback(records)
+        if resolver is None:
+            setup_failure_cause = FAILURE_CAUSE_MISSING_REQUIRED_STATE
+            setup_failure_status = STATUS_FAILED_MISSING_REQUIRED_STATE
+            setup_error_type = "MetadataMissingStateError"
+            setup_error_message = (
+                "No metadata_path in config.json "
+                "and no embedded source_metadata in records."
+            )
+
+    # Enrich records with resolved metadata
+    if resolver is not None and setup_failure_cause is None:
+        for rec in records:
+            try:
+                enriched_records.append(
+                    resolver.enrich_record(rec, csv_path=csv_path or None)
+                )
+            except MetadataResolverError as exc:
+                setup_failure_cause = FAILURE_CAUSE_INTERNAL_ERROR
+                setup_failure_status = STATUS_FAILED_INTERNAL_ERROR
+                setup_error_type = type(exc).__name__
+                setup_error_message = (
+                    f"Metadata resolution failed for "
+                    f"run_id={rec.get('run_id')}: {exc}"
+                )
+                break
+
+    # Load provider state
+    if setup_failure_cause is None:
+        try:
+            if method in {"RID", "HSTR", "HSQR"}:
+                provider_info = det_mod.load_state(enriched_records, device,
+                                                   method=method)
             else:
-                valid, validation_error = _validate_score(score, method)
-                if valid:
-                    row_status = ROW_STATUS_SCORED
-                    failure_cause = ""
-                    error_type = ""
-                else:
-                    row_status = ROW_STATUS_FAILED_SCORING
-                    failure_cause = FAILURE_CAUSE_SCORING_ERROR
-                    error_type = "ScoreContractViolation"
-                    error_msg = f"score validation failed: {validation_error}"
+                provider_info = det_mod.load_state(enriched_records, device)
         except DetectorMissingStateError as exc:
-            row_status = ROW_STATUS_FAILED_MISSING_STATE
-            failure_cause = FAILURE_CAUSE_MISSING_REQUIRED_STATE
-            error_type = type(exc).__name__
-            error_msg = str(exc)
+            setup_failure_cause = FAILURE_CAUSE_MISSING_REQUIRED_STATE
+            setup_failure_status = STATUS_FAILED_MISSING_REQUIRED_STATE
+            setup_error_type = type(exc).__name__
+            setup_error_message = str(exc)
+        except DetectorDependencyError as exc:
+            setup_failure_cause = FAILURE_CAUSE_MISSING_DEPENDENCY
+            setup_failure_status = STATUS_FAILED_MISSING_DEPENDENCY
+            setup_error_type = type(exc).__name__
+            setup_error_message = str(exc)
         except DetectorProviderInitializationError as exc:
-            row_status = ROW_STATUS_FAILED_PROVIDER
-            failure_cause = FAILURE_CAUSE_PROVIDER_INITIALIZATION
-            error_type = type(exc).__name__
-            error_msg = str(exc)
+            setup_failure_cause = FAILURE_CAUSE_PROVIDER_INITIALIZATION
+            setup_failure_status = STATUS_FAILED_PROVIDER_INITIALIZATION
+            setup_error_type = type(exc).__name__
+            setup_error_message = str(exc)
         except DetectorStateValidationError as exc:
-            row_status = ROW_STATUS_FAILED_STATE_VALIDATION
-            failure_cause = FAILURE_CAUSE_STATE_VALIDATION
-            error_type = type(exc).__name__
-            error_msg = str(exc)
-        except DetectorScoringError as exc:
+            setup_failure_cause = FAILURE_CAUSE_STATE_VALIDATION
+            setup_failure_status = STATUS_FAILED_STATE_VALIDATION
+            setup_error_type = type(exc).__name__
+            setup_error_message = str(exc)
+        except ImportError as exc:
+            setup_failure_cause = FAILURE_CAUSE_MISSING_DEPENDENCY
+            setup_failure_status = STATUS_FAILED_MISSING_DEPENDENCY
+            setup_error_type = type(exc).__name__
+            setup_error_message = str(exc)
+        except TypeError as exc:
+            setup_failure_cause = FAILURE_CAUSE_PROVIDER_INITIALIZATION
+            setup_failure_status = STATUS_FAILED_PROVIDER_INITIALIZATION
+            setup_error_type = type(exc).__name__
+            setup_error_message = str(exc)
+        except Exception as exc:
+            setup_failure_cause = FAILURE_CAUSE_INTERNAL_ERROR
+            setup_failure_status = STATUS_FAILED_INTERNAL_ERROR
+            setup_error_type = type(exc).__name__
+            setup_error_message = f"{type(exc).__name__}: {exc}"
+
+        if provider_info is None and setup_failure_cause is None:
+            setup_failure_cause = FAILURE_CAUSE_MISSING_REQUIRED_STATE
+            setup_failure_status = STATUS_FAILED_MISSING_REQUIRED_STATE
+            setup_error_type = "MissingProviderStateError"
+            setup_error_message = (
+                f"Provider state for {method} is not available."
+            )
+
+    # ---- Scoring phase: only if setup succeeded and there are valid images ----
+    detector_rows: list[dict[str, Any]] = list(preflight_rows)
+    unscored_due_to_setup_count = 0
+
+    if setup_failure_cause is None and valid_entries:
+        # Build record lookup from enriched records
+        record_index: dict[tuple[str, str], dict[str, Any]] = {}
+        for rec in enriched_records:
+            key = (str(rec["run_id"]), rec.get("role", "watermarked"))
+            record_index[key] = rec
+
+        for entry in valid_entries:
+            key = (entry["run_id"], entry["source_role"])
+            matched_record = record_index.get(key, {})
+
+            score = None
             row_status = ROW_STATUS_FAILED_SCORING
             failure_cause = FAILURE_CAUSE_SCORING_ERROR
-            error_type = type(exc).__name__
-            error_msg = str(exc)
-        except DetectorDependencyError as exc:
-            row_status = ROW_STATUS_FAILED_MISSING_DEPENDENCY
-            failure_cause = FAILURE_CAUSE_MISSING_DEPENDENCY
-            error_type = type(exc).__name__
-            error_msg = str(exc)
-        except ImportError as exc:
-            # ModuleNotFoundError is a subclass of ImportError — single handler
-            row_status = ROW_STATUS_FAILED_MISSING_DEPENDENCY
-            failure_cause = FAILURE_CAUSE_MISSING_DEPENDENCY
-            error_type = type(exc).__name__
-            error_msg = str(exc)
-        except FileNotFoundError:
-            row_status = ROW_STATUS_FAILED_MISSING_IMAGE
-            failure_cause = FAILURE_CAUSE_MISSING_IMAGE
-            error_type = "FileNotFoundError"
-            error_msg = f"Image not found inside score_image: {entry['image_path']}"
-        except TypeError as exc:
-            # Raw TypeError inside score_image is internal_error —
-            # only load_state() TypeError maps to provider initialization.
-            row_status = ROW_STATUS_FAILED_INTERNAL_ERROR
-            failure_cause = FAILURE_CAUSE_INTERNAL_ERROR
-            error_type = type(exc).__name__
-            error_msg = str(exc)
-        except Exception as exc:
-            row_status = ROW_STATUS_FAILED_INTERNAL_ERROR
-            failure_cause = FAILURE_CAUSE_INTERNAL_ERROR
-            error_type = type(exc).__name__
-            error_msg = f"{type(exc).__name__}: {exc}"
+            error_type = ""
+            error_msg = ""
+            try:
+                score = det_mod.score_image(
+                    provider_info, entry["image_path"],
+                    record=matched_record,
+                    evaluation_entry=entry,
+                )
+                if score is None:
+                    row_status = ROW_STATUS_FAILED_SCORING
+                    failure_cause = FAILURE_CAUSE_SCORING_ERROR
+                    error_type = "NoneReturn"
+                    error_msg = "score_image returned None"
+                elif not isinstance(score, dict):
+                    row_status = ROW_STATUS_FAILED_SCORING
+                    failure_cause = FAILURE_CAUSE_SCORING_ERROR
+                    error_type = "NonDictReturn"
+                    error_msg = (
+                        f"score_image returned non-dict: {type(score).__name__}"
+                    )
+                else:
+                    valid, validation_error = _validate_score(score, method)
+                    if valid:
+                        row_status = ROW_STATUS_SCORED
+                        failure_cause = ""
+                        error_type = ""
+                    else:
+                        row_status = ROW_STATUS_FAILED_SCORING
+                        failure_cause = FAILURE_CAUSE_SCORING_ERROR
+                        error_type = "ScoreContractViolation"
+                        error_msg = (
+                            f"score validation failed: {validation_error}"
+                        )
+            except DetectorMissingStateError as exc:
+                row_status = ROW_STATUS_FAILED_MISSING_STATE
+                failure_cause = FAILURE_CAUSE_MISSING_REQUIRED_STATE
+                error_type = type(exc).__name__
+                error_msg = str(exc)
+            except DetectorProviderInitializationError as exc:
+                row_status = ROW_STATUS_FAILED_PROVIDER
+                failure_cause = FAILURE_CAUSE_PROVIDER_INITIALIZATION
+                error_type = type(exc).__name__
+                error_msg = str(exc)
+            except DetectorStateValidationError as exc:
+                row_status = ROW_STATUS_FAILED_STATE_VALIDATION
+                failure_cause = FAILURE_CAUSE_STATE_VALIDATION
+                error_type = type(exc).__name__
+                error_msg = str(exc)
+            except DetectorScoringError as exc:
+                row_status = ROW_STATUS_FAILED_SCORING
+                failure_cause = FAILURE_CAUSE_SCORING_ERROR
+                error_type = type(exc).__name__
+                error_msg = str(exc)
+            except DetectorDependencyError as exc:
+                row_status = ROW_STATUS_FAILED_MISSING_DEPENDENCY
+                failure_cause = FAILURE_CAUSE_MISSING_DEPENDENCY
+                error_type = type(exc).__name__
+                error_msg = str(exc)
+            except ImportError as exc:
+                row_status = ROW_STATUS_FAILED_MISSING_DEPENDENCY
+                failure_cause = FAILURE_CAUSE_MISSING_DEPENDENCY
+                error_type = type(exc).__name__
+                error_msg = str(exc)
+            except FileNotFoundError:
+                row_status = ROW_STATUS_FAILED_MISSING_IMAGE
+                failure_cause = FAILURE_CAUSE_MISSING_IMAGE
+                error_type = "FileNotFoundError"
+                error_msg = (
+                    f"Image not found inside score_image: "
+                    f"{entry['image_path']}"
+                )
+            except TypeError as exc:
+                row_status = ROW_STATUS_FAILED_INTERNAL_ERROR
+                failure_cause = FAILURE_CAUSE_INTERNAL_ERROR
+                error_type = type(exc).__name__
+                error_msg = str(exc)
+            except Exception as exc:
+                row_status = ROW_STATUS_FAILED_INTERNAL_ERROR
+                failure_cause = FAILURE_CAUSE_INTERNAL_ERROR
+                error_type = type(exc).__name__
+                error_msg = f"{type(exc).__name__}: {exc}"
 
-        row = {
-            "run_id": entry["run_id"],
-            "source_role": entry["source_role"],
-            "evaluation_cohort": entry["evaluation_cohort"],
-            "image_path": entry["image_path"],
-            "method": method,
-            "status": row_status,
-        }
-        if isinstance(score, dict) and row_status == ROW_STATUS_SCORED:
-            row.update(score)
-        if failure_cause:
-            row["failure_cause"] = failure_cause
-        if error_type:
-            row["error_type"] = error_type
-        if error_msg:
-            row["error"] = error_msg
-        detector_rows.append(row)
+            row = {
+                "run_id": entry["run_id"],
+                "source_role": entry["source_role"],
+                "evaluation_cohort": entry["evaluation_cohort"],
+                "image_path": entry["image_path"],
+                "method": method,
+                "status": row_status,
+            }
+            if isinstance(score, dict) and row_status == ROW_STATUS_SCORED:
+                row.update(score)
+            if failure_cause:
+                row["failure_cause"] = failure_cause
+            if error_type:
+                row["error_type"] = error_type
+            if error_msg:
+                row["error"] = error_msg
+            detector_rows.append(row)
+    elif setup_failure_cause is not None:
+        # Setup failed — valid entries were never scored
+        unscored_due_to_setup_count = len(valid_entries)
 
-    # Write detector_records.jsonl
+    # Write detector_records.jsonl (preflight rows + any scored rows)
     det_path = detector_records_path(output_dir)
     tmp = det_path.with_name(f".detector_records.jsonl.{os.getpid()}.tmp")
     with tmp.open("w", encoding="utf-8") as handle:
@@ -845,7 +866,6 @@ def evaluate_detector(
 
     scored_count = aggregate.get("scored_count", 0)
     failed_count = aggregate.get("failed_count", 0)
-    missing = aggregate.get("missing_cohorts", [])
     cohort_counts = aggregate.get("cohort_counts", {})
 
     # ---- Issue #19: metric availability ----
@@ -870,6 +890,7 @@ def evaluate_detector(
 
     reducer_result = reduce_detector_stage_status(
         detector_rows,
+        setup_failure=setup_failure_cause,
         primary_report_available=primary_available,
         primary_metrics_complete=primary_available,
         optional_failed_count=optional_failed,
@@ -888,6 +909,14 @@ def evaluate_detector(
     aggregate["row_status_counts"] = reducer_result.get("row_status_counts", {})
     aggregate["failure_cause_counts"] = reducer_result.get(
         "failure_cause_counts", {})
+
+    # Setup failure diagnostics
+    if setup_failure_cause is not None:
+        aggregate["setup_failure_cause"] = setup_failure_cause
+        aggregate["setup_error_type"] = setup_error_type
+        aggregate["setup_error"] = setup_error_message
+    if unscored_due_to_setup_count > 0:
+        aggregate["unscored_due_to_setup_count"] = unscored_due_to_setup_count
 
     aggregate["stage"] = "detector"
     aggregate["method"] = method

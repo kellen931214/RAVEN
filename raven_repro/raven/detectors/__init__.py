@@ -188,6 +188,14 @@ def _failure_cause_for_row(row: dict[str, Any]) -> str | None:
     )
 
 
+def _normalize_failure_cause(cause: Any) -> str:
+    """Normalize a failure cause string.  Unknown causes fail closed as
+    ``internal_error``."""
+    if cause in KNOWN_FAILURE_CAUSES:
+        return cause
+    return FAILURE_CAUSE_INTERNAL_ERROR
+
+
 def reduce_detector_stage_status(
     detector_rows: list[dict[str, Any]],
     *,
@@ -218,6 +226,9 @@ def reduce_detector_stage_status(
     7. missing_dependency
     8. completed_with_errors
     9. completed
+
+    ``setup_failure`` participates in the same precedence pool as row-level
+    failures — it does NOT unconditionally override row causes.
     """
     # Count row statuses and failure causes
     row_status_counts: dict[str, int] = {}
@@ -233,27 +244,34 @@ def reduce_detector_stage_status(
         elif st == ROW_STATUS_SCORED:
             scored_count += 1
 
-    # If setup failure was provided, it takes precedence over row-level causes
-    effective_failure: str | None = setup_failure
+    # Normalize setup failure and add to cause counts
+    normalized_setup: str | None = None
+    if setup_failure is not None:
+        normalized_setup = _normalize_failure_cause(setup_failure)
+        # Add setup failure to overall cause counts for diagnostics.
+        # Use a distinct key to track "setup" vs "row" origin when needed.
+        failure_cause_counts[normalized_setup] = (
+            failure_cause_counts.get(normalized_setup, 0) + 1)
 
-    # Find highest-precedence row-level failure cause
-    if not effective_failure:
-        for cause, _stage_status in _STAGE_PRECEDENCE:
-            if failure_cause_counts.get(cause, 0) > 0:
-                effective_failure = cause
-                break
+    # Find highest-precedence failure cause across BOTH setup and rows
+    effective_failure: str | None = None
+    present_causes = set(failure_cause_counts.keys())
+    for cause, _stage_status in _STAGE_PRECEDENCE:
+        if cause in present_causes:
+            effective_failure = cause
+            break
 
     # Determine stage status
     if effective_failure is not None:
-        # If all failures are in optional cohorts, primary metrics are
-        # complete, AND every failure cause is a soft (exemptible) cause,
-        # the stage remains ``completed``.  Hard failures in optional
-        # cohorts (scoring_error, missing_image, state_validation,
-        # provider_init, internal_error) always propagate per precedence.
+        # Optional cohort exemption: only applicable when there is NO setup
+        # failure, all failures are in optional cohorts, primary metrics
+        # are complete, AND every failure cause is soft.
         total_failed = sum(failure_cause_counts.values())
         primary_failed = total_failed - optional_failed_count
-        if primary_failed <= 0 and primary_metrics_complete and scored_count > 0:
-            # Check every failure cause — only soft causes can be exempted
+        if (normalized_setup is None
+                and primary_failed <= 0
+                and primary_metrics_complete
+                and scored_count > 0):
             hard_causes = set(failure_cause_counts.keys()) - OPTIONAL_SOFT_FAILURE_CAUSES
             if not hard_causes:
                 reason_parts = []
@@ -273,12 +291,12 @@ def reduce_detector_stage_status(
                     "failure_cause_counts": failure_cause_counts,
                     "row_status_counts": row_status_counts,
                 }
-            # Hard failure in optional cohort — fall through to normal
-            # precedence handling below
 
         # missing_required_state softens to completed_with_errors when
-        # there are valid scores AND the primary report is complete.
-        if (effective_failure == FAILURE_CAUSE_MISSING_REQUIRED_STATE
+        # there are valid scores AND the primary report is complete
+        # AND there is no setup failure (setup failures are never softened).
+        if (normalized_setup is None
+                and effective_failure == FAILURE_CAUSE_MISSING_REQUIRED_STATE
                 and scored_count > 0
                 and primary_metrics_complete):
             reason_parts: list[str] = []

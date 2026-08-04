@@ -56,6 +56,11 @@ def _write_fake_run(tmp_path, method="TR", records=None, extra_config=None):
         img = out / "samples" / role / rid / "output.png"
         img.parent.mkdir(parents=True, exist_ok=True)
         img.write_bytes(b"fake png")
+        # Create input image for preflight (original cohorts)
+        input_path = Path(r.get("input_path", f"/tmp/in_{rid}.png"))
+        if not input_path.is_file():
+            input_path.parent.mkdir(parents=True, exist_ok=True)
+            input_path.write_bytes(b"fake png")
     rebuild_records_jsonl(out)
     return out
 

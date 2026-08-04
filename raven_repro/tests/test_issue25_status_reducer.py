@@ -1711,3 +1711,251 @@ class TestMethodDispatchAcceptance:
             assert (result["stages"]["detector"]["status"]
                     == "failed_missing_required_state")
 
+
+# ===========================================================================
+# K. Setup + row combined precedence tests
+# ===========================================================================
+class TestSetupRowPrecedence:
+    """Setup failures participate in same precedence pool as row failures."""
+
+    def _make_missing_image_row(self):
+        return {
+            "run_id": "1", "source_role": "clean",
+            "evaluation_cohort": "original_clean",
+            "image_path": "/nonexistent/img.png",
+            "method": "TR",
+            "status": "failed_missing_image",
+            "failure_cause": "missing_image",
+            "error_type": "FileNotFoundError",
+            "error": "Image file does not exist: /nonexistent/img.png",
+        }
+
+    def test_setup_missing_state_does_not_mask_missing_image(self):
+        from raven.detectors import (
+            reduce_detector_stage_status,
+            STATUS_FAILED_MISSING_IMAGE,
+            FAILURE_CAUSE_MISSING_IMAGE,
+            FAILURE_CAUSE_MISSING_REQUIRED_STATE,
+        )
+        rows = [self._make_missing_image_row()]
+        r = reduce_detector_stage_status(
+            rows, setup_failure=FAILURE_CAUSE_MISSING_REQUIRED_STATE)
+        assert r["status"] == STATUS_FAILED_MISSING_IMAGE
+        assert r["dominant_failure_cause"] == FAILURE_CAUSE_MISSING_IMAGE
+
+    def test_setup_missing_dependency_does_not_mask_missing_image(self):
+        from raven.detectors import (
+            reduce_detector_stage_status,
+            STATUS_FAILED_MISSING_IMAGE,
+            FAILURE_CAUSE_MISSING_IMAGE,
+            FAILURE_CAUSE_MISSING_DEPENDENCY,
+        )
+        rows = [self._make_missing_image_row()]
+        r = reduce_detector_stage_status(
+            rows, setup_failure=FAILURE_CAUSE_MISSING_DEPENDENCY)
+        assert r["status"] == STATUS_FAILED_MISSING_IMAGE
+        assert r["dominant_failure_cause"] == FAILURE_CAUSE_MISSING_IMAGE
+
+    def test_provider_failure_precedes_missing_image(self):
+        from raven.detectors import (
+            reduce_detector_stage_status,
+            STATUS_FAILED_PROVIDER_INITIALIZATION,
+            FAILURE_CAUSE_PROVIDER_INITIALIZATION,
+        )
+        rows = [self._make_missing_image_row()]
+        r = reduce_detector_stage_status(
+            rows, setup_failure=FAILURE_CAUSE_PROVIDER_INITIALIZATION)
+        assert r["status"] == STATUS_FAILED_PROVIDER_INITIALIZATION
+
+    def test_state_validation_precedes_missing_image(self):
+        from raven.detectors import (
+            reduce_detector_stage_status,
+            STATUS_FAILED_STATE_VALIDATION,
+            FAILURE_CAUSE_STATE_VALIDATION,
+        )
+        rows = [self._make_missing_image_row()]
+        r = reduce_detector_stage_status(
+            rows, setup_failure=FAILURE_CAUSE_STATE_VALIDATION)
+        assert r["status"] == STATUS_FAILED_STATE_VALIDATION
+
+    def test_internal_error_precedes_missing_image(self):
+        from raven.detectors import (
+            reduce_detector_stage_status,
+            STATUS_FAILED_INTERNAL_ERROR,
+            FAILURE_CAUSE_INTERNAL_ERROR,
+        )
+        rows = [self._make_missing_image_row()]
+        r = reduce_detector_stage_status(
+            rows, setup_failure=FAILURE_CAUSE_INTERNAL_ERROR)
+        assert r["status"] == STATUS_FAILED_INTERNAL_ERROR
+
+    def test_unknown_setup_failure_fails_closed(self):
+        from raven.detectors import (
+            reduce_detector_stage_status,
+            STATUS_FAILED_INTERNAL_ERROR,
+            FAILURE_CAUSE_INTERNAL_ERROR,
+        )
+        r = reduce_detector_stage_status(
+            [], setup_failure="unknown_setup_failure")
+        assert r["status"] == STATUS_FAILED_INTERNAL_ERROR
+
+    def test_setup_failure_not_optional_exempted(self):
+        from raven.detectors import (
+            reduce_detector_stage_status,
+            ROW_STATUS_FAILED_MISSING_STATE,
+            STATUS_FAILED_MISSING_REQUIRED_STATE,
+            FAILURE_CAUSE_MISSING_REQUIRED_STATE,
+        )
+        rows = [{
+            "status": ROW_STATUS_FAILED_MISSING_STATE,
+            "failure_cause": FAILURE_CAUSE_MISSING_REQUIRED_STATE,
+            "evaluation_cohort": "attacked_clean",
+        }]
+        r = reduce_detector_stage_status(
+            rows,
+            setup_failure=FAILURE_CAUSE_MISSING_REQUIRED_STATE,
+            primary_report_available=True,
+            primary_metrics_complete=True,
+            optional_failed_count=1,
+        )
+        assert r["status"] == STATUS_FAILED_MISSING_REQUIRED_STATE
+
+    def test_setup_failure_result_retains_diagnostics(self):
+        from raven.detectors import (
+            reduce_detector_stage_status,
+            FAILURE_CAUSE_MISSING_REQUIRED_STATE,
+        )
+        rows = [self._make_missing_image_row()]
+        r = reduce_detector_stage_status(
+            rows, setup_failure=FAILURE_CAUSE_MISSING_REQUIRED_STATE)
+        for field in ("status", "dominant_failure_cause",
+                      "status_reducer_reason", "available",
+                      "failure_cause_counts", "row_status_counts"):
+            assert field in r, f"missing field: {field}"
+        assert "missing_image" in r["failure_cause_counts"]
+        assert "missing_required_state" in r["failure_cause_counts"]
+
+
+# ===========================================================================
+# L. Method dispatch with combined failures
+# ===========================================================================
+class TestCombinedMethodFailures:
+    """GM/GS/T2S with image preflight + setup failures."""
+
+    def test_gm_missing_image_precedes_missing_bundle(self, monkeypatch):
+        from experiments.eval import evaluate_detector
+        from raven.detectors import (
+            STATUS_FAILED_MISSING_IMAGE, DetectorMissingStateError,
+        )
+        import raven.detectors.gm_detector as gm_mod
+
+        monkeypatch.setattr(
+            gm_mod, "load_state",
+            lambda records, device, **extra: (_ for _ in ()).throw(
+                DetectorMissingStateError("GM bundle not found")),
+        )
+
+        GM_META = {"gm_bundle_path": "/nonexistent/bundle",
+                    "gm_bundle_sha256": "abc"}
+        rec_wm = _make_record("1", "watermarked", method="GM",
+                              source_metadata=GM_META)
+
+        with tempfile.TemporaryDirectory() as td:
+            out = _write_fake_run(Path(td), method="GM", records=[rec_wm])
+            input_path = Path(rec_wm["input_path"])
+            input_path.unlink()
+
+            result = evaluate_detector([rec_wm], out, "GM", device="cpu")
+            assert result["status"] == STATUS_FAILED_MISSING_IMAGE
+            assert result["dominant_failure_cause"] == "missing_image"
+            assert result.get("setup_failure_cause") == "missing_required_state"
+
+    def test_t2s_provider_failure_precedes_missing_image(self, monkeypatch):
+        from experiments.eval import evaluate_detector
+        from raven.detectors import (
+            STATUS_FAILED_PROVIDER_INITIALIZATION,
+            DetectorProviderInitializationError,
+        )
+        import raven.detectors.t2s_detector as t2s_mod
+
+        monkeypatch.setattr(
+            t2s_mod, "load_state",
+            lambda records, device, **extra: (_ for _ in ()).throw(
+                DetectorProviderInitializationError("TypeError in constructor")),
+        )
+
+        T2S_META = {"t2s_state_path": "/tmp/fake.pt",
+                     "t2s_state_sha256": "abc",
+                     "t2s_provider_config_sha256": "def",
+                     "t2s_protocol_mode": "official"}
+        rec_wm = _make_record("1", "watermarked", method="T2S",
+                              source_metadata=T2S_META)
+
+        with tempfile.TemporaryDirectory() as td:
+            out = _write_fake_run(Path(td), method="T2S", records=[rec_wm])
+            input_path = Path(rec_wm["input_path"])
+            input_path.unlink()
+
+            result = evaluate_detector([rec_wm], out, "T2S", device="cpu")
+            assert result["status"] == STATUS_FAILED_PROVIDER_INITIALIZATION
+
+    def test_gs_missing_dependency_with_missing_image(self, monkeypatch):
+        from experiments.eval import evaluate_detector
+        from raven.detectors import (
+            STATUS_FAILED_MISSING_IMAGE, DetectorDependencyError,
+        )
+        import raven.detectors.gs_detector as gs_mod
+
+        monkeypatch.setattr(
+            gs_mod, "load_state",
+            lambda records, device, **extra: (_ for _ in ()).throw(
+                DetectorDependencyError("torch not installed")),
+        )
+
+        GS_META = {"gs_secret_index": "5", "gs_secret_bundle_sha256": "abc",
+                    "gs_protocol_mode": "official_compatible"}
+        rec_wm = _make_record("1", "watermarked", method="GS",
+                              source_metadata=GS_META)
+
+        with tempfile.TemporaryDirectory() as td:
+            out = _write_fake_run(Path(td), method="GS", records=[rec_wm])
+            input_path = Path(rec_wm["input_path"])
+            input_path.unlink()
+
+            result = evaluate_detector([rec_wm], out, "GS", device="cpu")
+            assert result["status"] == STATUS_FAILED_MISSING_IMAGE
+
+    def test_combined_missing_image_always_nonzero(self, monkeypatch):
+        import io
+        from experiments.eval import main
+        from raven.detectors import DetectorDependencyError
+        import raven.detectors.tr_detector as tr_mod
+
+        monkeypatch.setattr(
+            tr_mod, "load_state",
+            lambda records, device, **extra: (_ for _ in ()).throw(
+                DetectorDependencyError("no torch")),
+        )
+
+        rec_wm = _make_record("1", "watermarked", method="TR",
+                              source_metadata=TR_META)
+
+        with tempfile.TemporaryDirectory() as td:
+            out = _write_fake_run(Path(td), method="TR", records=[rec_wm])
+            input_path = Path(rec_wm["input_path"])
+            input_path.unlink()
+
+            for allow in (False, True):
+                argv = ["--output-dir", str(out), "--device", "cpu",
+                        "--stages", "detector", "--log-level", "ERROR"]
+                if allow:
+                    argv.append("--allow-missing-metrics")
+                stdout_buf = io.StringIO()
+                with mock.patch("sys.stdout", stdout_buf):
+                    exit_code = main(argv)
+                result = json.loads(stdout_buf.getvalue())
+                assert exit_code != 0, (
+                    f"allow={allow} exit={exit_code}")
+                assert (result["stages"]["detector"]["status"]
+                        == "failed_missing_image")
+
