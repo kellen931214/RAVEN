@@ -433,14 +433,27 @@ class TestProviderConfigIdentity:
 # 5. Pipe config — fail closed, no fallback
 # ---------------------------------------------------------------------------
 class TestPipeConfig:
-    @pytest.mark.parametrize("field", ["model_id", "model_revision",
-                                       "scheduler", "resolution"])
+    @pytest.mark.parametrize("field", ["model_id", "scheduler", "resolution"])
     def test_missing_field_raises(self, field):
         rec = _resolved_metadata()
         rec[field] = ""
         with pytest.raises(DetectorMissingStateError,
                           match=f"missing required pipe config field: {field}"):
             _validate_pipe_config_uniformity([rec])
+
+    def test_missing_model_revision_key_raises(self):
+        rec = _resolved_metadata()
+        del rec["model_revision"]
+        with pytest.raises(DetectorMissingStateError,
+                          match="model_revision"):
+            _validate_pipe_config_uniformity([rec])
+
+    def test_empty_model_revision_is_valid_sentinel(self):
+        """model_revision="" is a sentinel → normalized None, not missing."""
+        rec = _resolved_metadata()
+        rec["model_revision"] = ""
+        cfg = _validate_pipe_config_uniformity([rec])
+        assert cfg["model_revision"] is None
 
     def test_none_field_raises(self):
         rec = _resolved_metadata()
@@ -490,22 +503,11 @@ class TestPipeConfig:
 # 1. model_revision normalization
 # ---------------------------------------------------------------------------
 class TestModelRevisionNormalization:
-    """Sentinel revisions normalize to None; never passed to pipe."""
+    """Key-missing vs sentinel-value contract; integration through load_state."""
 
-    @pytest.mark.parametrize("value", [None, "", "none", "null",
-                                       "unspecified", "UNSPECIFIED",
-                                       "  unspecified  "])
-    def test_sentinels_normalize_to_none(self, value):
-        from raven.detectors.gs_detector import _normalize_model_revision
-        assert _normalize_model_revision(value) is None
-
-    @pytest.mark.parametrize("value", ["fp16", "9f4b8f2", "main",
-                                       "some-tag"])
-    def test_real_revisions_kept(self, value):
-        from raven.detectors.gs_detector import _normalize_model_revision
-        assert _normalize_model_revision(value) == value
-
-    def test_unspecified_revision_is_not_passed_to_pipe(self, monkeypatch):
+    @staticmethod
+    def _pipe_capture(monkeypatch):
+        """Configure fakes so get_pipe_provider records its kwargs."""
         captured = {}
         _fake_pipe_utils.get_pipe_provider.side_effect = (
             lambda **kw: captured.update(kw) or _mock_pipe())
@@ -520,84 +522,72 @@ class TestModelRevisionNormalization:
                        "gs_user_number": 1000000},
                       "CFG_HASH", "PIPE_HASH", "DET_HASH"),
         )
+        return captured
+
+    def test_python_none_revision_is_not_passed_to_pipe(self, monkeypatch):
+        """Real Python None goes through load_state, revision omitted."""
+        captured = self._pipe_capture(monkeypatch)
+        rec = _resolved_metadata("1", "watermarked", model_revision=None)
+        load_state([rec], "cpu")
+        assert "revision" not in captured
+
+    def test_empty_string_revision_is_not_passed_to_pipe(self, monkeypatch):
+        """Real empty string goes through load_state, revision omitted."""
+        captured = self._pipe_capture(monkeypatch)
+        rec = _resolved_metadata("1", "watermarked", model_revision="")
+        load_state([rec], "cpu")
+        assert "revision" not in captured
+
+    def test_none_sentinel_revision_is_not_passed_to_pipe(self, monkeypatch):
+        captured = self._pipe_capture(monkeypatch)
+        rec = _resolved_metadata("1", "watermarked", model_revision="none")
+        load_state([rec], "cpu")
+        assert "revision" not in captured
+
+    def test_null_sentinel_revision_is_not_passed_to_pipe(self, monkeypatch):
+        captured = self._pipe_capture(monkeypatch)
+        rec = _resolved_metadata("1", "watermarked", model_revision="null")
+        load_state([rec], "cpu")
+        assert "revision" not in captured
+
+    def test_unspecified_revision_is_not_passed_to_pipe(self, monkeypatch):
+        captured = self._pipe_capture(monkeypatch)
         rec = _resolved_metadata("1", "watermarked",
                                  model_revision="unspecified")
         load_state([rec], "cpu")
         assert "revision" not in captured
 
-    def test_none_revision_is_not_passed_to_pipe(self, monkeypatch):
-        captured = {}
-        _fake_pipe_utils.get_pipe_provider.side_effect = (
-            lambda **kw: captured.update(kw) or _mock_pipe())
-        GsProvider = mock.MagicMock()
-        _configure_fake_modules(gs_provider_cls=GsProvider)
-        monkeypatch.setattr(
-            "raven.detectors.gs_detector._validate_gs_provider_config",
-            lambda r: ({"gs_protocol_mode": "official_compatible",
-                       "message_width_in_bytes": 32, "l": 1,
-                       "num_replications": 64, "gs_channel_copy": 1,
-                       "gs_hw_copy": 8, "gs_fpr": 1e-6,
-                       "gs_user_number": 1000000},
-                      "CFG_HASH", "PIPE_HASH", "DET_HASH"),
-        )
-        rec = _resolved_metadata("1", "watermarked",
-                                 model_revision="none")
-        load_state([rec], "cpu")
-        assert "revision" not in captured
-
-    def test_empty_revision_is_not_passed_to_pipe(self, monkeypatch):
-        captured = {}
-        _fake_pipe_utils.get_pipe_provider.side_effect = (
-            lambda **kw: captured.update(kw) or _mock_pipe())
-        GsProvider = mock.MagicMock()
-        _configure_fake_modules(gs_provider_cls=GsProvider)
-        monkeypatch.setattr(
-            "raven.detectors.gs_detector._validate_gs_provider_config",
-            lambda r: ({"gs_protocol_mode": "official_compatible",
-                       "message_width_in_bytes": 32, "l": 1,
-                       "num_replications": 64, "gs_channel_copy": 1,
-                       "gs_hw_copy": 8, "gs_fpr": 1e-6,
-                       "gs_user_number": 1000000},
-                      "CFG_HASH", "PIPE_HASH", "DET_HASH"),
-        )
-        rec = _resolved_metadata("1", "watermarked",
-                                 model_revision="null")
-        load_state([rec], "cpu")
-        assert "revision" not in captured
+    def test_missing_revision_key_is_missing_state(self):
+        rec = _resolved_metadata("1", "watermarked")
+        del rec["model_revision"]
+        with pytest.raises(DetectorMissingStateError,
+                          match="model_revision"):
+            _validate_pipe_config_uniformity([rec])
 
     def test_real_revision_is_passed_to_pipe(self, monkeypatch):
-        captured = {}
-        _fake_pipe_utils.get_pipe_provider.side_effect = (
-            lambda **kw: captured.update(kw) or _mock_pipe())
-        GsProvider = mock.MagicMock()
-        _configure_fake_modules(gs_provider_cls=GsProvider)
-        monkeypatch.setattr(
-            "raven.detectors.gs_detector._validate_gs_provider_config",
-            lambda r: ({"gs_protocol_mode": "official_compatible",
-                       "message_width_in_bytes": 32, "l": 1,
-                       "num_replications": 64, "gs_channel_copy": 1,
-                       "gs_hw_copy": 8, "gs_fpr": 1e-6,
-                       "gs_user_number": 1000000},
-                      "CFG_HASH", "PIPE_HASH", "DET_HASH"),
-        )
+        captured = self._pipe_capture(monkeypatch)
         rec = _resolved_metadata("1", "watermarked",
                                  model_revision="9f4b8f2")
         load_state([rec], "cpu")
         assert captured["revision"] == "9f4b8f2"
 
     def test_revision_sentinels_have_same_pipe_hash(self):
-        """unspecified / null / none produce identical pipe config hash."""
+        """unspecified / null / none / "" / None → identical pipe hash."""
         rec_a = _resolved_metadata("1", "watermarked",
                                    model_revision="unspecified")
         rec_b = _resolved_metadata("1", "watermarked",
                                    model_revision="null")
         rec_c = _resolved_metadata("1", "watermarked",
                                    model_revision="none")
+        rec_d = _resolved_metadata("1", "watermarked", model_revision="")
+        rec_e = _resolved_metadata("1", "watermarked", model_revision=None)
         cfg_a = _validate_pipe_config_uniformity([rec_a])
         cfg_b = _validate_pipe_config_uniformity([rec_b])
         cfg_c = _validate_pipe_config_uniformity([rec_c])
+        cfg_d = _validate_pipe_config_uniformity([rec_d])
+        cfg_e = _validate_pipe_config_uniformity([rec_e])
         assert cfg_a["model_revision"] is None
-        assert cfg_a == cfg_b == cfg_c
+        assert cfg_a == cfg_b == cfg_c == cfg_d == cfg_e
 
     def test_pinned_revision_changes_pipe_hash(self):
         rec_a = _resolved_metadata("1", "watermarked",
@@ -686,6 +676,31 @@ class TestRoleNormalization:
         with pytest.raises(DetectorMissingStateError, match="role"):
             _resolved_source_role({"run_id": "1"})
 
+    def test_blank_role_is_missing_state(self):
+        from raven.detectors.gs_detector import _resolved_source_role
+        with pytest.raises(DetectorMissingStateError, match="role"):
+            _resolved_source_role({"role": ""})
+
+    def test_blank_source_role_is_missing_state(self):
+        from raven.detectors.gs_detector import _resolved_source_role
+        with pytest.raises(DetectorMissingStateError, match="role"):
+            _resolved_source_role({"source_role": "   "})
+
+    def test_both_blank_roles_are_missing_state(self):
+        from raven.detectors.gs_detector import _resolved_source_role
+        with pytest.raises(DetectorMissingStateError, match="role"):
+            _resolved_source_role({"role": "", "source_role": "  "})
+
+    def test_blank_role_with_valid_source_role_uses_source_role(self):
+        from raven.detectors.gs_detector import _resolved_source_role
+        assert _resolved_source_role(
+            {"role": "", "source_role": "clean"}) == "clean"
+
+    def test_valid_role_with_blank_source_role_uses_role(self):
+        from raven.detectors.gs_detector import _resolved_source_role
+        assert _resolved_source_role(
+            {"role": "watermarked", "source_role": " "}) == "watermarked"
+
     def test_source_role_clean_record_indexed_as_clean(self):
         """Record with only source_role=clean must NOT index as watermarked."""
         rec = _resolved_metadata("1", "clean")
@@ -749,6 +764,59 @@ class TestDetectionModeValidation:
                           match="detection mode not uniform"):
             _validate_gs_provider_config(recs)
 
+    def test_detection_mode_whitespace_is_canonicalized_consistently(self):
+        """Whitespace-padded mode canonicalizes to the same value."""
+        rec_a = _resolved_metadata("1", "watermarked",
+                                   gs_detection_mode=" official_onebit ")
+        rec_b = _resolved_metadata("1", "watermarked",
+                                   gs_detection_mode="official_onebit")
+        _validate_required_gs_metadata(rec_a)
+        _validate_required_gs_metadata(rec_b)
+        assert rec_a["gs_detection_mode"] == "official_onebit"
+        assert rec_a["gs_detection_mode"] == rec_b["gs_detection_mode"]
+
+    def test_detection_mode_hash_uses_canonical_value(self):
+        """Policy hash computed from canonical mode, not raw string."""
+        rec_a = _resolved_metadata("1", "watermarked",
+                                   gs_detection_mode=" official_onebit ")
+        rec_b = _resolved_metadata("1", "watermarked",
+                                   gs_detection_mode="official_onebit")
+        _validate_required_gs_metadata(rec_a)
+        _validate_required_gs_metadata(rec_b)
+        _, _, _, hash_a = _validate_gs_provider_config([rec_a])
+        _, _, _, hash_b = _validate_gs_provider_config([rec_b])
+        assert hash_a == hash_b
+
+    def test_constructor_receives_canonical_detection_mode(self, monkeypatch):
+        """Provider constructor gets the canonical stripped mode."""
+        GsProvider = mock.MagicMock()
+        inst = _mock_provider_instance(5)
+        GsProvider.return_value = inst
+        _configure_fake_modules(gs_provider_cls=GsProvider)
+        monkeypatch.setattr(
+            extract_verification_scores, "provider_kwargs",
+            lambda method, row: {"offset": 5, "gs_secret_index": 5},
+        )
+        monkeypatch.setattr(
+            "raven.pairing_provenance.tensor_sha256",
+            lambda t: "TGT_HASH",
+        )
+        monkeypatch.setattr(
+            "raven.eval_protocol.canonical_json_hash",
+            lambda p: "MASK_SENTINEL" if "mask" in str(p) else "CFG_HASH",
+        )
+        canonical = {"gs_protocol_mode": "official_compatible",
+                     "message_width_in_bytes": 32, "l": 1,
+                     "num_replications": 64, "gs_channel_copy": 1,
+                     "gs_hw_copy": 8, "gs_fpr": 1e-6,
+                     "gs_user_number": 1000000}
+        meta = _resolved_metadata("1", "watermarked",
+                                  gs_detection_mode=" official_onebit ")
+        _construct_provider(_mock_pipe(), GsProvider, torch.device("cpu"),
+                           meta, canonical)
+        _, kwargs = GsProvider.call_args
+        assert kwargs["gs_detection_mode"] == "official_onebit"
+
     def test_provider_runtime_mode_mismatch_raises(self, monkeypatch):
         """Provider runtime gs_detection_mode differs from metadata."""
         GsProvider = mock.MagicMock()
@@ -806,25 +874,53 @@ class TestDetectionModeValidation:
 # 2.5 Active detection policy
 # ---------------------------------------------------------------------------
 class TestActiveDetectionPolicy:
-    """Provider-owned policy validated, no adapter math."""
+    """Provider-owned policy cross-validated vs official_thresholds."""
 
     @staticmethod
     def _scored(monkeypatch, tmp_path, mode="official_onebit",
                 threshold=0.9, tau_onebit=0.9, tau_bits=0.95,
-                success=True, threshold_type="official_beta_tail_tau_onebit",
-                operator=">="):
+                success=True, threshold_type=None, operator=None,
+                nominal_fpr=1e-6, calibrated=False,
+                policy_tau_onebit=None, policy_tau_bits=None,
+                official_tau_onebit=0.9, official_tau_bits=0.95,
+                official_fpr=1e-6, official_op=">="):
+        if threshold_type is None:
+            threshold_type = {
+                "official_onebit": "official_beta_tail_tau_onebit",
+                "official_traceability": "official_beta_tail_tau_bits",
+                "legacy_default": "legacy_default_threshold",
+            }[mode]
+        if operator is None:
+            operator = {
+                "official_onebit": ">=",
+                "official_traceability": ">=",
+                "legacy_default": ">",
+            }[mode]
+        if policy_tau_onebit is None:
+            policy_tau_onebit = tau_onebit
+        if policy_tau_bits is None:
+            policy_tau_bits = tau_bits
+
         GsProvider = mock.MagicMock()
         inst = _mock_provider_instance(5, detection_mode=mode,
                                        detection_success=success)
+        inst.official_thresholds.return_value = {
+            "tau_onebit": official_tau_onebit,
+            "tau_bits": official_tau_bits,
+            "fpr": official_fpr,
+            "user_number": 1000000,
+            "comparison_operator": official_op,
+            "source": "test",
+        }
         inst.active_detection_threshold.return_value = {
             "detection_mode": mode,
             "threshold": threshold,
             "threshold_type": threshold_type,
             "comparison_operator": operator,
-            "nominal_fpr": 1e-6,
-            "calibrated_from_current_clean_negatives": False,
-            "official_tau_onebit": tau_onebit,
-            "official_tau_bits": tau_bits,
+            "nominal_fpr": nominal_fpr,
+            "calibrated_from_current_clean_negatives": calibrated,
+            "official_tau_onebit": policy_tau_onebit,
+            "official_tau_bits": policy_tau_bits,
         }
         GsProvider.return_value = inst
         _configure_fake_modules(gs_provider_cls=GsProvider)
@@ -944,8 +1040,124 @@ class TestActiveDetectionPolicy:
     def test_missing_policy_key_raises(self):
         from raven.detectors.gs_detector import _validate_active_policy
         with pytest.raises(DetectorScoringError, match="missing keys"):
-            _validate_active_policy({"detection_mode": "official_onebit"},
-                                    "official_onebit", "1")
+            _validate_active_policy(
+                {"detection_mode": "official_onebit"},
+                {"gs_official_tau_onebit": 0.9,
+                 "gs_official_tau_bits": 0.95,
+                 "gs_official_fpr": 1e-6,
+                 "gs_official_comparison_operator": ">="},
+                "official_onebit", "1")
+
+    # ---- Blocker 2 cross-validation tests ----
+    def test_active_policy_must_be_dict(self, monkeypatch, tmp_path):
+        GsProvider = mock.MagicMock()
+        inst = _mock_provider_instance(5)
+        inst.active_detection_threshold.return_value = "not_a_dict"
+        GsProvider.return_value = inst
+        _configure_fake_modules(gs_provider_cls=GsProvider)
+        monkeypatch.setattr(
+            "raven.detectors.gs_detector._validate_pipe_config_uniformity",
+            lambda r: {"model_id": "x", "model_revision": None,
+                      "scheduler": "DDIM", "resolution": 512},
+        )
+        monkeypatch.setattr(
+            "raven.detectors.gs_detector._validate_gs_provider_config",
+            lambda r: ({"gs_protocol_mode": "official_compatible",
+                       "message_width_in_bytes": 32, "l": 1,
+                       "num_replications": 64, "gs_channel_copy": 1,
+                       "gs_hw_copy": 8, "gs_fpr": 1e-6,
+                       "gs_user_number": 1000000},
+                      "CFG_HASH", "PIPE_HASH", "DET_HASH"),
+        )
+        monkeypatch.setattr(
+            extract_verification_scores, "provider_kwargs",
+            lambda method, row: {"offset": 5, "gs_secret_index": 5},
+        )
+        monkeypatch.setattr(
+            "raven.pairing_provenance.tensor_sha256",
+            lambda t: "TGT_HASH",
+        )
+        monkeypatch.setattr(
+            "raven.eval_protocol.canonical_json_hash",
+            lambda p: "MASK_SENTINEL" if "mask" in str(p) else "CFG_HASH",
+        )
+        meta = _resolved_metadata("1", "watermarked")
+        prov_info = load_state([meta], "cpu")
+        img = _build_fake_png(tmp_path, "img.png")
+        with pytest.raises(DetectorScoringError, match="must be a dict"):
+            score_image(prov_info, img, record=meta,
+                       evaluation_entry=_eval_entry("1", "watermarked"))
+
+    def test_active_tau_onebit_mismatch_official_thresholds_fails(
+            self, monkeypatch, tmp_path):
+        """Active policy tau_onebit differs from official_thresholds()."""
+        with pytest.raises(DetectorScoringError,
+                          match="official_tau_onebit"):
+            self._scored(monkeypatch, tmp_path, mode="official_onebit",
+                         policy_tau_onebit=0.75, official_tau_onebit=0.9)
+
+    def test_active_tau_bits_mismatch_official_thresholds_fails(
+            self, monkeypatch, tmp_path):
+        with pytest.raises(DetectorScoringError,
+                          match="official_tau_bits"):
+            self._scored(monkeypatch, tmp_path, mode="official_onebit",
+                         policy_tau_bits=0.8, official_tau_bits=0.95)
+
+    def test_official_onebit_wrong_operator_fails(self, monkeypatch,
+                                                  tmp_path):
+        with pytest.raises(DetectorScoringError,
+                          match="comparison_operator"):
+            self._scored(monkeypatch, tmp_path, mode="official_onebit",
+                         operator=">")
+
+    def test_official_traceability_wrong_operator_fails(self, monkeypatch,
+                                                        tmp_path):
+        with pytest.raises(DetectorScoringError,
+                          match="comparison_operator"):
+            self._scored(monkeypatch, tmp_path,
+                         mode="official_traceability", operator=">")
+
+    def test_legacy_default_non_strict_operator_fails(self, monkeypatch,
+                                                      tmp_path):
+        with pytest.raises(DetectorScoringError,
+                          match="comparison_operator"):
+            self._scored(monkeypatch, tmp_path, mode="legacy_default",
+                         operator=">=")
+
+    def test_official_onebit_wrong_threshold_type_fails(self, monkeypatch,
+                                                        tmp_path):
+        with pytest.raises(DetectorScoringError, match="threshold_type"):
+            self._scored(monkeypatch, tmp_path, mode="official_onebit",
+                         threshold_type="official_beta_tail_tau_bits")
+
+    def test_traceability_wrong_threshold_type_fails(self, monkeypatch,
+                                                     tmp_path):
+        with pytest.raises(DetectorScoringError, match="threshold_type"):
+            self._scored(monkeypatch, tmp_path,
+                         mode="official_traceability",
+                         threshold_type="legacy_default_threshold")
+
+    def test_legacy_wrong_threshold_type_fails(self, monkeypatch, tmp_path):
+        with pytest.raises(DetectorScoringError, match="threshold_type"):
+            self._scored(monkeypatch, tmp_path, mode="legacy_default",
+                         threshold_type="official_beta_tail_tau_onebit")
+
+    def test_calibrated_string_false_fails(self, monkeypatch, tmp_path):
+        """bool("false") is True — string value must be rejected."""
+        with pytest.raises(DetectorScoringError, match="real bool"):
+            self._scored(monkeypatch, tmp_path, mode="official_onebit",
+                         calibrated="false")
+
+    def test_nonfinite_active_tau_fails_as_scoring(self, monkeypatch,
+                                                   tmp_path):
+        with pytest.raises(DetectorScoringError, match="non-finite"):
+            self._scored(monkeypatch, tmp_path, mode="official_onebit",
+                         policy_tau_onebit=float("nan"))
+
+    def test_active_nominal_fpr_mismatch_fails(self, monkeypatch, tmp_path):
+        with pytest.raises(DetectorScoringError, match="nominal_fpr"):
+            self._scored(monkeypatch, tmp_path, mode="official_onebit",
+                         nominal_fpr=1e-5, official_fpr=1e-6)
 
 
 # ---------------------------------------------------------------------------
@@ -2184,19 +2396,29 @@ class TestAggregate:
 
     # ---- 3. official vs empirical summary separation ----
     def _policy_row(self, cohort, success, mode="official_onebit",
-                    threshold=0.9):
-        return {
+                    threshold=0.9, tau_onebit=0.9, tau_bits=0.95,
+                    fpr=1e-6, user_number=1000000, op=">=",
+                    policy_hash="POLICY_HASH", **overrides):
+        row = {
             "status": ROW_STATUS_SCORED,
             "evaluation_cohort": cohort,
             "canonical_score": 0.85,
             "gs_detection_mode": mode,
             "gs_active_threshold": threshold,
             "gs_active_threshold_type": "official_beta_tail_tau_onebit",
-            "gs_active_comparison_operator": ">=",
-            "gs_active_nominal_fpr": 1e-6,
+            "gs_active_comparison_operator": op,
+            "gs_active_nominal_fpr": fpr,
             "gs_active_calibrated_from_current_clean_negatives": False,
             "gs_detection_success": success,
+            "gs_official_tau_onebit": tau_onebit,
+            "gs_official_tau_bits": tau_bits,
+            "gs_official_fpr": fpr,
+            "gs_official_user_number": user_number,
+            "gs_official_comparison_operator": op,
+            "gs_detection_policy_hash": policy_hash,
         }
+        row.update(overrides)
+        return row
 
     def test_official_summary_uses_provider_decisions(self):
         rows = [
@@ -2208,6 +2430,7 @@ class TestAggregate:
             self._policy_row("attacked_watermarked", False),
         ]
         result = aggregate(rows)
+        assert result["gs_official_detection_summary_status"] == "available"
         official = result["gs_official_detection_summary"]
         assert official["detection_mode"] == "official_onebit"
         assert official["threshold"] == 0.9
@@ -2220,17 +2443,106 @@ class TestAggregate:
         assert official["attacked_watermarked_detection_rate"] == 0.5
         assert official["attack_success"] == 0.5
 
-    def test_official_summary_fails_closed_on_mixed_policy(self):
+    def test_aggregate_mixed_policy_hash_fails_closed(self):
         rows = [
             self._policy_row("original_watermarked", True,
-                             mode="official_onebit"),
+                             policy_hash="HASH_A"),
             self._policy_row("attacked_watermarked", True,
-                             mode="official_traceability"),
+                             policy_hash="HASH_B"),
         ]
         result = aggregate(rows)
-        official = result["gs_official_detection_summary"]
-        assert "error" in official
-        assert official["distinct_policies"] == 2
+        assert result["gs_official_detection_summary_status"] == \
+            "failed_state_validation"
+        assert "gs_official_detection_summary" not in result
+
+    def test_aggregate_mixed_official_tau_fails_closed(self):
+        rows = [
+            self._policy_row("original_watermarked", True, tau_onebit=0.9),
+            self._policy_row("attacked_watermarked", True, tau_onebit=0.85),
+        ]
+        result = aggregate(rows)
+        assert result["gs_official_detection_summary_status"] == \
+            "failed_state_validation"
+
+    def test_aggregate_mixed_official_fpr_fails_closed(self):
+        rows = [
+            self._policy_row("original_watermarked", True, fpr=1e-6),
+            self._policy_row("attacked_watermarked", True, fpr=1e-5),
+        ]
+        result = aggregate(rows)
+        assert result["gs_official_detection_summary_status"] == \
+            "failed_state_validation"
+
+    def test_aggregate_partial_missing_detection_success_fails_closed(self):
+        """One scored row missing gs_detection_success → fail closed."""
+        rows = [
+            self._policy_row("original_watermarked", True),
+            dict(self._policy_row("attacked_watermarked", True),
+                 **{"gs_detection_success": None}),
+        ]
+        result = aggregate(rows)
+        assert result["gs_official_detection_summary_status"] == \
+            "failed_state_validation"
+        assert "gs_official_detection_summary" not in result
+
+    def test_aggregate_partial_missing_policy_fields_fails_closed(self):
+        """One scored row missing gs_active_threshold → fail closed."""
+        rows = [
+            self._policy_row("original_watermarked", True),
+            dict(self._policy_row("attacked_watermarked", True),
+                 **{"gs_active_threshold": None}),
+        ]
+        result = aggregate(rows)
+        assert result["gs_official_detection_summary_status"] == \
+            "failed_state_validation"
+
+    def test_aggregate_nonbool_detection_success_fails_closed(self):
+        rows = [
+            self._policy_row("original_watermarked", True),
+            self._policy_row("attacked_watermarked", "yes"),
+        ]
+        result = aggregate(rows)
+        assert result["gs_official_detection_summary_status"] == \
+            "failed_state_validation"
+        assert "gs_official_detection_summary" not in result
+
+    def test_aggregate_never_computes_rates_from_policy_subset(self):
+        """Mixed complete+legacy rows → no rates from the complete subset."""
+        rows = [
+            self._policy_row("original_watermarked", True),
+            {"status": ROW_STATUS_SCORED,
+             "evaluation_cohort": "attacked_watermarked",
+             "canonical_score": 0.7},
+        ]
+        result = aggregate(rows)
+        assert result["gs_official_detection_summary_status"] == \
+            "failed_state_validation"
+        assert "gs_official_detection_summary" not in result
+
+    def test_aggregate_all_legacy_rows_reports_official_unavailable(self):
+        """Legacy scored rows (no policy fields) → unavailable marker."""
+        rows = [
+            {"status": ROW_STATUS_SCORED,
+             "evaluation_cohort": "original_clean", "canonical_score": 0.4},
+            {"status": ROW_STATUS_SCORED,
+             "evaluation_cohort": "original_clean", "canonical_score": 0.5},
+            {"status": ROW_STATUS_SCORED,
+             "evaluation_cohort": "original_watermarked",
+             "canonical_score": 0.9},
+            {"status": ROW_STATUS_SCORED,
+             "evaluation_cohort": "original_watermarked",
+             "canonical_score": 0.95},
+            {"status": ROW_STATUS_SCORED,
+             "evaluation_cohort": "attacked_watermarked",
+             "canonical_score": 0.7},
+            {"status": ROW_STATUS_SCORED,
+             "evaluation_cohort": "attacked_watermarked",
+             "canonical_score": 0.8},
+        ]
+        result = aggregate(rows)
+        assert result["gs_official_detection_summary_status"] == \
+            "unavailable_legacy_rows"
+        assert "gs_official_detection_summary" not in result
 
     def test_empirical_summary_separate_from_official(self):
         """clean_calibrated_1pct_fpr_summary is distinct, clearly labeled."""
@@ -2258,8 +2570,13 @@ class TestAggregate:
         assert empirical["threshold_source"] == "current_original_clean_cohort"
         assert empirical["calibrated_from_current_clean_negatives"] is True
         # detection_summary is the deprecated empirical alias — must NOT look
-        # like an official GS policy.
+        # like an official GS policy, with machine-readable markers.
         alias = result["detection_summary"]
         assert alias["target_fpr"] == 0.01
         assert "detection_mode" not in alias
+        assert result["detection_summary_alias_of"] == \
+            "clean_calibrated_1pct_fpr_summary"
+        assert result["detection_summary_deprecated"] is True
+        assert result["gs_official_detection_summary_status"] == \
+            "unavailable_legacy_rows"
         assert "gs_official_detection_summary" not in result

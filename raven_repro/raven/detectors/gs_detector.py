@@ -4,8 +4,9 @@ Every source sample gets its own canonical ``GsProvider``, constructed once
 and cached per ``(run_id, role)``.  The adapter validates required metadata,
 formal provider configuration identity (``require_uniform_provider_config``),
 pipe profile uniformity, secret provenance, watermark target/mask identity,
-detection policy, and scoring outputs — all before returning a scored row.
-No GS algorithm is reimplemented here.
+detection policy (cross-validated against ``official_thresholds()``), and
+scoring outputs — all before returning a scored row.  No GS algorithm is
+reimplemented here.
 
 Failure taxonomy
 ----------------
@@ -13,7 +14,7 @@ Failure taxonomy
   → ``failed_missing_required_state`` (allowable under ``--allow-missing-metrics``)
 * SHA / target / mask / protocol / config / policy mismatch → ``DetectorStateValidationError``
   → ``failed_state_validation`` (hard failure)
-* runtime inversion / decoding / scoring failure → ``DetectorScoringError``
+* runtime inversion / decoding / scoring / malformed policy → ``DetectorScoringError``
   → ``failed_scoring`` (hard failure)
 * missing image → ``FileNotFoundError`` → ``failed_missing_image`` (hard failure)
 """
@@ -69,6 +70,26 @@ GS_DETECTION_MODES: frozenset[str] = frozenset({
 # Comparison operators the official/legacy threshold families support.
 _GS_OPERATORS: frozenset[str] = frozenset({">=", ">"})
 
+# Strict mode→policy binding.  Threshold type and comparison operator must
+# match the mode exactly — membership in _GS_OPERATORS is not enough.
+EXPECTED_POLICY: dict[str, dict[str, str]] = {
+    "official_onebit": {
+        "threshold_type": "official_beta_tail_tau_onebit",
+        "comparison_operator": ">=",
+        "threshold_source": "tau_onebit",
+    },
+    "official_traceability": {
+        "threshold_type": "official_beta_tail_tau_bits",
+        "comparison_operator": ">=",
+        "threshold_source": "tau_bits",
+    },
+    "legacy_default": {
+        "threshold_type": "legacy_default_threshold",
+        "comparison_operator": ">",
+        "threshold_source": "legacy",
+    },
+}
+
 # Active-policy keys every scored policy dict must carry.
 _ACTIVE_POLICY_KEYS: tuple[str, ...] = (
     "detection_mode",
@@ -84,6 +105,23 @@ _ACTIVE_POLICY_KEYS: tuple[str, ...] = (
 # Sentinel values for model_revision — normalized to None, never passed to
 # the pipe helper as a real Hugging Face revision.
 _REVISION_SENTINELS: frozenset[str] = frozenset({"", "none", "null", "unspecified"})
+
+# Fields a scored row must carry for the official detection summary.
+_OFFICIAL_POLICY_ROW_FIELDS: tuple[str, ...] = (
+    "gs_detection_mode",
+    "gs_active_threshold",
+    "gs_active_threshold_type",
+    "gs_active_comparison_operator",
+    "gs_active_nominal_fpr",
+    "gs_active_calibrated_from_current_clean_negatives",
+    "gs_detection_success",
+    "gs_official_tau_onebit",
+    "gs_official_tau_bits",
+    "gs_official_fpr",
+    "gs_official_user_number",
+    "gs_official_comparison_operator",
+    "gs_detection_policy_hash",
+)
 
 
 def _normalize_model_revision(value: Any) -> str | None:
@@ -142,38 +180,60 @@ def _strict_nonneg_int(value: Any) -> int:
     raise ValueError(f"invalid secret index: {value!r}")
 
 
+def _nonempty_role(value: Any) -> str | None:
+    """Normalize a role value to None if absent/blank."""
+    if value is None:
+        return None
+    normalized = str(value).strip().lower()
+    return normalized or None
+
+
 def _resolved_source_role(record: dict[str, Any]) -> str:
     """Resolve the normalized source role from a record, fail closed.
 
-    ``role`` and ``source_role`` must agree when both are present; neither is
+    Both values absent or blank → ``DetectorMissingStateError``.  Both
+    present and different → ``DetectorStateValidationError``.  Neither is
     silently defaulted to ``watermarked``.  Only ``clean`` and
     ``watermarked`` are accepted.
     """
-    role = record.get("role")
-    source_role = record.get("source_role")
+    role = _nonempty_role(record.get("role"))
+    source_role = _nonempty_role(record.get("source_role"))
 
     if role is None and source_role is None:
         raise DetectorMissingStateError(
             "record missing role/source_role"
         )
-    if role is None or not str(role).strip():
-        normalized = str(source_role).strip().lower()
-    elif source_role is None or not str(source_role).strip():
-        normalized = str(role).strip().lower()
-    else:
-        a = str(role).strip().lower()
-        b = str(source_role).strip().lower()
-        if a != b:
-            raise DetectorStateValidationError(
-                f"role={role!r} and source_role={source_role!r} conflict"
-            )
-        normalized = a
+    if role is not None and source_role is not None and role != source_role:
+        raise DetectorStateValidationError(
+            f"role={role!r} and source_role={source_role!r} conflict"
+        )
+    normalized = role if role is not None else source_role
 
     if normalized not in {"clean", "watermarked"}:
         raise DetectorStateValidationError(
             f"unknown source role: {normalized!r}"
         )
     return normalized
+
+
+def _normalize_detection_mode(value: Any) -> str:
+    """Canonicalize gs_detection_mode, fail closed.
+
+    Missing/blank → ``DetectorMissingStateError``; unknown value →
+    ``DetectorStateValidationError``.  Returns the canonical stripped mode —
+    the ONLY string used for hashing, provider kwargs, runtime comparison
+    and aggregate identity.
+    """
+    if value is None or not str(value).strip():
+        raise DetectorMissingStateError(
+            "missing required GS metadata field: gs_detection_mode"
+        )
+    mode = str(value).strip()
+    if mode not in GS_DETECTION_MODES:
+        raise DetectorStateValidationError(
+            f"unsupported gs_detection_mode: {mode!r}"
+        )
+    return mode
 
 
 # ---------------------------------------------------------------------------
@@ -193,11 +253,9 @@ _GS_REQUIRED_METADATA_FIELDS: tuple[str, ...] = (
     "provider_config_hash",
 )
 
-# Pipe-level fields validated for cohort uniformity (NOT part of the formal
-# provider_config_hash — they are a separate pipe identity).
-_GS_PIPE_CONFIG_FIELDS: tuple[str, ...] = (
+# Pipe fields other than model_revision — presence + non-empty required.
+_GS_PIPE_PRESENCE_FIELDS: tuple[str, ...] = (
     "model_id",
-    "model_revision",
     "scheduler",
     "resolution",
 )
@@ -235,8 +293,7 @@ def _validate_required_gs_metadata(record: dict[str, Any]) -> None:
     Runs before ``provider_kwargs("GS", row)`` so canonical defaults cannot
     mask missing or invalid values.  ``gs_secret_index`` must be a
     non-negative integer (strict — rejects float, bool, scientific notation);
-    ``gs_detection_mode`` must be present and one of the supported values —
-    no silent ``official_onebit`` fallback.
+    ``gs_detection_mode`` is canonicalized — no silent fallback.
     """
     run_id = str(record.get("run_id", ""))
     if not run_id.strip():
@@ -261,12 +318,9 @@ def _validate_required_gs_metadata(record: dict[str, Any]) -> None:
             f"integer, got {record.get('gs_secret_index')!r}"
         ) from exc
 
-    detection_mode = str(record.get("gs_detection_mode", "")).strip()
-    if detection_mode not in GS_DETECTION_MODES:
-        raise DetectorStateValidationError(
-            f"run_id={run_id}: unsupported gs_detection_mode: "
-            f"{detection_mode!r}"
-        )
+    # Canonicalize detection mode; returns canonical stripped mode.
+    canonical_mode = _normalize_detection_mode(record.get("gs_detection_mode"))
+    record["gs_detection_mode"] = canonical_mode
 
 
 # ---------------------------------------------------------------------------
@@ -306,23 +360,30 @@ def _validate_pipe_config_uniformity(
 ) -> dict[str, Any]:
     """Extract pipe-level config from resolved metadata, verify uniformity.
 
-    Every record MUST carry model_id, model_revision, scheduler, resolution.
-    Missing/None/empty → ``DetectorMissingStateError``; invalid resolution →
-    ``DetectorStateValidationError``; mixed profile → ``DetectorStateValidationError``.
-    No fallback defaults.  ``model_revision`` sentinels are normalized to
-    None for identity and pipe construction.
+    ``model_id`` / ``scheduler`` / ``resolution`` must be present and
+    non-empty.  ``model_revision`` has a distinct contract: the key must
+    exist (missing → ``DetectorMissingStateError``), but sentinel values
+    (None, "", none, null, unspecified) normalize to None.  No fallback
+    defaults.  Pipe identity hash uses the normalized revision.
     """
     pipe_hashes: dict[str, dict[str, Any]] = {}
     for rec in enriched_records:
         run_id = str(rec.get("run_id", ""))
 
-        for field in _GS_PIPE_CONFIG_FIELDS:
+        for field in _GS_PIPE_PRESENCE_FIELDS:
             value = rec.get(field)
             if value is None or str(value).strip() == "":
                 raise DetectorMissingStateError(
                     f"run_id={run_id}: missing required pipe config "
                     f"field: {field}"
                 )
+
+        if "model_revision" not in rec:
+            raise DetectorMissingStateError(
+                f"run_id={run_id}: missing required pipe config "
+                "field: model_revision"
+            )
+        normalized_revision = _normalize_model_revision(rec["model_revision"])
 
         try:
             resolution = _strict_positive_int(rec.get("resolution"),
@@ -331,8 +392,6 @@ def _validate_pipe_config_uniformity(
             raise DetectorStateValidationError(
                 f"run_id={run_id}: {exc}"
             ) from exc
-
-        normalized_revision = _normalize_model_revision(rec.get("model_revision"))
 
         from raven.eval_protocol import canonical_json_hash
 
@@ -394,10 +453,13 @@ def _validate_gs_provider_config(
         "resolution": pipe_cfg["resolution"],
     })
 
-    # Detection policy — separate hash from EXPLICITLY validated modes.
-    # Preflight has already rejected missing/empty/invalid modes, so no
-    # fallback default is consulted here.
-    modes = {str(r["gs_detection_mode"]) for r in enriched_records}
+    # Detection policy — separate hash from CANONICALIZED modes.  Preflight
+    # has already normalized each record's mode, so no fallback default is
+    # consulted here.
+    modes = {
+        _normalize_detection_mode(r["gs_detection_mode"])
+        for r in enriched_records
+    }
     if len(modes) != 1:
         raise DetectorStateValidationError(
             f"GS detection mode not uniform: {sorted(modes)}"
@@ -424,9 +486,9 @@ def _construct_provider(
     Merges the cohort-wide canonical config with per-row ``provider_kwargs``
     (secret index / sampling seed), so the provider receives the full formal
     configuration — never just the per-row secret state.  Validates runtime
-    provider fields (including ``gs_detection_mode``) against the canonical
-    config, secret provenance, target, mask, and protocol identity against
-    the resolved metadata.
+    provider fields (including canonical ``gs_detection_mode``) against the
+    canonical config, secret provenance, target, mask, and protocol identity
+    against the resolved metadata.
 
     Returns ``(provider, provenance_record)``.
 
@@ -445,11 +507,10 @@ def _construct_provider(
     # Full provider kwargs = canonical cohort config + per-row secret state.
     provider_kwargs_full = dict(canonical_config)
     provider_kwargs_full.update(per_row_kwargs)
-    # gs_detection_mode is a detection-time policy, not part of the embedding
-    # config hash, but it is required metadata and must be honored — no
+    # Canonical detection mode — from the normalized metadata value, never a
     # fallback default.
-    provider_kwargs_full["gs_detection_mode"] = str(
-        metadata["gs_detection_mode"])
+    canonical_mode = _normalize_detection_mode(metadata["gs_detection_mode"])
+    provider_kwargs_full["gs_detection_mode"] = canonical_mode
 
     try:
         provider = GsProvider(
@@ -499,13 +560,12 @@ def _construct_provider(
                 f"canonical={expected!r} runtime={actual!r}"
             )
 
-    # gs_detection_mode runtime validation — strict string comparison.
-    expected_mode = str(metadata["gs_detection_mode"])
+    # gs_detection_mode runtime validation — strict canonical string compare.
     actual_mode = str(getattr(provider, "gs_detection_mode", ""))
-    if actual_mode != expected_mode:
+    if actual_mode != canonical_mode:
         raise DetectorStateValidationError(
             f"run_id={run_id}: GS provider runtime gs_detection_mode "
-            f"mismatch: expected={expected_mode!r} runtime={actual_mode!r}"
+            f"mismatch: expected={canonical_mode!r} runtime={actual_mode!r}"
         )
 
     # ---- secret provenance ----
@@ -584,7 +644,7 @@ def _construct_provider(
         "gs_nonce_sha256": secret["nonce_sha256"],
         "gs_secret_bundle_sha256": secret["secret_bundle_sha256"],
         "gs_protocol_mode": actual_protocol,
-        "gs_detection_mode": actual_mode,
+        "gs_detection_mode": canonical_mode,
         "source_watermark_target_sha256": source_target,
         "detector_watermark_target_sha256": detector_target,
         "source_watermark_mask_sha256": source_mask,
@@ -665,6 +725,23 @@ def _validate_scoring_result(result: dict[str, Any], run_id: str) -> None:
         )
 
 
+def _finite_float(value: Any, label: str, run_id: str) -> float:
+    """Convert *value* to a finite float or raise DetectorScoringError."""
+    try:
+        result = float(value)
+    except (ValueError, TypeError):
+        raise DetectorScoringError(
+            f"run_id={run_id}: GS active policy {label} not convertible "
+            f"to float: {value!r}"
+        ) from None
+    if not math.isfinite(result):
+        raise DetectorScoringError(
+            f"run_id={run_id}: GS active policy {label} is non-finite: "
+            f"{value!r}"
+        )
+    return result
+
+
 def _validate_thresholds(
     thresholds: dict[str, Any], run_id: str,
 ) -> dict[str, Any]:
@@ -719,82 +796,167 @@ def _validate_thresholds(
 
 
 def _validate_active_policy(
-    active_policy: dict[str, Any],
+    active_policy: Any,
+    threshold_record: dict[str, Any],
     expected_mode: str,
     run_id: str,
 ) -> dict[str, Any]:
     """Validate the provider-owned active detection policy, fail closed.
 
-    Returns a sanitized record with the policy fields the adapter persists.
-    Raises ``DetectorScoringError`` on any violation.
+    Cross-validates the active policy against the already-validated
+    ``official_thresholds()`` record and the strict mode→policy binding.
+    Returns a sanitized policy record.  Every malformed value is classified
+    ``DetectorScoringError`` — no ``TypeError``/``ValueError`` escapes.
     """
-    missing = [k for k in _ACTIVE_POLICY_KEYS if k not in active_policy]
-    if missing:
-        raise DetectorScoringError(
-            f"run_id={run_id}: GS active detection policy missing keys: "
-            f"{missing}"
-        )
-
-    mode = str(active_policy["detection_mode"])
-    if mode != expected_mode:
-        raise DetectorScoringError(
-            f"run_id={run_id}: GS active policy detection_mode={mode!r} "
-            f"does not match metadata/provider mode {expected_mode!r}"
-        )
-
-    threshold = active_policy["threshold"]
-    threshold_type = str(active_policy["threshold_type"])
-    operator = str(active_policy["comparison_operator"])
-    nominal_fpr = active_policy["nominal_fpr"]
-    calibrated = active_policy["calibrated_from_current_clean_negatives"]
-    tau_onebit = active_policy["official_tau_onebit"]
-    tau_bits = active_policy["official_tau_bits"]
-
-    if operator not in _GS_OPERATORS:
-        raise DetectorScoringError(
-            f"run_id={run_id}: GS active policy comparison operator "
-            f"unsupported: {operator!r}"
-        )
-
-    if threshold is None:
-        raise DetectorScoringError(
-            f"run_id={run_id}: GS active policy threshold is None for "
-            f"mode {mode!r}"
-        )
     try:
-        threshold_f = float(threshold)
-    except (ValueError, TypeError):
-        raise DetectorScoringError(
-            f"run_id={run_id}: GS active policy threshold not convertible "
-            f"to float: {threshold!r}"
-        )
-    if not math.isfinite(threshold_f):
-        raise DetectorScoringError(
-            f"run_id={run_id}: GS active policy threshold non-finite: "
-            f"{threshold_f!r}"
-        )
-
-    # Official modes use the beta-tail thresholds in [0, 1].
-    if mode in ("official_onebit", "official_traceability"):
-        if not (0.0 <= threshold_f <= 1.0):
+        if not isinstance(active_policy, dict):
             raise DetectorScoringError(
-                f"run_id={run_id}: GS active policy threshold out of "
-                f"range [0,1]: {threshold_f!r}"
+                f"run_id={run_id}: GS active detection policy must be a "
+                f"dict, got {type(active_policy).__name__}"
             )
-        if mode == "official_onebit":
-            if threshold_f != float(tau_onebit):
+
+        missing = [k for k in _ACTIVE_POLICY_KEYS if k not in active_policy]
+        if missing:
+            raise DetectorScoringError(
+                f"run_id={run_id}: GS active detection policy missing "
+                f"keys: {missing}"
+            )
+
+        mode = active_policy["detection_mode"]
+        if not isinstance(mode, str):
+            raise DetectorScoringError(
+                f"run_id={run_id}: GS active policy detection_mode must "
+                f"be str, got {type(mode).__name__}"
+            )
+        mode = _normalize_detection_mode(mode)
+        if mode != expected_mode:
+            raise DetectorScoringError(
+                f"run_id={run_id}: GS active policy detection_mode={mode!r} "
+                f"does not match metadata/provider mode {expected_mode!r}"
+            )
+
+        threshold_type = active_policy["threshold_type"]
+        if not isinstance(threshold_type, str) or not threshold_type.strip():
+            raise DetectorScoringError(
+                f"run_id={run_id}: GS active policy threshold_type must "
+                f"be a non-empty str, got {threshold_type!r}"
+            )
+
+        operator = active_policy["comparison_operator"]
+        if not isinstance(operator, str):
+            raise DetectorScoringError(
+                f"run_id={run_id}: GS active policy comparison_operator "
+                f"must be str, got {type(operator).__name__}"
+            )
+
+        calibrated = active_policy["calibrated_from_current_clean_negatives"]
+        if not isinstance(calibrated, bool):
+            # bool("false") is True — truthiness is not acceptable.
+            raise DetectorScoringError(
+                f"run_id={run_id}: GS active policy "
+                "calibrated_from_current_clean_negatives must be a real "
+                f"bool, got {type(calibrated).__name__}: {calibrated!r}"
+            )
+
+        official_tau_onebit = _finite_float(
+            active_policy["official_tau_onebit"], "official_tau_onebit",
+            run_id)
+        official_tau_bits = _finite_float(
+            active_policy["official_tau_bits"], "official_tau_bits", run_id)
+        if not (0.0 <= official_tau_onebit <= 1.0) or not (
+                0.0 <= official_tau_bits <= 1.0):
+            raise DetectorScoringError(
+                f"run_id={run_id}: GS active policy official tau out of "
+                f"range [0,1]: onebit={official_tau_onebit!r} "
+                f"bits={official_tau_bits!r}"
+            )
+
+        threshold_f = _finite_float(active_policy["threshold"], "threshold",
+                                    run_id)
+        nominal_fpr = _finite_float(active_policy["nominal_fpr"],
+                                    "nominal_fpr", run_id)
+
+        # ---- cross-validation vs official_thresholds() record ----
+        expected_t1 = float(threshold_record["gs_official_tau_onebit"])
+        expected_tb = float(threshold_record["gs_official_tau_bits"])
+        if not math.isclose(official_tau_onebit, expected_t1,
+                            rel_tol=0.0, abs_tol=1e-12):
+            raise DetectorScoringError(
+                f"run_id={run_id}: GS active policy official_tau_onebit "
+                f"({official_tau_onebit!r}) disagrees with "
+                f"official_thresholds() ({expected_t1!r})"
+            )
+        if not math.isclose(official_tau_bits, expected_tb,
+                            rel_tol=0.0, abs_tol=1e-12):
+            raise DetectorScoringError(
+                f"run_id={run_id}: GS active policy official_tau_bits "
+                f"({official_tau_bits!r}) disagrees with "
+                f"official_thresholds() ({expected_tb!r})"
+            )
+
+        # ---- strict mode binding ----
+        binding = EXPECTED_POLICY[mode]
+        if threshold_type != binding["threshold_type"]:
+            raise DetectorScoringError(
+                f"run_id={run_id}: GS active policy threshold_type "
+                f"{threshold_type!r} does not match mode {mode!r} "
+                f"(expected {binding['threshold_type']!r})"
+            )
+        if operator != binding["comparison_operator"]:
+            raise DetectorScoringError(
+                f"run_id={run_id}: GS active policy comparison_operator "
+                f"{operator!r} does not match mode {mode!r} "
+                f"(expected {binding['comparison_operator']!r})"
+            )
+
+        # Threshold source binding.
+        if binding["threshold_source"] == "tau_onebit":
+            if not math.isclose(threshold_f, expected_t1,
+                                rel_tol=0.0, abs_tol=1e-12):
                 raise DetectorScoringError(
                     f"run_id={run_id}: official_onebit policy must use "
                     f"tau_onebit, got threshold={threshold_f!r} "
-                    f"tau_onebit={tau_onebit!r}"
+                    f"tau_onebit={expected_t1!r}"
                 )
-        else:
-            if threshold_f != float(tau_bits):
+        elif binding["threshold_source"] == "tau_bits":
+            if not math.isclose(threshold_f, expected_tb,
+                                rel_tol=0.0, abs_tol=1e-12):
                 raise DetectorScoringError(
                     f"run_id={run_id}: official_traceability policy must "
                     f"use tau_bits, got threshold={threshold_f!r} "
-                    f"tau_bits={tau_bits!r}"
+                    f"tau_bits={expected_tb!r}"
                 )
+
+        # Official modes: nominal_fpr + operator must equal official record.
+        if mode in ("official_onebit", "official_traceability"):
+            expected_fpr = float(threshold_record["gs_official_fpr"])
+            if not math.isclose(nominal_fpr, expected_fpr,
+                                rel_tol=1e-9, abs_tol=1e-12):
+                raise DetectorScoringError(
+                    f"run_id={run_id}: GS active policy nominal_fpr "
+                    f"({nominal_fpr!r}) disagrees with official_thresholds "
+                    f"fpr ({expected_fpr!r})"
+                )
+            expected_op = str(
+                threshold_record["gs_official_comparison_operator"])
+            if operator != expected_op:
+                raise DetectorScoringError(
+                    f"run_id={run_id}: GS active policy comparison_operator "
+                    f"{operator!r} disagrees with official_thresholds "
+                    f"({expected_op!r})"
+                )
+            if not (0.0 <= threshold_f <= 1.0):
+                raise DetectorScoringError(
+                    f"run_id={run_id}: GS active policy threshold out of "
+                    f"range [0,1]: {threshold_f!r}"
+                )
+    except DetectorScoringError:
+        raise
+    except Exception as exc:
+        raise DetectorScoringError(
+            f"run_id={run_id}: GS active detection policy malformed: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
 
     return {
         "gs_detection_mode": mode,
@@ -802,9 +964,9 @@ def _validate_active_policy(
         "gs_active_threshold_type": threshold_type,
         "gs_active_comparison_operator": operator,
         "gs_active_nominal_fpr": nominal_fpr,
-        "gs_active_calibrated_from_current_clean_negatives": bool(calibrated),
-        "gs_official_tau_onebit": float(tau_onebit),
-        "gs_official_tau_bits": float(tau_bits),
+        "gs_active_calibrated_from_current_clean_negatives": calibrated,
+        "gs_official_tau_onebit": official_tau_onebit,
+        "gs_official_tau_bits": official_tau_bits,
     }
 
 
@@ -874,8 +1036,8 @@ def load_state(records: list[dict[str, Any]], device: str,
             "schedulers_name": pipe_cfg["scheduler"],
             "disable_tqdm": True,
         }
-        # The pipe helper's kwarg is ``revision``; sentinel revisions
-        # (None, "", unspecified, ...) are never passed.
+        # The pipe helper's kwarg is ``revision``; normalized None (sentinel
+        # revisions) is never passed.
         if pipe_cfg.get("model_revision") is not None:
             load_kwargs["revision"] = pipe_cfg["model_revision"]
         pipe = pipe_utils.get_pipe_provider(**load_kwargs)
@@ -1057,17 +1219,23 @@ def score_image(provider_info: dict[str, Any], image_path: str, *,
             f"run_id={run_id}: gs_detection_success must be a real bool, "
             f"got {type(detection_success).__name__}: {detection_success!r}"
         )
+
+    # Cross-validated policy record — taus verified equal to the official
+    # thresholds record before any dict merge.
     policy_record = _validate_active_policy(
         active_policy,
-        expected_mode=str(provenance_record["gs_detection_mode"]),
+        threshold_record,
+        expected_mode=provenance_record["gs_detection_mode"],
         run_id=run_id,
     )
-    if policy_record["gs_detection_mode"] != provenance_record["gs_detection_mode"]:
-        raise DetectorScoringError(
-            f"run_id={run_id}: active policy mode "
-            f"{policy_record['gs_detection_mode']!r} disagrees with "
-            f"provider mode {provenance_record['gs_detection_mode']!r}"
-        )
+
+    # Single canonical source for official tau: policy_record (already
+    # cross-validated against threshold_record).  Drop the duplicates from
+    # the threshold record so dict merge can never mask a mismatch.
+    threshold_record_for_row = {
+        k: v for k, v in threshold_record.items()
+        if k not in ("gs_official_tau_onebit", "gs_official_tau_bits")
+    }
 
     # ---- provider config identity ----
     detector_config_hash = provider_info.get(
@@ -1115,14 +1283,33 @@ def score_image(provider_info: dict[str, Any], image_path: str, *,
         "gs_target_verified": True,
         "gs_mask_verified": True,
         "provider_config_verified": True,
-        # active detection policy (provider-owned)
+        # cross-validated active detection policy (canonical tau source)
         **policy_record,
         # detection success decision (provider-owned)
         "gs_detection_success": detection_success,
-        # official thresholds
-        **threshold_record,
+        # official threshold extras (tau dropped — single canonical source)
+        **threshold_record_for_row,
     }
     return scored
+
+
+def _official_policy_identity(row: dict[str, Any]) -> tuple[Any, ...]:
+    """Tuple identity of a scored row's detection policy, fail closed."""
+    mode = _normalize_detection_mode(row["gs_detection_mode"])
+    return (
+        mode,
+        row["gs_active_threshold"],
+        str(row["gs_active_threshold_type"]),
+        str(row["gs_active_comparison_operator"]),
+        row["gs_active_nominal_fpr"],
+        row["gs_active_calibrated_from_current_clean_negatives"],
+        row["gs_official_tau_onebit"],
+        row["gs_official_tau_bits"],
+        row["gs_official_fpr"],
+        row["gs_official_user_number"],
+        str(row["gs_official_comparison_operator"]),
+        str(row["gs_detection_policy_hash"]),
+    )
 
 
 def aggregate(detector_rows: list[dict[str, Any]], **extra) -> dict[str, Any]:
@@ -1132,15 +1319,17 @@ def aggregate(detector_rows: list[dict[str, Any]], **extra) -> dict[str, Any]:
 
     * ``gs_official_detection_summary`` — per-cohort rates of the
       provider-owned ``gs_detection_success`` decision under the active
-      official policy.  Fails closed (no summary) if policy fields differ
-      across scored rows.
+      official policy, with ``gs_official_detection_summary_status``.
+      Fails closed (no rates, ``failed_state_validation``) if any scored row
+      is missing policy fields, policy identity differs across rows, or a
+      decision is not a real bool.  Rows entirely without policy fields are
+      treated as legacy output → ``unavailable_legacy_rows``.
     * ``clean_calibrated_1pct_fpr_summary`` — the empirical operating point
       calibrated on the current original_clean cohort at 1% FPR.  This is
       NOT a GS official threshold.
 
-    ``detection_summary`` is kept as a deprecated alias of the empirical
-    summary for backward compatibility; it never represents the official
-    GS policy.
+    ``detection_summary`` is a deprecated alias of the empirical summary
+    with machine-readable deprecation markers.
     """
     from raven.metrics import summarize_detection
     from . import ROW_STATUS_SCORED
@@ -1171,73 +1360,110 @@ def aggregate(detector_rows: list[dict[str, Any]], **extra) -> dict[str, Any]:
     }
 
     # ---- 3.1 official detection summary (provider-owned decisions) ----
-    policy_rows = [
-        r for r in detector_rows
-        if r.get("status") == ROW_STATUS_SCORED
-        and r.get("gs_detection_success") is not None
+    scored_rows = [
+        row for row in detector_rows
+        if row.get("status") == ROW_STATUS_SCORED
     ]
-    if policy_rows:
-        policy_identities = {
-            (
-                str(r.get("gs_detection_mode", "")),
-                r.get("gs_active_threshold"),
-                str(r.get("gs_active_threshold_type", "")),
-                str(r.get("gs_active_comparison_operator", "")),
-                r.get("gs_active_nominal_fpr"),
-                bool(r.get("gs_active_calibrated_from_current_clean_negatives")),
-            )
-            for r in policy_rows
-        }
-        if len(policy_identities) != 1:
-            # Fail closed — never mix statistics across policies.
-            result["gs_official_detection_summary"] = {
-                "error": (
-                    "inconsistent detection policy across scored rows; "
-                    "no official summary emitted"
-                ),
-                "distinct_policies": len(policy_identities),
-            }
+    if scored_rows:
+        complete = [
+            row for row in scored_rows
+            if all(field in row for field in _OFFICIAL_POLICY_ROW_FIELDS)
+        ]
+        partial = [
+            row for row in scored_rows
+            if any(field in row for field in _OFFICIAL_POLICY_ROW_FIELDS)
+            and not all(field in row for field in _OFFICIAL_POLICY_ROW_FIELDS)
+        ]
+
+        # Fail closed: partial rows or a mix of complete/incomplete rows.
+        if partial or (complete and len(complete) != len(scored_rows)):
+            result["gs_official_detection_summary_status"] = (
+                "failed_state_validation")
+            result["gs_official_detection_summary_error"] = (
+                "scored rows have incomplete or mixed GS policy fields; "
+                "no detection rates computed")
+            # Never emit a summary dict here — downstream must not mistake
+            # an error payload for a real official summary.
+        elif not complete:
+            # All scored rows are legacy (no policy fields at all).
+            result["gs_official_detection_summary_status"] = (
+                "unavailable_legacy_rows")
         else:
-            first = policy_rows[0]
-            official_summary: dict[str, Any] = {
-                "detection_mode": str(first.get("gs_detection_mode", "")),
-                "threshold": first.get("gs_active_threshold"),
-                "threshold_type": str(
-                    first.get("gs_active_threshold_type", "")),
-                "comparison_operator": str(
-                    first.get("gs_active_comparison_operator", "")),
-                "nominal_fpr": first.get("gs_active_nominal_fpr"),
-                "calibrated_from_current_clean_negatives": bool(
-                    first.get(
-                        "gs_active_calibrated_from_current_clean_negatives")),
-            }
-            for cohort in (
-                "original_clean", "original_watermarked",
-                "attacked_watermarked", "attacked_clean",
-            ):
-                cohort_rows = [
-                    r for r in policy_rows
-                    if r.get("evaluation_cohort") == cohort
+            # Every scored row carries full policy fields.
+            try:
+                identities = {_official_policy_identity(row)
+                              for row in complete}
+            except (DetectorMissingStateError,
+                    DetectorStateValidationError,
+                    DetectorScoringError) as exc:
+                result["gs_official_detection_summary_status"] = (
+                    "failed_state_validation")
+                result["gs_official_detection_summary_error"] = str(exc)
+            else:
+                bad_decision = [
+                    row for row in complete
+                    if not isinstance(row["gs_detection_success"], bool)
                 ]
-                if cohort_rows:
-                    successes = [r["gs_detection_success"]
-                                 for r in cohort_rows]
-                    rate = sum(1 for s in successes if s) / len(successes)
+                if bad_decision:
+                    result["gs_official_detection_summary_status"] = (
+                        "failed_state_validation")
+                    result["gs_official_detection_summary_error"] = (
+                        "gs_detection_success must be a real bool in every "
+                        "scored row; no detection rates computed")
+                elif len(identities) != 1:
+                    result["gs_official_detection_summary_status"] = (
+                        "failed_state_validation")
+                    result["gs_official_detection_summary_error"] = (
+                        f"detection policy not uniform across scored rows "
+                        f"({len(identities)} distinct identities); no "
+                        "detection rates computed")
                 else:
-                    rate = None
-                if cohort == "original_clean":
-                    official_summary["original_clean_positive_rate"] = rate
-                elif cohort == "original_watermarked":
-                    official_summary["original_watermarked_detection_rate"] = rate
-                elif cohort == "attacked_watermarked":
-                    official_summary["attacked_watermarked_detection_rate"] = rate
-                else:
-                    official_summary["attacked_clean_positive_rate"] = rate
-            att_rate = official_summary.get("attacked_watermarked_detection_rate")
-            official_summary["attack_success"] = (
-                None if att_rate is None else 1.0 - att_rate
-            )
-            result["gs_official_detection_summary"] = official_summary
+                    first = complete[0]
+                    official_summary: dict[str, Any] = {
+                        "detection_mode": str(first.get("gs_detection_mode",
+                                                         "")),
+                        "threshold": first.get("gs_active_threshold"),
+                        "threshold_type": str(
+                            first.get("gs_active_threshold_type", "")),
+                        "comparison_operator": str(
+                            first.get("gs_active_comparison_operator", "")),
+                        "nominal_fpr": first.get("gs_active_nominal_fpr"),
+                        "calibrated_from_current_clean_negatives": bool(
+                            first.get(
+                                "gs_active_calibrated_from_current_clean_negatives")),
+                    }
+                    for cohort in (
+                        "original_clean", "original_watermarked",
+                        "attacked_watermarked", "attacked_clean",
+                    ):
+                        cohort_rows = [
+                            r for r in complete
+                            if r.get("evaluation_cohort") == cohort
+                        ]
+                        if cohort_rows:
+                            successes = [r["gs_detection_success"]
+                                         for r in cohort_rows]
+                            rate = (sum(1 for s in successes if s)
+                                    / len(successes))
+                        else:
+                            rate = None
+                        if cohort == "original_clean":
+                            official_summary["original_clean_positive_rate"] = rate
+                        elif cohort == "original_watermarked":
+                            official_summary[
+                                "original_watermarked_detection_rate"] = rate
+                        elif cohort == "attacked_watermarked":
+                            official_summary[
+                                "attacked_watermarked_detection_rate"] = rate
+                        else:
+                            official_summary["attacked_clean_positive_rate"] = rate
+                    att_rate = official_summary.get(
+                        "attacked_watermarked_detection_rate")
+                    official_summary["attack_success"] = (
+                        None if att_rate is None else 1.0 - att_rate
+                    )
+                    result["gs_official_detection_summary_status"] = "available"
+                    result["gs_official_detection_summary"] = official_summary
 
     # ---- 3.2 empirical clean-calibrated summary ----
     clean = cohorts.get("original_clean", [])
@@ -1259,8 +1485,10 @@ def aggregate(detector_rows: list[dict[str, Any]], **extra) -> dict[str, Any]:
         }
         result["clean_calibrated_1pct_fpr_summary"] = empirical
         # ---- 3.3 backward-compat alias — empirical only, never official ----
-        # Deprecated alias: downstream code may read detection_summary, but it
-        # is the empirical 1% FPR operating point, NOT the GS official policy.
+        # Machine-readable deprecation markers; never misread as GS official
+        # policy.
         result["detection_summary"] = dict(empirical)
+        result["detection_summary_alias_of"] = "clean_calibrated_1pct_fpr_summary"
+        result["detection_summary_deprecated"] = True
 
     return result
