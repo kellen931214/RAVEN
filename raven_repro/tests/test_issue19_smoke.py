@@ -559,15 +559,20 @@ class TestMetricCohortCompleteness:
             assert result["missing_metric_cohorts"] == []
 
     def test_no_attacked_clean_does_not_block_original_report(self, monkeypatch):
-        """attacked_clean scoring fails, but 3 primary cohorts succeed → completed.
+        """attacked_clean missing state, but 3 primary cohorts succeed → completed.
 
-        Uses evaluation_entry to make ONLY attacked_clean return None while
-        original_clean, original_watermarked, attacked_watermarked all score
-        successfully.  The primary threshold report must be complete even
-        though recalibrated is unavailable.
+        Uses evaluation_entry to make ONLY attacked_clean raise
+        DetectorMissingStateError while original_clean, original_watermarked,
+        attacked_watermarked all score successfully.  Missing state in the
+        optional cohort is a soft failure — it does not downgrade the primary
+        report.  Hard failures (scoring_error, etc.) in optional cohorts
+        would still propagate.
         """
         from experiments.eval import evaluate_detector
-        from raven.detectors import STATUS_COMPLETED, ROW_STATUS_FAILED_SCORING
+        from raven.detectors import (
+            STATUS_COMPLETED, ROW_STATUS_FAILED_MISSING_STATE,
+            DetectorMissingStateError,
+        )
 
         rec_clean = _make_record("1", "clean", method="TR",
                                   source_metadata=TR_META)
@@ -578,7 +583,8 @@ class TestMetricCohortCompleteness:
                        record=None, evaluation_entry=None, steps=50):
             if (evaluation_entry is not None
                     and evaluation_entry.get("evaluation_cohort") == "attacked_clean"):
-                return None  # attacked_clean fails
+                raise DetectorMissingStateError(
+                    "optional detector state missing for attacked_clean")
             return {"raw_score": 0.001, "canonical_score": 10.0}
 
         self._patch_tr(monkeypatch, fake_score)
@@ -589,7 +595,8 @@ class TestMetricCohortCompleteness:
             result = evaluate_detector([rec_clean, rec_wm], out,
                                        "TR", device="cpu")
 
-            # Stage must be completed — primary cohorts all OK
+            # Stage must be completed — primary cohorts all OK,
+            # optional failure is soft (missing_required_state only)
             assert result["status"] == STATUS_COMPLETED, (
                 f"expected completed, got {result['status']}"
             )
@@ -616,7 +623,7 @@ class TestMetricCohortCompleteness:
             assert ("original_clean", "scored") in statuses
             assert ("original_watermarked", "scored") in statuses
             assert ("attacked_watermarked", "scored") in statuses
-            assert ("attacked_clean", ROW_STATUS_FAILED_SCORING) in statuses
+            assert ("attacked_clean", ROW_STATUS_FAILED_MISSING_STATE) in statuses
 
     def test_cannot_convert_to_float_fails(self, monkeypatch):
         """String that can't convert to float → failed_scoring."""

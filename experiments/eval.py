@@ -40,6 +40,7 @@ from raven.detectors import (  # noqa: E402
     ROW_STATUS_FAILED_SCORING,
     ROW_STATUS_FAILED_STATE_VALIDATION,
     ROW_STATUS_FAILED_MISSING_DEPENDENCY,
+    ROW_STATUS_FAILED_INTERNAL_ERROR,
     STATUS_COMPLETED,
     STATUS_COMPLETED_WITH_ERRORS,
     STATUS_SKIPPED_INSUFFICIENT_DATA,
@@ -673,6 +674,11 @@ def evaluate_detector(
     except ImportError as exc:
         load_error_type = STATUS_FAILED_MISSING_DEPENDENCY
         load_error_detail = str(exc)
+    except TypeError as exc:
+        # Raw TypeError during provider setup is a provider initialization
+        # failure (bad constructor arguments, wrong type, etc.).
+        load_error_type = STATUS_FAILED_PROVIDER_INITIALIZATION
+        load_error_detail = f"{type(exc).__name__}: {exc}"
     except Exception as exc:
         load_error_type = STATUS_FAILED_INTERNAL_ERROR
         load_error_detail = f"{type(exc).__name__}: {exc}"
@@ -700,6 +706,26 @@ def evaluate_detector(
     for entry in image_index:
         key = (entry["run_id"], entry["source_role"])
         matched_record = record_index.get(key, {})
+
+        # ---- Issue #25: image path preflight ----
+        image_path_obj = Path(entry["image_path"])
+        if not image_path_obj.is_file():
+            row = {
+                "run_id": entry["run_id"],
+                "source_role": entry["source_role"],
+                "evaluation_cohort": entry["evaluation_cohort"],
+                "image_path": entry["image_path"],
+                "method": method,
+                "status": ROW_STATUS_FAILED_MISSING_IMAGE,
+                "failure_cause": FAILURE_CAUSE_MISSING_IMAGE,
+                "error_type": "FileNotFoundError",
+                "error": (
+                    "Image file does not exist or is not a regular file: "
+                    f"{entry['image_path']}"
+                ),
+            }
+            detector_rows.append(row)
+            continue
 
         score = None
         row_status = ROW_STATUS_FAILED_SCORING
@@ -756,13 +782,31 @@ def evaluate_detector(
             failure_cause = FAILURE_CAUSE_SCORING_ERROR
             error_type = type(exc).__name__
             error_msg = str(exc)
+        except DetectorDependencyError as exc:
+            row_status = ROW_STATUS_FAILED_MISSING_DEPENDENCY
+            failure_cause = FAILURE_CAUSE_MISSING_DEPENDENCY
+            error_type = type(exc).__name__
+            error_msg = str(exc)
+        except ImportError as exc:
+            # ModuleNotFoundError is a subclass of ImportError — single handler
+            row_status = ROW_STATUS_FAILED_MISSING_DEPENDENCY
+            failure_cause = FAILURE_CAUSE_MISSING_DEPENDENCY
+            error_type = type(exc).__name__
+            error_msg = str(exc)
         except FileNotFoundError:
             row_status = ROW_STATUS_FAILED_MISSING_IMAGE
             failure_cause = FAILURE_CAUSE_MISSING_IMAGE
             error_type = "FileNotFoundError"
-            error_msg = f"Image not found: {entry['image_path']}"
+            error_msg = f"Image not found inside score_image: {entry['image_path']}"
+        except TypeError as exc:
+            # Raw TypeError inside score_image is internal_error —
+            # only load_state() TypeError maps to provider initialization.
+            row_status = ROW_STATUS_FAILED_INTERNAL_ERROR
+            failure_cause = FAILURE_CAUSE_INTERNAL_ERROR
+            error_type = type(exc).__name__
+            error_msg = str(exc)
         except Exception as exc:
-            row_status = ROW_STATUS_FAILED_SCORING
+            row_status = ROW_STATUS_FAILED_INTERNAL_ERROR
             failure_cause = FAILURE_CAUSE_INTERNAL_ERROR
             error_type = type(exc).__name__
             error_msg = f"{type(exc).__name__}: {exc}"

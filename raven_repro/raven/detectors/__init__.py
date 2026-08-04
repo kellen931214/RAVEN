@@ -56,6 +56,7 @@ ROW_STATUS_FAILED_PROVIDER = "failed_provider"
 ROW_STATUS_FAILED_SCORING = "failed_scoring"
 ROW_STATUS_FAILED_STATE_VALIDATION = "failed_state_validation"
 ROW_STATUS_FAILED_MISSING_DEPENDENCY = "failed_missing_dependency"
+ROW_STATUS_FAILED_INTERNAL_ERROR = "failed_internal_error"
 
 ROW_NONZERO_STATUSES = frozenset({
     ROW_STATUS_FAILED_MISSING_IMAGE,
@@ -64,6 +65,7 @@ ROW_NONZERO_STATUSES = frozenset({
     ROW_STATUS_FAILED_SCORING,
     ROW_STATUS_FAILED_STATE_VALIDATION,
     ROW_STATUS_FAILED_MISSING_DEPENDENCY,
+    ROW_STATUS_FAILED_INTERNAL_ERROR,
 })
 
 # Row failure causes — structured, never derived from error strings
@@ -83,7 +85,19 @@ _ROW_STATUS_TO_FAILURE_CAUSE: dict[str, str] = {
     ROW_STATUS_FAILED_SCORING: FAILURE_CAUSE_SCORING_ERROR,
     ROW_STATUS_FAILED_STATE_VALIDATION: FAILURE_CAUSE_STATE_VALIDATION,
     ROW_STATUS_FAILED_MISSING_DEPENDENCY: FAILURE_CAUSE_MISSING_DEPENDENCY,
+    ROW_STATUS_FAILED_INTERNAL_ERROR: FAILURE_CAUSE_INTERNAL_ERROR,
 }
+
+# Known failure causes — used to validate explicit row failure_cause values
+KNOWN_FAILURE_CAUSES = frozenset({
+    FAILURE_CAUSE_INTERNAL_ERROR,
+    FAILURE_CAUSE_STATE_VALIDATION,
+    FAILURE_CAUSE_PROVIDER_INITIALIZATION,
+    FAILURE_CAUSE_SCORING_ERROR,
+    FAILURE_CAUSE_MISSING_IMAGE,
+    FAILURE_CAUSE_MISSING_REQUIRED_STATE,
+    FAILURE_CAUSE_MISSING_DEPENDENCY,
+})
 
 # Stage-level status
 STATUS_COMPLETED = "completed"
@@ -127,6 +141,14 @@ _FAILURE_CAUSE_TO_STAGE_STATUS: dict[str, str] = {
     FAILURE_CAUSE_MISSING_DEPENDENCY: STATUS_FAILED_MISSING_DEPENDENCY,
 }
 
+# Optional-cohort failure causes that may be silently recorded without
+# downgrading the primary report.  Only ``missing_required_state`` qualifies;
+# all other causes (scoring_error, missing_image, state_validation, etc.)
+# are hard failures regardless of which cohort they occur in.
+OPTIONAL_SOFT_FAILURE_CAUSES = frozenset({
+    FAILURE_CAUSE_MISSING_REQUIRED_STATE,
+})
+
 # Precedence order for stage-status reduction (highest first).
 # Each entry is (failure_cause, stage_status_when_dominant).
 _STAGE_PRECEDENCE: list[tuple[str, str]] = [
@@ -144,11 +166,26 @@ _STAGE_PRECEDENCE: list[tuple[str, str]] = [
 # Stage-status reducer — single deterministic entry point
 # ---------------------------------------------------------------------------
 def _failure_cause_for_row(row: dict[str, Any]) -> str | None:
-    """Return the structured failure cause for a detector row, or None if scored."""
+    """Return the structured failure cause for a detector row, or None if scored.
+
+    Explicit ``failure_cause`` on the row takes priority over the
+    status-derived mapping.  An unrecognized explicit cause fails closed
+    as ``internal_error``.
+    """
     status = row.get("status", "")
     if status == ROW_STATUS_SCORED:
         return None
-    return _ROW_STATUS_TO_FAILURE_CAUSE.get(status)
+
+    explicit = row.get("failure_cause")
+    if explicit is not None and explicit != "":
+        if explicit in KNOWN_FAILURE_CAUSES:
+            return explicit
+        # Unknown structured cause — fail closed
+        return FAILURE_CAUSE_INTERNAL_ERROR
+
+    return _ROW_STATUS_TO_FAILURE_CAUSE.get(
+        status, FAILURE_CAUSE_INTERNAL_ERROR,
+    )
 
 
 def reduce_detector_stage_status(
@@ -208,29 +245,36 @@ def reduce_detector_stage_status(
 
     # Determine stage status
     if effective_failure is not None:
-        # If all failures are in optional cohorts and primary metrics are
-        # complete, the stage is still ``completed`` — optional failures
-        # must never downgrade the primary report (Issue #19 / #25 D.5).
+        # If all failures are in optional cohorts, primary metrics are
+        # complete, AND every failure cause is a soft (exemptible) cause,
+        # the stage remains ``completed``.  Hard failures in optional
+        # cohorts (scoring_error, missing_image, state_validation,
+        # provider_init, internal_error) always propagate per precedence.
         total_failed = sum(failure_cause_counts.values())
         primary_failed = total_failed - optional_failed_count
         if primary_failed <= 0 and primary_metrics_complete and scored_count > 0:
-            reason_parts = []
-            for cause, _st in _STAGE_PRECEDENCE:
-                cnt = failure_cause_counts.get(cause, 0)
-                if cnt > 0:
-                    reason_parts.append(f"{cnt} {cause}")
-            reason = ", ".join(reason_parts)
-            return {
-                "status": STATUS_COMPLETED,
-                "dominant_failure_cause": effective_failure,
-                "status_reducer_reason": (
-                    f"all {total_failed} failure(s) in optional cohorts; "
-                    f"primary metrics complete: {reason}"
-                ),
-                "available": True,
-                "failure_cause_counts": failure_cause_counts,
-                "row_status_counts": row_status_counts,
-            }
+            # Check every failure cause — only soft causes can be exempted
+            hard_causes = set(failure_cause_counts.keys()) - OPTIONAL_SOFT_FAILURE_CAUSES
+            if not hard_causes:
+                reason_parts = []
+                for cause, _st in _STAGE_PRECEDENCE:
+                    cnt = failure_cause_counts.get(cause, 0)
+                    if cnt > 0:
+                        reason_parts.append(f"{cnt} {cause}")
+                reason = ", ".join(reason_parts)
+                return {
+                    "status": STATUS_COMPLETED,
+                    "dominant_failure_cause": effective_failure,
+                    "status_reducer_reason": (
+                        f"all {total_failed} soft failure(s) in optional "
+                        f"cohorts; primary metrics complete: {reason}"
+                    ),
+                    "available": True,
+                    "failure_cause_counts": failure_cause_counts,
+                    "row_status_counts": row_status_counts,
+                }
+            # Hard failure in optional cohort — fall through to normal
+            # precedence handling below
 
         # missing_required_state softens to completed_with_errors when
         # there are valid scores AND the primary report is complete.

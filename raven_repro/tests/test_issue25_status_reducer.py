@@ -58,9 +58,15 @@ def _write_fake_run(tmp_path, method="TR", records=None):
         role = r.get("role", "watermarked")
         rid = r["run_id"]
         write_record(out, role, rid, r)
+        # Create output image
         img = out / "samples" / role / rid / "output.png"
         img.parent.mkdir(parents=True, exist_ok=True)
         img.write_bytes(b"fake png")
+        # Create input image so preflight doesn't fail for original cohorts
+        input_path = Path(r.get("input_path", f"/tmp/in_{rid}.png"))
+        if not input_path.is_file():
+            input_path.parent.mkdir(parents=True, exist_ok=True)
+            input_path.write_bytes(b"fake png")
     rebuild_records_jsonl(out)
     return out
 
@@ -271,14 +277,37 @@ class TestReducerUnit:
         assert r["available"] is True
 
     def test_all_optional_failures_primary_complete(self):
-        """D.5: optional cohort failures only → completed with flag."""
+        """D.5: optional cohort missing-state failures only → completed.
+
+        Only ``missing_required_state`` is a soft cause — scoring_error
+        and other hard failures in optional cohorts must still propagate.
+        """
+        from raven.detectors import (
+            reduce_detector_stage_status,
+            ROW_STATUS_SCORED,
+            ROW_STATUS_FAILED_MISSING_STATE,
+            STATUS_COMPLETED,
+        )
+        # 3 primary rows scored, 1 optional missing-state row
+        r = reduce_detector_stage_status(
+            [self._row(ROW_STATUS_SCORED)] * 3
+            + [self._row(ROW_STATUS_FAILED_MISSING_STATE)],
+            primary_report_available=True,
+            primary_metrics_complete=True,
+            optional_failed_count=1,
+        )
+        assert r["status"] == STATUS_COMPLETED
+        assert "dominant_failure_cause" in r
+
+    def test_optional_hard_failure_not_exempted(self):
+        """Optional scoring_error must NOT be suppressed to completed."""
         from raven.detectors import (
             reduce_detector_stage_status,
             ROW_STATUS_SCORED,
             ROW_STATUS_FAILED_SCORING,
-            STATUS_COMPLETED,
+            STATUS_FAILED_SCORING,
         )
-        # 3 primary rows scored, 1 optional row failed
+        # 3 primary rows scored, 1 optional scoring_error
         r = reduce_detector_stage_status(
             [self._row(ROW_STATUS_SCORED)] * 3
             + [self._row(ROW_STATUS_FAILED_SCORING)],
@@ -286,7 +315,7 @@ class TestReducerUnit:
             primary_metrics_complete=True,
             optional_failed_count=1,
         )
-        assert r["status"] == STATUS_COMPLETED
+        assert r["status"] == STATUS_FAILED_SCORING
 
     def test_empty_rows_skipped(self):
         from raven.detectors import (
@@ -1101,4 +1130,584 @@ class TestQualityStageStatus:
             assert result["stages"]["quality"]["status"] == (
                 "skipped_insufficient_data")
             assert result["stages"]["quality"]["available"] is False
+
+
+# ===========================================================================
+# F. Explicit failure-cause precedence (reducer unit tests)
+# ===========================================================================
+class TestExplicitFailureCause:
+    """Reducer must use explicit ``failure_cause``, not derive from status."""
+
+    def test_explicit_internal_error_overrides_status(self):
+        """Row with status=failed_scoring + explicit internal_error
+        → dominant = internal_error, stage = failed_internal_error."""
+        from raven.detectors import (
+            reduce_detector_stage_status,
+            ROW_STATUS_FAILED_SCORING,
+            ROW_STATUS_FAILED_MISSING_STATE,
+            STATUS_FAILED_INTERNAL_ERROR,
+            FAILURE_CAUSE_INTERNAL_ERROR,
+        )
+        rows = [
+            {"status": ROW_STATUS_FAILED_SCORING,
+             "failure_cause": FAILURE_CAUSE_INTERNAL_ERROR},
+        ]
+        r = reduce_detector_stage_status(rows)
+        assert r["dominant_failure_cause"] == FAILURE_CAUSE_INTERNAL_ERROR
+        assert r["status"] == STATUS_FAILED_INTERNAL_ERROR
+
+    def test_explicit_internal_error_beats_many_others(self):
+        """1 explicit internal_error + 10 missing_state + 10 scoring_error
+        → failed_internal_error."""
+        from raven.detectors import (
+            reduce_detector_stage_status,
+            ROW_STATUS_FAILED_SCORING,
+            ROW_STATUS_FAILED_MISSING_STATE,
+            STATUS_FAILED_INTERNAL_ERROR,
+            FAILURE_CAUSE_INTERNAL_ERROR,
+            FAILURE_CAUSE_MISSING_REQUIRED_STATE,
+        )
+        rows = [
+            {"status": ROW_STATUS_FAILED_SCORING,
+             "failure_cause": FAILURE_CAUSE_INTERNAL_ERROR},
+        ]
+        rows += [{"status": ROW_STATUS_FAILED_MISSING_STATE}] * 10
+        rows += [{"status": ROW_STATUS_FAILED_SCORING}] * 10
+        r = reduce_detector_stage_status(rows)
+        assert r["dominant_failure_cause"] == FAILURE_CAUSE_INTERNAL_ERROR
+        assert r["status"] == STATUS_FAILED_INTERNAL_ERROR
+        assert "takes precedence" in r["status_reducer_reason"]
+
+    def test_unknown_explicit_cause_fails_closed(self):
+        """Unrecognized explicit failure_cause → internal_error."""
+        from raven.detectors import (
+            reduce_detector_stage_status,
+            STATUS_FAILED_INTERNAL_ERROR,
+            FAILURE_CAUSE_INTERNAL_ERROR,
+        )
+        row = {
+            "status": "failed_scoring",
+            "failure_cause": "unrecognized_failure",
+        }
+        r = reduce_detector_stage_status([row])
+        assert r["dominant_failure_cause"] == FAILURE_CAUSE_INTERNAL_ERROR
+        assert r["status"] == STATUS_FAILED_INTERNAL_ERROR
+
+
+# ===========================================================================
+# G. Optional-cohort hard failure integration tests
+# ===========================================================================
+class TestOptionalHardFailures:
+    """Hard failures in optional cohorts must propagate, not be suppressed."""
+
+    def test_optional_missing_image_primary_complete(self, monkeypatch):
+        """optional missing_image + primary complete → failed_missing_image."""
+        from experiments.eval import evaluate_detector
+        from raven.detectors import STATUS_FAILED_MISSING_IMAGE
+
+        rec_clean = _make_record("1", "clean", method="TR",
+                                 source_metadata=TR_META)
+        rec_wm = _make_record("1", "watermarked", method="TR",
+                              source_metadata=TR_META)
+
+        def fake_score(provider_info, image_path, *,
+                       record=None, evaluation_entry=None, steps=50):
+            if (evaluation_entry is not None
+                    and evaluation_entry.get("evaluation_cohort") == "attacked_clean"):
+                raise FileNotFoundError("optional image missing")
+            return {"raw_score": 0.001, "canonical_score": 10.0}
+
+        _patch_tr_module(monkeypatch, score_fn=fake_score)
+
+        with tempfile.TemporaryDirectory() as td:
+            out = _write_fake_run(Path(td), method="TR",
+                                  records=[rec_clean, rec_wm])
+            result = evaluate_detector([rec_clean, rec_wm], out,
+                                       "TR", device="cpu")
+            assert result["status"] == STATUS_FAILED_MISSING_IMAGE
+
+    def test_optional_state_validation_primary_complete(self, monkeypatch):
+        """optional state_validation + primary complete →
+        failed_state_validation."""
+        from experiments.eval import evaluate_detector
+        from raven.detectors import (
+            STATUS_FAILED_STATE_VALIDATION, DetectorStateValidationError,
+        )
+
+        rec_clean = _make_record("1", "clean", method="TR",
+                                 source_metadata=TR_META)
+        rec_wm = _make_record("1", "watermarked", method="TR",
+                              source_metadata=TR_META)
+
+        def fake_score(provider_info, image_path, *,
+                       record=None, evaluation_entry=None, steps=50):
+            if (evaluation_entry is not None
+                    and evaluation_entry.get("evaluation_cohort") == "attacked_clean"):
+                raise DetectorStateValidationError(
+                    "optional provenance mismatch")
+            return {"raw_score": 0.001, "canonical_score": 10.0}
+
+        _patch_tr_module(monkeypatch, score_fn=fake_score)
+
+        with tempfile.TemporaryDirectory() as td:
+            out = _write_fake_run(Path(td), method="TR",
+                                  records=[rec_clean, rec_wm])
+            result = evaluate_detector([rec_clean, rec_wm], out,
+                                       "TR", device="cpu")
+            assert result["status"] == STATUS_FAILED_STATE_VALIDATION
+
+
+# ===========================================================================
+# H. Image path preflight — actual missing files
+# ===========================================================================
+class TestImagePreflight:
+    """Image preflight checks path BEFORE calling score_image."""
+
+    def test_missing_input_image_preflight(self, monkeypatch):
+        """Delete one input image → that row is caught by preflight.
+
+        Other rows with valid images still call score_image.  Only the row
+        with the deleted input is classified as failed_missing_image.
+        """
+        from experiments.eval import evaluate_detector
+        from raven.detectors import (
+            STATUS_FAILED_MISSING_IMAGE, ROW_STATUS_FAILED_MISSING_IMAGE,
+        )
+
+        rec_clean = _make_record("1", "clean", method="TR",
+                                 source_metadata=TR_META)
+        rec_wm = _make_record("1", "watermarked", method="TR",
+                              source_metadata=TR_META)
+        rec_wm2 = _make_record("2", "watermarked", method="TR",
+                               source_metadata=TR_META)
+
+        called_entries = []
+
+        def track_calls(*a, **kw):
+            called_entries.append(kw.get("evaluation_entry", {}).get(
+                "evaluation_cohort", "unknown"))
+            return {"raw_score": 0.001, "canonical_score": 10.0}
+
+        _patch_tr_module(monkeypatch, score_fn=track_calls)
+
+        with tempfile.TemporaryDirectory() as td:
+            out = _write_fake_run(Path(td), method="TR",
+                                  records=[rec_clean, rec_wm, rec_wm2])
+            # Delete input image for the clean record
+            input_path = Path(rec_clean["input_path"])
+            input_path.unlink()
+
+            result = evaluate_detector([rec_clean, rec_wm, rec_wm2], out,
+                                       "TR", device="cpu")
+            # original_clean should NOT have called score_image
+            assert "original_clean" not in called_entries, (
+                f"preflight should have caught missing input before "
+                f"score_image, but original_clean was in {called_entries}")
+            # Other cohorts should have called score_image
+            assert len(called_entries) >= 3
+            assert result["status"] == STATUS_FAILED_MISSING_IMAGE
+            rc = result["row_status_counts"]
+            assert rc.get(ROW_STATUS_FAILED_MISSING_IMAGE, 0) >= 1
+
+    def test_missing_output_image_preflight(self, monkeypatch):
+        """Delete one output image → that row caught by preflight.
+
+        Other rows with valid images still call score_image.
+        """
+        from experiments.eval import evaluate_detector, _build_detector_image_index
+        from raven.detectors import (
+            STATUS_FAILED_MISSING_IMAGE, ROW_STATUS_FAILED_MISSING_IMAGE,
+        )
+        from raven.experiment_io import output_image_path
+
+        rec_wm = _make_record("1", "watermarked", method="TR",
+                              source_metadata=TR_META)
+        rec_wm2 = _make_record("2", "watermarked", method="TR",
+                               source_metadata=TR_META)
+
+        called_entries = []
+
+        def track_calls(*a, **kw):
+            called_entries.append(kw.get("evaluation_entry", {}).get(
+                "evaluation_cohort", "unknown"))
+            return {"raw_score": 0.001, "canonical_score": 10.0}
+
+        _patch_tr_module(monkeypatch, score_fn=track_calls)
+
+        with tempfile.TemporaryDirectory() as td:
+            out = _write_fake_run(Path(td), method="TR",
+                                  records=[rec_wm, rec_wm2])
+            # Delete the attacked_watermarked output image for run_id=1
+            att_path = output_image_path(out, "watermarked", "1")
+            Path(str(att_path)).unlink()
+
+            result = evaluate_detector([rec_wm, rec_wm2], out,
+                                       "TR", device="cpu")
+            # attacked_watermarked for run_id=1 should NOT have called
+            # score_image
+            assert "attacked_watermarked" in called_entries or len(
+                called_entries) >= 3, (
+                "other rows should still call score_image")
+            assert result["status"] == STATUS_FAILED_MISSING_IMAGE
+            rc = result["row_status_counts"]
+            assert rc.get(ROW_STATUS_FAILED_MISSING_IMAGE, 0) >= 1
+
+
+# ===========================================================================
+# I. Exception classification — load_state TypeError + per-row dependency
+# ===========================================================================
+class TestExceptionClassification:
+    """Raw TypeError in load_state → provider init.
+    Per-row dependency errors → missing_dependency."""
+
+    def test_raw_typeerror_in_load_state(self, monkeypatch):
+        """TypeError in load_state → failed_provider_initialization."""
+        from experiments.eval import evaluate_detector
+        from raven.detectors import STATUS_FAILED_PROVIDER_INITIALIZATION
+
+        rec_wm = _make_record("1", "watermarked", method="TR",
+                              source_metadata=TR_META)
+        _patch_tr_module(
+            monkeypatch,
+            load_fn=lambda records, device, **extra: (_ for _ in ()).throw(
+                TypeError("__init__() got an unexpected keyword argument 'foo'")),
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            out = _write_fake_run(Path(td), method="TR", records=[rec_wm])
+            result = evaluate_detector([rec_wm], out, "TR", device="cpu")
+            assert result["status"] == STATUS_FAILED_PROVIDER_INITIALIZATION
+
+    def test_per_row_dependency_error(self, monkeypatch):
+        """DetectorDependencyError in score_image →
+        row=failed_missing_dependency, stage=failed_missing_dependency."""
+        from experiments.eval import evaluate_detector
+        from raven.detectors import (
+            STATUS_FAILED_MISSING_DEPENDENCY,
+            ROW_STATUS_FAILED_MISSING_DEPENDENCY,
+            DetectorDependencyError,
+        )
+
+        rec_wm = _make_record("1", "watermarked", method="TR",
+                              source_metadata=TR_META)
+        _patch_tr_module(
+            monkeypatch,
+            score_fn=lambda *a, **kw: (_ for _ in ()).throw(
+                DetectorDependencyError("optional dependency not installed")),
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            out = _write_fake_run(Path(td), method="TR", records=[rec_wm])
+            result = evaluate_detector([rec_wm], out, "TR", device="cpu")
+            assert result["status"] == STATUS_FAILED_MISSING_DEPENDENCY
+            rc = result["row_status_counts"]
+            assert rc.get(ROW_STATUS_FAILED_MISSING_DEPENDENCY, 0) >= 1
+
+    def test_per_row_import_error(self, monkeypatch):
+        """ImportError in score_image → failed_missing_dependency."""
+        from experiments.eval import evaluate_detector
+        from raven.detectors import (
+            STATUS_FAILED_MISSING_DEPENDENCY,
+            ROW_STATUS_FAILED_MISSING_DEPENDENCY,
+        )
+
+        rec_wm = _make_record("1", "watermarked", method="TR",
+                              source_metadata=TR_META)
+        _patch_tr_module(
+            monkeypatch,
+            score_fn=lambda *a, **kw: (_ for _ in ()).throw(
+                ImportError("No module named 'torch'")),
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            out = _write_fake_run(Path(td), method="TR", records=[rec_wm])
+            result = evaluate_detector([rec_wm], out, "TR", device="cpu")
+            assert result["status"] == STATUS_FAILED_MISSING_DEPENDENCY
+            rc = result["row_status_counts"]
+            assert rc.get(ROW_STATUS_FAILED_MISSING_DEPENDENCY, 0) >= 1
+
+
+# ===========================================================================
+# J. Method-specific dispatch acceptance tests
+# ===========================================================================
+class TestMethodDispatchAcceptance:
+    """GM, GS, T2S via actual adapter modules with monkeypatch."""
+
+    # ---- GM: cohort-wide missing bundle ----
+    def test_gm_load_state_missing_bundle(self, monkeypatch):
+        from experiments.eval import evaluate_detector
+        from raven.detectors import (
+            STATUS_FAILED_MISSING_REQUIRED_STATE,
+            DetectorMissingStateError,
+        )
+        import raven.detectors.gm_detector as gm_mod
+
+        monkeypatch.setattr(
+            gm_mod, "load_state",
+            lambda records, device, **extra: (_ for _ in ()).throw(
+                DetectorMissingStateError("GM bundle not found")),
+        )
+
+        GM_META = {"gm_bundle_path": "/nonexistent/bundle",
+                    "gm_bundle_sha256": "abc"}
+        rec_wm = _make_record("1", "watermarked", method="GM",
+                              source_metadata=GM_META)
+
+        with tempfile.TemporaryDirectory() as td:
+            out = _write_fake_run(Path(td), method="GM", records=[rec_wm])
+            result = evaluate_detector([rec_wm], out, "GM", device="cpu")
+            assert result["status"] == STATUS_FAILED_MISSING_REQUIRED_STATE
+
+    def test_gm_missing_bundle_without_allow_nonzero(self, monkeypatch):
+        import io
+        from experiments.eval import main
+        from raven.detectors import DetectorMissingStateError
+        import raven.detectors.gm_detector as gm_mod
+
+        monkeypatch.setattr(
+            gm_mod, "load_state",
+            lambda records, device, **extra: (_ for _ in ()).throw(
+                DetectorMissingStateError("GM bundle not found")),
+        )
+
+        GM_META = {"gm_bundle_path": "/nonexistent/bundle",
+                    "gm_bundle_sha256": "abc"}
+        rec_wm = _make_record("1", "watermarked", method="GM",
+                              source_metadata=GM_META)
+
+        with tempfile.TemporaryDirectory() as td:
+            out = _write_fake_run(Path(td), method="GM", records=[rec_wm])
+            argv = ["--output-dir", str(out), "--device", "cpu",
+                    "--stages", "detector", "--log-level", "ERROR"]
+            stdout_buf = io.StringIO()
+            with mock.patch("sys.stdout", stdout_buf):
+                exit_code = main(argv)
+            result = json.loads(stdout_buf.getvalue())
+            assert exit_code != 0
+            assert (result["stages"]["detector"]["status"]
+                    == "failed_missing_required_state")
+
+    def test_gm_missing_bundle_with_allow_exit_0(self, monkeypatch):
+        import io
+        from experiments.eval import main
+        from raven.detectors import DetectorMissingStateError
+        import raven.detectors.gm_detector as gm_mod
+
+        monkeypatch.setattr(
+            gm_mod, "load_state",
+            lambda records, device, **extra: (_ for _ in ()).throw(
+                DetectorMissingStateError("GM bundle not found")),
+        )
+
+        GM_META = {"gm_bundle_path": "/nonexistent/bundle",
+                    "gm_bundle_sha256": "abc"}
+        rec_wm = _make_record("1", "watermarked", method="GM",
+                              source_metadata=GM_META)
+
+        with tempfile.TemporaryDirectory() as td:
+            out = _write_fake_run(Path(td), method="GM", records=[rec_wm])
+            argv = ["--output-dir", str(out), "--device", "cpu",
+                    "--stages", "detector", "--log-level", "ERROR",
+                    "--allow-missing-metrics"]
+            stdout_buf = io.StringIO()
+            with mock.patch("sys.stdout", stdout_buf):
+                exit_code = main(argv)
+            result = json.loads(stdout_buf.getvalue())
+            assert exit_code == 0
+            # JSON status preserved — NOT rewritten
+            assert (result["stages"]["detector"]["status"]
+                    == "failed_missing_required_state")
+            assert result["allowed_by_policy"] is True
+
+    # ---- GS: per-row secret state missing ----
+    def test_gs_per_row_missing_state(self, monkeypatch):
+        from experiments.eval import evaluate_detector
+        from raven.detectors import (
+            STATUS_FAILED_MISSING_REQUIRED_STATE,
+            ROW_STATUS_FAILED_MISSING_STATE,
+            DetectorMissingStateError,
+        )
+        import raven.detectors.gs_detector as gs_mod
+
+        monkeypatch.setattr(gs_mod, "load_state",
+                            lambda records, device, **extra: {"fake": True})
+        monkeypatch.setattr(
+            gs_mod, "score_image",
+            lambda *a, **kw: (_ for _ in ()).throw(
+                DetectorMissingStateError("GS secret missing for this row")),
+        )
+
+        GS_META = {"gs_secret_index": "5", "gs_secret_bundle_sha256": "abc",
+                    "gs_protocol_mode": "official_compatible"}
+        rec_wm = _make_record("1", "watermarked", method="GS",
+                              source_metadata=GS_META)
+
+        with tempfile.TemporaryDirectory() as td:
+            out = _write_fake_run(Path(td), method="GS", records=[rec_wm])
+            result = evaluate_detector([rec_wm], out, "GS", device="cpu")
+            assert result["status"] == STATUS_FAILED_MISSING_REQUIRED_STATE
+            rc = result["row_status_counts"]
+            assert rc.get(ROW_STATUS_FAILED_MISSING_STATE, 0) >= 1
+
+    def test_gs_missing_state_without_allow_nonzero(self, monkeypatch):
+        import io
+        from experiments.eval import main
+        from raven.detectors import DetectorMissingStateError
+        import raven.detectors.gs_detector as gs_mod
+
+        monkeypatch.setattr(gs_mod, "load_state",
+                            lambda records, device, **extra: {"fake": True})
+        monkeypatch.setattr(
+            gs_mod, "score_image",
+            lambda *a, **kw: (_ for _ in ()).throw(
+                DetectorMissingStateError("GS secret missing")),
+        )
+
+        GS_META = {"gs_secret_index": "5", "gs_secret_bundle_sha256": "abc",
+                    "gs_protocol_mode": "official_compatible"}
+        rec_wm = _make_record("1", "watermarked", method="GS",
+                              source_metadata=GS_META)
+
+        with tempfile.TemporaryDirectory() as td:
+            out = _write_fake_run(Path(td), method="GS", records=[rec_wm])
+            argv = ["--output-dir", str(out), "--device", "cpu",
+                    "--stages", "detector", "--log-level", "ERROR"]
+            stdout_buf = io.StringIO()
+            with mock.patch("sys.stdout", stdout_buf):
+                exit_code = main(argv)
+            result = json.loads(stdout_buf.getvalue())
+            assert exit_code != 0
+            assert (result["stages"]["detector"]["status"]
+                    == "failed_missing_required_state")
+
+    def test_gs_missing_state_with_allow_exit_0(self, monkeypatch):
+        import io
+        from experiments.eval import main
+        from raven.detectors import DetectorMissingStateError
+        import raven.detectors.gs_detector as gs_mod
+
+        monkeypatch.setattr(gs_mod, "load_state",
+                            lambda records, device, **extra: {"fake": True})
+        monkeypatch.setattr(
+            gs_mod, "score_image",
+            lambda *a, **kw: (_ for _ in ()).throw(
+                DetectorMissingStateError("GS secret missing")),
+        )
+
+        GS_META = {"gs_secret_index": "5", "gs_secret_bundle_sha256": "abc",
+                    "gs_protocol_mode": "official_compatible"}
+        rec_wm = _make_record("1", "watermarked", method="GS",
+                              source_metadata=GS_META)
+
+        with tempfile.TemporaryDirectory() as td:
+            out = _write_fake_run(Path(td), method="GS", records=[rec_wm])
+            argv = ["--output-dir", str(out), "--device", "cpu",
+                    "--stages", "detector", "--log-level", "ERROR",
+                    "--allow-missing-metrics"]
+            stdout_buf = io.StringIO()
+            with mock.patch("sys.stdout", stdout_buf):
+                exit_code = main(argv)
+            result = json.loads(stdout_buf.getvalue())
+            assert exit_code == 0
+            assert (result["stages"]["detector"]["status"]
+                    == "failed_missing_required_state")
+
+    # ---- T2S: per-row state missing ----
+    def test_t2s_per_row_missing_state(self, monkeypatch):
+        from experiments.eval import evaluate_detector
+        from raven.detectors import (
+            STATUS_FAILED_MISSING_REQUIRED_STATE,
+            ROW_STATUS_FAILED_MISSING_STATE,
+            DetectorMissingStateError,
+        )
+        import raven.detectors.t2s_detector as t2s_mod
+
+        monkeypatch.setattr(t2s_mod, "load_state",
+                            lambda records, device, **extra: {"fake": True})
+        monkeypatch.setattr(
+            t2s_mod, "score_image",
+            lambda *a, **kw: (_ for _ in ()).throw(
+                DetectorMissingStateError("T2S state missing for this row")),
+        )
+
+        T2S_META = {"t2s_state_path": "/tmp/fake.pt",
+                     "t2s_state_sha256": "abc",
+                     "t2s_provider_config_sha256": "def",
+                     "t2s_protocol_mode": "official"}
+        rec_wm = _make_record("1", "watermarked", method="T2S",
+                              source_metadata=T2S_META)
+
+        with tempfile.TemporaryDirectory() as td:
+            out = _write_fake_run(Path(td), method="T2S", records=[rec_wm])
+            result = evaluate_detector([rec_wm], out, "T2S", device="cpu")
+            assert result["status"] == STATUS_FAILED_MISSING_REQUIRED_STATE
+            rc = result["row_status_counts"]
+            assert rc.get(ROW_STATUS_FAILED_MISSING_STATE, 0) >= 1
+
+    def test_t2s_missing_state_without_allow_nonzero(self, monkeypatch):
+        import io
+        from experiments.eval import main
+        from raven.detectors import DetectorMissingStateError
+        import raven.detectors.t2s_detector as t2s_mod
+
+        monkeypatch.setattr(t2s_mod, "load_state",
+                            lambda records, device, **extra: {"fake": True})
+        monkeypatch.setattr(
+            t2s_mod, "score_image",
+            lambda *a, **kw: (_ for _ in ()).throw(
+                DetectorMissingStateError("T2S state missing")),
+        )
+
+        T2S_META = {"t2s_state_path": "/tmp/fake.pt",
+                     "t2s_state_sha256": "abc",
+                     "t2s_provider_config_sha256": "def",
+                     "t2s_protocol_mode": "official"}
+        rec_wm = _make_record("1", "watermarked", method="T2S",
+                              source_metadata=T2S_META)
+
+        with tempfile.TemporaryDirectory() as td:
+            out = _write_fake_run(Path(td), method="T2S", records=[rec_wm])
+            argv = ["--output-dir", str(out), "--device", "cpu",
+                    "--stages", "detector", "--log-level", "ERROR"]
+            stdout_buf = io.StringIO()
+            with mock.patch("sys.stdout", stdout_buf):
+                exit_code = main(argv)
+            result = json.loads(stdout_buf.getvalue())
+            assert exit_code != 0
+            assert (result["stages"]["detector"]["status"]
+                    == "failed_missing_required_state")
+
+    def test_t2s_missing_state_with_allow_exit_0(self, monkeypatch):
+        import io
+        from experiments.eval import main
+        from raven.detectors import DetectorMissingStateError
+        import raven.detectors.t2s_detector as t2s_mod
+
+        monkeypatch.setattr(t2s_mod, "load_state",
+                            lambda records, device, **extra: {"fake": True})
+        monkeypatch.setattr(
+            t2s_mod, "score_image",
+            lambda *a, **kw: (_ for _ in ()).throw(
+                DetectorMissingStateError("T2S state missing")),
+        )
+
+        T2S_META = {"t2s_state_path": "/tmp/fake.pt",
+                     "t2s_state_sha256": "abc",
+                     "t2s_provider_config_sha256": "def",
+                     "t2s_protocol_mode": "official"}
+        rec_wm = _make_record("1", "watermarked", method="T2S",
+                              source_metadata=T2S_META)
+
+        with tempfile.TemporaryDirectory() as td:
+            out = _write_fake_run(Path(td), method="T2S", records=[rec_wm])
+            argv = ["--output-dir", str(out), "--device", "cpu",
+                    "--stages", "detector", "--log-level", "ERROR",
+                    "--allow-missing-metrics"]
+            stdout_buf = io.StringIO()
+            with mock.patch("sys.stdout", stdout_buf):
+                exit_code = main(argv)
+            result = json.loads(stdout_buf.getvalue())
+            assert exit_code == 0
+            assert (result["stages"]["detector"]["status"]
+                    == "failed_missing_required_state")
 
