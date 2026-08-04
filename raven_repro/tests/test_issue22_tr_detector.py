@@ -1899,6 +1899,9 @@ class TestAggregateFailureOrchestrator:
                 assert result["dominant_failure_cause"] == FAILURE_CAUSE_SCORING_ERROR
                 assert result.get("aggregate_error_type") == "DetectorScoringError"
                 assert "metric bug" in result.get("aggregate_error", "")
+                # stage identity preserved
+                assert result["stage"] == "detector"
+                assert result["method"] == "TR"
 
                 # counts + invariant preserved
                 assert result["requested_count"] == 4
@@ -1911,6 +1914,61 @@ class TestAggregateFailureOrchestrator:
                 rows = _read_detector_rows(out)
                 assert len(rows) == 4
                 assert all(r["status"] == "scored" for r in rows)
+
+    def test_aggregate_state_validation_failure_classified(self, monkeypatch):
+        """DetectorStateValidationError from aggregate stays
+        failed_state_validation, never flattened to failed_scoring."""
+        import raven.detectors.tr_detector as tr_mod
+        from raven.detectors import (
+            DetectorStateValidationError, STATUS_FAILED_STATE_VALIDATION,
+            FAILURE_CAUSE_STATE_VALIDATION,
+        )
+
+        def _raise_state_validation(*args, **kwargs):
+            raise DetectorStateValidationError("state bug")
+        monkeypatch.setattr(tr_mod, "aggregate", _raise_state_validation)
+
+        from experiments.eval import evaluate_detector
+
+        records = self._four_cohort_records()
+        with _patch_integration(monkeypatch):
+            with tempfile.TemporaryDirectory() as td:
+                out = _write_fake_run(Path(td), method="TR", records=records)
+                result = evaluate_detector(records, out, "TR", device="cpu")
+
+                assert result["status"] == STATUS_FAILED_STATE_VALIDATION
+                assert result["dominant_failure_cause"] == FAILURE_CAUSE_STATE_VALIDATION
+                assert result.get("aggregate_error_type") == "DetectorStateValidationError"
+                assert "state bug" in result.get("aggregate_error", "")
+                assert result["stage"] == "detector"
+                assert result["method"] == "TR"
+                assert result["count_invariant_satisfied"] is True
+
+    def test_aggregate_unknown_error_classified_internal(self, monkeypatch):
+        """Unknown aggregate exception fails closed as failed_internal_error."""
+        import raven.detectors.tr_detector as tr_mod
+        from raven.detectors import (
+            STATUS_FAILED_INTERNAL_ERROR, FAILURE_CAUSE_INTERNAL_ERROR,
+        )
+
+        def _raise_unknown(*args, **kwargs):
+            raise RuntimeError("boom")
+        monkeypatch.setattr(tr_mod, "aggregate", _raise_unknown)
+
+        from experiments.eval import evaluate_detector
+
+        records = self._four_cohort_records()
+        with _patch_integration(monkeypatch):
+            with tempfile.TemporaryDirectory() as td:
+                out = _write_fake_run(Path(td), method="TR", records=records)
+                result = evaluate_detector(records, out, "TR", device="cpu")
+
+                assert result["status"] == STATUS_FAILED_INTERNAL_ERROR
+                assert result["dominant_failure_cause"] == FAILURE_CAUSE_INTERNAL_ERROR
+                assert result.get("aggregate_error_type") == "RuntimeError"
+                assert "boom" in result.get("aggregate_error", "")
+                assert result["stage"] == "detector"
+                assert result["method"] == "TR"
 
     def test_cli_exit_without_allow_is_2(self, monkeypatch):
         import raven.metrics as metrics
