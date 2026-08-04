@@ -2,6 +2,67 @@
 
 This file records implementation bugs, validated non-bugs, ablations, and the evidence used to verify each change. Large logs and generated outputs are not copied here; paths point to the source artifacts.
 
+## 2026-08-04 — TR DDIM-DDPM-nearest parity: fix update_experiment_table.py schema fallback for historical TR runs
+
+### Problem
+`experiments/update_experiment_table.py` could not process the formal TR DDIM-inverse + DDPM-forward + nearest 1001-sample run (`outputs/tr/diffusiondb/ablation_eval/ddim_inverse_ddpm_nearest/full1001/formal_attack`) because `tr_detector_metric_name()` and `tr_score_direction()` only checked the field `"detector_protocol"` (new schema). Historical TR `tr_nfpa/aggregate_results.json` files use `"protocol": "formal_tree_ring_complex_l1_v3"` and `"threshold_rule": "NFPA order statistic; strict score < threshold"` (old schema). The `no_color_eval/aggregate_results.json` variant nests the same fields under a `"detector"` subdict. Both variants were rejected with `UpdaterError: unknown TR detector metric`.
+
+### Root cause
+`tr_detector_metric_name()` searched only `"detector_protocol"` (not the bare `"protocol"` field). `tr_score_direction()` searched only `"detector_protocol"` (not `"threshold_rule"` or `"protocol"`). Neither function checked the nested `detector` subdict that the `no_color_eval` aggregate uses.
+
+### Affected files
+- `experiments/update_experiment_table.py:tr_detector_metric_name` — add fallback to `"protocol"` field and look inside nested `detector` subdict.
+- `experiments/update_experiment_table.py:tr_score_direction` — add fallback to `"threshold_rule"` and `"protocol"` fields and look inside nested `detector` subdict.
+
+### Affected outputs
+None invalidated. The fix only extends backward-compatible schema reading; no metric values are changed.
+
+### Fix
+Both functions now iterate over `[payload, dig(payload, "detector")]` (the flat and nested-detector schemas), and within each container check `"detector_metric"`, `"detector_protocol"`, `"threshold_rule"`, and `"protocol"` in that priority order. The string-matching rules for `"complex_l1"` / `"l1_complex"` / `"complex-l1"` and for `"score < threshold"` / `"lower"` are preserved unchanged.
+
+### Reused code
+- `dig()` (existing helper already used in `tr_protocol_block`).
+- `first_present()` (existing helper unchanged).
+- `normalize_score_direction()` (existing helper unchanged).
+
+### Historical bug coverage
+- No prior DEBUG_CHANGELOG entry covered this schema incompatibility.
+- Confirmed that `grep -rn "detector_protocol\|detector_metric" raven_repro/tests/test_update_experiment_table.py` — existing tests all use the new-schema field; no test exercised the old-schema (`"protocol"`) fallback. No new negative test was added because both functions remain fail-closed: they still raise `UpdaterError` when neither old nor new schema is found.
+
+### Regression prevention
+All 43 existing tests passed before and after the fix (`python3 -m pytest raven_repro/tests/test_update_experiment_table.py raven_repro/tests/test_formal_table.py -q`).
+
+### Validation
+After the fix, `python3 experiments/update_experiment_table.py --run-root /workspace/RAVEN/outputs/tr/diffusiondb/ablation_eval/ddim_inverse_ddpm_nearest/full1001/formal_attack` exits 0 and writes:
+- N=1001, experiment=ablation_eval, run_key=formal_attack
+- detector_metric=l1_complex, score_direction=lower_is_watermarked
+- threshold=75.67994689941406 (empirical_clean_1pct_fpr)
+- After Detection Rate=0.01898101898101898 (= 19/1001, TPR at original threshold)
+- FID=27.144841, CLIP=0.458042 — both within tolerance of the expected historical values.
+
+`python3 experiments/update_experiment_table.py --run-root /workspace/RAVEN/outputs/tr/diffusiondb/ablation_eval/ddim_inverse_ddpm_nearest/full1001/no_color_eval` also exits 0 and writes:
+- PSNR=25.963721, SSIM=0.770436 (no_color_eval quality).
+
+Historical parity confirmed:
+- TPR: 0.01898101898101898 (19/1001) — exact match
+- Threshold: 75.67994689941406 — exact match  
+- Target SHA: 087e4198bb56d0d907ec502eb7ff35e7369ea72d5c136950b05d3021830502a3 — exact match
+- Mask SHA: 6636fc4a74bdeb1a7c80b362e70e429acbf9e4f459fc0593b3c2c49b8659a6d6 — exact match
+- FID: 27.144841 vs expected 27.14 (diff=0.005, tol=0.10) — PASS
+- CLIP: 0.458042 vs expected 0.4580 (diff=0.000042, tol=0.001) — PASS
+- Detection decision mismatches: 0
+
+### Source-data validity
+1001-sample formal run; base-latent uniqueness confirmed by VALIDATED.json (`unique_base_latent_hashes=1001`, `duplicate_base_latent_hashes=0`). Attack-config hash `24f2e147205b7ff79903e253a3bc5b3054e6803a99b4c5f14f64ea6573008b9b` confirmed: DDIM inversion, DDPMScheduler, nearest, reflection padding, shift 24–32 px, color_transfer=aligned.
+
+### Git provenance
+- Repository: /workspace/RAVEN-worktrees/feature-worktree
+- Branch: feature/worktree
+- Commit: (see below after push)
+- Remote branch: origin/feature/worktree
+- Entry point: experiments/update_experiment_table.py
+- Formal output eligibility: fix only; no outputs regenerated
+
 ## 2026-07-29 — Issue #17 RID/HSTR/HSQR detached formal waiter
 
 ### Problem

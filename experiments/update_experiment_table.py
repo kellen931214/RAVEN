@@ -678,14 +678,24 @@ def tr_protocol_block(sources: Sources) -> tuple[dict[str, Any], str, str] | Non
 def tr_detector_metric_name(sources: Sources, source: str) -> str:
     for key in ("aggregate", "formal_aggregate", "verification", "run_config"):
         payload = sources.get(key)
-        explicit = first_present(payload, ("detector_metric",))
-        if isinstance(explicit, str) and explicit.strip():
-            return explicit.strip()
-        protocol = first_present(payload, ("detector_protocol",))
-        if isinstance(protocol, str):
-            lowered = protocol.lower()
-            if "complex-l1" in lowered or "complex_l1" in lowered or "l1_complex" in lowered:
-                return "l1_complex"
+        # Check payload and its nested 'detector' subdict (no_color_eval schema).
+        nested = dig(payload, "detector") if isinstance(payload, dict) else None
+        for container in filter(None, [payload, nested if isinstance(nested, dict) else None]):
+            explicit = first_present(container, ("detector_metric",))
+            if isinstance(explicit, str) and explicit.strip():
+                return explicit.strip()
+            # Check detector_protocol first (new schema), then bare protocol field
+            # (used by historical TR ablation runs: "formal_tree_ring_complex_l1_v3").
+            for field in ("detector_protocol", "protocol"):
+                protocol = first_present(container, (field,))
+                if isinstance(protocol, str):
+                    lowered = protocol.lower()
+                    if (
+                        "complex-l1" in lowered
+                        or "complex_l1" in lowered
+                        or "l1_complex" in lowered
+                    ):
+                        return "l1_complex"
     raise UpdaterError(
         f"unknown TR detector metric: no detector_metric or recognized "
         f"detector_protocol recorded in {source}"
@@ -695,16 +705,24 @@ def tr_detector_metric_name(sources: Sources, source: str) -> str:
 def tr_score_direction(sources: Sources, source: str) -> str:
     for key in ("aggregate", "formal_aggregate", "verification", "run_config"):
         payload = sources.get(key)
-        explicit = first_present(payload, ("score_direction",))
-        if isinstance(explicit, str) and explicit.strip():
-            return normalize_score_direction(explicit, source)
-        protocol = first_present(payload, ("detector_protocol",))
-        if isinstance(protocol, str):
-            lowered = protocol.lower()
-            if "score < threshold" in lowered or "lower" in lowered:
-                return "lower_is_watermarked"
-            if "score > threshold" in lowered or "higher" in lowered:
-                return "higher_is_watermarked"
+        # Check payload and its nested 'detector' subdict (no_color_eval schema).
+        nested = dig(payload, "detector") if isinstance(payload, dict) else None
+        for container in filter(None, [payload, nested if isinstance(nested, dict) else None]):
+            explicit = first_present(container, ("score_direction",))
+            if isinstance(explicit, str) and explicit.strip():
+                return normalize_score_direction(explicit, source)
+            # Check detector_protocol and threshold_rule (new schema), then bare
+            # protocol field (historical runs: "formal_tree_ring_complex_l1_v3").
+            # Also check threshold_rule which historical runs use for direction:
+            # "NFPA order statistic; strict score < threshold".
+            for field in ("detector_protocol", "threshold_rule", "protocol"):
+                protocol = first_present(container, (field,))
+                if isinstance(protocol, str):
+                    lowered = protocol.lower()
+                    if "score < threshold" in lowered or "lower" in lowered:
+                        return "lower_is_watermarked"
+                    if "score > threshold" in lowered or "higher" in lowered:
+                        return "higher_is_watermarked"
     raise UpdaterError(
         f"unknown TR score direction: not recorded in {source}"
     )
