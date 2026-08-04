@@ -862,7 +862,22 @@ def evaluate_detector(
     agg_kwargs: dict[str, Any] = {}
     if method in {"RID", "HSTR", "HSQR"}:
         agg_kwargs["method"] = method
-    aggregate = det_mod.aggregate(detector_rows, **agg_kwargs)
+    # ---- Aggregate phase exception boundary ----
+    # An adapter metric-computation failure must not abort the whole stage:
+    # detector_records.jsonl is already written above, and the stage result
+    # stays a normal dict whose classification preserves the original
+    # exception type (via _error_to_failure_cause / _error_to_stage_status).
+    aggregate_failure: dict[str, Any] | None = None
+    try:
+        aggregate = det_mod.aggregate(detector_rows, **agg_kwargs)
+    except Exception as exc:
+        aggregate = {}
+        aggregate_failure = {
+            "aggregate_error_type": type(exc).__name__,
+            "aggregate_error": str(exc),
+            "aggregate_failure_cause": _error_to_failure_cause(exc),
+            "aggregate_stage_status": _error_to_stage_status(exc),
+        }
 
     # ---- Issue #25: orchestrator is count source of truth ----
     # Adapter only receives detector_rows; it cannot know about entries
@@ -936,6 +951,26 @@ def evaluate_detector(
         aggregate["setup_failure_cause"] = setup_failure_cause
         aggregate["setup_error_type"] = setup_error_type
         aggregate["setup_error"] = setup_error_message
+
+    # Aggregate phase failure: the adapter could not produce a metric
+    # aggregate.  detector_records.jsonl and all counts are preserved; the
+    # stage identity (stage/method) is set and the classification preserves
+    # the original exception type.
+    if aggregate_failure is not None:
+        aggregate["stage"] = "detector"
+        aggregate["method"] = method
+        aggregate.update(aggregate_failure)
+        aggregate["dominant_failure_cause"] = aggregate_failure[
+            "aggregate_failure_cause"]
+        aggregate["status"] = aggregate_failure["aggregate_stage_status"]
+        aggregate["available"] = row_scored_count > 0
+        aggregate["status_reducer_reason"] = (
+            "aggregate phase failed: "
+            f"{aggregate_failure['aggregate_error_type']}: "
+            f"{aggregate_failure['aggregate_error']}"
+        )
+        return aggregate
+
     aggregate["stage"] = "detector"
     aggregate["method"] = method
     aggregate["status"] = stage_status
