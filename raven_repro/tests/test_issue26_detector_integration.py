@@ -76,9 +76,10 @@ def _write_fake_run(tmp_path, method="TR", records=None, config=None,
         _write_minimal_png(img)
         if create_input_images:
             input_path = Path(r.get("input_path", f"/tmp/in_{rid}.png"))
-            if not input_path.is_file():
-                input_path.parent.mkdir(parents=True, exist_ok=True)
-                _write_minimal_png(input_path)
+            input_path.parent.mkdir(parents=True, exist_ok=True)
+            # Always overwrite — stale files from previous test runs must
+            # never leak into a new run (they may hold invalid PNG bytes).
+            _write_minimal_png(input_path)
     rebuild_records_jsonl(out)
     return out
 
@@ -2359,7 +2360,7 @@ def _tr_real_deps(monkeypatch):
         monkeypatch.setitem(sys.modules, mod_name, mod_obj)
     orig = builtins.__import__
     monkeypatch.setattr(builtins, "__import__",
-                       lambda n, *a, **kw: _imps.get(n, orig(n, *a, **kw)))
+                       lambda n, *a, **kw: (_imps[n] if (n in _imps and (kw.get('level', a[3] if len(a) > 3 else 0) == 0)) else orig(n, *a, **kw)))
 
     import raven.pairing_provenance as pp
     monkeypatch.setattr(pp, "tensor_sha256",
@@ -2396,45 +2397,53 @@ def _gs_real_deps(monkeypatch):
     fake_pu.get_pipe_provider.return_value = fake_pipe
 
     _gs_fake_wm_mod = mock.MagicMock()
-    # Build a proper GsProvider mock that returns instances with required attrs
-    _gs_inst = mock.MagicMock()
-    _gs_inst.gs_protocol_mode = "official_compatible"
-    _gs_inst.gs_detection_mode = "official_onebit"
-    _gs_inst.message_width_in_bytes = 32
-    _gs_inst.l = 1
-    _gs_inst.num_replications = 64
-    _gs_inst.gs_channel_copy = 1
-    _gs_inst.gs_hw_copy = 8
-    _gs_inst.gs_fpr = 1e-6
-    _gs_inst.gs_user_number = 1000000
-    _gs_inst.secret_provenance.return_value = {
-        "secret_index": 5, "message_sha256": "msg_sha",
-        "key_sha256": "key_sha", "nonce_sha256": "nonce_sha",
-        "secret_bundle_sha256": "bundle_sha",
-    }
-    _gs_inst.watermark_target_tensor.return_value = mock.MagicMock()
-    _gs_inst.invert_images.return_value = {"zT_torch": mock.MagicMock()}
-    _gs_inst.get_accuracies.return_value = {
-        "bit_accuracies": [0.85],
-        "message_bits_str_list": ["0" * 256],
-    }
-    _gs_inst.official_thresholds.return_value = {
-        "tau_onebit": 0.9, "tau_bits": 0.95,
-        "fpr": 1e-6, "user_number": 1000000,
-        "comparison_operator": ">=", "source": "test",
-    }
-    _gs_inst.active_detection_threshold.return_value = {
-        "detection_mode": "official_onebit",
-        "threshold": 0.9,
-        "threshold_type": "official_beta_tail_tau_onebit",
-        "comparison_operator": ">=",
-        "nominal_fpr": 1e-6,
-        "calibrated_from_current_clean_negatives": False,
-        "official_tau_onebit": 0.9,
-        "official_tau_bits": 0.95,
-    }
-    _gs_inst.is_detection_successful.return_value = True
-    _gs_prov_cls = mock.MagicMock(return_value=_gs_inst)
+
+    def _make_gs_instance(*args, **kwargs):
+        """Build a GsProvider instance whose secret identity follows the
+        constructor's ``gs_secret_index`` — lets per-source differentiation
+        be exercised for real (one provider per (run_id, role))."""
+        secret_idx = kwargs.get("gs_secret_index", 5)
+        inst = mock.MagicMock()
+        inst.gs_protocol_mode = "official_compatible"
+        inst.gs_detection_mode = "official_onebit"
+        inst.message_width_in_bytes = 32
+        inst.l = 1
+        inst.num_replications = 64
+        inst.gs_channel_copy = 1
+        inst.gs_hw_copy = 8
+        inst.gs_fpr = 1e-6
+        inst.gs_user_number = 1000000
+        inst.gs_secret_index = secret_idx
+        inst.secret_provenance.return_value = {
+            "secret_index": secret_idx, "message_sha256": "msg_sha",
+            "key_sha256": "key_sha", "nonce_sha256": "nonce_sha",
+            "secret_bundle_sha256": "bundle_sha",
+        }
+        inst.watermark_target_tensor.return_value = mock.MagicMock()
+        inst.invert_images.return_value = {"zT_torch": mock.MagicMock()}
+        inst.get_accuracies.return_value = {
+            "bit_accuracies": [0.85],
+            "message_bits_str_list": ["0" * 256],
+        }
+        inst.official_thresholds.return_value = {
+            "tau_onebit": 0.9, "tau_bits": 0.95,
+            "fpr": 1e-6, "user_number": 1000000,
+            "comparison_operator": ">=", "source": "test",
+        }
+        inst.active_detection_threshold.return_value = {
+            "detection_mode": "official_onebit",
+            "threshold": 0.9,
+            "threshold_type": "official_beta_tail_tau_onebit",
+            "comparison_operator": ">=",
+            "nominal_fpr": 1e-6,
+            "calibrated_from_current_clean_negatives": False,
+            "official_tau_onebit": 0.9,
+            "official_tau_bits": 0.95,
+        }
+        inst.is_detection_successful.return_value = True
+        return inst
+
+    _gs_prov_cls = mock.MagicMock(side_effect=_make_gs_instance)
     _gs_fake_wm_mod.GsProvider = _gs_prov_cls
     _gs_fake_wm_mod.__name__ = "gs_provider"
     _fake_pipe_mod = mock.MagicMock()
@@ -2482,24 +2491,6 @@ def _gs_real_deps(monkeypatch):
     import raven.pairing_provenance as pp
     monkeypatch.setattr(pp, "tensor_sha256",
                         mock.MagicMock(return_value="default_target_sha_placeholder"))
-
-    # Mock internal GS validation functions — these do provider config and pipe
-    # validation which requires specific hash computations.  Mocking them is
-    # allowed per issue requirements (provider config identity validation).
-    monkeypatch.setattr(gs_mod, "_validate_gs_provider_config",
-                        lambda r: ({
-                            "gs_protocol_mode": "official_compatible",
-                            "message_width_in_bytes": 32, "l": 1,
-                            "num_replications": 64, "gs_channel_copy": 1,
-                            "gs_hw_copy": 8, "gs_fpr": 1e-6,
-                            "gs_user_number": 1000000,
-                        }, "CFG_HASH", "PIPE_HASH", "DET_HASH"))
-    monkeypatch.setattr(gs_mod, "_validate_pipe_config_uniformity",
-                        lambda r: {
-                            "model_id": "RedbeardNZ/stable-diffusion-2-1-base",
-                            "model_revision": None,
-                            "scheduler": "DDIM", "resolution": 512,
-                        })
 
     yield fake_pu, _gs_fake_wm_mod.GsProvider, fake_pipe
 
@@ -2571,10 +2562,11 @@ def _gm_real_deps(monkeypatch, tmp_path):
     def _fake_manifest(row, run_id):
         import json as _json
         bundle_dir = Path(row["gm_bundle_dir"])
-        return _json.loads((bundle_dir / "manifest.json").read_text())
+        manifest = _json.loads((bundle_dir / "manifest.json").read_text())
+        return bundle_dir, manifest
 
     def _fake_provider_kwargs(row, run_id):
-        mf = _fake_manifest(row, run_id)
+        _bd, mf = _fake_manifest(row, run_id)
         return {
             "gm_profile": mf["profile"],
             "gm_bundle_dir": row["gm_bundle_dir"],
@@ -2614,14 +2606,17 @@ def _gm_real_deps(monkeypatch, tmp_path):
     fake_extract.gm_bundle_manifest = _fake_manifest
     fake_extract.gm_provider_kwargs = _fake_provider_kwargs
     fake_extract.evaluate_image.return_value = {
-        "p_values": [0.001],
-        "p_value_diagnostics": [
-            {"log_p": -20.0, "sigma": 1.0, "lambda": 100.0,
-             "statistic": 50.0, "df": 100, "p_underflow": False},
-        ],
+        "gm_raw_bit_accuracy": 0.85,
+        "gm_raw_ring_l1": 10.0,
+        "gm_report_label": "gauss_marker_clean_calibrated",
+        "gm_score_definition": "gm_neg_mean_cosine_sim_l1_per_bit_target_direction",
+        "gm_threshold_source": "clean_calibrated",
+        "gm_comparison_operator": ">=",
     }
-    fake_extract.raw_score.return_value = 0.001
-    fake_extract.canonical_score.return_value = 10.0
+    fake_extract.raw_score.side_effect = (
+        lambda method, result: result["gm_raw_bit_accuracy"])
+    fake_extract.canonical_score.side_effect = (
+        lambda method, raw, result: 0.85)
     monkeypatch.setattr(gm_mod, "_get_extract_module", lambda: fake_extract)
 
     fake_pipe = mock.MagicMock()
@@ -2685,7 +2680,7 @@ def _gm_real_deps(monkeypatch, tmp_path):
         monkeypatch.setitem(sys.modules, mod_name, mod_obj)
     orig = builtins.__import__
     monkeypatch.setattr(builtins, "__import__",
-                       lambda n, *a, **kw: _imps.get(n, orig(n, *a, **kw)))
+                       lambda n, *a, **kw: (_imps[n] if (n in _imps and (kw.get('level', a[3] if len(a) > 3 else 0) == 0)) else orig(n, *a, **kw)))
 
     import raven.pairing_provenance as pp
     monkeypatch.setattr(pp, "tensor_sha256",
@@ -2748,11 +2743,16 @@ def _t2s_real_deps(monkeypatch, tmp_path):
     fake_t2s_mod.T2SWatermarkState = mock.MagicMock()
 
     def _fake_load(path):
+        import hashlib as _hashlib
         import json as _json
         data = _json.loads(Path(path).read_text())
         st = mock.MagicMock()
         for k, v in data.items():
             setattr(st, k, v)
+        # Real SHA-256 of the state file — mirrors the canonical
+        # T2SWatermarkState contract (state_sha256() is a method).
+        file_sha = _hashlib.sha256(Path(path).read_bytes()).hexdigest()
+        st.state_sha256.return_value = file_sha
         st.load = classmethod(lambda cls, p: _fake_load(p))
         return st
     fake_t2s_mod.T2SWatermarkState.load = _fake_load
@@ -2762,9 +2762,9 @@ def _t2s_real_deps(monkeypatch, tmp_path):
         "t2s_score_true_key": 0.85,
         "t2s_score_control_key": 0.40,
         "t2s_score_margin": 0.45,
-        "t2s_detection_success": True,
-        "t2s_key_accuracy": 1.0,
-        "t2s_bit_accuracy": 0.98,
+        "detection_success": True,
+        "key_accuracy": 1.0,
+        "message_accuracy": 1.0,
     }
 
     # Stub t2s_inversion module
@@ -2811,7 +2811,7 @@ def _t2s_real_deps(monkeypatch, tmp_path):
         monkeypatch.setitem(sys.modules, mod_name, mod_obj)
     orig = builtins.__import__
     monkeypatch.setattr(builtins, "__import__",
-                       lambda n, *a, **kw: _imps.get(n, orig(n, *a, **kw)))
+                       lambda n, *a, **kw: (_imps[n] if (n in _imps and (kw.get('level', a[3] if len(a) > 3 else 0) == 0)) else orig(n, *a, **kw)))
 
     yield fake_t2s_mod, fake_inv_mod, fake_pu, fake_pipe
 
@@ -2899,7 +2899,8 @@ def _fourier_real_deps(monkeypatch, method="RID"):
         bundle_dir = Path(row.get(f"{prefix}_bundle_dir", ""))
         if not bundle_dir.is_dir():
             raise RuntimeError(f"bundle dir not found: {bundle_dir}")
-        return _json.loads((bundle_dir / "manifest.json").read_text())
+        manifest = _json.loads((bundle_dir / "manifest.json").read_text())
+        return bundle_dir, manifest
 
     fake_extract.fourier_bundle_manifest = _fake_fourier_manifest
     fake_extract.evaluate_image.return_value = {
@@ -2913,16 +2914,24 @@ def _fourier_real_deps(monkeypatch, method="RID"):
     fake_extract.canonical_score.return_value = 10.0
 
     def _fake_rid_kwargs(bundle_dir, device, **extra):
-        return {"bundle_dir": str(bundle_dir), "device": device}
+        return {"bundle_dir": str(bundle_dir), "rid_profile": "legacy"}
 
     def _fake_hstr_kwargs(bundle_dir, device, **extra):
-        return {"bundle_dir": str(bundle_dir), "device": device}
+        return {"bundle_dir": str(bundle_dir), "hstr_profile": "legacy"}
 
-    def _fake_hsqr_from_bundle(bundle_dir, device, **extra):
+    def _fake_hsqr_from_bundle(bundle_dir, identifier, latent_shape, device,
+                               **extra):
         prov = mock.MagicMock()
         prov.bundle = mock.MagicMock()
-        prov.bundle.manifest = {}
+        prov.bundle.manifest = {
+            "selected_pattern_sha256": "tgt_sha",
+            "mask_sha256": "tgt_sha",
+        }
         prov.profile = "legacy"
+        prov.state_source = "bundle"
+        prov.selected_pattern_sha256 = "tgt_sha"
+        prov.watermark_mask_sha256 = "tgt_sha"
+        prov.latent_shape = latent_shape
         return prov
 
     fake_extract.rid_provider_kwargs_from_bundle = _fake_rid_kwargs
@@ -2941,9 +2950,14 @@ def _fourier_real_deps(monkeypatch, method="RID"):
     # Build per-method provider
     fake_prov = mock.MagicMock()
     fake_prov.bundle = mock.MagicMock()
-    fake_prov.bundle.manifest = {}
+    fake_prov.bundle.manifest = {
+        "selected_pattern_sha256": "tgt_sha",
+        "mask_sha256": "tgt_sha",
+    }
     fake_prov.state_source = "bundle"
     fake_prov.profile = "legacy"
+    fake_prov.selected_pattern_sha256 = "tgt_sha"
+    fake_prov.watermark_mask_sha256 = "tgt_sha"
 
     if method == "RID":
         fake_prov_cls = mock.MagicMock(return_value=fake_prov)
@@ -2985,7 +2999,7 @@ def _fourier_real_deps(monkeypatch, method="RID"):
         monkeypatch.setitem(sys.modules, mod_name, mod_obj)
     orig = builtins.__import__
     monkeypatch.setattr(builtins, "__import__",
-                       lambda n, *a, **kw: _imps.get(n, orig(n, *a, **kw)))
+                       lambda n, *a, **kw: (_imps[n] if (n in _imps and (kw.get('level', a[3] if len(a) > 3 else 0) == 0)) else orig(n, *a, **kw)))
 
     import raven.pairing_provenance as pp
     monkeypatch.setattr(pp, "tensor_sha256",
@@ -3057,7 +3071,7 @@ class TestTRRealAdapter:
             monkeypatch.setitem(sys.modules, mod_name, mod_obj)
         monkeypatch.setattr(builtins, "__import__",
                            lambda *a, **kw: (
-                               _imps.get(a[0], orig_import(*a, **kw))))
+                               _imps[a[0]] if (a[0] in _imps and (kw.get('level', a[3] if len(a) > 3 else 0) == 0)) else orig_import(*a, **kw)))
 
         monkeypatch.setattr(pp, "tensor_sha256",
                             mock.MagicMock(side_effect=[
@@ -3175,7 +3189,6 @@ class TestTRRealAdapter:
 class TestGSRealAdapter:
     """GS real load_state → score_image with per-source provider cache."""
 
-    @pytest.mark.xfail(reason="Real adapter mock infra needs method-specific provider tuning")
     def test_real_adapter_success_with_metadata_csv(self, monkeypatch):
         """GS: real adapter success through evaluate_detector."""
         from experiments.eval import evaluate_detector
@@ -3212,7 +3225,7 @@ class TestGSRealAdapter:
                     "scheduler": "DDIM", "resolution": "512",
                     "model_revision": "c6a5e9bab8d874d081de76fa270ae0aefa5410ff",
                     "watermark_target_sha256": "default_target_sha_placeholder",
-                    "watermark_mask_sha256": "default_mask_sha_placeholder",
+                    "watermark_mask_sha256": "f80e7f814ec3c12e1fde467c29f60eb2de0efc69edbae02396f60106368f7ece",
                     "provider_config_hash": gs_cfg_hash,
                 }, {
                     "run_id": "1", "role": "watermarked",
@@ -3227,7 +3240,7 @@ class TestGSRealAdapter:
                     "scheduler": "DDIM", "resolution": "512",
                     "model_revision": "c6a5e9bab8d874d081de76fa270ae0aefa5410ff",
                     "watermark_target_sha256": "default_target_sha_placeholder",
-                    "watermark_mask_sha256": "default_mask_sha_placeholder",
+                    "watermark_mask_sha256": "f80e7f814ec3c12e1fde467c29f60eb2de0efc69edbae02396f60106368f7ece",
                     "provider_config_hash": gs_cfg_hash,
                 }]
                 _write_metadata_csv(csv_path, csv_rows)
@@ -3250,7 +3263,6 @@ class TestGSRealAdapter:
                 assert len(rows) == 4
                 assert all(r["status"] == "scored" for r in rows)
 
-    @pytest.mark.xfail(reason="Real adapter mock infra needs method-specific provider tuning")
     def test_real_per_row_secret_provider_differentiation(self, monkeypatch):
         """GS: different secret_index per (run_id, role) → separate providers."""
         from experiments.eval import evaluate_detector
@@ -3290,7 +3302,7 @@ class TestGSRealAdapter:
                     "scheduler": "DDIM", "resolution": "512",
                     "model_revision": "c6a5e9bab8d874d081de76fa270ae0aefa5410ff",
                     "watermark_target_sha256": "default_target_sha_placeholder",
-                    "watermark_mask_sha256": "default_mask_sha_placeholder",
+                    "watermark_mask_sha256": "f80e7f814ec3c12e1fde467c29f60eb2de0efc69edbae02396f60106368f7ece",
                     "provider_config_hash": gs_cfg_hash_5,
                 }, {
                     "run_id": "1", "role": "watermarked",
@@ -3305,7 +3317,7 @@ class TestGSRealAdapter:
                     "scheduler": "DDIM", "resolution": "512",
                     "model_revision": "c6a5e9bab8d874d081de76fa270ae0aefa5410ff",
                     "watermark_target_sha256": "default_target_sha_placeholder",
-                    "watermark_mask_sha256": "default_mask_sha_placeholder",
+                    "watermark_mask_sha256": "f80e7f814ec3c12e1fde467c29f60eb2de0efc69edbae02396f60106368f7ece",
                     "provider_config_hash": gs_cfg_hash_7,
                 }]
                 _write_metadata_csv(csv_path, csv_rows)
@@ -3333,7 +3345,6 @@ class TestGSRealAdapter:
 class TestGMRealAdapter:
     """GM real load_state with synthetic bundle directory."""
 
-    @pytest.mark.xfail(reason="Real adapter mock infra needs method-specific provider tuning")
     def test_real_adapter_success_with_bundle_and_csv(self, monkeypatch):
         """GM: real adapter success with synthetic bundle + metadata CSV."""
         from experiments.eval import evaluate_detector
@@ -3445,7 +3456,6 @@ class TestGMRealAdapter:
                 assert result["dominant_failure_cause"] == "state_validation_error"
                 assert result["count_invariant_satisfied"] is True
 
-    @pytest.mark.xfail(reason="Real adapter mock infra needs method-specific provider tuning")
     def test_real_protocol_profile_separation(self, monkeypatch):
         """GM: protocol_mode ≠ profile — both identities verified by real adapter."""
         from experiments.eval import evaluate_detector
@@ -3510,7 +3520,6 @@ class TestGMRealAdapter:
 class TestT2SRealAdapter:
     """T2S real load_state with synthetic state files + MetadataResolver."""
 
-    @pytest.mark.xfail(reason="Real adapter mock infra needs method-specific provider tuning")
     def test_real_adapter_success_with_state_and_csv(self, monkeypatch):
         """T2S: real adapter with synthetic state files and metadata CSV."""
         from experiments.eval import evaluate_detector
@@ -3522,12 +3531,13 @@ class TestT2SRealAdapter:
             # Write synthetic state files
             state_path_wm = tdp / "states" / "wm_1.pt"
             state_data_wm = _write_t2s_state(state_path_wm)
-            state_sha_wm = "wm_state_sha"
+            import hashlib as _hashlib
+            state_sha_wm = _hashlib.sha256(state_path_wm.read_bytes()).hexdigest()
 
             state_path_wm2 = tdp / "states" / "wm_2.pt"
             state_data_wm2 = _write_t2s_state(state_path_wm2,
                                               watermark_id="t2s-synth-02")
-            state_sha_wm2 = "wm2_state_sha"
+            state_sha_wm2 = _hashlib.sha256(state_path_wm2.read_bytes()).hexdigest()
 
             with _t2s_real_deps(monkeypatch, tdp):
                 csv_path = tdp / "metadata.csv"
@@ -3573,7 +3583,6 @@ class TestT2SRealAdapter:
                 assert len(rows) == 4
                 assert all(r["status"] == "scored" for r in rows)
 
-    @pytest.mark.xfail(reason="Real adapter mock infra needs method-specific provider tuning")
     def test_real_state_resolution_by_run_id_role(self, monkeypatch):
         """T2S: real state resolution distinguishes (run_id, role) pairs."""
         from experiments.eval import evaluate_detector
@@ -3585,11 +3594,13 @@ class TestT2SRealAdapter:
             state_data = _write_t2s_state(state_path)
 
             with _t2s_real_deps(monkeypatch, tdp):
+                import hashlib as _hashlib
+                state_sha = _hashlib.sha256(state_path.read_bytes()).hexdigest()
                 csv_path = tdp / "metadata.csv"
                 csv_rows = [{
                     "run_id": "1", "role": "watermarked",
                     "t2s_state_path": str(state_path),
-                    "t2s_state_sha256": "sha_a",
+                    "t2s_state_sha256": state_sha,
                     "t2s_watermark_id": state_data["watermark_id"],
                     "t2s_provider_config_sha256": state_data["provider_config_sha256"],
                     "t2s_protocol_mode": "official_math_shared_tr_clean",
@@ -3599,7 +3610,7 @@ class TestT2SRealAdapter:
                 }, {
                     "run_id": "2", "role": "watermarked",
                     "t2s_state_path": str(state_path),
-                    "t2s_state_sha256": "sha_a",
+                    "t2s_state_sha256": state_sha,
                     "t2s_watermark_id": state_data["watermark_id"],
                     "t2s_provider_config_sha256": state_data["provider_config_sha256"],
                     "t2s_protocol_mode": "official_math_shared_tr_clean",
@@ -3623,7 +3634,6 @@ class TestT2SRealAdapter:
                 run_ids = {r["run_id"] for r in rows}
                 assert len(run_ids) == 2
 
-    @pytest.mark.xfail(reason="Real adapter mock infra needs method-specific provider tuning")
     def test_real_benchmark_num_inference_steps_binding(self, monkeypatch):
         """T2S benchmark_ddim: invert_image kwargs use num_inference_steps."""
         from experiments.eval import evaluate_detector
@@ -3640,11 +3650,13 @@ class TestT2SRealAdapter:
             )
 
             with _t2s_real_deps(monkeypatch, tdp) as (t2s_mod, inv_mod, pu, pipe):
+                import hashlib as _hashlib
+                state_sha = _hashlib.sha256(state_path.read_bytes()).hexdigest()
                 csv_path = tdp / "metadata.csv"
                 csv_rows = [{
                     "run_id": "1", "role": "watermarked",
                     "t2s_state_path": str(state_path),
-                    "t2s_state_sha256": "sha_a",
+                    "t2s_state_sha256": state_sha,
                     "t2s_watermark_id": state_data["watermark_id"],
                     "t2s_provider_config_sha256": state_data["provider_config_sha256"],
                     "t2s_protocol_mode": "official_math_shared_tr_clean",
@@ -3665,16 +3677,69 @@ class TestT2SRealAdapter:
                 assert result["status"] == STATUS_COMPLETED
                 assert result["scored_count"] == 2
 
-                # Verify invert_image received benchmark_num_inference_steps
+                # Verify invert_image kwargs from the REAL score_image:
+                # benchmark_ddim → benchmark_num_inference_steps = state.num_inference_steps
                 inv_calls = inv_mod.invert_image.mock_calls
                 assert inv_calls, "invert_image was never called"
                 for call in inv_calls:
-                    _, kwargs = call.args, call.kwargs
-                    if kwargs:
-                        steps_val = kwargs.get("benchmark_num_inference_steps")
-                        if steps_val is not None:
-                            assert steps_val == 30, \
-                                f"benchmark_num_inference_steps={steps_val}, expected 30"
+                    assert call.kwargs, f"invert_image call missing kwargs: {call}"
+                    assert call.kwargs["benchmark_num_inference_steps"] == 30, \
+                        f"benchmark_num_inference_steps={call.kwargs['benchmark_num_inference_steps']}, " \
+                        f"expected 30 (= state.num_inference_steps)"
+                    assert call.kwargs["num_inversion_steps"] == 15, \
+                        f"num_inversion_steps={call.kwargs['num_inversion_steps']}, " \
+                        f"expected 15 (= state.num_inversion_steps)"
+                    assert call.kwargs["inversion_mode"] == "benchmark_ddim"
+
+    def test_real_t2s_official_steps_binding(self, monkeypatch):
+        """T2S t2s_official: invert_image uses num_inversion_steps = state value."""
+        from experiments.eval import evaluate_detector
+        from raven.detectors import STATUS_COMPLETED
+
+        with tempfile.TemporaryDirectory() as td:
+            tdp = Path(td)
+            state_path = tdp / "states" / "wm.pt"
+            state_data = _write_t2s_state(
+                state_path,
+                inversion_mode="t2s_official",
+                num_inversion_steps=12,
+                num_inference_steps=50,
+            )
+
+            with _t2s_real_deps(monkeypatch, tdp) as (t2s_mod, inv_mod, pu, pipe):
+                import hashlib as _hashlib
+                state_sha = _hashlib.sha256(state_path.read_bytes()).hexdigest()
+                csv_path = tdp / "metadata.csv"
+                csv_rows = [{
+                    "run_id": "1", "role": "watermarked",
+                    "t2s_state_path": str(state_path),
+                    "t2s_state_sha256": state_sha,
+                    "t2s_watermark_id": state_data["watermark_id"],
+                    "t2s_provider_config_sha256": state_data["provider_config_sha256"],
+                    "t2s_protocol_mode": "official_math_shared_tr_clean",
+                    "t2s_rng_mode": state_data["rng_mode"],
+                    "t2s_inversion_mode": "t2s_official",
+                    "t2s_num_inversion_steps": "12",
+                }]
+                _write_metadata_csv(csv_path, csv_rows)
+
+                rec_wm = _min_record("1", "watermarked", "T2S")
+
+                out = _write_fake_run(tdp, method="T2S",
+                                      records=[rec_wm],
+                                      config={"metadata_path": str(csv_path)})
+                result = evaluate_detector([rec_wm],
+                                           out, "T2S", device="cpu", config={"method": "T2S", "metadata_path": str(csv_path)})
+
+                assert result["status"] == STATUS_COMPLETED
+
+                inv_calls = inv_mod.invert_image.mock_calls
+                assert inv_calls, "invert_image was never called"
+                for call in inv_calls:
+                    assert call.kwargs["num_inversion_steps"] == 12, \
+                        f"num_inversion_steps={call.kwargs['num_inversion_steps']}, " \
+                        f"expected 12 (= state.num_inversion_steps)"
+                    assert call.kwargs["inversion_mode"] == "t2s_official"
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -3684,7 +3749,6 @@ class TestT2SRealAdapter:
 class TestRIDRealAdapter:
     """RID real load_state with synthetic bundle + MetadataResolver."""
 
-    @pytest.mark.xfail(reason="Real adapter mock infra needs method-specific provider tuning")
     def test_real_adapter_success_with_bundle_and_csv(self, monkeypatch):
         """RID: real adapter success with synthetic Fourier bundle."""
         from experiments.eval import evaluate_detector
@@ -3786,7 +3850,6 @@ class TestRIDRealAdapter:
 class TestHSTRRealAdapter:
     """HSTR real load_state with SfwBundle gate validation."""
 
-    @pytest.mark.xfail(reason="Real adapter mock infra needs method-specific provider tuning")
     def test_real_adapter_success_with_bundle_and_csv(self, monkeypatch):
         """HSTR: real adapter with SfwBundle + MetadataResolver."""
         from experiments.eval import evaluate_detector
@@ -3888,7 +3951,6 @@ class TestHSTRRealAdapter:
 class TestHSQRRealAdapter:
     """HSQR real load_state — no state_source gate."""
 
-    @pytest.mark.xfail(reason="Real adapter mock infra needs method-specific provider tuning")
     def test_real_adapter_success_with_bundle_and_csv(self, monkeypatch):
         """HSQR: real adapter with SfwBundle, no state_source required."""
         from experiments.eval import evaluate_detector
@@ -3941,7 +4003,6 @@ class TestHSQRRealAdapter:
                 assert len(rows) == 4
                 assert all(r["status"] == "scored" for r in rows)
 
-    @pytest.mark.xfail(reason="Real adapter mock infra needs method-specific provider tuning")
     def test_real_bundle_gate_no_state_source_contract(self, monkeypatch):
         """HSQR: bundle loaded successfully without state_source check."""
         from experiments.eval import evaluate_detector
