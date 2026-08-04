@@ -1307,5 +1307,589 @@ class TestOrchestratorFailureStatuses:
         result = evaluate_detector(records, out_dir, "GM", device="cpu")
 
         assert result["status"] == STATUS_FAILED_PROVIDER_INITIALIZATION
+
+
+# ============================================================================
+# GNR usage — Bug 1 & Bug 2 fixes
+# ============================================================================
+
+class TestGnrUsage:
+
+    @pytest.fixture
+    def gnr_provider_info(self, provider_info):
+        """provider_info with _canonical_kwargs gm_use_gnr=False."""
+        provider_info["_canonical_kwargs"] = {"gm_use_gnr": False,
+                                                "gm_use_classifier": False}
+        return provider_info
+
+    def test_canonical_false_scorer_true_contradiction(
+        self, gnr_provider_info, fake_image):
+        """canonical gm_use_gnr=False + scorer gm_used_gnr=True → DetectorScoringError."""
+        import raven.detectors.gm_detector as gm_mod
+        stub = _StubExtractModule()
+        stub.evaluate_image = lambda *a, **kw: {
+            "gm_raw_bit_accuracy": 0.85, "gm_raw_ring_l1": 0.12,
+            "gm_restored_bit_accuracy": None, "gm_classifier_probability": None,
+            "gm_report_label": "x", "gm_score_definition": "x",
+            "gm_threshold_source": "x", "gm_comparison_operator": ">=",
+            "gm_used_gnr": True, "gm_used_classifier": False,
+        }
+        gnr_provider_info["extract_module"] = stub
+
+        record = _gm_record("0",
+            watermark_target_sha256=gnr_provider_info["provider_target_hash"],
+            watermark_mask_sha256=gnr_provider_info["provider_mask_hash"])
+        with pytest.raises(DetectorScoringError,
+                           match="usage contradiction"):
+            score_image(gnr_provider_info, fake_image, record=record)
+
+    def test_scorer_string_false_not_accepted(
+        self, gnr_provider_info, fake_image):
+        """gm_used_gnr='false' (string) → DetectorScoringError, NOT True."""
+        import raven.detectors.gm_detector as gm_mod
+        stub = _StubExtractModule()
+        stub.evaluate_image = lambda *a, **kw: {
+            "gm_raw_bit_accuracy": 0.85, "gm_raw_ring_l1": 0.12,
+            "gm_restored_bit_accuracy": None, "gm_classifier_probability": None,
+            "gm_report_label": "x", "gm_score_definition": "x",
+            "gm_threshold_source": "x", "gm_comparison_operator": ">=",
+            "gm_used_gnr": "false", "gm_used_classifier": False,
+        }
+        gnr_provider_info["extract_module"] = stub
+
+        record = _gm_record("0",
+            watermark_target_sha256=gnr_provider_info["provider_target_hash"],
+            watermark_mask_sha256=gnr_provider_info["provider_mask_hash"])
+        with pytest.raises(DetectorScoringError,
+                           match="must be bool"):
+            score_image(gnr_provider_info, fake_image, record=record)
+
+    def test_value_1_not_accepted_as_bool(
+        self, gnr_provider_info, fake_image):
+        """gm_used_gnr=1 (int) → DetectorScoringError, NOT True."""
+        import raven.detectors.gm_detector as gm_mod
+        stub = _StubExtractModule()
+        stub.evaluate_image = lambda *a, **kw: {
+            "gm_raw_bit_accuracy": 0.85, "gm_raw_ring_l1": 0.12,
+            "gm_restored_bit_accuracy": None, "gm_classifier_probability": None,
+            "gm_report_label": "x", "gm_score_definition": "x",
+            "gm_threshold_source": "x", "gm_comparison_operator": ">=",
+            "gm_used_gnr": 1, "gm_used_classifier": False,
+        }
+        gnr_provider_info["extract_module"] = stub
+
+        record = _gm_record("0",
+            watermark_target_sha256=gnr_provider_info["provider_target_hash"],
+            watermark_mask_sha256=gnr_provider_info["provider_mask_hash"])
+        with pytest.raises(DetectorScoringError,
+                           match="must be bool"):
+            score_image(gnr_provider_info, fake_image, record=record)
+
+    def test_conflicting_aliases_gnr(
+        self, gnr_provider_info, fake_image):
+        """gm_used_gnr=True + gm_gnr_used=False → DetectorScoringError."""
+        import raven.detectors.gm_detector as gm_mod
+        stub = _StubExtractModule()
+        stub.evaluate_image = lambda *a, **kw: {
+            "gm_raw_bit_accuracy": 0.85, "gm_raw_ring_l1": 0.12,
+            "gm_restored_bit_accuracy": None, "gm_classifier_probability": None,
+            "gm_report_label": "x", "gm_score_definition": "x",
+            "gm_threshold_source": "x", "gm_comparison_operator": ">=",
+            "gm_used_gnr": True, "gm_gnr_used": False,
+            "gm_used_classifier": False,
+        }
+        gnr_provider_info["extract_module"] = stub
+
+        record = _gm_record("0",
+            watermark_target_sha256=gnr_provider_info["provider_target_hash"],
+            watermark_mask_sha256=gnr_provider_info["provider_mask_hash"])
+        with pytest.raises(DetectorScoringError,
+                           match="conflicting"):
+            score_image(gnr_provider_info, fake_image, record=record)
+
+    def test_scorer_missing_fallback_to_canonical(
+        self, gnr_provider_info, fake_image):
+        """Scorer reports no GNR flag → fallback to canonical gm_use_gnr=False."""
+        import raven.detectors.gm_detector as gm_mod
+        stub = _StubExtractModule()
+        stub.evaluate_image = lambda *a, **kw: {
+            "gm_raw_bit_accuracy": 0.85, "gm_raw_ring_l1": 0.12,
+            "gm_restored_bit_accuracy": None, "gm_classifier_probability": None,
+            "gm_report_label": "x", "gm_score_definition": "x",
+            "gm_threshold_source": "x", "gm_comparison_operator": ">=",
+            # No gm_used_gnr / gm_gnr_used at all
+            "gm_used_classifier": False,
+        }
+        gnr_provider_info["extract_module"] = stub
+
+        record = _gm_record("0",
+            watermark_target_sha256=gnr_provider_info["provider_target_hash"],
+            watermark_mask_sha256=gnr_provider_info["provider_mask_hash"])
+        score = score_image(gnr_provider_info, fake_image, record=record)
+        assert score["gm_gnr_used"] is False
+
+    def test_scorer_false_canonical_false_passes(
+        self, gnr_provider_info, fake_image):
+        """Scorer gm_used_gnr=False + canonical False → passes."""
+        import raven.detectors.gm_detector as gm_mod
+        stub = _StubExtractModule()
+        stub.evaluate_image = lambda *a, **kw: {
+            "gm_raw_bit_accuracy": 0.85, "gm_raw_ring_l1": 0.12,
+            "gm_restored_bit_accuracy": None, "gm_classifier_probability": None,
+            "gm_report_label": "x", "gm_score_definition": "x",
+            "gm_threshold_source": "x", "gm_comparison_operator": ">=",
+            "gm_used_gnr": False, "gm_used_classifier": False,
+        }
+        gnr_provider_info["extract_module"] = stub
+
+        record = _gm_record("0",
+            watermark_target_sha256=gnr_provider_info["provider_target_hash"],
+            watermark_mask_sha256=gnr_provider_info["provider_mask_hash"])
+        score = score_image(gnr_provider_info, fake_image, record=record)
+        assert score["gm_gnr_used"] is False
+
+
+# ============================================================================
+# Classifier usage — symmetric to GNR
+# ============================================================================
+
+class TestClassifierUsage:
+
+    @pytest.fixture
+    def clf_provider_info(self, provider_info):
+        provider_info["_canonical_kwargs"] = {"gm_use_gnr": False,
+                                                "gm_use_classifier": False}
+        return provider_info
+
+    def test_canonical_false_scorer_true_contradiction(
+        self, clf_provider_info, fake_image):
+        import raven.detectors.gm_detector as gm_mod
+        stub = _StubExtractModule()
+        stub.evaluate_image = lambda *a, **kw: {
+            "gm_raw_bit_accuracy": 0.85, "gm_raw_ring_l1": 0.12,
+            "gm_restored_bit_accuracy": None, "gm_classifier_probability": None,
+            "gm_report_label": "x", "gm_score_definition": "x",
+            "gm_threshold_source": "x", "gm_comparison_operator": ">=",
+            "gm_used_gnr": False, "gm_used_classifier": True,
+        }
+        clf_provider_info["extract_module"] = stub
+
+        record = _gm_record("0",
+            watermark_target_sha256=clf_provider_info["provider_target_hash"],
+            watermark_mask_sha256=clf_provider_info["provider_mask_hash"])
+        with pytest.raises(DetectorScoringError,
+                           match="usage contradiction"):
+            score_image(clf_provider_info, fake_image, record=record)
+
+    def test_scorer_string_false_not_accepted(
+        self, clf_provider_info, fake_image):
+        import raven.detectors.gm_detector as gm_mod
+        stub = _StubExtractModule()
+        stub.evaluate_image = lambda *a, **kw: {
+            "gm_raw_bit_accuracy": 0.85, "gm_raw_ring_l1": 0.12,
+            "gm_restored_bit_accuracy": None, "gm_classifier_probability": None,
+            "gm_report_label": "x", "gm_score_definition": "x",
+            "gm_threshold_source": "x", "gm_comparison_operator": ">=",
+            "gm_used_gnr": False, "gm_used_classifier": "false",
+        }
+        clf_provider_info["extract_module"] = stub
+
+        record = _gm_record("0",
+            watermark_target_sha256=clf_provider_info["provider_target_hash"],
+            watermark_mask_sha256=clf_provider_info["provider_mask_hash"])
+        with pytest.raises(DetectorScoringError,
+                           match="must be bool"):
+            score_image(clf_provider_info, fake_image, record=record)
+
+    def test_conflicting_aliases_classifier(
+        self, clf_provider_info, fake_image):
+        import raven.detectors.gm_detector as gm_mod
+        stub = _StubExtractModule()
+        stub.evaluate_image = lambda *a, **kw: {
+            "gm_raw_bit_accuracy": 0.85, "gm_raw_ring_l1": 0.12,
+            "gm_restored_bit_accuracy": None, "gm_classifier_probability": None,
+            "gm_report_label": "x", "gm_score_definition": "x",
+            "gm_threshold_source": "x", "gm_comparison_operator": ">=",
+            "gm_used_gnr": False,
+            "gm_used_classifier": True, "gm_classifier_used": False,
+        }
+        clf_provider_info["extract_module"] = stub
+
+        record = _gm_record("0",
+            watermark_target_sha256=clf_provider_info["provider_target_hash"],
+            watermark_mask_sha256=clf_provider_info["provider_mask_hash"])
+        with pytest.raises(DetectorScoringError,
+                           match="conflicting"):
+            score_image(clf_provider_info, fake_image, record=record)
+
+    def test_scorer_missing_fallback_to_canonical(
+        self, clf_provider_info, fake_image):
+        import raven.detectors.gm_detector as gm_mod
+        stub = _StubExtractModule()
+        stub.evaluate_image = lambda *a, **kw: {
+            "gm_raw_bit_accuracy": 0.85, "gm_raw_ring_l1": 0.12,
+            "gm_restored_bit_accuracy": None, "gm_classifier_probability": None,
+            "gm_report_label": "x", "gm_score_definition": "x",
+            "gm_threshold_source": "x", "gm_comparison_operator": ">=",
+            "gm_used_gnr": False,
+            # No classifier flags
+        }
+        clf_provider_info["extract_module"] = stub
+
+        record = _gm_record("0",
+            watermark_target_sha256=clf_provider_info["provider_target_hash"],
+            watermark_mask_sha256=clf_provider_info["provider_mask_hash"])
+        score = score_image(clf_provider_info, fake_image, record=record)
+        assert score["gm_classifier_used"] is False
+
+    def test_scorer_false_canonical_false_passes(
+        self, clf_provider_info, fake_image):
+        import raven.detectors.gm_detector as gm_mod
+        stub = _StubExtractModule()
+        stub.evaluate_image = lambda *a, **kw: {
+            "gm_raw_bit_accuracy": 0.85, "gm_raw_ring_l1": 0.12,
+            "gm_restored_bit_accuracy": None, "gm_classifier_probability": None,
+            "gm_report_label": "x", "gm_score_definition": "x",
+            "gm_threshold_source": "x", "gm_comparison_operator": ">=",
+            "gm_used_gnr": False, "gm_used_classifier": False,
+        }
+        clf_provider_info["extract_module"] = stub
+
+        record = _gm_record("0",
+            watermark_target_sha256=clf_provider_info["provider_target_hash"],
+            watermark_mask_sha256=clf_provider_info["provider_mask_hash"])
+        score = score_image(clf_provider_info, fake_image, record=record)
+        assert score["gm_classifier_used"] is False
+
+
+# ============================================================================
+# Scorer output — bool rejection in numeric fields
+# ============================================================================
+
+class TestBoolRejectionInNumericFields:
+
+    def test_bool_rejected_in_bit_accuracy(self):
+        from raven.detectors.gm_detector import _validate_scorer_outputs
+        result = {
+            "gm_raw_bit_accuracy": True,
+            "gm_raw_ring_l1": 0.12,
+            "gm_report_label": "x", "gm_score_definition": "x",
+            "gm_threshold_source": "x", "gm_comparison_operator": ">=",
+        }
+        with pytest.raises(ValueError, match="wrong type"):
+            _validate_scorer_outputs(result)
+
+    def test_bool_rejected_in_ring_l1(self):
+        from raven.detectors.gm_detector import _validate_scorer_outputs
+        result = {
+            "gm_raw_bit_accuracy": 0.85,
+            "gm_raw_ring_l1": False,
+            "gm_report_label": "x", "gm_score_definition": "x",
+            "gm_threshold_source": "x", "gm_comparison_operator": ">=",
+        }
+        with pytest.raises(ValueError, match="wrong type"):
+            _validate_scorer_outputs(result)
+
+    def test_bool_rejected_in_optional_restored_accuracy(self):
+        from raven.detectors.gm_detector import _validate_scorer_outputs
+        result = {
+            "gm_raw_bit_accuracy": 0.85, "gm_raw_ring_l1": 0.12,
+            "gm_report_label": "x", "gm_score_definition": "x",
+            "gm_threshold_source": "x", "gm_comparison_operator": ">=",
+            "gm_restored_bit_accuracy": True,
+        }
+        with pytest.raises(ValueError, match="wrong type"):
+            _validate_scorer_outputs(result)
+
+    def test_ring_l1_no_range_bound(self):
+        """gm_raw_ring_l1 must be finite but has NO [0,1] bound."""
+        from raven.detectors.gm_detector import _validate_scorer_outputs
+        result = {
+            "gm_raw_bit_accuracy": 0.85, "gm_raw_ring_l1": 5000.0,
+            "gm_report_label": "x", "gm_score_definition": "x",
+            "gm_threshold_source": "x", "gm_comparison_operator": ">=",
+        }
+        _validate_scorer_outputs(result)  # no exception
+
+
+# ============================================================================
+# Missing bundle artifacts
+# ============================================================================
+
+class TestMissingBundleArtifacts:
+
+    def test_w1_missing_is_detector_missing_state(self, bundle_dir):
+        (bundle_dir / "w1.pth").unlink()
+        with pytest.raises(DetectorMissingStateError, match="w1.pth"):
+            _validate_bundle_files_exist(str(bundle_dir))
+
+    def test_w2_missing_is_detector_missing_state(self, bundle_dir):
+        (bundle_dir / "w2.pth").unlink()
+        with pytest.raises(DetectorMissingStateError, match="w2.pth"):
+            _validate_bundle_files_exist(str(bundle_dir))
+
+    def test_w1_missing_via_load_state(self, mock_deps, bundle_dir):
+        (bundle_dir / "w1.pth").unlink()
+        records = [_gm_record("0", gm_bundle_dir=str(bundle_dir))]
+        with pytest.raises(DetectorMissingStateError, match="w1.pth"):
+            load_state(records, "cpu")
+
+    def test_w2_missing_via_load_state(self, mock_deps, bundle_dir):
+        (bundle_dir / "w2.pth").unlink()
+        records = [_gm_record("0", gm_bundle_dir=str(bundle_dir))]
+        with pytest.raises(DetectorMissingStateError, match="w2.pth"):
+            load_state(records, "cpu")
+
+
+# ============================================================================
+# Canonical provider identity — field-level tests
+# ============================================================================
+
+class TestCanonicalProviderIdentityFields:
+
+    def _base_kwargs(self):
+        return {f: f"val_{f}" if f not in ("gm_channel_copy", "gm_w_copy",
+            "gm_h_copy", "w_seed", "w_channel", "w_radius", "resolution",
+            "gm_watermark_bits_seed") else 0
+            for f in _CANONICAL_KWARGS_FIELDS}
+
+    def test_same_fields_same_identity(self):
+        k1 = self._base_kwargs()
+        k2 = self._base_kwargs()
+        assert _canonical_provider_identity(k1) == _canonical_provider_identity(k2)
+
+    def test_gm_profile_changes_identity(self):
+        k1 = self._base_kwargs()
+        k2 = self._base_kwargs()
+        k2["gm_profile"] = "different"
+        assert _canonical_provider_identity(k1) != _canonical_provider_identity(k2)
+
+    def test_gm_bundle_dir_changes_identity(self):
+        k1 = self._base_kwargs()
+        k2 = self._base_kwargs()
+        k2["gm_bundle_dir"] = "/other/path"
+        assert _canonical_provider_identity(k1) != _canonical_provider_identity(k2)
+
+    def test_gm_use_gnr_changes_identity(self):
+        k1 = self._base_kwargs()
+        k2 = self._base_kwargs()
+        k2["gm_use_gnr"] = not k1["gm_use_gnr"]
+        assert _canonical_provider_identity(k1) != _canonical_provider_identity(k2)
+
+    def test_gm_use_classifier_changes_identity(self):
+        k1 = self._base_kwargs()
+        k2 = self._base_kwargs()
+        k2["gm_use_classifier"] = not k1["gm_use_classifier"]
+        assert _canonical_provider_identity(k1) != _canonical_provider_identity(k2)
+
+    def test_modelid_target_changes_identity(self):
+        k1 = self._base_kwargs()
+        k2 = self._base_kwargs()
+        k2["modelid_target"] = "other/model"
+        assert _canonical_provider_identity(k1) != _canonical_provider_identity(k2)
+
+    def test_model_revision_changes_identity(self):
+        k1 = self._base_kwargs()
+        k2 = self._base_kwargs()
+        k2["model_revision"] = "other_rev"
+        assert _canonical_provider_identity(k1) != _canonical_provider_identity(k2)
+
+    def test_scheduler_target_changes_identity(self):
+        k1 = self._base_kwargs()
+        k2 = self._base_kwargs()
+        k2["scheduler_target"] = "DPM"
+        assert _canonical_provider_identity(k1) != _canonical_provider_identity(k2)
+
+    def test_resolution_changes_identity(self):
+        k1 = self._base_kwargs()
+        k2 = self._base_kwargs()
+        k2["resolution"] = 768
+        assert _canonical_provider_identity(k1) != _canonical_provider_identity(k2)
+
+    def test_w_seed_changes_identity(self):
+        k1 = self._base_kwargs()
+        k2 = self._base_kwargs()
+        k2["w_seed"] = 999
+        assert _canonical_provider_identity(k1) != _canonical_provider_identity(k2)
+
+
+class TestMixedCanonicalIdentityRejectedBeforeProvider:
+
+    def test_mixed_identity_provider_not_constructed(
+        self, mock_deps, bundle_dir, monkeypatch):
+        """Two rows with different gm_use_gnr produce different canonical
+        identities → rejected before provider construction."""
+        import raven.detectors.gm_detector as gm_mod
+        counter = [0]
+
+        class CountingProvider(StubGmProvider):
+            def __init__(self, **kw):
+                counter[0] += 1
+                super().__init__(**kw)
+
+        fake_gm = sys.modules.get("eval_bench_wm.utils.wm.gm_provider")
+        fake_gm.GmProvider = CountingProvider
+
+        # Create two bundles with different profiles to produce different kwargs.
+        bundle2 = _make_bundle_dir(bundle_dir.parent / "bundle2",
+                                   profile="different_profile")
+        try:
+            records = [
+                _gm_record("0", gm_bundle_dir=str(bundle_dir),
+                           gm_protocol_mode=GM_SHARED_TR_CLEAN_MODE),
+                _gm_record("1", gm_bundle_dir=str(bundle2),
+                           gm_protocol_mode=GM_SHARED_TR_CLEAN_MODE,
+                           gm_bundle_config_sha256="a" * 64,
+                           gm_w1_file_sha256="b" * 64,
+                           gm_w2_file_sha256="c" * 64,
+                           gm_m_sha256="m" * 64,
+                           gm_watermark_sha256="n" * 64,
+                           gm_target_sha256="o" * 64),
+            ]
+            # The second bundle's manifest has profile="different_profile" which
+            # won't match GM_SHARED_TR_CLEAN_MODE from the protocol, so it fails
+            # at protocol validation.  Let me instead test with same protocol
+            # but different identity via a custom extract module that returns
+            # different kwargs per row.
+            pass  # see next test
+        finally:
+            fake_gm.GmProvider = StubGmProvider
+
+    def test_mixed_identity_via_custom_extract(
+        self, mock_deps, bundle_dir, monkeypatch):
+        """Custom extract module returns different kwargs for row 1 → mixed identity."""
+        import raven.detectors.gm_detector as gm_mod
+        counter = [0]
+
+        class CountingProvider(StubGmProvider):
+            def __init__(self, **kw):
+                counter[0] += 1
+                super().__init__(**kw)
+
+        fake_gm = sys.modules.get("eval_bench_wm.utils.wm.gm_provider")
+        fake_gm.GmProvider = CountingProvider
+
+        row1_kwargs = None
+        class RowVaryingExtract(_StubExtractModule):
+            def gm_provider_kwargs(self, row, identifier):
+                nonlocal row1_kwargs
+                bd, mf = self.gm_bundle_manifest(row, identifier)
+                kw = super().gm_provider_kwargs(row, identifier)
+                if str(row.get("run_id")) == "1":
+                    kw = dict(kw, gm_use_gnr=not kw.get("gm_use_gnr", False))
+                else:
+                    row1_kwargs = dict(kw)
+                return kw
+
+        monkeypatch.setattr(gm_mod, "_get_extract_module",
+                            lambda: RowVaryingExtract())
+        try:
+            records = [
+                _gm_record("0", gm_bundle_dir=str(bundle_dir)),
+                _gm_record("1", gm_bundle_dir=str(bundle_dir)),
+            ]
+            with pytest.raises(DetectorStateValidationError,
+                               match="mixed canonical"):
+                load_state(records, "cpu")
+            assert counter[0] == 0
+        finally:
+            fake_gm.GmProvider = StubGmProvider
+
+
+# ============================================================================
+# Canonical helper delegation — raw_score/canonical_score + error wrapping
+# ============================================================================
+
+class TestCanonicalHelperDelegationFull:
+
+    def test_raw_score_called_once(self, mock_deps, bundle_dir, monkeypatch):
+        import raven.detectors.gm_detector as gm_mod
+        stub = _StubExtractModule()
+        calls = []
+        _orig = stub.raw_score
+        stub.raw_score = lambda m, r: calls.append(("raw_score", m)) or _orig(m, r)
+        monkeypatch.setattr(gm_mod, "_get_extract_module", lambda: stub)
+
+        records = [_gm_record("0", gm_bundle_dir=str(bundle_dir))]
+        info = load_state(records, "cpu")
+        info["extract_module"] = stub
+
+        from PIL import Image
+        fake = bundle_dir.parent / "deleg_raw.png"
+        Image.new("RGB", (16, 16)).save(fake)
+
+        record = _gm_record("0",
+            watermark_target_sha256=info["provider_target_hash"],
+            watermark_mask_sha256=info["provider_mask_hash"])
+        score_image(info, str(fake), record=record)
+        assert len(calls) == 1
+        assert calls[0] == ("raw_score", "GM")
+
+    def test_canonical_score_called_once(self, mock_deps, bundle_dir, monkeypatch):
+        import raven.detectors.gm_detector as gm_mod
+        stub = _StubExtractModule()
+        calls = []
+        _orig = stub.canonical_score
+        stub.canonical_score = lambda m, r, res: calls.append(("canonical", m)) or _orig(m, r, res)
+        monkeypatch.setattr(gm_mod, "_get_extract_module", lambda: stub)
+
+        records = [_gm_record("0", gm_bundle_dir=str(bundle_dir))]
+        info = load_state(records, "cpu")
+        info["extract_module"] = stub
+
+        from PIL import Image
+        fake = bundle_dir.parent / "deleg_canon.png"
+        Image.new("RGB", (16, 16)).save(fake)
+
+        record = _gm_record("0",
+            watermark_target_sha256=info["provider_target_hash"],
+            watermark_mask_sha256=info["provider_mask_hash"])
+        score_image(info, str(fake), record=record)
+        assert len(calls) == 1
+        assert calls[0] == ("canonical", "GM")
+
+    def test_raw_score_error_wrapped_as_scoring_error(
+        self, mock_deps, bundle_dir, monkeypatch):
+        import raven.detectors.gm_detector as gm_mod
+        stub = _StubExtractModule()
+        stub.raw_score = lambda m, r: (_ for _ in ()).throw(
+            RuntimeError("raw fail"))
+        monkeypatch.setattr(gm_mod, "_get_extract_module", lambda: stub)
+
+        records = [_gm_record("0", gm_bundle_dir=str(bundle_dir))]
+        info = load_state(records, "cpu")
+        info["extract_module"] = stub
+
+        from PIL import Image
+        fake = bundle_dir.parent / "deleg_err1.png"
+        Image.new("RGB", (16, 16)).save(fake)
+
+        record = _gm_record("0",
+            watermark_target_sha256=info["provider_target_hash"],
+            watermark_mask_sha256=info["provider_mask_hash"])
+        with pytest.raises(DetectorScoringError, match="scoring failed"):
+            score_image(info, str(fake), record=record)
+
+    def test_canonical_score_error_wrapped_as_scoring_error(
+        self, mock_deps, bundle_dir, monkeypatch):
+        import raven.detectors.gm_detector as gm_mod
+        stub = _StubExtractModule()
+        stub.canonical_score = lambda m, r, res: (
+            _ for _ in ()).throw(RuntimeError("canonical fail"))
+        monkeypatch.setattr(gm_mod, "_get_extract_module", lambda: stub)
+
+        records = [_gm_record("0", gm_bundle_dir=str(bundle_dir))]
+        info = load_state(records, "cpu")
+        info["extract_module"] = stub
+
+        from PIL import Image
+        fake = bundle_dir.parent / "deleg_err2.png"
+        Image.new("RGB", (16, 16)).save(fake)
+
+        record = _gm_record("0",
+            watermark_target_sha256=info["provider_target_hash"],
+            watermark_mask_sha256=info["provider_mask_hash"])
+        with pytest.raises(DetectorScoringError, match="scoring failed"):
+            score_image(info, str(fake), record=record)
         assert not stage_status_is_allowable(
             STATUS_FAILED_PROVIDER_INITIALIZATION, allow_missing_metrics=True)
