@@ -8,9 +8,24 @@ defaults is forbidden — missing fields cause ``DetectorMissingStateError``,
 invalid values cause ``DetectorStateValidationError``.  Mixed provider
 configurations across records are rejected before scoring.
 
+The adapter binds directly to the canonical source metadata schema written by
+``experiments/generate_watermarked_images.py``:
+
+    model_id, model_revision, scheduler_target, num_inference_steps_target,
+    resolution, w_seed, w_channel, w_radius, w_pattern, w_mask_shape,
+    w_measurement, w_injection, w_pattern_const,
+    watermark_target_sha256, watermark_mask_sha256
+
+Aliases are resolved explicitly (``scheduler``/``scheduler_target``,
+``steps``/``num_inference_steps_target``).  Fields that only extraction
+outputs produce (inverse_scheduler, detector_dtype, vae_id,
+vae_scaling_factor, provider_config_hash) are optional source assertions:
+when absent the runtime-derived value is used and recorded without claiming
+source verification.
+
 A uniform cohort constructs exactly one provider from the verified profile.
-Target and mask identities are validated against provider-derived hashes.
-Pipe is built from the verified cohort profile, never hard-coded.
+Pipe is built from the verified cohort profile, never hard-coded.  Metadata
+steps control canonical inversion — the caller cannot override them.
 """
 
 from __future__ import annotations
@@ -51,22 +66,34 @@ _ALLOWED_W_PATTERN: frozenset[str] = frozenset({
 _ALLOWED_W_MASK_SHAPE: frozenset[str] = frozenset({"circle", "square", "no"})
 _ALLOWED_W_INJECTION: frozenset[str] = frozenset({"complex", "seed"})
 
-# TR profile identity fields.  Every row MUST have a non-empty value for each
-# field, and all rows MUST agree.  Missing fields → DetectorMissingStateError.
-# Mixed values → DetectorStateValidationError.
-TR_PROFILE_IDENTITY_FIELDS: tuple[str, ...] = (
-    "model_id",
-    "model_revision",
-    "scheduler",
+# The canonical TR scoring path always runs the non-central chi-square
+# p-value test; no alternate measurement implementation exists.  The formal
+# TR profile therefore requires exactly this value.
+REQUIRED_W_MEASUREMENT: str = "l1_complex"
+
+# Source-required profile identity fields and their canonical aliases.
+# ``scheduler`` and ``steps`` have generator-schema aliases; everything else
+# is a single field.  Missing → DetectorMissingStateError; mixed →
+# DetectorStateValidationError.
+SOURCE_REQUIRED_IDENTITY: dict[str, tuple[str, ...]] = {
+    "model_id": ("model_id",),
+    "model_revision": ("model_revision",),
+    "scheduler": ("scheduler", "scheduler_target"),
+    "steps": ("steps", "num_inference_steps_target"),
+    "resolution": ("resolution",),
+    "watermark_target_sha256": ("watermark_target_sha256",),
+    "watermark_mask_sha256": ("watermark_mask_sha256",),
+}
+
+# Fields only extraction outputs produce.  Source may assert them; when
+# absent the runtime-derived value is used and the assertion is recorded as
+# unavailable (never fabricated as source-verified).
+OPTIONAL_ASSERTION_FIELDS: tuple[str, ...] = (
     "inverse_scheduler",
-    "steps",
-    "resolution",
     "detector_dtype",
     "vae_id",
     "vae_scaling_factor",
     "provider_config_hash",
-    "watermark_target_sha256",
-    "watermark_mask_sha256",
 )
 
 _extract_module = None
@@ -100,10 +127,9 @@ def describe_required_artifacts() -> list[str]:
         "w_seed, w_channel, w_radius, w_pattern, w_mask_shape, "
         "w_measurement, w_injection, w_pattern_const",
         "Stable Diffusion pipe provider (pipe_utils.get_pipe_provider)",
-        "TR profile identity: model_id, model_revision, scheduler, "
-        "inverse_scheduler, steps, resolution, detector_dtype, vae_id, "
-        "vae_scaling_factor, provider_config_hash, "
-        "watermark_target_sha256, watermark_mask_sha256",
+        "TR source identity: model_id, model_revision, "
+        "scheduler/scheduler_target, steps/num_inference_steps_target, "
+        "resolution, watermark_target_sha256, watermark_mask_sha256",
     ]
 
 
@@ -128,25 +154,136 @@ def _require_nonempty(record: dict[str, Any], field: str,
     return text
 
 
-def _require_uniform_field(records: list[dict[str, Any]],
-                           field: str) -> str:
-    """Every record must have a non-empty value for *field* and all must agree.
+def _resolve_profile_field(
+    record: dict[str, Any],
+    canonical_name: str,
+    aliases: tuple[str, ...],
+    *,
+    record_index: int,
+) -> str:
+    """Resolve one canonical profile field from its alias set.
 
-    Returns the single canonical value.  Missing → DetectorMissingStateError,
-    mixed → DetectorStateValidationError.
+    Both aliases absent → DetectorMissingStateError.
+    Both present but different → DetectorStateValidationError.
+    Exactly one present → that value.
     """
-    values: list[str] = []
-    for idx, record in enumerate(records):
-        values.append(_require_nonempty(record, field, idx))
+    present: dict[str, str] = {}
+    for alias in aliases:
+        raw = record.get(alias)
+        if raw is not None and str(raw).strip():
+            present[alias] = str(raw).strip()
+    if not present:
+        raise DetectorMissingStateError(
+            f"TR profile field {canonical_name!r} is missing at record index "
+            f"{record_index} (run_id={record.get('run_id', '?')}); expected "
+            f"one of {list(aliases)}"
+        )
+    unique = sorted(set(present.values()))
+    if len(unique) != 1:
+        raise DetectorStateValidationError(
+            f"TR profile field {canonical_name!r} has conflicting values at "
+            f"record index {record_index} (run_id={record.get('run_id', '?')}): "
+            f"{present} — aliases {list(aliases)} must agree"
+        )
+    return unique[0]
 
+
+def _resolve_uniform_field(
+    records: list[dict[str, Any]],
+    canonical_name: str,
+    aliases: tuple[str, ...],
+) -> str:
+    """Resolve a canonical field for every record and require uniformity."""
+    values = [
+        _resolve_profile_field(record, canonical_name, aliases,
+                               record_index=idx)
+        for idx, record in enumerate(records)
+    ]
     unique = sorted(set(values))
     if len(unique) != 1:
         raise DetectorStateValidationError(
-            f"Mixed {field} across TR cohort ({len(unique)} distinct values "
-            f"across {len(records)} records): {unique}. "
-            f"All records must agree on detector profile identity fields."
+            f"Mixed {canonical_name} across TR cohort "
+            f"({len(unique)} distinct values across {len(records)} records): "
+            f"{unique}"
         )
     return unique[0]
+
+
+def _strict_int_value(text: str, field: str, *, record_index: int,
+                      rid: Any, minimum: int | None = None,
+                      multiple_of: int | None = None) -> int:
+    """Parse a resolved text value as a strict integer (structured taxonomy)."""
+    try:
+        value = int(text)
+    except (ValueError, TypeError):
+        raise DetectorStateValidationError(
+            f"TR {field} must be an integer at record index {record_index} "
+            f"(run_id={rid}): got {text!r}"
+        ) from None
+    if minimum is not None and value < minimum:
+        raise DetectorStateValidationError(
+            f"TR {field} must be >= {minimum} at record index "
+            f"{record_index} (run_id={rid}): got {value}"
+        )
+    if multiple_of is not None and value % multiple_of != 0:
+        raise DetectorStateValidationError(
+            f"TR {field} must be a multiple of {multiple_of} at record index "
+            f"{record_index} (run_id={rid}): got {value}"
+        )
+    return value
+
+
+def _strict_float_value(text: str, field: str, *, record_index: int,
+                        rid: Any, minimum: float | None = None) -> float:
+    """Parse a resolved text value as a strict finite float (structured)."""
+    try:
+        value = float(text)
+    except (ValueError, TypeError):
+        raise DetectorStateValidationError(
+            f"TR {field} must be a finite float at record index "
+            f"{record_index} (run_id={rid}): got {text!r}"
+        ) from None
+    if not math.isfinite(value):
+        raise DetectorStateValidationError(
+            f"TR {field} must be finite at record index {record_index} "
+            f"(run_id={rid}): got {value}"
+        )
+    if minimum is not None and value <= minimum:
+        raise DetectorStateValidationError(
+            f"TR {field} must be > {minimum} at record index "
+            f"{record_index} (run_id={rid}): got {value}"
+        )
+    return value
+
+
+def _optional_uniform_assertion(
+    records: list[dict[str, Any]],
+    field: str,
+) -> tuple[str | None, bool]:
+    """Resolve an optional source-assertion field across the cohort.
+
+    Returns ``(value, asserted)``.  When no record carries a non-empty value,
+    ``(None, False)`` — the runtime-derived value must be used and the source
+    assertion marked unavailable.  When present, all non-empty values must
+    agree; mixed → DetectorStateValidationError.
+    """
+    values: list[str] = []
+    for idx, record in enumerate(records):
+        raw = record.get(field)
+        if raw is None:
+            continue
+        text = str(raw).strip()
+        if text:
+            values.append(text)
+    unique = sorted(set(values))
+    if len(unique) > 1:
+        raise DetectorStateValidationError(
+            f"Mixed {field} across TR cohort: {unique} — where present the "
+            f"source assertion must be uniform"
+        )
+    if not unique:
+        return None, False
+    return unique[0], True
 
 
 def _normalize_tr_provider_config(
@@ -172,19 +309,19 @@ def _normalize_tr_provider_config(
             f"(run_id={rid}): got {w_seed_text!r}"
         ) from None
 
-    # ---- w_channel: non-negative integer ----
+    # ---- w_channel: -1 (all channels) or non-negative integer ----
     w_channel_text = _require_nonempty(record, "w_channel", record_index)
     try:
         w_channel = int(w_channel_text)
     except (ValueError, TypeError):
         raise DetectorStateValidationError(
-            f"TR w_channel must be a non-negative integer at record index "
-            f"{record_index} (run_id={rid}): got {w_channel_text!r}"
+            f"TR w_channel must be -1 or a non-negative integer at record "
+            f"index {record_index} (run_id={rid}): got {w_channel_text!r}"
         ) from None
-    if w_channel < 0:
+    if w_channel < -1:
         raise DetectorStateValidationError(
-            f"TR w_channel must be non-negative at record index "
-            f"{record_index} (run_id={rid}): got {w_channel}"
+            f"TR w_channel must be -1 (all channels) or non-negative at "
+            f"record index {record_index} (run_id={rid}): got {w_channel}"
         )
 
     # ---- w_radius: positive integer ----
@@ -235,6 +372,12 @@ def _normalize_tr_provider_config(
         )
 
     w_measurement = _require_nonempty(record, "w_measurement", record_index)
+    if w_measurement != REQUIRED_W_MEASUREMENT:
+        raise DetectorStateValidationError(
+            f"TR w_measurement {w_measurement!r} is not supported: the "
+            f"canonical TR scoring path only implements "
+            f"{REQUIRED_W_MEASUREMENT!r}"
+        )
 
     w_injection = _require_nonempty(record, "w_injection", record_index)
     if w_injection not in _ALLOWED_W_INJECTION:
@@ -256,17 +399,29 @@ def _normalize_tr_provider_config(
     }
 
 
+def _validate_w_channel_range(w_channel: int, latent_shape: tuple[int, ...],
+                              record_index: int) -> None:
+    """Validate w_channel against the actual latent channel count."""
+    channel_count = latent_shape[1]
+    if w_channel != -1 and not 0 <= w_channel < channel_count:
+        raise DetectorStateValidationError(
+            f"TR w_channel {w_channel} is out of range for a "
+            f"{channel_count}-channel latent"
+        )
+
+
 # ---------------------------------------------------------------------------
-# load_state — fail-closed, cohort-consistent
+# load_state — fail-closed, cohort-consistent, canonical-schema bound
 # ---------------------------------------------------------------------------
 def load_state(records: list[dict[str, Any]], device: str,
                **extra) -> dict[str, Any]:
     """Load TR provider and pipe.  Raises on missing/bad state, never swallows.
 
-    Validates every record — not just the first — so a mixed-key or
-    mixed-profile cohort is rejected before any scoring happens.  A uniform
-    cohort constructs exactly one provider built from the verified profile.
-    Pipe is built from cohort metadata, never hard-coded.
+    Binds directly to the canonical generator metadata schema.  Validates
+    every record — not just the first — so a mixed-key or mixed-profile
+    cohort is rejected before any scoring happens.  A uniform cohort
+    constructs exactly one provider built from the verified profile.  Pipe is
+    built from cohort metadata, never hard-coded.
     """
     import torch
 
@@ -296,13 +451,12 @@ def load_state(records: list[dict[str, Any]], device: str,
     for idx, record in enumerate(records):
         configs.append(_normalize_tr_provider_config(record, record_index=idx))
 
-    # Check uniform provider config via canonical hash
+    # Uniform provider config via canonical hash
     from raven.eval_protocol import provider_config_hash
     provider_hashes: set[str] = set()
     for idx, record in enumerate(records):
         try:
-            h = provider_config_hash("TR", record)
-            provider_hashes.add(h)
+            provider_hashes.add(provider_config_hash("TR", record))
         except (ValueError, TypeError) as exc:
             raise DetectorStateValidationError(
                 f"TR provider config hash failed at record index {idx} "
@@ -321,36 +475,66 @@ def load_state(records: list[dict[str, Any]], device: str,
     computed_config_hash = next(iter(provider_hashes))
     uniform_cfg = configs[0]
 
-    # ---- 2: validate uniform profile identity fields ----
-    profile: dict[str, str] = {}
-    for field in TR_PROFILE_IDENTITY_FIELDS:
-        profile[field] = _require_uniform_field(records, field)
+    # ---- 2: resolve source-required identity fields (aliases honoured) ----
+    source_identity: dict[str, str] = {}
+    for canonical, aliases in SOURCE_REQUIRED_IDENTITY.items():
+        source_identity[canonical] = _resolve_uniform_field(
+            records, canonical, aliases)
 
-    # ---- 3: validate recorded provider_config_hash ----
-    recorded_hash = profile["provider_config_hash"]
-    if recorded_hash != computed_config_hash:
+    model_id = source_identity["model_id"]
+    model_revision = source_identity["model_revision"]
+    scheduler = source_identity["scheduler"]
+    rid0 = records[0].get("run_id", "?")
+    resolution = _strict_int_value(
+        source_identity["resolution"], "resolution", record_index=0,
+        rid=rid0, minimum=1, multiple_of=8)
+    steps = _strict_int_value(
+        source_identity["steps"], "steps", record_index=0,
+        rid=rid0, minimum=1)
+
+    # ---- 3: optional source assertions ----
+    assertions: dict[str, tuple[str | None, bool]] = {}
+    for field in OPTIONAL_ASSERTION_FIELDS:
+        assertions[field] = _optional_uniform_assertion(records, field)
+
+    asserted_inverse, inverse_asserted = assertions["inverse_scheduler"]
+    asserted_dtype, dtype_asserted = assertions["detector_dtype"]
+    asserted_vae_id, vae_id_asserted = assertions["vae_id"]
+    asserted_vae_scaling, vae_scaling_asserted = assertions["vae_scaling_factor"]
+    asserted_hash, hash_asserted = assertions["provider_config_hash"]
+
+    # vae_scaling_factor strict parse when asserted
+    if vae_scaling_asserted:
+        assert asserted_vae_scaling is not None
+        _strict_float_value(
+            asserted_vae_scaling, "vae_scaling_factor", record_index=0,
+            rid=rid0, minimum=0.0)
+
+    # ---- 4: provider_config_hash source assertion (canonical semantics) ----
+    # Missing or empty recorded hash is legal: the detector still saves the
+    # computed hash.  Present-but-mismatched fails closed.
+    if hash_asserted:
+        assert asserted_hash is not None
+        if asserted_hash != computed_config_hash:
+            raise DetectorStateValidationError(
+                f"Recorded provider_config_hash {asserted_hash!r} does not "
+                f"match canonical computed hash {computed_config_hash!r}"
+            )
+
+    # ---- 5: scheduler validation against real pipe registry ----
+    supported_schedulers = set(pipe_utils.SCHEDULER_CLASSES)
+    if scheduler not in supported_schedulers:
         raise DetectorStateValidationError(
-            f"Recorded provider_config_hash {recorded_hash!r} does not "
-            f"match canonical computed hash {computed_config_hash!r}"
+            f"TR scheduler {scheduler!r} is not in the pipe registry: "
+            f"{sorted(supported_schedulers)}"
         )
 
-    # ---- 4: build pipe from verified profile ----
-    model_id = profile["model_id"]
-    model_revision = profile["model_revision"]
-    scheduler = profile["scheduler"]
-    resolution = int(profile["resolution"])
-
-    # Validate formal scheduler values
-    _ALLOWED_SCHEDULERS: frozenset[str] = frozenset({"DDIM", "DDPM"})
-    if scheduler not in _ALLOWED_SCHEDULERS:
-        raise DetectorStateValidationError(
-            f"TR scheduler {scheduler!r} not in canonical allowed set: "
-            f"{sorted(_ALLOWED_SCHEDULERS)}"
-        )
-
+    # ---- 6: build pipe from verified profile ----
     try:
         device_obj = torch.device(device)
         load_options = {"revision": model_revision} if model_revision else {}
+        if vae_id_asserted:
+            load_options["vae_id"] = asserted_vae_id
         pipe = pipe_utils.get_pipe_provider(
             pretrained_model_name_or_path=model_id,
             resolution=resolution,
@@ -369,42 +553,45 @@ def load_state(records: list[dict[str, Any]], device: str,
             f"TR pipe construction failed: {type(exc).__name__}: {exc}"
         ) from exc
 
-    # ---- 5: verify pipe runtime matches profile ----
+    # ---- 7: verify pipe runtime against profile ----
     latent_shape = pipe.get_latent_shape()
     pipe_dtype = str(pipe.get_dtype())
-    expected_dtype = profile["detector_dtype"]
-    if pipe_dtype != expected_dtype:
+    if dtype_asserted and pipe_dtype != asserted_dtype:
         raise DetectorStateValidationError(
-            f"Pipe dtype {pipe_dtype!r} does not match cohort profile "
-            f"detector_dtype {expected_dtype!r}"
+            f"Pipe dtype {pipe_dtype!r} does not match source-asserted "
+            f"detector_dtype {asserted_dtype!r}"
         )
 
-    expected_steps = int(profile["steps"])
-    expected_resolution = int(profile["resolution"])
-    if latent_shape[-1] != expected_resolution // 8:
+    if latent_shape[-1] != resolution // 8:
         raise DetectorStateValidationError(
             f"Pipe latent spatial size {latent_shape[-1]} does not match "
-            f"cohort resolution {expected_resolution} (expected "
-            f"{expected_resolution // 8})"
+            f"cohort resolution {resolution} (expected {resolution // 8})"
         )
 
     inverse_scheduler_name = type(pipe.scheduler_inverse).__name__
-    expected_inverse = profile["inverse_scheduler"]
-    if inverse_scheduler_name != expected_inverse:
+    if inverse_asserted and inverse_scheduler_name != asserted_inverse:
         raise DetectorStateValidationError(
             f"Pipe inverse scheduler {inverse_scheduler_name!r} does not "
-            f"match cohort profile inverse_scheduler {expected_inverse!r}"
+            f"match source-asserted inverse_scheduler {asserted_inverse!r}"
         )
 
     vae_scaling = float(pipe.pipe.vae.config.scaling_factor)
-    expected_vae = float(profile["vae_scaling_factor"])
-    if not math.isclose(vae_scaling, expected_vae, rel_tol=1e-9):
-        raise DetectorStateValidationError(
-            f"Pipe VAE scaling factor {vae_scaling} does not match cohort "
-            f"vae_scaling_factor {expected_vae}"
-        )
+    if vae_scaling_asserted:
+        assert asserted_vae_scaling is not None
+        if not math.isclose(vae_scaling, float(asserted_vae_scaling),
+                            rel_tol=1e-9):
+            raise DetectorStateValidationError(
+                f"Pipe VAE scaling factor {vae_scaling} does not match "
+                f"source-asserted vae_scaling_factor "
+                f"{float(asserted_vae_scaling)}"
+            )
 
-    # ---- 6: build provider from uniform config ----
+    # Runtime VAE identity: checkpoint-default when source did not assert one.
+    runtime_vae_id = asserted_vae_id if vae_id_asserted else "checkpoint-default"
+
+    # ---- 8: validate w_channel against latent shape, build provider ----
+    _validate_w_channel_range(uniform_cfg["w_channel"], latent_shape, 0)
+
     try:
         provider = TrProvider(
             latent_shape=latent_shape,
@@ -425,26 +612,24 @@ def load_state(records: list[dict[str, Any]], device: str,
             f"TR initialization error: {type(exc).__name__}: {exc}"
         ) from exc
 
-    # ---- 7: derive and verify target / mask identity ----
+    # ---- 9: derive and verify target / mask identity ----
     from raven.pairing_provenance import tensor_sha256
 
-    # Target: gt_patch (complex tensor)
     target = getattr(provider, "gt_patch", None)
     if target is None:
         raise DetectorStateValidationError(
             "TR provider has no gt_patch — cannot derive watermark target identity"
         )
     detector_target_sha = tensor_sha256(target)
-    source_target_sha = profile["watermark_target_sha256"]
+    source_target_sha = source_identity["watermark_target_sha256"]
 
-    # Mask: watermarking_mask
     mask = getattr(provider, "watermarking_mask", None)
     if mask is None:
         raise DetectorStateValidationError(
             "TR provider has no watermarking_mask — cannot derive mask identity"
         )
     detector_mask_sha = tensor_sha256(mask)
-    source_mask_sha = profile["watermark_mask_sha256"]
+    source_mask_sha = source_identity["watermark_mask_sha256"]
 
     if source_target_sha != detector_target_sha:
         raise DetectorStateValidationError(
@@ -457,18 +642,17 @@ def load_state(records: list[dict[str, Any]], device: str,
             f"match provider-derived mask SHA {detector_mask_sha!r}"
         )
 
-    # ---- 8: assemble verified provenance ----
-    verified_profile = {
+    # ---- 10: assemble verified provenance ----
+    verified_profile: dict[str, Any] = {
         "model_id": model_id,
         "model_revision": model_revision,
         "scheduler": scheduler,
         "inverse_scheduler": inverse_scheduler_name,
-        "steps": expected_steps,
+        "steps": steps,
         "resolution": resolution,
         "detector_dtype": pipe_dtype,
-        "vae_id": profile["vae_id"],
+        "vae_id": runtime_vae_id,
         "vae_scaling_factor": vae_scaling,
-        # The actual value passed to TrProvider — never a default.
         "w_pattern_const": uniform_cfg["w_pattern_const"],
     }
 
@@ -479,13 +663,21 @@ def load_state(records: list[dict[str, Any]], device: str,
         "provider_kwargs": uniform_cfg,
         "device_obj": device_obj,
         # verified provenance
-        "source_provider_config_hash": recorded_hash,
+        "source_provider_config_hash": asserted_hash or "",
         "detector_provider_config_hash": computed_config_hash,
+        "tr_provider_config_hash_source_asserted": hash_asserted,
+        "tr_provider_config_verified": True,
         "source_watermark_target_sha256": source_target_sha,
         "detector_watermark_target_sha256": detector_target_sha,
         "source_watermark_mask_sha256": source_mask_sha,
         "detector_watermark_mask_sha256": detector_mask_sha,
         "verified_profile": verified_profile,
+        "inversion_steps": steps,
+        # source-assertion availability flags
+        "tr_inverse_scheduler_source_asserted": inverse_asserted,
+        "tr_detector_dtype_source_asserted": dtype_asserted,
+        "tr_vae_id_source_asserted": vae_id_asserted,
+        "tr_vae_scaling_source_asserted": vae_scaling_asserted,
     }
 
 
@@ -495,13 +687,15 @@ def load_state(records: list[dict[str, Any]], device: str,
 def score_image(provider_info: dict[str, Any], image_path: str, *,
                 record: dict[str, Any] | None = None,
                 evaluation_entry: dict[str, Any] | None = None,
-                steps: int = 50) -> dict[str, Any]:
+                steps: int | None = None) -> dict[str, Any]:
     """Score one image using the canonical TR detection path.
 
-    Delegates to ``extract_verification_scores.evaluate_image``,
-    ``raw_score``, and ``canonical_score`` inside a single try/except so
-    canonical-helper failures are ``DetectorScoringError``, never
-    ``failed_internal_error``.
+    The inversion step count comes from the verified cohort profile
+    (``provider_info["inversion_steps"]``) — the canonical helper is never
+    called with a hard-coded default.  ``steps`` defaults to None so an
+    orchestrator that does not pass it cannot override the metadata profile;
+    an explicit caller-supplied ``steps`` that differs from the profile is
+    rejected with ``DetectorStateValidationError``.
     """
     import torch
 
@@ -513,12 +707,20 @@ def score_image(provider_info: dict[str, Any], image_path: str, *,
     pipe = provider_info["pipe"]
     mod = provider_info["extract_module"]
 
+    effective_steps = int(provider_info["inversion_steps"])
+    if steps is not None and int(steps) != effective_steps:
+        raise DetectorStateValidationError(
+            f"TR caller-supplied steps {steps} conflicts with verified "
+            f"cohort profile inversion_steps {effective_steps}"
+        )
+
     # The canonical evaluate_image helper already reads and decodes the image
-    # internally, so the adapter does NOT duplicate image I/O here.  The entire
-    # scoring path (evaluate → raw → canonical → diagnostics) runs inside one
-    # exception boundary.
+    # internally, so the adapter does NOT duplicate image I/O here.  The
+    # entire scoring path (evaluate → raw → canonical → diagnostics) runs
+    # inside one exception boundary.
     try:
-        result = mod.evaluate_image(torch, provider, pipe, path, steps)
+        result = mod.evaluate_image(
+            torch, provider, pipe, path, effective_steps)
         raw = mod.raw_score("TR", result)
         canonical = mod.canonical_score("TR", raw, result)
     except DetectorScoringError:
@@ -570,6 +772,8 @@ def score_image(provider_info: dict[str, Any], image_path: str, *,
     score["tr_provider_config_hash"] = provider_info.get(
         "detector_provider_config_hash", "")
     score["tr_provider_config_verified"] = True
+    score["tr_provider_config_hash_source_asserted"] = bool(
+        provider_info.get("tr_provider_config_hash_source_asserted", False))
     score["tr_source_watermark_target_sha256"] = provider_info.get(
         "source_watermark_target_sha256", "")
     score["tr_detector_watermark_target_sha256"] = provider_info.get(
@@ -584,11 +788,20 @@ def score_image(provider_info: dict[str, Any], image_path: str, *,
     score["tr_model_revision"] = verified_profile.get("model_revision", "")
     score["tr_scheduler"] = verified_profile.get("scheduler", "")
     score["tr_inverse_scheduler"] = verified_profile.get("inverse_scheduler", "")
+    score["tr_inverse_scheduler_source_asserted"] = bool(
+        provider_info.get("tr_inverse_scheduler_source_asserted", False))
     score["tr_steps"] = verified_profile.get("steps", "")
     score["tr_resolution"] = verified_profile.get("resolution", "")
     score["tr_detector_dtype"] = verified_profile.get("detector_dtype", "")
-    # The provider's actual w_pattern_const, verified against metadata.
-    score["tr_w_pattern_const"] = verified_profile.get("w_pattern_const")
+    score["tr_detector_dtype_source_asserted"] = bool(
+        provider_info.get("tr_detector_dtype_source_asserted", False))
+    score["tr_vae_id"] = verified_profile.get("vae_id", "")
+    score["tr_vae_id_source_asserted"] = bool(
+        provider_info.get("tr_vae_id_source_asserted", False))
+    score["tr_vae_scaling_factor"] = verified_profile.get("vae_scaling_factor", "")
+    score["tr_vae_scaling_source_asserted"] = bool(
+        provider_info.get("tr_vae_scaling_source_asserted", False))
+    score["tr_w_pattern_const"] = verified_profile.get("w_pattern_const", "")
 
     return score
 
@@ -604,6 +817,9 @@ def aggregate(detector_rows: list[dict[str, Any]], **extra) -> dict[str, Any]:
 
     ``attacked_clean`` controls the independent ``tr_recalibrated`` block
     and does NOT block the original-threshold report when absent.
+
+    A recalibration metric-computation error is never disguised as data
+    unavailability: it re-raises as a structured scoring failure.
     """
     from raven.metrics import summarize_detection
     from . import ROW_STATUS_SCORED
@@ -656,31 +872,28 @@ def aggregate(detector_rows: list[dict[str, Any]], **extra) -> dict[str, Any]:
             "attack_success_at_original_threshold": 1.0 - summary.attacked_tpr,
         }
 
-    # Recalibrated: independent block gated on attacked_clean
+    # Recalibrated: independent block gated on attacked_clean AND the
+    # positive cohorts it calibrates against.  When any of those cohorts has
+    # no scored rows the metrics genuinely cannot be computed — that is plain
+    # unavailability, not an error.  When all inputs are present, a
+    # summarize_detection failure is a real computation bug and must
+    # propagate as a structured failure rather than being disguised as
+    # data unavailability.
     attacked_clean = cohorts.get("attacked_clean", [])
-    if attacked_clean and clean:
-        try:
-            recal = summarize_detection(
-                attacked_clean, watermarked, attacked, target_fpr=0.01)
-            result["tr_recalibrated"] = {
-                "recalibrated_metrics_available": True,
-                "attacked_clean_count": len(attacked_clean),
-                "attacked_clean_recalibrated_threshold": recal.calibration.threshold,
-                "attacked_clean_target_fpr": recal.calibration.target_fpr,
-                "attacked_clean_actual_fpr": recal.calibration.actual_fpr,
-                "attacked_clean_false_positives": recal.calibration.false_positives,
-                "attacked_watermarked_tpr_at_recalibrated_threshold": recal.attacked_tpr,
-                "attack_success_at_recalibrated_threshold": 1.0 - recal.attacked_tpr,
-                "recalibrated_roc_auc": recal.attacked_auc,
-            }
-        except Exception:
-            result["tr_recalibrated"] = {
-                "recalibrated_metrics_available": False,
-                "recalibrated_error": (
-                    "metric computation failed unexpectedly — "
-                    "this is a bug, not a data-availability problem"
-                ),
-            }
+    if attacked_clean and clean and watermarked and attacked:
+        recal = summarize_detection(
+            attacked_clean, watermarked, attacked, target_fpr=0.01)
+        result["tr_recalibrated"] = {
+            "recalibrated_metrics_available": True,
+            "attacked_clean_count": len(attacked_clean),
+            "attacked_clean_recalibrated_threshold": recal.calibration.threshold,
+            "attacked_clean_target_fpr": recal.calibration.target_fpr,
+            "attacked_clean_actual_fpr": recal.calibration.actual_fpr,
+            "attacked_clean_false_positives": recal.calibration.false_positives,
+            "attacked_watermarked_tpr_at_recalibrated_threshold": recal.attacked_tpr,
+            "attack_success_at_recalibrated_threshold": 1.0 - recal.attacked_tpr,
+            "recalibrated_roc_auc": recal.attacked_auc,
+        }
     else:
         result["tr_recalibrated"] = {
             "recalibrated_metrics_available": False,
