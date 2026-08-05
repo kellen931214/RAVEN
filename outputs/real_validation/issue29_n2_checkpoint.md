@@ -31,17 +31,49 @@ All runs: `python3 experiments/eval.py --output-dir outputs/real_validation/<met
 
 ### Exit code
 
-All methods exit 2.  Attacked cohorts (`attacked_clean`, `attacked_watermarked`) are absent
-for every real cohort — these produce explicit `failed_missing_image` rows.  GS/GM/RID/HSTR
-each have 4 attacked-missing and 0 detector failures.  T2S has 2 attacked-missing (no clean
-cohort).  Exit 2 reflects the missing attacked images, not a scoring defect.
+GS, GM, T2S, RID, HSTR exit 2 only because attacked cohorts (`attacked_clean`,
+`attacked_watermarked`) are absent — every available detector row scored successfully
+(0 detector failures).  T2S has 2 attacked-missing (no clean cohort).
+
+HSQR exits 2 with compound failures: 4 attacked-missing rows AND 4 independent
+`DetectorStateValidationError` rows from source-metadata / bundle mask SHA mismatch.
+The exit code alone does not distinguish these; the `row_status_counts` and
+`failure_cause_counts` in the aggregate output do.
 
 ## Blocked
 
 **HSQR** — `DetectorStateValidationError: detector/source mask SHA mismatch`.
+
 Source CSV records `hsqr_mask_sha256=0416a022...`; detector computes
-`83f2e3e8...` from bundle artifact.  Source metadata disagrees with the
-HSQR bundle.  No scored rows.  No metadata or bundle modified.
+`83f2e3e8...` from the bundle's `selected_pattern.pt`.  Classification:
+**source metadata stale** — the generation pipeline wrote a mask hash that
+the current detector code cannot reproduce from the persisted bundle.
+
+Provenance evidence:
+
+- CSV SHA256: `446ca4b6...c1a81a`
+- Bundle dir: `/workspace/RAVEN/data/hsqr/diffusiondb_shared_tr/bundle/`
+- Manifest SHA256: `e55f41d1...2fb46`, schema `sfw_bundle_v1`
+- Manifest has `selected_pattern_sha256=4fb8b70e...` but NO `mask_sha256`
+  or `mask_file_sha256` field
+- Bundle contents: `manifest.json`, `selected_pattern.pt` — NO `watermark_mask.pt`
+  (contrast RID which has `watermark_mask.pt`; HSTR also lacks it but
+  derives a matching hash from its pattern)
+- CSV `hsqr_mask_sha256` = `0416a022...` (constant across all 1001 rows)
+- CSV `watermark_mask_sha256` = `0416a022...` (same value)
+- CSV `hsqr_selected_pattern_sha256` = `4fb8b70e...` — matches manifest
+- The value `0416a022...` does not appear in the bundle manifest or any
+  artifact file on disk
+- Generation was at git `8e9eb5ce` on branch `issue-6-shared-clean`, dirty=False
+
+Root cause hypothesis: HSQR generation computed a mask tensor in memory,
+hashed it for the CSV, but the bundle was saved without a dedicated mask
+artifact.  The detector re-derives a mask from `selected_pattern.pt` but
+arrives at `83f2e3e8...` — different from the generation-time value.  Either
+the mask derivation changed between generation and detection, or the
+generation ran a different path.
+
+No metadata, bundle, or artifact modified.
 
 ## Deferred
 
