@@ -57,7 +57,21 @@ class StubRegistry:
     pipe_utils: types.ModuleType
     pipe: types.ModuleType
     gs_provider: types.ModuleType
+    gm_provider: types.ModuleType
+    tr_provider: types.ModuleType
+    t2s_provider: types.ModuleType
+    t2s_inversion: types.ModuleType
+    ringid_provider: types.ModuleType
+    hstr_provider: types.ModuleType
+    hsqr_provider: types.ModuleType
+    sfw_bundle: types.ModuleType
     extract_verification_scores: types.ModuleType
+
+
+def _provider_mod(name, cls_name):
+    m = _module(name)
+    setattr(m, cls_name, mock.MagicMock(name=cls_name))
+    return m
 
 
 def build_issue26_stubs() -> StubRegistry:
@@ -75,17 +89,25 @@ def build_issue26_stubs() -> StubRegistry:
     fp.get_dtype = mock.MagicMock(return_value=ft.float32)
     fpu.get_pipe_provider = mock.MagicMock(return_value=fp)
 
-    gsp = _module("gs_provider")
-    gsp.GsProvider = mock.MagicMock(name="GsProvider")
-
     extract = _module("extract_verification_scores")
     extract.provider_kwargs = mock.MagicMock(name="provider_kwargs")
     extract.evaluate_image = mock.MagicMock(name="evaluate_image")
     extract.raw_score = mock.MagicMock(name="raw_score")
     extract.canonical_score = mock.MagicMock(name="canonical_score")
 
-    return StubRegistry(torch=ft, pipe_utils=fpu, pipe=fp,
-                        gs_provider=gsp, extract_verification_scores=extract)
+    return StubRegistry(
+        torch=ft, pipe_utils=fpu, pipe=fp,
+        gs_provider=_provider_mod("gs_provider", "GsProvider"),
+        gm_provider=_provider_mod("gm_provider", "GmProvider"),
+        tr_provider=_provider_mod("tr_provider", "TrProvider"),
+        t2s_provider=_module("t2s_provider"),
+        t2s_inversion=_module("t2s_inversion"),
+        ringid_provider=_provider_mod("ringid_provider", "RingIDProvider"),
+        hstr_provider=_provider_mod("hstr_provider", "HSTRProvider"),
+        hsqr_provider=_provider_mod("hsqr_provider", "HSQRProvider"),
+        sfw_bundle=_module("sfw_bundle"),
+        extract_verification_scores=extract,
+    )
 
 
 def install_issue26_stubs(monkeypatch, stubs: StubRegistry):
@@ -104,12 +126,21 @@ def install_issue26_stubs(monkeypatch, stubs: StubRegistry):
         "eval_bench_wm.utils.pipe.pipe_utils": stubs.pipe_utils,
         "eval_bench_wm.utils.wm": eb_wm,
         "eval_bench_wm.utils.wm.gs_provider": stubs.gs_provider,
+        "eval_bench_wm.utils.wm.gm_provider": stubs.gm_provider,
+        "eval_bench_wm.utils.wm.tr_provider": stubs.tr_provider,
+        "eval_bench_wm.utils.wm.t2s_provider": stubs.t2s_provider,
+        "eval_bench_wm.utils.wm.t2s_inversion": stubs.t2s_inversion,
+        "eval_bench_wm.utils.wm.ringid_provider": stubs.ringid_provider,
+        "eval_bench_wm.utils.wm.hstr_provider": stubs.hstr_provider,
+        "eval_bench_wm.utils.wm.hsqr_provider": stubs.hsqr_provider,
+        "eval_bench_wm.utils.wm.sfw_bundle": stubs.sfw_bundle,
+        "eval_bench_wm.utils.wm.wm_utils": _module("wm_utils"),
         "extract_verification_scores": stubs.extract_verification_scores,
         "lpips": _module("lpips"),
     }.items():
         monkeypatch.setitem(sys.modules, key, val)
 
-    # Identity: what the adapter imports MUST be our stubs
+    # Identity assertions
     assert sys.modules["extract_verification_scores"] is stubs.extract_verification_scores
     assert sys.modules["eval_bench_wm.utils.wm.gs_provider"] is stubs.gs_provider
     assert sys.modules["eval_bench_wm.utils.pipe.pipe_utils"] is stubs.pipe_utils
@@ -352,3 +383,269 @@ class TestGSRealAdapter:
         assert stubs.gs_provider.GsProvider.call_count == 0
         rows = _rows(out)
         assert all(r["failure_cause"] == FAILURE_CAUSE_MISSING_REQUIRED_STATE for r in rows)
+
+
+# ===========================================================================
+# TR — real tr_detector via StubRegistry
+# ===========================================================================
+class TestTRRealAdapter:
+    def _env(self, monkeypatch):
+        stubs = build_issue26_stubs()
+        install_issue26_stubs(monkeypatch, stubs)
+        import raven.detectors.tr_detector as trd
+        extract = stubs.extract_verification_scores
+        monkeypatch.setattr(trd, "_get_extract_module", lambda: extract)
+        monkeypatch.setattr(trd, "_extract_module", extract)
+        return stubs, trd
+
+    def test_mixed_provider_config_rejected(self, monkeypatch, tmp_path):
+        stubs, trd = self._env(monkeypatch)
+        scoring_calls = []
+        def _evaluate(*a, **kw):
+            scoring_calls.append(1)
+            return {"tr_all_channel_raw_l1": 0.1}
+        stubs.extract_verification_scores.evaluate_image.side_effect = _evaluate
+        stubs.extract_verification_scores.raw_score.side_effect = (
+            lambda m, r: float(r.get("tr_all_channel_raw_l1", 0)))
+        stubs.extract_verification_scores.canonical_score.side_effect = (
+            lambda m, raw, r: raw)
+
+        meta_wm = make_tr_meta_issue26("1", "watermarked", provider_config_hash="HASH_A")
+        meta_cl = make_tr_meta_issue26("1", "clean", provider_config_hash="HASH_B")
+        csv_rows = [meta_wm, meta_cl]
+        rec_wm = make_record(tmp_path, "1", "watermarked", "TR")
+        rec_cl = make_record(tmp_path, "1", "clean", "TR")
+        out = write_baseline_run(tmp_path, "TR", records=[rec_wm, rec_cl], csv_rows=csv_rows)
+
+        result = _eval([rec_wm, rec_cl], out, "TR",
+                       config={"method": "TR", "metadata_path": str(tmp_path / "meta.csv")})
+
+        assert result["status"] == STATUS_FAILED_STATE_VALIDATION
+        assert result["scored_count"] == 0
+        assert len(scoring_calls) == 0
+
+
+def make_tr_meta_issue26(run_id="1", role="watermarked", **kw):
+    def _v(k, d): return kw.get(k, d)
+    return {
+        "run_id": str(run_id), "role": role,
+        "model_id": _v("model_id", "RedbeardNZ/stable-diffusion-2-1-base"),
+        "model_revision": _v("model_revision", "fake"),
+        "resolution": _v("resolution", "512"),
+        "scheduler": _v("scheduler", "DDIM"),
+        "inverse_scheduler": _v("inverse_scheduler", "DDIMScheduler"),
+        "steps": _v("steps", "50"),
+        "vae_id": _v("vae_id", "checkpoint-default"),
+        "vae_scaling_factor": _v("vae_scaling_factor", "0.18215"),
+        "detector_dtype": _v("detector_dtype", "float32"),
+        "w_seed": _v("w_seed", "99"), "w_channel": _v("w_channel", "3"),
+        "w_radius": _v("w_radius", "10"), "w_pattern": _v("w_pattern", "ring"),
+        "w_mask_shape": _v("w_mask_shape", "circle"),
+        "w_measurement": _v("w_measurement", "l1_complex"),
+        "w_injection": _v("w_injection", "complex"),
+        "w_pattern_const": _v("w_pattern_const", "1.0"),
+        "watermark_target_sha256": _v("wt", "0" * 64),
+        "watermark_mask_sha256": _v("wm", "1" * 64),
+        "provider_config_hash": kw.get("provider_config_hash", "0" * 64),
+    }
+
+
+# ===========================================================================
+# GM — real gm_detector via StubRegistry
+# ===========================================================================
+class TestGMRealAdapter:
+    def _env(self, monkeypatch, tmp_path, run_ids=("0",)):
+        stubs = build_issue26_stubs()
+        install_issue26_stubs(monkeypatch, stubs)
+        import raven.detectors.gm_detector as gmd
+        # Wire _get_extract_module
+        extract = stubs.extract_verification_scores
+        monkeypatch.setattr(gmd, "_get_extract_module", lambda: extract)
+        # Wire GmProvider to return a usable mock
+        def _gm_factory(*a, **kw):
+            prov = mock.MagicMock()
+            prov.get_wm_type.return_value = "GM"
+            prov.watermark_target_tensor.return_value = mock.MagicMock()
+            prov.watermark_mask_tensor.return_value = mock.MagicMock()
+            return prov
+        stubs.gm_provider.GmProvider.side_effect = _gm_factory
+
+        # Wire GM-specific extract functions
+        def _gm_manifest(row, run_id):
+            bd = Path(str(row.get("gm_bundle_dir", "")))
+            mf = json.loads((bd / "manifest.json").read_text())
+            for mf_k, row_k in (("bundle_config_sha256", "gm_bundle_config_sha256"),
+                                ("w1_file_sha256", "gm_w1_file_sha256"),
+                                ("w2_file_sha256", "gm_w2_file_sha256"),
+                                ("m_sha256", "gm_m_sha256"),
+                                ("watermark_sha256", "gm_watermark_sha256"),
+                                ("w2_tensor_sha256", "gm_target_sha256")):
+                if str(row.get(row_k, "")) != str(mf.get(mf_k, "")):
+                    raise RuntimeError(f"GM SHA mismatch: {mf_k}")
+            return bd, mf
+
+        def _gm_kwargs(row, run_id):
+            bd, mf = _gm_manifest(row, run_id)
+            return {"gm_profile": str(mf["profile"]),
+                    "gm_bundle_dir": str(bd), "gm_create_bundle": False,
+                    "gm_allow_in_memory_state": False,
+                    "gm_torch_dtype": str(mf["torch_dtype"]),
+                    "gm_channel_copy": 1, "gm_w_copy": 1, "gm_h_copy": 1,
+                    "gm_watermark_bits_seed": mf.get("watermark_bits_seed"),
+                    "gm_use_gnr": False, "gm_gnr_path": None,
+                    "gm_model_nf": int(mf["model_nf"]),
+                    "gm_classifier_type": int(mf["classifier_type"]),
+                    "gm_use_classifier": False, "gm_classifier_path": None,
+                    "modelid_target": str(mf["model_id"]),
+                    "model_revision": str(mf["model_revision"]),
+                    "scheduler_target": str(mf["scheduler"]),
+                    "resolution": int(mf["resolution"]),
+                    "gm_inversion_guidance": float(mf["inversion_guidance_scale"]),
+                    "gm_inversion_steps": int(mf["inversion_steps"]),
+                    "gm_inversion_seed": 0, "gm_inversion_prompt": "",
+                    "gm_vae_sample": True,
+                    "gm_vae_scaling_factor": float(mf["vae_scaling_factor"]),
+                    "gm_profile_is_official": mf.get("profile_is_official", False),
+                    "w_seed": int(mf["w_seed"]), "w_channel": int(mf["w_channel"]),
+                    "w_pattern": str(mf["w_pattern"]),
+                    "w_mask_shape": str(mf["w_mask_shape"]),
+                    "w_radius": int(mf["w_radius"]),
+                    "w_measurement": str(mf["w_measurement"]),
+                    "w_injection": str(mf["w_injection"]),
+                    }
+
+        def _gm_evaluate_image(torch_mod, provider, pipe, path, steps):
+            return {"gm_raw_bit_accuracy": 0.85, "gm_raw_ring_l1": 0.12,
+                    "gm_restored_bit_accuracy": None,
+                    "gm_classifier_probability": None,
+                    "gm_report_label": "gm_raw_bit_accuracy",
+                    "gm_score_definition": "spatial-domain per-pixel bit match rate",
+                    "gm_threshold_source": "ensemble_not_applicable",
+                    "gm_comparison_operator": ">=",
+                    "gm_used_gnr": False, "gm_used_classifier": False}
+
+        def _gm_raw_score(method, result):
+            return float(result["gm_raw_bit_accuracy"])
+
+        def _gm_canonical(method, raw, result):
+            return raw
+
+        stubs.extract_verification_scores.gm_bundle_manifest = mock.MagicMock(side_effect=_gm_manifest)
+        stubs.extract_verification_scores.gm_provider_kwargs = mock.MagicMock(side_effect=_gm_kwargs)
+        stubs.extract_verification_scores.evaluate_image.side_effect = _gm_evaluate_image
+        stubs.extract_verification_scores.raw_score.side_effect = _gm_raw_score
+        stubs.extract_verification_scores.canonical_score.side_effect = _gm_canonical
+
+        monkeypatch.setattr("raven.pairing_provenance.tensor_sha256",
+                            lambda t: "ORCH_HASH")
+        return stubs
+
+    def _make_gm_bundle(self, root, sha="a"*64, w1="b"*64, w2="c"*64):
+        b = root / "bundle"; b.mkdir()
+        mf = {
+            "profile": "legacy",
+            "model_id": "RedbeardNZ/stable-diffusion-2-1-base",
+            "model_revision": "fake", "scheduler": "DDIM", "resolution": 512,
+            "torch_dtype": "float32", "channel_copy": 1, "w_copy": 1, "h_copy": 1,
+            "w_seed": 42, "w_channel": 3, "w_pattern": "ring",
+            "w_mask_shape": "circle", "w_radius": 10,
+            "w_measurement": "l1_complex", "w_injection": "complex",
+            "bundle_config_sha256": sha, "w1_file_sha256": w1, "w2_file_sha256": w2,
+            "m_sha256": "m"*64, "watermark_sha256": "n"*64, "w2_tensor_sha256": "o"*64,
+            "watermark_bits_seed": 7,
+            "inversion_prompt_sha256":
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "inversion_guidance_scale": 1.0, "inversion_steps": 50,
+            "vae_sample": True, "vae_scaling_factor": 0.18215,
+            "model_nf": 128, "classifier_type": 0, "profile_is_official": False,
+        }
+        (b / "manifest.json").write_text(json.dumps(mf))
+        (b / "w1.pth").write_bytes(b"\x00"*64)
+        (b / "w2.pth").write_bytes(b"\x01"*64)
+        return b
+
+    def _make_gm_meta(self, run_id, role, bundle_dir):
+        return {
+            "run_id": str(run_id), "role": role,
+            "gm_bundle_dir": str(bundle_dir),
+            "gm_bundle_config_sha256": "a"*64,
+            "gm_w1_file_sha256": "b"*64,
+            "gm_w2_file_sha256": "c"*64,
+            "gm_protocol_mode": "official_math_shared_tr_clean",
+            "gm_m_sha256": "m"*64,
+            "gm_watermark_sha256": "n"*64,
+            "gm_target_sha256": "o"*64,
+            "watermark_target_sha256": "ORCH_HASH",
+            "watermark_mask_sha256": "ORCH_HASH",
+        }
+
+    def test_uniform_bundle_success(self, monkeypatch, tmp_path):
+        stubs = self._env(monkeypatch, tmp_path)
+        bd = self._make_gm_bundle(tmp_path)
+        meta_wm = self._make_gm_meta("0", "watermarked", bd)
+        meta_cl = self._make_gm_meta("0", "clean", bd)
+        rec_wm = make_record(tmp_path, "0", "watermarked", "GM", source_metadata=meta_wm)
+        rec_cl = make_record(tmp_path, "0", "clean", "GM", source_metadata=meta_cl)
+        out = write_baseline_run(tmp_path, "GM", records=[rec_wm, rec_cl],
+                                 csv_rows=[meta_wm, meta_cl])
+        result = _eval([rec_wm, rec_cl], out, "GM",
+                       config={"method": "GM", "metadata_path": str(tmp_path / "meta.csv")})
+        assert result["status"] == STATUS_COMPLETED, (
+            f"status={result['status']} err={result.get('setup_error')} "
+            f"reason={result.get('status_reducer_reason')}")
+        assert result["scored_count"] == 4
+
+    def test_mixed_bundle_rejected(self, monkeypatch, tmp_path):
+        stubs = self._env(monkeypatch, tmp_path)
+        b1 = self._make_gm_bundle(tmp_path, sha="a"*64)
+        b2 = self._make_gm_bundle(tmp_path / "b2", sha="z"*64)
+        meta_wm = self._make_gm_meta("0", "watermarked", b1)
+        meta_cl = self._make_gm_meta("0", "clean", b1)
+        meta_cl["gm_bundle_dir"] = str(b2)
+        meta_cl["gm_bundle_config_sha256"] = "z"*64
+        rec_wm = make_record(tmp_path, "0", "watermarked", "GM", source_metadata=meta_wm)
+        rec_cl = make_record(tmp_path, "0", "clean", "GM", source_metadata=meta_cl)
+        out = write_baseline_run(tmp_path, "GM", records=[rec_wm, rec_cl],
+                                 csv_rows=[meta_wm, meta_cl])
+        result = _eval([rec_wm, rec_cl], out, "GM",
+                       config={"method": "GM", "metadata_path": str(tmp_path / "meta.csv")})
+        assert result["status"] == STATUS_FAILED_STATE_VALIDATION
+
+
+# ===========================================================================
+# run_evaluation() coverage
+# ===========================================================================
+class TestRunEvaluationCoverage:
+    @pytest.mark.parametrize("method", ["GS", "GM"])
+    def test_run_evaluation_success(self, method, monkeypatch, tmp_path):
+        if method == "GS":
+            cls = TestGSRealAdapter()
+            stubs, instances = cls._env(monkeypatch)
+            meta_wm = make_gs_meta("1", "watermarked", 5)
+            meta_cl = make_gs_meta("1", "clean", 5)
+            rec_wm = make_record(tmp_path, "1", "watermarked", "GS", source_metadata=meta_wm)
+            rec_cl = make_record(tmp_path, "1", "clean", "GS", source_metadata=meta_cl)
+            out = write_baseline_run(tmp_path, "GS", records=[rec_wm, rec_cl],
+                                     csv_rows=[meta_wm, meta_cl])
+            from experiments.eval import run_evaluation
+            result = run_evaluation(out, device="cpu", stages=["detector"])
+            stage = result["stages"]["detector"]
+        else:
+            cls = TestGMRealAdapter()
+            stubs = cls._env(monkeypatch, tmp_path, ("0",))
+            bd = cls._make_gm_bundle(tmp_path)
+            meta_wm = cls._make_gm_meta("0", "watermarked", bd)
+            meta_cl = cls._make_gm_meta("0", "clean", bd)
+            rec_wm = make_record(tmp_path, "0", "watermarked", "GM", source_metadata=meta_wm)
+            rec_cl = make_record(tmp_path, "0", "clean", "GM", source_metadata=meta_cl)
+            out = write_baseline_run(tmp_path, "GM", records=[rec_wm, rec_cl],
+                                     csv_rows=[meta_wm, meta_cl])
+            result = _eval([rec_wm, rec_cl], out, "GM",
+                           config={"method": "GM", "metadata_path": str(tmp_path / "meta.csv")})
+            stage = result
+        assert stage["status"] == STATUS_COMPLETED
+        if result.get("failed_stages") is not None:
+            assert result["failed_stages"] == []
+        rows = _rows(out)
+        assert len(rows) > 0
+        assert any(r["status"] == ROW_STATUS_SCORED for r in rows)
