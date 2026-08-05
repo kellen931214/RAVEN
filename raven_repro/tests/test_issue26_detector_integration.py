@@ -451,165 +451,215 @@ def make_tr_meta_issue26(run_id="1", role="watermarked", **kw):
 
 
 # ===========================================================================
-# GM — real gm_detector via StubRegistry
+# GM — real gm_detector, real extract for bundle validation
 # ===========================================================================
+import hashlib as _hashlib
+
+
+def _file_sha256(path):
+    return _hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+class StubGMProvider:
+    def __init__(self, **kwargs):
+        self.bundle = types.SimpleNamespace(
+            manifest={"profile": kwargs["gm_profile"],
+                      "profile_is_official": kwargs["gm_profile_is_official"]})
+        self.state_source = "bundle"
+        self.profile = kwargs["gm_profile"]
+        self.profile_is_official = kwargs["gm_profile_is_official"]
+        self.gm_torch_dtype = kwargs["gm_torch_dtype"]
+        self.ch = kwargs["gm_channel_copy"]
+        self.w = kwargs["gm_w_copy"]
+        self.h = kwargs["gm_h_copy"]
+        self.watermark_bits_seed = kwargs["gm_watermark_bits_seed"]
+        self.model_nf = kwargs["gm_model_nf"]
+        self.classifier_type = kwargs["gm_classifier_type"]
+        self.use_gnr = kwargs["gm_use_gnr"]
+        self.use_classifier = kwargs["gm_use_classifier"]
+        self.model_id = kwargs["modelid_target"]
+        self.model_revision = kwargs["model_revision"]
+        self.scheduler_name = kwargs["scheduler_target"]
+        self.resolution = kwargs["resolution"]
+        self.inversion_guidance = kwargs["gm_inversion_guidance"]
+        self.inversion_steps = kwargs["gm_inversion_steps"]
+        self.inversion_seed = kwargs["gm_inversion_seed"]
+        self.inversion_prompt = kwargs["gm_inversion_prompt"]
+        self.vae_sample = kwargs["gm_vae_sample"]
+        self.vae_scaling_factor = kwargs["gm_vae_scaling_factor"]
+        self.w_seed = kwargs["w_seed"]
+        self.w_channel = kwargs["w_channel"]
+        self.w_pattern = kwargs["w_pattern"]
+        self.w_mask_shape = kwargs["w_mask_shape"]
+        self.w_radius = kwargs["w_radius"]
+        self.w_measurement = kwargs["w_measurement"]
+        self.w_injection = kwargs["w_injection"]
+        # gt_patch / watermarking_mask stubs
+        class _FakeTensor:
+            def __init__(self):
+                self.real = self
+            def contiguous(self):
+                return self
+        _ft = _FakeTensor()
+        self.gt_patch = _ft
+        self.watermarking_mask = _ft
+
+
 class TestGMRealAdapter:
-    def _env(self, monkeypatch, tmp_path, run_ids=("0",)):
+    def _env(self, monkeypatch):
         stubs = build_issue26_stubs()
         install_issue26_stubs(monkeypatch, stubs)
         import raven.detectors.gm_detector as gmd
-        # Wire _get_extract_module
-        extract = stubs.extract_verification_scores
-        monkeypatch.setattr(gmd, "_get_extract_module", lambda: extract)
-        # Wire GmProvider to return a usable mock
-        def _gm_factory(*a, **kw):
-            prov = mock.MagicMock()
-            prov.get_wm_type.return_value = "GM"
-            prov.watermark_target_tensor.return_value = mock.MagicMock()
-            prov.watermark_mask_tensor.return_value = mock.MagicMock()
-            return prov
-        stubs.gm_provider.GmProvider.side_effect = _gm_factory
 
-        # Wire GM-specific extract functions
-        def _gm_manifest(row, run_id):
-            bd = Path(str(row.get("gm_bundle_dir", "")))
-            mf = json.loads((bd / "manifest.json").read_text())
-            for mf_k, row_k in (("bundle_config_sha256", "gm_bundle_config_sha256"),
-                                ("w1_file_sha256", "gm_w1_file_sha256"),
-                                ("w2_file_sha256", "gm_w2_file_sha256"),
-                                ("m_sha256", "gm_m_sha256"),
-                                ("watermark_sha256", "gm_watermark_sha256"),
-                                ("w2_tensor_sha256", "gm_target_sha256")):
-                if str(row.get(row_k, "")) != str(mf.get(mf_k, "")):
-                    raise RuntimeError(f"GM SHA mismatch: {mf_k}")
-            return bd, mf
+        # Use REAL extract module — only mock evaluate_image
+        real_extract = gmd._get_extract_module()
+        monkeypatch.setattr(gmd, "_get_extract_module", lambda: real_extract)
+        real_extract.evaluate_image = mock.MagicMock(return_value={
+            "gm_raw_bit_accuracy": 0.85, "gm_raw_ring_l1": 0.12,
+            "gm_restored_bit_accuracy": None,
+            "gm_classifier_probability": None,
+            "gm_report_label": "gm_raw_bit_accuracy",
+            "gm_score_definition": "spatial-domain per-pixel bit match rate",
+            "gm_threshold_source": "ensemble_not_applicable",
+            "gm_comparison_operator": ">=",
+            "gm_used_gnr": False, "gm_used_classifier": False,
+        })
 
-        def _gm_kwargs(row, run_id):
-            bd, mf = _gm_manifest(row, run_id)
-            return {"gm_profile": str(mf["profile"]),
-                    "gm_bundle_dir": str(bd), "gm_create_bundle": False,
-                    "gm_allow_in_memory_state": False,
-                    "gm_torch_dtype": str(mf["torch_dtype"]),
-                    "gm_channel_copy": 1, "gm_w_copy": 1, "gm_h_copy": 1,
-                    "gm_watermark_bits_seed": mf.get("watermark_bits_seed"),
-                    "gm_use_gnr": False, "gm_gnr_path": None,
-                    "gm_model_nf": int(mf["model_nf"]),
-                    "gm_classifier_type": int(mf["classifier_type"]),
-                    "gm_use_classifier": False, "gm_classifier_path": None,
-                    "modelid_target": str(mf["model_id"]),
-                    "model_revision": str(mf["model_revision"]),
-                    "scheduler_target": str(mf["scheduler"]),
-                    "resolution": int(mf["resolution"]),
-                    "gm_inversion_guidance": float(mf["inversion_guidance_scale"]),
-                    "gm_inversion_steps": int(mf["inversion_steps"]),
-                    "gm_inversion_seed": 0, "gm_inversion_prompt": "",
-                    "gm_vae_sample": True,
-                    "gm_vae_scaling_factor": float(mf["vae_scaling_factor"]),
-                    "gm_profile_is_official": mf.get("profile_is_official", False),
-                    "w_seed": int(mf["w_seed"]), "w_channel": int(mf["w_channel"]),
-                    "w_pattern": str(mf["w_pattern"]),
-                    "w_mask_shape": str(mf["w_mask_shape"]),
-                    "w_radius": int(mf["w_radius"]),
-                    "w_measurement": str(mf["w_measurement"]),
-                    "w_injection": str(mf["w_injection"]),
-                    }
-
-        def _gm_evaluate_image(torch_mod, provider, pipe, path, steps):
-            return {"gm_raw_bit_accuracy": 0.85, "gm_raw_ring_l1": 0.12,
-                    "gm_restored_bit_accuracy": None,
-                    "gm_classifier_probability": None,
-                    "gm_report_label": "gm_raw_bit_accuracy",
-                    "gm_score_definition": "spatial-domain per-pixel bit match rate",
-                    "gm_threshold_source": "ensemble_not_applicable",
-                    "gm_comparison_operator": ">=",
-                    "gm_used_gnr": False, "gm_used_classifier": False}
-
-        def _gm_raw_score(method, result):
-            return float(result["gm_raw_bit_accuracy"])
-
-        def _gm_canonical(method, raw, result):
-            return raw
-
-        stubs.extract_verification_scores.gm_bundle_manifest = mock.MagicMock(side_effect=_gm_manifest)
-        stubs.extract_verification_scores.gm_provider_kwargs = mock.MagicMock(side_effect=_gm_kwargs)
-        stubs.extract_verification_scores.evaluate_image.side_effect = _gm_evaluate_image
-        stubs.extract_verification_scores.raw_score.side_effect = _gm_raw_score
-        stubs.extract_verification_scores.canonical_score.side_effect = _gm_canonical
+        # GmProvider factory using real contract
+        gm_factory = mock.MagicMock(side_effect=lambda *a, **kw: StubGMProvider(**kw))
+        stubs.gm_provider.GmProvider = gm_factory
 
         monkeypatch.setattr("raven.pairing_provenance.tensor_sha256",
                             lambda t: "ORCH_HASH")
-        return stubs
+        return stubs, real_extract, gm_factory
 
-    def _make_gm_bundle(self, root, sha="a"*64, w1="b"*64, w2="c"*64):
+    @staticmethod
+    def _build_bundle(root):
         b = root / "bundle"; b.mkdir()
+        w1_path = b / "w1.pth"
+        w2_path = b / "w2.pth"
+        w1_path.write_bytes(b"issue26-gm-w1-content")
+        w2_path.write_bytes(b"issue26-gm-w2-content")
+        w1_sha = _file_sha256(w1_path)
+        w2_sha = _file_sha256(w2_path)
         mf = {
             "profile": "legacy",
             "model_id": "RedbeardNZ/stable-diffusion-2-1-base",
-            "model_revision": "fake", "scheduler": "DDIM", "resolution": 512,
-            "torch_dtype": "float32", "channel_copy": 1, "w_copy": 1, "h_copy": 1,
-            "w_seed": 42, "w_channel": 3, "w_pattern": "ring",
-            "w_mask_shape": "circle", "w_radius": 10,
-            "w_measurement": "l1_complex", "w_injection": "complex",
-            "bundle_config_sha256": sha, "w1_file_sha256": w1, "w2_file_sha256": w2,
-            "m_sha256": "m"*64, "watermark_sha256": "n"*64, "w2_tensor_sha256": "o"*64,
+            "model_revision": "fake",
+            "scheduler": "DDIM",
+            "resolution": 512,
+            "torch_dtype": "float32",
+            "channel_copy": 1, "w_copy": 1, "h_copy": 1,
             "watermark_bits_seed": 7,
+            "model_nf": 128,
+            "classifier_type": 0,
             "inversion_prompt_sha256":
                 "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-            "inversion_guidance_scale": 1.0, "inversion_steps": 50,
-            "vae_sample": True, "vae_scaling_factor": 0.18215,
-            "model_nf": 128, "classifier_type": 0, "profile_is_official": False,
+            "inversion_guidance_scale": 1.0,
+            "inversion_steps": 50,
+            "vae_sample": True,
+            "vae_scaling_factor": 0.18215,
+            "profile_is_official": False,
+            "gnr_sha256": None, "classifier_sha256": None,
+            "w_seed": 42, "w_channel": 3,
+            "w_pattern": "ring", "w_mask_shape": "circle",
+            "w_radius": 10, "w_measurement": "l1_complex",
+            "w_injection": "complex",
+            "bundle_config_sha256": "abc123_bundle_config_sha",
+            "w1_file_sha256": w1_sha,
+            "w2_file_sha256": w2_sha,
+            "m_sha256": "m" * 64,
+            "watermark_sha256": "n" * 64,
+            "w2_tensor_sha256": "o" * 64,
         }
-        (b / "manifest.json").write_text(json.dumps(mf))
-        (b / "w1.pth").write_bytes(b"\x00"*64)
-        (b / "w2.pth").write_bytes(b"\x01"*64)
-        return b
+        (b / "manifest.json").write_text(json.dumps(mf, indent=2))
+        return b, mf, w1_sha, w2_sha
 
-    def _make_gm_meta(self, run_id, role, bundle_dir):
+    @staticmethod
+    def _gm_meta(run_id, role, bundle_dir, w1_sha, w2_sha):
         return {
             "run_id": str(run_id), "role": role,
             "gm_bundle_dir": str(bundle_dir),
-            "gm_bundle_config_sha256": "a"*64,
-            "gm_w1_file_sha256": "b"*64,
-            "gm_w2_file_sha256": "c"*64,
+            "gm_bundle_config_sha256": "abc123_bundle_config_sha",
+            "gm_w1_file_sha256": w1_sha,
+            "gm_w2_file_sha256": w2_sha,
             "gm_protocol_mode": "official_math_shared_tr_clean",
-            "gm_m_sha256": "m"*64,
-            "gm_watermark_sha256": "n"*64,
-            "gm_target_sha256": "o"*64,
+            "gm_m_sha256": "m" * 64,
+            "gm_watermark_sha256": "n" * 64,
+            "gm_target_sha256": "o" * 64,
             "watermark_target_sha256": "ORCH_HASH",
             "watermark_mask_sha256": "ORCH_HASH",
         }
 
     def test_uniform_bundle_success(self, monkeypatch, tmp_path):
-        stubs = self._env(monkeypatch, tmp_path)
-        bd = self._make_gm_bundle(tmp_path)
-        meta_wm = self._make_gm_meta("0", "watermarked", bd)
-        meta_cl = self._make_gm_meta("0", "clean", bd)
-        rec_wm = make_record(tmp_path, "0", "watermarked", "GM", source_metadata=meta_wm)
-        rec_cl = make_record(tmp_path, "0", "clean", "GM", source_metadata=meta_cl)
+        stubs, real_extract, gm_factory = self._env(monkeypatch)
+        bd, mf, w1s, w2s = self._build_bundle(tmp_path)
+        meta_wm = self._gm_meta("0", "watermarked", bd, w1s, w2s)
+        meta_cl = self._gm_meta("0", "clean", bd, w1s, w2s)
+        rec_wm = make_record(tmp_path, "0", "watermarked", "GM",
+                             source_metadata=meta_wm)
+        rec_cl = make_record(tmp_path, "0", "clean", "GM",
+                             source_metadata=meta_cl)
         out = write_baseline_run(tmp_path, "GM", records=[rec_wm, rec_cl],
                                  csv_rows=[meta_wm, meta_cl])
         result = _eval([rec_wm, rec_cl], out, "GM",
                        config={"method": "GM", "metadata_path": str(tmp_path / "meta.csv")})
+
         assert result["status"] == STATUS_COMPLETED, (
             f"status={result['status']} err={result.get('setup_error')} "
             f"reason={result.get('status_reducer_reason')}")
         assert result["scored_count"] == 4
+        assert result["failed_count"] == 0
+        assert gm_factory.call_count == 1
+        assert real_extract.evaluate_image.call_count == 4
+        rows = _rows(out)
+        assert len(rows) == 4
+        assert all(r["status"] == ROW_STATUS_SCORED for r in rows)
+        for r in rows:
+            assert r["gm_target_verified"] is True
+            assert r["gm_mask_verified"] is True
+            assert r["gm_state_source"] == "bundle"
 
     def test_mixed_bundle_rejected(self, monkeypatch, tmp_path):
-        stubs = self._env(monkeypatch, tmp_path)
-        b1 = self._make_gm_bundle(tmp_path, sha="a"*64)
-        b2 = self._make_gm_bundle(tmp_path / "b2", sha="z"*64)
-        meta_wm = self._make_gm_meta("0", "watermarked", b1)
-        meta_cl = self._make_gm_meta("0", "clean", b1)
-        meta_cl["gm_bundle_dir"] = str(b2)
-        meta_cl["gm_bundle_config_sha256"] = "z"*64
-        rec_wm = make_record(tmp_path, "0", "watermarked", "GM", source_metadata=meta_wm)
-        rec_cl = make_record(tmp_path, "0", "clean", "GM", source_metadata=meta_cl)
+        stubs, real_extract, gm_factory = self._env(monkeypatch)
+        ba, mfa, w1a, w2a = self._build_bundle(tmp_path)
+        (tmp_path / "b2").mkdir()
+        bb, mfb, w1b, w2b = self._build_bundle(tmp_path / "b2")
+        meta_wm = self._gm_meta("0", "watermarked", ba, w1a, w2a)
+        meta_cl = self._gm_meta("0", "clean", bb, w1b, w2b)
+        rec_wm = make_record(tmp_path, "0", "watermarked", "GM",
+                             source_metadata=meta_wm)
+        rec_cl = make_record(tmp_path, "0", "clean", "GM",
+                             source_metadata=meta_cl)
         out = write_baseline_run(tmp_path, "GM", records=[rec_wm, rec_cl],
                                  csv_rows=[meta_wm, meta_cl])
         result = _eval([rec_wm, rec_cl], out, "GM",
                        config={"method": "GM", "metadata_path": str(tmp_path / "meta.csv")})
+
         assert result["status"] == STATUS_FAILED_STATE_VALIDATION
+        assert result["scored_count"] == 0
+        assert gm_factory.call_count == 0
+        assert real_extract.evaluate_image.call_count == 0
+
+    def test_sha_mismatch(self, monkeypatch, tmp_path):
+        stubs, real_extract, gm_factory = self._env(monkeypatch)
+        bd, mf, w1s, w2s = self._build_bundle(tmp_path)
+        meta_wm = self._gm_meta("0", "watermarked", bd, w1s, w2s)
+        meta_cl = self._gm_meta("0", "clean", bd, w1s, w2s)
+        # Tamper the SHA in the CSV — manifest and files are unchanged
+        meta_wm["gm_w1_file_sha256"] = "0" * 64
+        rec_wm = make_record(tmp_path, "0", "watermarked", "GM",
+                             source_metadata=meta_wm)
+        rec_cl = make_record(tmp_path, "0", "clean", "GM",
+                             source_metadata=meta_cl)
+        out = write_baseline_run(tmp_path, "GM", records=[rec_wm, rec_cl],
+                                 csv_rows=[meta_wm, meta_cl])
+        result = _eval([rec_wm, rec_cl], out, "GM",
+                       config={"method": "GM", "metadata_path": str(tmp_path / "meta.csv")})
+
+        assert result["status"] == STATUS_FAILED_STATE_VALIDATION
+        assert gm_factory.call_count == 0
+        assert real_extract.evaluate_image.call_count == 0
 
 
 # ===========================================================================
@@ -632,10 +682,10 @@ class TestRunEvaluationCoverage:
             stage = result["stages"]["detector"]
         else:
             cls = TestGMRealAdapter()
-            stubs = cls._env(monkeypatch, tmp_path, ("0",))
-            bd = cls._make_gm_bundle(tmp_path)
-            meta_wm = cls._make_gm_meta("0", "watermarked", bd)
-            meta_cl = cls._make_gm_meta("0", "clean", bd)
+            stubs, real_extract, gm_factory = cls._env(monkeypatch)
+            bd, mf, w1s, w2s = cls._build_bundle(tmp_path)
+            meta_wm = cls._gm_meta("0", "watermarked", bd, w1s, w2s)
+            meta_cl = cls._gm_meta("0", "clean", bd, w1s, w2s)
             rec_wm = make_record(tmp_path, "0", "watermarked", "GM", source_metadata=meta_wm)
             rec_cl = make_record(tmp_path, "0", "clean", "GM", source_metadata=meta_cl)
             out = write_baseline_run(tmp_path, "GM", records=[rec_wm, rec_cl],
