@@ -21,12 +21,18 @@ sys.path.insert(0, str(REPO / "raven_repro"))
 # Helpers
 # ===========================================================================
 def _make_record(run_id="17", role="watermarked", **kw):
+    prompt_source = kw.pop("prompt_source", "metadata")
+    raw_prompt = kw.pop("prompt", "")
+    if prompt_source == "formal_config":
+        resolved_prompt = ""
+    else:
+        resolved_prompt = raw_prompt
     base = {
         "run_id": run_id, "role": role, "method": kw.get("method", "TR"),
         "input_path": kw.get("input_path", f"/tmp/in_{run_id}.png"),
         "output_path": f"/tmp/out/{role}/{run_id}/output.png",
-        "prompt": kw.get("prompt", ""),
-        "prompt_source": kw.get("prompt_source", "metadata"),
+        "prompt": resolved_prompt,
+        "prompt_source": prompt_source,
         "attack_seed": 59,
         "planned_flow_dx_image_px": 24.0,
         "planned_flow_dy_image_px": -24.0,
@@ -537,3 +543,40 @@ class TestDiffusionPairs:
         from raven.experiment_config import validate_diffusion_pair
         with pytest.raises(ValueError):
             validate_diffusion_pair("ddpm", "ddim")
+
+
+# ===========================================================================
+# Issue #29 — formal prompt contract
+# ===========================================================================
+class TestFormalPromptContract:
+    def test_config_normalize_prompt_source_default(self):
+        from raven.experiment_config import normalize_config
+        cfg = normalize_config(metadata_path="/tmp/m.csv", output_dir="/tmp/o")
+        assert cfg["prompt_source"] == "metadata"
+        assert cfg["prompt"] == ""
+
+    def test_config_normalize_prompt_source_formal(self):
+        from raven.experiment_config import normalize_config
+        cfg = normalize_config(metadata_path="/tmp/m.csv", output_dir="/tmp/o",
+                               prompt_source="formal_config")
+        assert cfg["prompt_source"] == "formal_config"
+
+    def test_prompt_source_in_algorithm_fields(self):
+        from raven.experiment_config import ALGORITHM_FIELDS
+        assert "prompt_source" in ALGORITHM_FIELDS
+
+    def test_record_with_formal_prompt_source_has_empty_prompt(self):
+        """formal_config: prompt = \"\" regardless of metadata value."""
+        rec = _make_record(run_id="1", role="watermarked",
+                           prompt="hello from metadata",
+                           prompt_source="formal_config")
+        assert rec["prompt"] == ""
+        assert rec["prompt_source"] == "formal_config"
+
+    def test_record_with_metadata_prompt_source_preserves_prompt(self):
+        """metadata: prompt from the record is preserved."""
+        rec = _make_record(run_id="1", role="watermarked",
+                           prompt="hello from metadata",
+                           prompt_source="metadata")
+        assert rec["prompt"] == "hello from metadata"
+        assert rec["prompt_source"] == "metadata"
