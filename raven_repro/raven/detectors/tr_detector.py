@@ -1,7 +1,23 @@
-"""Tree-Ring detector adapter.
+"""Tree-Ring detector adapter — package-local scoring.
 
-Delegates to the canonical TR scoring in ``extract_verification_scores.py``.
-Does NOT reimplement FFT / non-central chi-square / -log10(p) math.
+Production TR scoring lives in this package: ``tr_scoring.py`` holds the
+image decode, inversion, FFT convention, mask/target extraction, and the
+default complex-L1 mean score.  The adapter never imports legacy scripts
+(``extract_verification_scores.py`` / ``raven_nfpa_tr_eval.py``) and never
+loads modules dynamically.
+
+Default score protocol (issue #28):
+
+    score_definition    = complex_l1_mean
+    raw_score           = torch.abs(decoded_watermark - target_watermark).mean()
+    raw_score_direction = lower_is_watermarked
+    canonical_score     = -raw_score
+    canonical_score_direction = higher_is_watermarked
+    comparison_operator = >=
+
+A p-value protocol (``-log10(p)``) remains only as an explicitly named
+optional mode: metadata must declare ``tr_score_mode = log10p`` for the
+cohort, and the resulting rows carry separate provenance fields.
 
 All TR provider parameters MUST come from metadata.  Silent fallback to
 defaults is forbidden — missing fields cause ``DetectorMissingStateError``,
@@ -31,7 +47,6 @@ steps control canonical inversion — the caller cannot override them.
 from __future__ import annotations
 
 import math
-import sys
 from pathlib import Path
 from typing import Any
 
@@ -42,6 +57,7 @@ from . import (
     DetectorScoringError,
     DetectorStateValidationError,
 )
+from . import tr_scoring
 
 # ---------------------------------------------------------------------------
 # Required TR provider fields — every field must be present, non-empty, and
@@ -66,10 +82,14 @@ _ALLOWED_W_PATTERN: frozenset[str] = frozenset({
 _ALLOWED_W_MASK_SHAPE: frozenset[str] = frozenset({"circle", "square", "no"})
 _ALLOWED_W_INJECTION: frozenset[str] = frozenset({"complex", "seed"})
 
-# The canonical TR scoring path always runs the non-central chi-square
-# p-value test; no alternate measurement implementation exists.  The formal
-# TR profile therefore requires exactly this value.
+# The canonical TR scoring path always runs the complex-L1 mean test; no
+# alternate measurement implementation exists.  The formal TR profile
+# therefore requires exactly this value.
 REQUIRED_W_MEASUREMENT: str = "l1_complex"
+
+# Optional metadata field naming the score protocol.  Absent → the default
+# complex-L1 protocol.  Present → must be a supported mode and uniform.
+SCORE_MODE_FIELD: str = "tr_score_mode"
 
 # Source-required profile identity fields and their canonical aliases.
 # ``scheduler`` and ``steps`` have generator-schema aliases; everything else
@@ -95,30 +115,6 @@ OPTIONAL_ASSERTION_FIELDS: tuple[str, ...] = (
     "vae_scaling_factor",
     "provider_config_hash",
 )
-
-_extract_module = None
-
-
-def _get_extract_module():
-    global _extract_module
-    if _extract_module is not None:
-        return _extract_module
-    repo = Path(__file__).resolve().parents[3]
-    scripts_dir = repo / "raven_repro" / "scripts"
-    if str(scripts_dir) not in sys.path:
-        sys.path.insert(0, str(scripts_dir))
-    eb = str(repo / "eval_bench_wm")
-    if eb not in sys.path:
-        sys.path.insert(0, eb)
-    import importlib.util
-    spec = importlib.util.spec_from_file_location(
-        "extract_verification_scores",
-        scripts_dir / "extract_verification_scores.py",
-    )
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    _extract_module = mod
-    return mod
 
 
 def describe_required_artifacts() -> list[str]:
@@ -303,6 +299,44 @@ def _optional_uniform_assertion(
     return unique[0], True
 
 
+def _resolve_score_mode(records: list[dict[str, Any]]) -> str:
+    """Resolve the optional ``tr_score_mode`` protocol selector.
+
+    Absent on every record → the default complex-L1 protocol (documented
+    default, never silently invented).  Present → must be a supported mode
+    and uniform across the cohort; anything else fails closed.
+    """
+    present: dict[int, str] = {}
+    absent: list[int] = []
+    for idx, record in enumerate(records):
+        raw = record.get(SCORE_MODE_FIELD)
+        text = str(raw).strip() if raw is not None else ""
+        if text:
+            present[idx] = text
+        else:
+            absent.append(idx)
+    if not present:
+        return tr_scoring.SCORE_DEFINITION
+    if absent:
+        raise DetectorStateValidationError(
+            f"Partial {SCORE_MODE_FIELD} across TR cohort: present at record "
+            f"index(es) {sorted(present)}, missing at record index(es) "
+            f"{absent}.  The score protocol must be uniform across the cohort."
+        )
+    unique = sorted(set(present.values()))
+    if len(unique) != 1:
+        raise DetectorStateValidationError(
+            f"Mixed {SCORE_MODE_FIELD} across TR cohort: {unique}"
+        )
+    mode = unique[0]
+    if mode not in tr_scoring.SUPPORTED_SCORE_MODES:
+        raise DetectorStateValidationError(
+            f"TR {SCORE_MODE_FIELD} {mode!r} is not a supported score "
+            f"protocol: {sorted(tr_scoring.SUPPORTED_SCORE_MODES)}"
+        )
+    return mode
+
+
 def _normalize_tr_provider_config(
     record: dict[str, Any],
     *,
@@ -427,6 +461,20 @@ def _validate_w_channel_range(w_channel: int, latent_shape: tuple[int, ...],
         )
 
 
+def assert_tensor_identity_match(source_sha: str, detector_sha: str,
+                                 kind: str) -> None:
+    """Fail closed when the source digest and provider-derived digest differ.
+
+    ``kind`` is "target" or "mask"; used by load_state step 9 to bind the
+    detector tensors to the generation-time hashes recorded in metadata.
+    """
+    if source_sha != detector_sha:
+        raise DetectorStateValidationError(
+            f"TR source watermark_{kind}_sha256 {source_sha!r} does not "
+            f"match provider-derived {kind} SHA {detector_sha!r}"
+        )
+
+
 # ---------------------------------------------------------------------------
 # load_state — fail-closed, cohort-consistent, canonical-schema bound
 # ---------------------------------------------------------------------------
@@ -440,14 +488,18 @@ def load_state(records: list[dict[str, Any]], device: str,
     constructs exactly one provider built from the verified profile.  Pipe is
     built from cohort metadata, never hard-coded.
     """
+    import sys
+
     import torch
 
-    try:
-        mod = _get_extract_module()
-    except Exception as exc:
-        raise DetectorDependencyError(
-            f"Cannot load extract_verification_scores: {exc}"
-        ) from exc
+    # ``eval_bench_wm`` is a namespace package (no __init__.py): the repo
+    # root must be on sys.path so ``import eval_bench_wm`` resolves, and the
+    # eval_bench_wm directory itself so the absolute ``from utils...``
+    # imports inside eval_bench_wm resolve.
+    repo = Path(__file__).resolve().parents[3]
+    for entry in (str(repo), str(repo / "eval_bench_wm")):
+        if entry not in sys.path:
+            sys.path.insert(0, entry)
 
     try:
         from eval_bench_wm.utils.pipe import pipe_utils
@@ -462,6 +514,9 @@ def load_state(records: list[dict[str, Any]], device: str,
             "TR provider requires at least one record with metadata. "
             "All required fields: " + ", ".join(sorted(REQUIRED_METADATA_FIELDS))
         )
+
+    # ---- 0: resolve the optional score protocol selector ----
+    score_mode = _resolve_score_mode(records)
 
     # ---- 1: normalise every record's TR provider config ----
     configs: list[dict[str, Any]] = []
@@ -648,16 +703,8 @@ def load_state(records: list[dict[str, Any]], device: str,
     detector_mask_sha = tensor_sha256(mask)
     source_mask_sha = source_identity["watermark_mask_sha256"]
 
-    if source_target_sha != detector_target_sha:
-        raise DetectorStateValidationError(
-            f"TR source watermark_target_sha256 {source_target_sha!r} does not "
-            f"match provider-derived target SHA {detector_target_sha!r}"
-        )
-    if source_mask_sha != detector_mask_sha:
-        raise DetectorStateValidationError(
-            f"TR source watermark_mask_sha256 {source_mask_sha!r} does not "
-            f"match provider-derived mask SHA {detector_mask_sha!r}"
-        )
+    assert_tensor_identity_match(source_target_sha, detector_target_sha, "target")
+    assert_tensor_identity_match(source_mask_sha, detector_mask_sha, "mask")
 
     # ---- 10: assemble verified provenance ----
     verified_profile: dict[str, Any] = {
@@ -676,7 +723,7 @@ def load_state(records: list[dict[str, Any]], device: str,
     return {
         "provider": provider,
         "pipe": pipe,
-        "extract_module": mod,
+        "score_mode": score_mode,
         "provider_kwargs": uniform_cfg,
         "device_obj": device_obj,
         # verified provenance
@@ -699,13 +746,22 @@ def load_state(records: list[dict[str, Any]], device: str,
 
 
 # ---------------------------------------------------------------------------
-# score_image — canonical delegation, wrapped in one scoring boundary
+# score_image — package-local scoring in one scoring boundary
 # ---------------------------------------------------------------------------
 def score_image(provider_info: dict[str, Any], image_path: str, *,
                 record: dict[str, Any] | None = None,
                 evaluation_entry: dict[str, Any] | None = None,
                 steps: int | None = None) -> dict[str, Any]:
-    """Score one image using the canonical TR detection path.
+    """Score one image through the package-local TR scoring path.
+
+    The default protocol is complex L1 mean:
+
+        raw_score = torch.abs(decoded_watermark - target_watermark).mean()
+        canonical_score = -raw_score
+
+    When the verified cohort profile declares ``tr_score_mode = log10p`` the
+    explicitly named p-value protocol runs instead and the score dict carries
+    separate ``tr_log_p`` provenance fields.
 
     The inversion step count comes from the verified cohort profile
     (``provider_info["inversion_steps"]``) — the canonical helper is never
@@ -722,7 +778,7 @@ def score_image(provider_info: dict[str, Any], image_path: str, *,
 
     provider = provider_info["provider"]
     pipe = provider_info["pipe"]
-    mod = provider_info["extract_module"]
+    score_mode = provider_info.get("score_mode", tr_scoring.SCORE_DEFINITION)
 
     effective_steps = int(provider_info["inversion_steps"])
     if steps is not None and int(steps) != effective_steps:
@@ -731,16 +787,38 @@ def score_image(provider_info: dict[str, Any], image_path: str, *,
             f"cohort profile inversion_steps {effective_steps}"
         )
 
-    # The canonical evaluate_image helper already reads and decodes the image
+    # The canonical tr_scoring helpers already read and decode the image
     # internally, so the adapter does NOT duplicate image I/O here.  The
-    # entire scoring path (evaluate → raw → canonical → diagnostics) runs
-    # inside one exception boundary.
+    # entire scoring path runs inside one exception boundary.
     try:
-        result = mod.evaluate_image(
-            torch, provider, pipe, path, effective_steps)
-        raw = mod.raw_score("TR", result)
-        canonical = mod.canonical_score("TR", raw, result)
+        if score_mode == tr_scoring.SCORE_DEFINITION:
+            result = tr_scoring.complex_l1_score(
+                torch, provider, pipe, path, effective_steps)
+            if result["nan"] or result["inf"]:
+                raise DetectorScoringError(
+                    f"TR complex-L1 score is non-finite for {image_path}: "
+                    f"{result['score']}"
+                )
+            raw = result["score"]
+            canonical = tr_scoring.canonical_score(raw)
+            l1_diagnostics = {
+                "decoded_abs_mean": result["decoded_abs_mean"],
+                "target_abs_mean": result["target_abs_mean"],
+            }
+        elif score_mode == tr_scoring.LOG10P_MODE:
+            result = tr_scoring.evaluate_log10p(
+                torch, provider, pipe, path, effective_steps)
+            raw = tr_scoring.raw_log10p_score(result)
+            canonical = tr_scoring.log10p_canonical(raw)
+            l1_diagnostics = None
+        else:
+            raise DetectorStateValidationError(
+                f"TR score_mode {score_mode!r} is not supported: "
+                f"{sorted(tr_scoring.SUPPORTED_SCORE_MODES)}"
+            )
     except DetectorScoringError:
+        raise
+    except DetectorStateValidationError:
         raise
     except Exception as exc:
         raise DetectorScoringError(
@@ -769,9 +847,25 @@ def score_image(provider_info: dict[str, Any], image_path: str, *,
     score: dict[str, Any] = {
         "raw_score": raw_f,
         "canonical_score": canonical_f,
+        # default score protocol declaration
+        "tr_score_protocol": score_mode,
+        "tr_score_definition": tr_scoring.SCORE_DEFINITION,
+        "tr_raw_score_direction": tr_scoring.RAW_SCORE_DIRECTION,
+        "tr_canonical_score_direction": tr_scoring.CANONICAL_SCORE_DIRECTION,
+        "tr_comparison_operator": tr_scoring.COMPARISON_OPERATOR,
     }
-    diagnostics = result.get("p_value_diagnostics") or []
-    if diagnostics:
+
+    if score_mode == tr_scoring.SCORE_DEFINITION:
+        assert l1_diagnostics is not None
+        score["tr_decoded_abs_mean"] = l1_diagnostics["decoded_abs_mean"]
+        score["tr_target_abs_mean"] = l1_diagnostics["target_abs_mean"]
+    else:
+        diagnostics = result.get("p_value_diagnostics") or []
+        if not diagnostics:
+            raise DetectorScoringError(
+                f"TR p-value mode produced no p_value_diagnostics for "
+                f"{image_path}"
+            )
         d = diagnostics[0]
         score["tr_log_p"] = d.get("log_p")
         score["tr_sigma"] = d.get("sigma")
@@ -779,10 +873,6 @@ def score_image(provider_info: dict[str, Any], image_path: str, *,
         score["tr_statistic"] = d.get("statistic")
         score["tr_df"] = d.get("df")
         score["tr_p_underflow"] = d.get("p_underflow", False)
-    else:
-        raise DetectorScoringError(
-            f"TR scoring produced no p_value_diagnostics for {image_path}"
-        )
 
     # ---- attach verified provenance to score ----
     verified_profile = provider_info.get("verified_profile", {})
@@ -842,6 +932,7 @@ def aggregate(detector_rows: list[dict[str, Any]], **extra) -> dict[str, Any]:
     from . import ROW_STATUS_SCORED
 
     cohorts: dict[str, list[float]] = {}
+    protocols: set[str] = set()
     for row in detector_rows:
         if row.get("status") != ROW_STATUS_SCORED:
             continue
@@ -849,6 +940,8 @@ def aggregate(detector_rows: list[dict[str, Any]], **extra) -> dict[str, Any]:
         cs = row.get("canonical_score")
         if cs is not None and math.isfinite(float(cs)):
             cohorts.setdefault(cohort, []).append(float(cs))
+        if row.get("tr_score_protocol"):
+            protocols.add(str(row["tr_score_protocol"]))
 
     scored = sum(1 for r in detector_rows if r.get("status") == ROW_STATUS_SCORED)
     failed = len(detector_rows) - scored
@@ -860,7 +953,18 @@ def aggregate(detector_rows: list[dict[str, Any]], **extra) -> dict[str, Any]:
         "failed_count": failed,
         "cohort_counts": {c: len(v) for c, v in cohorts.items()},
         "missing_cohorts": [],
+        # default protocol declaration for the aggregate
+        "score_definition": tr_scoring.SCORE_DEFINITION,
+        "raw_score_direction": tr_scoring.RAW_SCORE_DIRECTION,
+        "canonical_score_direction": tr_scoring.CANONICAL_SCORE_DIRECTION,
+        "comparison_operator": tr_scoring.COMPARISON_OPERATOR,
     }
+    if protocols:
+        if len(protocols) != 1:
+            raise DetectorScoringError(
+                f"TR rows declare mixed score protocols: {sorted(protocols)}"
+            )
+        result["tr_score_protocol"] = next(iter(protocols))
 
     # Primary threshold report requires all three cohorts
     primary_required = {"original_clean", "original_watermarked",
