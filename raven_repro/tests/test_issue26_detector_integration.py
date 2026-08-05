@@ -937,3 +937,167 @@ class TestRunEvaluationCoverage:
         rows = _rows(out)
         assert len(rows) > 0
         assert any(r["status"] == ROW_STATUS_SCORED for r in rows)
+
+
+# ===========================================================================
+# Fourier (RID / HSTR / HSQR) — parameterized, real fourier_detector
+# ===========================================================================
+_FOURIER_PROTO = {
+    "RID": "official_math_shared_tr_clean",
+    "HSTR": "official_math_shared_tr_clean",
+    "HSQR": "official_math_shared_tr_clean",
+}
+_FOURIER_SCHEMA = {"RID": "rid_bundle_v1", "HSTR": "sfw_bundle_v1", "HSQR": "sfw_bundle_v1"}
+
+
+class TestFourierRealAdapter:
+    @staticmethod
+    def _build_bundle(root, method):
+        b = root / "bundle"; b.mkdir()
+        prefix = method.lower()
+        mf = {
+            "method": method,
+            "schema": _FOURIER_SCHEMA[method],
+            "bundle_config_sha256": "f_bundle_sha",
+            "selected_pattern_sha256": "f_pattern_sha",
+            "mask_sha256": "f_mask_sha",
+            "selected_key_index": 0,
+            "profile_name": "legacy_raven",
+            "model_id": "RedbeardNZ/stable-diffusion-2-1-base",
+            "model_revision": "fake",
+            "scheduler": "DDIM",
+            "scheduler_type": "DDIM",
+            "resolution": 512,
+        }
+        (b / "manifest.json").write_text(json.dumps(mf))
+        return b, mf
+
+    @staticmethod
+    def _fourier_meta(method, run_id, role, bundle_dir):
+        prefix = method.lower()
+        return {
+            "run_id": str(run_id), "role": role, "method": method,
+            f"{prefix}_bundle_dir": str(bundle_dir),
+            f"{prefix}_bundle_config_sha256": "f_bundle_sha",
+            f"{prefix}_selected_pattern_sha256": "f_pattern_sha",
+            f"{prefix}_mask_sha256": "f_mask_sha",
+            f"{prefix}_key_index": "0",
+            f"{prefix}_protocol_mode": _FOURIER_PROTO[method],
+            "watermark_target_sha256": "f_pattern_sha",
+            "watermark_mask_sha256": "f_mask_sha",
+        }
+
+    def _env(self, monkeypatch, method):
+        stubs = build_issue26_stubs()
+        install_issue26_stubs(monkeypatch, stubs)
+        import raven.detectors.fourier_detector as fd
+
+        # Mock _get_extract_module
+        extract = stubs.extract_verification_scores
+        monkeypatch.setattr(fd, "_get_extract_module", lambda: extract)
+        monkeypatch.setattr(fd, "_ensure_paths", lambda: None)
+
+        # fourier_bundle_manifest — return the real bundle path + manifest
+        def _fbm(record, run_id, method_str):
+            bd = Path(str(record.get(f"{method_str.lower()}_bundle_dir", "")))
+            mf = json.loads((bd / "manifest.json").read_text())
+            return bd, mf
+        extract.fourier_bundle_manifest = mock.MagicMock(side_effect=_fbm)
+
+        # Provider factories
+        stubs.ringid_provider.RingIDProvider.side_effect = (
+            lambda *a, **kw: _FourierProv("RID", **kw))
+        stubs.hstr_provider.HSTRProvider.side_effect = (
+            lambda *a, **kw: _FourierProv("HSTR", **kw))
+        stubs.hsqr_provider.HSQRProvider.side_effect = (
+            lambda *a, **kw: _FourierProv("HSQR", **kw))
+
+        # Per-method extract helpers
+        def _rid_kwargs(row, run_id):
+            return {"rid_profile": "legacy_raven", "rid_bundle_dir": str(
+                row.get("rid_bundle_dir", "")), "rid_create_bundle": False,
+                "rid_key_index": 0, "rid_key_seed": 42, "rid_key_rng_device": "cpu",
+                "rid_key_rng_dtype": "float32", "channel_min": 0, "ring_value_range": 1,
+                "quantization_levels": 16, "ring_width": 1, "assigned_keys": 4,
+                "fix_gt": 1, "time_shift": 1, "time_shift_factor": 1.0,
+                "rid_shift_semantics": "periodic", "rid_torch_dtype": "float32",
+                "rid_inversion_prompt": "", "rid_inversion_guidance": 2.5,
+                "rid_inversion_steps": 50, "rid_vae_sample": True,
+                "rid_vae_scaling_factor": 0.18215, "rid_profile_is_official": False,
+                "rid_profile_overrides": {},
+                "modelid_target": "RedbeardNZ/stable-diffusion-2-1-base",
+                "model_revision": "fake", "scheduler_target": "DDIM", "resolution": 512,
+                "selected_pattern_sha256": "f_pattern_sha",
+                "mask_sha256": "f_mask_sha",
+            }
+        def _hstr_kwargs(row, run_id):
+            return {"hstr_profile": "legacy_raven", "hstr_bundle_dir": str(
+                row.get("hstr_bundle_dir", "")), "hstr_create_bundle": False,
+                "hstr_key_index": 0, "hstr_key_seed": 42,
+                "hstr_key_rng_device": "cpu", "hstr_key_rng_dtype": "float32",
+                "hstr_torch_dtype": "float32", "hstr_inversion_prompt": "",
+                "hstr_inversion_guidance": 2.5, "hstr_inversion_steps": 50,
+                "hstr_vae_sample": True, "hstr_vae_scaling_factor": 0.18215,
+                "hstr_profile_is_official": False, "hstr_profile_overrides": {},
+                "modelid_target": "RedbeardNZ/stable-diffusion-2-1-base",
+                "model_revision": "fake", "scheduler_target": "DDIM", "resolution": 512,
+                "selected_pattern_sha256": "f_pattern_sha",
+                "mask_sha256": "f_mask_sha",
+            }
+        def _hsqr_from_bundle(row, run_id, latent_shape, device):
+            return _FourierProv("HSQR", selected_pattern_sha256="f_pattern_sha",
+                                mask_sha256="f_mask_sha")
+        extract.rid_provider_kwargs_from_bundle = mock.MagicMock(side_effect=_rid_kwargs)
+        extract.hstr_provider_kwargs_from_bundle = mock.MagicMock(side_effect=_hstr_kwargs)
+        extract.hsqr_provider_from_bundle = mock.MagicMock(side_effect=_hsqr_from_bundle)
+
+        # Scoring
+        extract.evaluate_image = mock.MagicMock(
+            return_value={"fourier_raw_l1": 0.1})
+        extract.raw_score = mock.MagicMock(return_value=0.1)
+        extract.canonical_score = mock.MagicMock(return_value=0.1)
+
+        monkeypatch.setattr("raven.pairing_provenance.tensor_sha256",
+                            lambda t: "TGT_HASH")
+
+        return stubs, extract, fd
+
+    @pytest.mark.parametrize("method", ["RID", "HSTR", "HSQR"])
+    def test_success(self, method, monkeypatch, tmp_path):
+        stubs, extract, fd = self._env(monkeypatch, method)
+        bd, mf = self._build_bundle(tmp_path, method)
+        meta_wm = self._fourier_meta(method, "0", "watermarked", bd)
+        meta_cl = self._fourier_meta(method, "0", "clean", bd)
+        rec_wm = make_record(tmp_path, "0", "watermarked", method)
+        rec_cl = make_record(tmp_path, "0", "clean", method)
+        out = write_baseline_run(tmp_path, method, records=[rec_wm, rec_cl],
+                                 csv_rows=[meta_wm, meta_cl])
+        result = _eval([rec_wm, rec_cl], out, method,
+                       config={"method": method, "metadata_path": str(tmp_path / "meta.csv")})
+
+        assert result["status"] == STATUS_COMPLETED, (
+            f"{method}: status={result['status']} err={result.get('setup_error')} "
+            f"reason={result.get('status_reducer_reason')}")
+        assert result["scored_count"] == 4
+        assert result["failed_count"] == 0
+        rows = _rows(out)
+        assert len(rows) == 4
+        assert all(r["status"] == ROW_STATUS_SCORED for r in rows)
+
+
+class _FourierProv:
+    """Minimal Fourier provider stub."""
+    def __init__(self, wm_type="RID", **kw):
+        self._wm_type = wm_type
+        for k, v in kw.items():
+            setattr(self, k, v)
+        pat = kw.get("selected_pattern_sha256", "f_pattern_sha")
+        mask = kw.get("mask_sha256", "f_mask_sha")
+        self.bundle = types.SimpleNamespace(
+            manifest={"selected_pattern_sha256": pat, "mask_sha256": mask})
+        self.state_source = "bundle"
+        self.selected_pattern_sha256 = pat
+        self.watermark_mask_sha256 = mask
+        self.gt_patch = _FakeTensor()
+        self.watermarking_mask = _FakeTensor()
+        self.get_wm_type = mock.MagicMock(return_value=wm_type)
