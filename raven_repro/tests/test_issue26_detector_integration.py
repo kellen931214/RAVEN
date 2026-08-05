@@ -663,6 +663,74 @@ class TestGMRealAdapter:
 
 
 # ===========================================================================
+# T2S — real t2s_detector, state/inversion/accuracy mocked
+# ===========================================================================
+class TestT2SRealAdapter:
+    def _env(self, monkeypatch, tmp_path):
+        stubs = build_issue26_stubs()
+        install_issue26_stubs(monkeypatch, stubs)
+        import test_issue21_t2s_detector as t21
+        t21.install_pipe_utils_stub()
+        return stubs, t21
+
+    def test_role_based_state_pairing(self, monkeypatch, tmp_path):
+        from unittest import mock as um
+        stubs, t21 = self._env(monkeypatch, tmp_path)
+        cs = t21._make_state(watermark_id="clean-id",
+                             provider_config_sha256=t21._sha256("pc"))
+        ws = t21._make_state(watermark_id="wm-id",
+                             provider_config_sha256=t21._sha256("pc"))
+        cp = tmp_path / "cs.json"; cp.write_text("{}")
+        wp = tmp_path / "ws.json"; wp.write_text("{}")
+        cr = t21._make_orch_record("42", "clean", cs, cp, tmp_path)
+        wr = t21._make_orch_record("42", "watermarked", ws, wp, tmp_path)
+        out = t21._setup_run(tmp_path, [cr, wr])
+        t21.install_state_load_mock(monkeypatch, {str(cp): cs, str(wp): ws})
+        t21.install_accuracies_mock(monkeypatch, lambda st, inv:
+            t21._consistent_accuracies(0.91, 0.05, True) if st.watermark_id == "wm-id"
+            else t21._consistent_accuracies(0.11, 0.05, True))
+        t21.install_inversion_mock(monkeypatch)
+        with um.patch("PIL.Image.open"), um.patch("PIL.ImageOps.exif_transpose"):
+            result = _eval([cr, wr], out, "T2S")
+        assert result["status"] == STATUS_COMPLETED
+        rows = _rows(out)
+        scored = [r for r in rows if r["status"] == ROW_STATUS_SCORED]
+        cids = {r["t2s_watermark_id"] for r in scored if r["source_role"] == "clean"}
+        wids = {r["t2s_watermark_id"] for r in scored if r["source_role"] == "watermarked"}
+        assert cids == {"clean-id"}
+        assert wids == {"wm-id"}
+
+    def test_missing_state(self, monkeypatch, tmp_path):
+        from unittest import mock as um
+        stubs, t21 = self._env(monkeypatch, tmp_path)
+        t21.install_pipe_utils_stub()
+        st = t21._make_state()
+        mp = tmp_path / "missing.json"
+        rec = t21._make_orch_record("1", "watermarked", st, mp, tmp_path)
+        out = t21._setup_run(tmp_path, [rec])
+        monkeypatch.setattr(t21._provider_module().T2SWatermarkState, "load",
+            staticmethod(lambda p: pytest.fail("load must not be called")))
+        with um.patch("PIL.Image.open"), um.patch("PIL.ImageOps.exif_transpose"):
+            result = _eval([rec], out, "T2S")
+        assert result["status"] == STATUS_FAILED_MISSING_REQUIRED_STATE
+
+    def test_scoring_error(self, monkeypatch, tmp_path):
+        from unittest import mock as um
+        stubs, t21 = self._env(monkeypatch, tmp_path)
+        t21.install_pipe_utils_stub()
+        st = t21._make_state()
+        gp = tmp_path / "state.json"; gp.write_text("{}")
+        rec = t21._make_orch_record("1", "watermarked", st, gp, tmp_path)
+        out = t21._setup_run(tmp_path, [rec])
+        t21.install_state_load_mock(monkeypatch, {str(gp): st})
+        def _fail(*a, **kw): raise RuntimeError("OOM")
+        t21.install_inversion_mock(monkeypatch, _fail)
+        with um.patch("PIL.Image.open"), um.patch("PIL.ImageOps.exif_transpose"):
+            result = _eval([rec], out, "T2S")
+        assert result["status"] == STATUS_FAILED_SCORING
+
+
+# ===========================================================================
 # run_evaluation() coverage
 # ===========================================================================
 class TestRunEvaluationCoverage:
