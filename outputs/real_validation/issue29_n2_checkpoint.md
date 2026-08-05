@@ -75,9 +75,20 @@ generation ran a different path.
 
 No metadata, bundle, or artifact modified.
 
-## Deferred
+## Pass — TR (after issue #28 integration)
 
-**TR** — pending issue #18 smoke validation and issue #28 cherry-pick.
+Integration commit: `943c380` (cherry-picked from issue #28 `9cb7871`).
+4/4 scored: 2 original_clean + 2 original_watermarked, 4 attacked-missing.
+Exit 2 (attacked cohorts absent).
+
+Score protocol: raw = complex_l1_mean, raw direction lower_is_watermarked,
+canonical = -raw, direction higher_is_watermarked, comparison >=.
+Target/mask/provider config all verified.  Detector computes mask
+`6636fc4a...` / target `087e4198...` from metadata row; matches real
+watermark config.
+
+Exact deterministic parity with issue #28 n2 reference — zero diff on all
+4 canonical scores.  No legacy extract_verification_scores.py import.
 
 ## Fix record
 
