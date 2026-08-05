@@ -1,6 +1,11 @@
-"""Tests for TR RAVEN storage-light mode (no input.png copy, no attack-clean)."""
+"""Tests for TR RAVEN storage-light mode (no input.png copy, no attack-clean).
+
+TR scoring semantics come from the package modules directly; the legacy
+``raven_nfpa_tr_eval.py`` script is not loaded here.
+"""
 
 import importlib.util
+import math
 import sys
 from pathlib import Path
 
@@ -13,7 +18,6 @@ from raven.pipeline_raven import RavenPipeline
 
 REPO = Path(__file__).resolve().parents[2]
 FORMAL_EVAL_PATH = REPO / "experiments" / "run_raven_formal_eval.py"
-TR_EVAL_PATH = REPO / "raven_repro" / "scripts" / "raven_nfpa_tr_eval.py"
 
 
 def _load_module(name: str, path: Path):
@@ -25,7 +29,6 @@ def _load_module(name: str, path: Path):
 
 
 formal_eval = _load_module("run_raven_formal_eval_under_test", FORMAL_EVAL_PATH)
-tr_eval = _load_module("raven_nfpa_tr_eval_under_test", TR_EVAL_PATH)
 
 
 class _Stop(RuntimeError):
@@ -178,32 +181,30 @@ def test_parse_bool_flag_rejects_garbage():
 
 
 def test_aggregate_no_clean_omits_recalibration():
-    rows = [
-        {
-            "original_clean_l1_full_precision": 1.0 + i * 0.01,
-            "watermarked_l1_full_precision": 0.1 + i * 0.01,
-            "attacked_watermarked_l1_full_precision": 0.2 + i * 0.01,
-        }
-        for i in range(100)
-    ]
-    agg = tr_eval.aggregate_nfpa_protocol_no_clean(rows, "full_precision")
-    assert agg["attack_clean_enabled"] is False
-    assert agg["recalibrated_metrics_available"] is False
-    assert agg["attacked_clean_recalibrated_threshold"] is None
-    assert agg["attacked_clean_actual_fpr"] is None
-    assert agg["attacked_tpr_at_attacked_clean_recalibrated_threshold"] is None
+    """Storage-light TR (no attacked-clean rows): the unified detector
+    aggregate reports the original-clean threshold report and marks the
+    recalibrated block unavailable — never fabricates recalibration."""
+    from raven.detectors import ROW_STATUS_SCORED
+    from raven.detectors.tr_detector import aggregate
+
+    rows = []
+    for i in range(100):
+        rows.append({"status": ROW_STATUS_SCORED,
+                     "evaluation_cohort": "original_clean",
+                     "canonical_score": -(1.0 + i * 0.01)})
+        rows.append({"status": ROW_STATUS_SCORED,
+                     "evaluation_cohort": "original_watermarked",
+                     "canonical_score": -(0.1 + i * 0.01)})
+        rows.append({"status": ROW_STATUS_SCORED,
+                     "evaluation_cohort": "attacked_watermarked",
+                     "canonical_score": -(0.2 + i * 0.01)})
+
+    agg = aggregate(rows)
+    assert agg["tr_recalibrated"]["recalibrated_metrics_available"] is False
     # original-clean calibration and TPR at that threshold are still finite.
-    assert np.isfinite(agg["original_clean_threshold"])
-    assert np.isfinite(agg["before_tpr"])
-    assert np.isfinite(agg["attacked_tpr_at_original_clean_threshold"])
-
-
-def test_score_formal_parser_rejects_conflicting_clean_flags():
-    parser = tr_eval.build_parser()
-    args = parser.parse_args([
-        "score-formal", "--manifest", "m.csv", "--output-dir", "o",
-        "--no-attacked-clean", "--attacked-clean-records", "c.jsonl",
-    ])
-    # Parser accepts both; command_score_formal enforces mutual exclusion.
-    assert args.no_attacked_clean is True
-    assert args.attacked_clean_records is not None
+    summary = agg["detection_summary"]
+    assert math.isfinite(summary["original_clean_threshold"])
+    assert math.isfinite(summary["original_watermarked_tpr"])
+    assert math.isfinite(summary["attacked_watermarked_tpr_at_original_threshold"])
+    assert summary["threshold_comparison_operator"] == ">="
+    assert agg["score_definition"] == "complex_l1_mean"

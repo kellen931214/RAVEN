@@ -1,5 +1,8 @@
-"""Issue #22 complete regression tests — TR detector bound to canonical
-source metadata profile.
+"""Issue #22/#28 regression tests — TR detector bound to canonical
+source metadata profile, with package-local complex-L1 scoring.
+
+The detector imports its scoring math from ``raven.detectors.tr_scoring``
+directly — no legacy script loading, no ``importlib.util``.
 
 Covers:
 - w_pattern_const in REQUIRED_METADATA_FIELDS, passed to provider
@@ -13,9 +16,16 @@ Covers:
 - w_channel = -1 contract
 - Strict numeric parsing taxonomy
 - w_measurement == "l1_complex" contract
+- Default score protocol: complex L1 mean (raw lower-is-watermarked,
+  canonical -raw higher-is-watermarked, comparison >=), optional named
+  log10p mode with separate provenance
+- Complex-L1 formula: torch.abs(decoded - target).mean() over masked FFT
+- Threshold equality / tie policy via the canonical calibration helper
 - Recalibration computation errors never disguised as unavailable
 - Real generator-schema integration through evaluate_detector
+- Mixed model_id / model_revision rejection
 - Manifest builder retains required source identity
+- Real TrProvider scoring through tr_scoring (no mocked math)
 
 Run:  pytest -q raven_repro/tests/test_issue22_tr_detector.py
 """
@@ -160,12 +170,7 @@ _FAKE_SCHEDULER_CLASSES = {
 @contextmanager
 def _mock_load_state_deps(monkeypatch):
     """Replace heavy imports so load_state can run CPU-only."""
-    import raven.detectors.tr_detector as tr_mod
     import builtins
-
-    fake_extract = mock.MagicMock()
-    monkeypatch.setattr(tr_mod, "_extract_module", fake_extract)
-    monkeypatch.setattr(tr_mod, "_get_extract_module", lambda: fake_extract)
 
     fake_pipe_obj = mock.MagicMock()
     fake_pipe_obj.get_latent_shape.return_value = (1, 4, 64, 64)
@@ -531,29 +536,35 @@ class TestStepsAlias:
 # 4 — Metadata steps control canonical inversion
 # ===========================================================================
 class TestInversionStepsControl:
+    def _patch_scoring(self, monkeypatch, raw=0.001):
+        """Patch the package-local complex-L1 helper; record its call args."""
+        import raven.detectors.tr_scoring as tr_scoring
+
+        fake = mock.MagicMock(return_value={
+            "score": raw,
+            "decoded_abs_mean": 1.0,
+            "target_abs_mean": 1.0,
+            "nan": False,
+            "inf": False,
+        })
+        monkeypatch.setattr(tr_scoring, "complex_l1_score", fake)
+        return fake
+
     def _provider_info(self, steps):
-        fake_mod = mock.MagicMock()
-        fake_mod.evaluate_image.return_value = {
-            "p_values": [0.001],
-            "p_value_diagnostics": [
-                {"log_p": -20.0, "sigma": 1.0, "lambda": 100.0,
-                 "statistic": 50.0, "df": 100, "p_underflow": False},
-            ],
-        }
-        fake_mod.raw_score.return_value = 0.001
-        fake_mod.canonical_score.return_value = 10.0
         return {
             "provider": mock.MagicMock(),
             "pipe": mock.MagicMock(),
-            "extract_module": fake_mod,
+            "score_mode": "complex_l1_mean",
             "inversion_steps": steps,
         }
 
-    def test_evaluate_image_receives_metadata_steps(self, tmp_path):
+    def test_evaluate_image_receives_metadata_steps(self, monkeypatch, tmp_path):
         """With no caller override, the verified metadata steps (17) must
-        reach evaluate_image — never the old hard-coded 50."""
+        reach the scoring helper — never the old hard-coded 50."""
+        import raven.detectors.tr_scoring as tr_scoring
         from raven.detectors.tr_detector import score_image
 
+        fake = self._patch_scoring(monkeypatch)
         info = self._provider_info(17)
         img = tmp_path / "test.png"
         from PIL import Image
@@ -561,13 +572,14 @@ class TestInversionStepsControl:
 
         score_image(info, str(img))
 
-        _, args, _ = info["extract_module"].evaluate_image.mock_calls[0]
-        assert args[4] == 17, f"expected evaluate_image steps=17, got {args[4]}"
+        call = fake.call_args
+        assert call.args[4] == 17, f"expected steps=17, got {call.args[4]}"
 
-    def test_caller_override_conflict_rejected(self, tmp_path):
+    def test_caller_override_conflict_rejected(self, monkeypatch, tmp_path):
         from raven.detectors.tr_detector import score_image
         from raven.detectors import DetectorStateValidationError
 
+        self._patch_scoring(monkeypatch)
         info = self._provider_info(17)
         img = tmp_path / "test.png"
         from PIL import Image
@@ -576,16 +588,18 @@ class TestInversionStepsControl:
         with pytest.raises(DetectorStateValidationError, match="steps"):
             score_image(info, str(img), steps=25)
 
-    def test_caller_matching_steps_accepted(self, tmp_path):
+    def test_caller_matching_steps_accepted(self, monkeypatch, tmp_path):
         from raven.detectors.tr_detector import score_image
 
+        self._patch_scoring(monkeypatch, raw=0.001)
         info = self._provider_info(17)
         img = tmp_path / "test.png"
         from PIL import Image
         Image.new("RGB", (64, 64)).save(img)
 
         result = score_image(info, str(img), steps=17)
-        assert result["canonical_score"] == 10.0
+        assert result["canonical_score"] == -0.001
+        assert result["tr_score_definition"] == "complex_l1_mean"
 
 
 # ===========================================================================
@@ -1168,22 +1182,34 @@ class TestAggregateCohorts:
 # 14 — Scoring boundary taxonomy
 # ===========================================================================
 class TestScoringBoundary:
-    def _make_provider_info(self, steps=50):
-        fake_mod = mock.MagicMock()
-        fake_mod.evaluate_image.return_value = {
-            "p_values": [0.001],
-            "p_value_diagnostics": [{"log_p": -20.0, "sigma": 1.0,
-                                     "lambda": 100.0, "statistic": 50.0,
-                                     "df": 100, "p_underflow": False}],
-        }
-        fake_mod.raw_score.return_value = 0.001
-        fake_mod.canonical_score.return_value = 10.0
+    def _make_provider_info(self, steps=50, score_mode="complex_l1_mean"):
         return {
             "provider": mock.MagicMock(),
             "pipe": mock.MagicMock(),
-            "extract_module": fake_mod,
+            "score_mode": score_mode,
             "inversion_steps": steps,
         }
+
+    def _patch_l1(self, monkeypatch, **result):
+        import raven.detectors.tr_scoring as tr_scoring
+
+        default = {"score": 0.001, "decoded_abs_mean": 1.0,
+                   "target_abs_mean": 1.0, "nan": False, "inf": False}
+        default.update(result)
+        fake = mock.MagicMock(return_value=default)
+        monkeypatch.setattr(tr_scoring, "complex_l1_score", fake)
+        return fake
+
+    def _patch_log10p(self, monkeypatch, **result):
+        import raven.detectors.tr_scoring as tr_scoring
+
+        default = {"p_values": [0.001], "p_value_diagnostics": [
+            {"log_p": -20.0, "sigma": 1.0, "lambda": 100.0,
+             "statistic": 50.0, "df": 100, "p_underflow": False}]}
+        default.update(result)
+        fake = mock.MagicMock(return_value=default)
+        monkeypatch.setattr(tr_scoring, "evaluate_log10p", fake)
+        return fake
 
     def _make_fake_image(self, tmp_path):
         from PIL import Image
@@ -1198,45 +1224,61 @@ class TestScoringBoundary:
             score_image({"fake": True, "inversion_steps": 50},
                         "/nonexistent/path.png")
 
-    def test_raw_score_failure_is_scoring_error(self, tmp_path):
+    def test_scoring_failure_is_scoring_error(self, monkeypatch, tmp_path):
         from raven.detectors.tr_detector import score_image, DetectorScoringError
 
-        info = self._make_provider_info()
-        info["extract_module"].raw_score.side_effect = ValueError("bad raw")
+        fake = self._patch_l1(monkeypatch)
+        fake.side_effect = ValueError("bad raw")
 
         with pytest.raises(DetectorScoringError, match="bad raw"):
-            score_image(info, self._make_fake_image(tmp_path))
+            score_image(self._make_provider_info(), self._make_fake_image(tmp_path))
 
-    def test_canonical_score_failure_is_scoring_error(self, tmp_path):
+    def test_canonical_score_failure_is_scoring_error(self, monkeypatch, tmp_path):
+        """Non-finite helper output → structured scoring error, never a row."""
         from raven.detectors.tr_detector import score_image, DetectorScoringError
 
-        info = self._make_provider_info()
-        info["extract_module"].canonical_score.side_effect = (
-            RuntimeError("bad canonical"))
-
-        with pytest.raises(DetectorScoringError, match="bad canonical"):
-            score_image(info, self._make_fake_image(tmp_path))
-
-    def test_nan_raw_score_is_scoring_error(self, tmp_path):
-        from raven.detectors.tr_detector import score_image, DetectorScoringError
-
-        info = self._make_provider_info()
-        info["extract_module"].raw_score.return_value = float("nan")
+        self._patch_l1(monkeypatch, score=float("nan"))
 
         with pytest.raises(DetectorScoringError, match="raw_score"):
-            score_image(info, self._make_fake_image(tmp_path))
+            score_image(self._make_provider_info(), self._make_fake_image(tmp_path))
 
-    def test_missing_diagnostics_is_scoring_error(self, tmp_path):
+    def test_nan_raw_score_is_scoring_error(self, monkeypatch, tmp_path):
         from raven.detectors.tr_detector import score_image, DetectorScoringError
 
-        info = self._make_provider_info()
-        info["extract_module"].evaluate_image.return_value = {
-            "p_values": [0.001],
-        }
+        self._patch_l1(monkeypatch, score=float("nan"), nan=True)
+
+        with pytest.raises(DetectorScoringError, match="raw_score"):
+            score_image(self._make_provider_info(), self._make_fake_image(tmp_path))
+
+    def test_log10p_mode_missing_diagnostics_is_scoring_error(self, monkeypatch, tmp_path):
+        """Explicitly named p-value mode without diagnostics fails closed."""
+        from raven.detectors.tr_detector import score_image, DetectorScoringError
+
+        self._patch_log10p(monkeypatch, p_value_diagnostics=[])
 
         with pytest.raises(DetectorScoringError,
                            match="p_value_diagnostics"):
-            score_image(info, self._make_fake_image(tmp_path))
+            score_image(self._make_provider_info(score_mode="log10p"),
+                        self._make_fake_image(tmp_path))
+
+    def test_log10p_mode_requires_explicit_metadata(self, monkeypatch, tmp_path):
+        """score_mode=log10p must come from verified metadata; the default
+        protocol is complex L1 mean, never -log10(p)."""
+        import raven.detectors.tr_scoring as tr_scoring
+        from raven.detectors.tr_detector import score_image
+
+        l1 = self._patch_l1(monkeypatch)
+        pv = self._patch_log10p(monkeypatch)
+
+        # default mode → complex L1 helper, p-value helper never called
+        score_image(self._make_provider_info(), self._make_fake_image(tmp_path))
+        assert l1.call_count == 1
+        assert pv.call_count == 0
+        # explicit mode → p-value helper, L1 helper never called
+        score_image(self._make_provider_info(score_mode="log10p"),
+                    self._make_fake_image(tmp_path))
+        assert pv.call_count == 1
+        assert l1.call_count == 1
 
     def test_no_image_io_in_score_image(self):
         """score_image must not call Image.open — canonical helper does it."""
@@ -1285,30 +1327,24 @@ def _patch_integration(monkeypatch,
                        target_sha=TR_PROFILE["watermark_target_sha256"],
                        mask_sha=TR_PROFILE["watermark_mask_sha256"],
                        raw_score_val=0.001,
-                       canonical_score_val=10.0):
-    """Mock only pipe, provider construction, canonical scoring, and
-    tensor hashing.  Everything else — load_state, score_image,
+                       canonical_score_val=-0.001):
+    """Mock only pipe, provider construction, the package-local scoring
+    helper, and tensor hashing.  Everything else — load_state, score_image,
     evaluate_detector, aggregate, stage reducer — runs for real."""
-    import raven.detectors.tr_detector as tr_mod
     import builtins
+    import raven.detectors.tr_scoring as tr_scoring
 
-    fake_extract = mock.MagicMock()
-    try:
-        log_p = math.log(float(raw_score_val)) if float(raw_score_val) > 0 else -690.0
-    except (ValueError, TypeError):
-        log_p = -690.0
-    fake_extract.evaluate_image.return_value = {
-        "p_values": [raw_score_val],
-        "p_value_diagnostics": [
-            {"log_p": log_p,
-             "sigma": 1.0, "lambda": 100.0, "statistic": 50.0,
-             "df": 100, "p_underflow": False},
-        ],
-    }
-    fake_extract.raw_score.return_value = raw_score_val
-    fake_extract.canonical_score.return_value = canonical_score_val
-    monkeypatch.setattr(tr_mod, "_extract_module", fake_extract)
-    monkeypatch.setattr(tr_mod, "_get_extract_module", lambda: fake_extract)
+    def _fake_l1(torch, provider, pipe, path, steps):
+        raw = float(raw_score_val)
+        return {
+            "score": raw,
+            "decoded_abs_mean": 1.0,
+            "target_abs_mean": 1.0,
+            "nan": not math.isfinite(raw) or math.isnan(raw),
+            "inf": math.isinf(raw),
+        }
+    fake_l1 = mock.MagicMock(side_effect=_fake_l1)
+    monkeypatch.setattr(tr_scoring, "complex_l1_score", fake_l1)
 
     fake_pipe = mock.MagicMock()
     fake_pipe.get_latent_shape.return_value = (1, 4, 64, 64)
@@ -1408,8 +1444,9 @@ class TestGeneratorSchemaIntegration:
                       "w_pattern_const"):
             assert field in p_kwargs, f"{field} not passed to TrProvider"
 
-    def test_generator_schema_metadata_steps_reach_evaluate_image(self, monkeypatch):
-        """num_inference_steps_target=17 must reach evaluate_image."""
+    def test_generator_schema_metadata_steps_reach_scoring(self, monkeypatch):
+        """num_inference_steps_target=17 must reach the scoring helper."""
+        import raven.detectors.tr_scoring as tr_scoring
         from experiments.eval import evaluate_detector
 
         profile = dict(TR_PROFILE_GENERATOR,
@@ -1423,12 +1460,12 @@ class TestGeneratorSchemaIntegration:
                                       records=[rec_wm])
                 evaluate_detector([rec_wm], out, "TR", device="cpu")
 
-        import raven.detectors.tr_detector as tr_mod
-        eval_calls = tr_mod._extract_module.evaluate_image.mock_calls
-        assert eval_calls, "evaluate_image was never called"
-        for call in eval_calls:
-            assert call.args[4] == 17, (
-                f"evaluate_image steps={call.args[4]}, expected 17")
+        steps_seen = [
+            call.args[4] for call in tr_scoring.complex_l1_score.call_args_list
+        ]
+        assert steps_seen, "complex_l1_score was never called"
+        for seen in steps_seen:
+            assert seen == 17, f"scoring steps={seen}, expected 17"
 
     def test_detector_records_contain_assertion_flags(self, monkeypatch):
         from experiments.eval import evaluate_detector
@@ -1538,6 +1575,42 @@ class TestIntegrationFailures:
 
         assert result["status"] == STATUS_FAILED_STATE_VALIDATION
 
+    def test_mixed_model_id_state_validation(self, monkeypatch):
+        from experiments.eval import evaluate_detector
+        from raven.detectors import STATUS_FAILED_STATE_VALIDATION
+
+        profile_a = dict(TR_PROFILE_GENERATOR)
+        profile_b = dict(TR_PROFILE_GENERATOR, model_id="other/model")
+        rec_a = _generator_record("1", "watermarked", profile=profile_a)
+        rec_b = _generator_record("2", "watermarked", profile=profile_b)
+
+        with _patch_integration(monkeypatch):
+            with tempfile.TemporaryDirectory() as td:
+                out = _write_fake_run(Path(td), method="TR",
+                                      records=[rec_a, rec_b])
+                result = evaluate_detector(
+                    [rec_a, rec_b], out, "TR", device="cpu")
+
+        assert result["status"] == STATUS_FAILED_STATE_VALIDATION
+
+    def test_mixed_model_revision_state_validation(self, monkeypatch):
+        from experiments.eval import evaluate_detector
+        from raven.detectors import STATUS_FAILED_STATE_VALIDATION
+
+        profile_a = dict(TR_PROFILE_GENERATOR)
+        profile_b = dict(TR_PROFILE_GENERATOR, model_revision="deadbeef")
+        rec_a = _generator_record("1", "watermarked", profile=profile_a)
+        rec_b = _generator_record("2", "watermarked", profile=profile_b)
+
+        with _patch_integration(monkeypatch):
+            with tempfile.TemporaryDirectory() as td:
+                out = _write_fake_run(Path(td), method="TR",
+                                      records=[rec_a, rec_b])
+                result = evaluate_detector(
+                    [rec_a, rec_b], out, "TR", device="cpu")
+
+        assert result["status"] == STATUS_FAILED_STATE_VALIDATION
+
     def test_canonical_helper_failure_scoring_error(self, monkeypatch):
         from experiments.eval import evaluate_detector
         from raven.detectors import STATUS_FAILED_SCORING
@@ -1616,24 +1689,20 @@ class TestCompleteContract:
                     "inversion_steps"):
             assert key in result, f"Missing {key} in provider_info"
 
-    def test_scored_row_has_provenance_fields(self, tmp_path):
+    def test_scored_row_has_provenance_fields(self, monkeypatch, tmp_path):
+        import raven.detectors.tr_scoring as tr_scoring
         from raven.detectors.tr_detector import score_image
 
-        fake_mod = mock.MagicMock()
-        fake_mod.evaluate_image.return_value = {
-            "p_values": [0.001],
-            "p_value_diagnostics": [
-                {"log_p": -20.0, "sigma": 1.0, "lambda": 100.0,
-                 "statistic": 50.0, "df": 100, "p_underflow": False},
-            ],
-        }
-        fake_mod.raw_score.return_value = 0.001
-        fake_mod.canonical_score.return_value = 10.0
+        monkeypatch.setattr(tr_scoring, "complex_l1_score",
+                            mock.MagicMock(return_value={
+                                "score": 0.001, "decoded_abs_mean": 1.0,
+                                "target_abs_mean": 1.0,
+                                "nan": False, "inf": False}))
 
         info = {
             "provider": mock.MagicMock(),
             "pipe": mock.MagicMock(),
-            "extract_module": fake_mod,
+            "score_mode": "complex_l1_mean",
             "inversion_steps": 17,
             "detector_provider_config_hash": "h",
             "tr_provider_config_hash_source_asserted": False,
@@ -1671,10 +1740,19 @@ class TestCompleteContract:
                       "tr_detector_dtype_source_asserted",
                       "tr_vae_id_source_asserted",
                       "tr_vae_scaling_source_asserted",
-                      "tr_w_pattern_const"):
+                      "tr_w_pattern_const",
+                      # default protocol declaration
+                      "tr_score_protocol", "tr_score_definition",
+                      "tr_raw_score_direction",
+                      "tr_canonical_score_direction",
+                      "tr_comparison_operator",
+                      "tr_decoded_abs_mean", "tr_target_abs_mean"):
             assert field in score, f"Missing {field} in score dict"
 
         assert score["tr_steps"] == 17
+        assert score["tr_score_definition"] == "complex_l1_mean"
+        assert score["tr_comparison_operator"] == ">="
+        assert score["canonical_score"] == -0.001
 
 
 class TestManifestCompatibility:
@@ -1720,6 +1798,125 @@ class TestManifestCompatibility:
 
 
 # ===========================================================================
+# 18b — Score-mode resolution: default complex-L1, explicit log10p
+# ===========================================================================
+class TestScoreModeResolution:
+    def test_default_mode_without_metadata(self, monkeypatch):
+        """No tr_score_mode in metadata → default complex-L1 protocol."""
+        from raven.detectors.tr_detector import load_state
+
+        records = [_generator_record("1")]
+
+        with _mock_load_state_deps(monkeypatch):
+            _patch_tensor_sha256(monkeypatch)
+            result = load_state(records, "cpu")
+
+        assert result["score_mode"] == "complex_l1_mean"
+
+    def test_explicit_log10p_accepted(self, monkeypatch):
+        from raven.detectors.tr_detector import load_state
+
+        profile = dict(TR_PROFILE_GENERATOR, tr_score_mode="log10p")
+        records = [_generator_record("1", profile=profile)]
+
+        with _mock_load_state_deps(monkeypatch):
+            _patch_tensor_sha256(monkeypatch)
+            result = load_state(records, "cpu")
+
+        assert result["score_mode"] == "log10p"
+
+    def test_unknown_mode_rejected(self, monkeypatch):
+        from raven.detectors.tr_detector import (
+            load_state, DetectorStateValidationError)
+
+        profile = dict(TR_PROFILE_GENERATOR, tr_score_mode="bayes")
+        records = [_generator_record("1", profile=profile)]
+
+        with _mock_load_state_deps(monkeypatch):
+            with pytest.raises(DetectorStateValidationError,
+                               match="tr_score_mode"):
+                load_state(records, "cpu")
+
+    def test_mixed_mode_rejected(self, monkeypatch):
+        from raven.detectors.tr_detector import (
+            load_state, DetectorStateValidationError)
+
+        profile_a = dict(TR_PROFILE_GENERATOR, tr_score_mode="log10p")
+        profile_b = dict(TR_PROFILE_GENERATOR)
+        records = [
+            _generator_record("1", profile=profile_a),
+            _generator_record("2", profile=profile_b),
+        ]
+
+        with _mock_load_state_deps(monkeypatch):
+            with pytest.raises(DetectorStateValidationError,
+                               match="tr_score_mode"):
+                load_state(records, "cpu")
+
+
+# ===========================================================================
+# 18c — Complex-L1 protocol: formula, directions, threshold equality
+# ===========================================================================
+class TestComplexL1Protocol:
+    def test_formula_is_abs_mean_over_masked_complex_fft(self, tmp_path):
+        """raw = torch.abs(decoded - target).mean() over masked FFT positions."""
+        import torch
+        from raven.detectors import tr_scoring
+
+        torch.manual_seed(0)
+        mask = torch.zeros((1, 4, 64, 64), dtype=torch.bool)
+        mask[0, 3, 20:25, 20:25] = True
+        target = torch.randn(1, 4, 64, 64, dtype=torch.complex64)
+        latents = torch.randn(1, 4, 64, 64, dtype=torch.complex64)
+
+        provider = mock.MagicMock()
+        provider.watermarking_mask = mask
+        provider.gt_patch = target
+        provider.invert_images = mock.MagicMock(
+            return_value={"zT_torch": latents})
+        pipe = mock.MagicMock()
+
+        from PIL import Image
+        img = tmp_path / "in.png"
+        Image.new("RGB", (64, 64)).save(img)
+
+        result = tr_scoring.complex_l1_score(torch, provider, pipe, img, 50)
+
+        recovered_fft = torch.fft.fftshift(
+            torch.fft.fft2(latents), dim=(-1, -2))
+        expected = float(
+            torch.abs(recovered_fft[0][mask[0]] - target[0][mask[0]]).mean())
+        assert result["score"] == pytest.approx(expected)
+
+    def test_canonical_is_negative_raw(self):
+        from raven.detectors import tr_scoring
+
+        assert tr_scoring.canonical_score(0.5) == -0.5
+        assert tr_scoring.SCORE_DEFINITION == "complex_l1_mean"
+        assert tr_scoring.RAW_SCORE_DIRECTION == "lower_is_watermarked"
+        assert tr_scoring.CANONICAL_SCORE_DIRECTION == "higher_is_watermarked"
+        assert tr_scoring.COMPARISON_OPERATOR == ">="
+
+    def test_threshold_equality_and_tie_policy(self):
+        """Tied clean scores stay one group; detection uses >=."""
+        from raven.metrics import calibrate_threshold, detection_rate
+
+        clean = [1.0] * 3 + [float(v) for v in range(2, 99)]
+        assert len(clean) == 100
+        cal = calibrate_threshold(clean, target_fpr=0.01)
+        assert cal.false_positives == 1
+        assert cal.actual_fpr == pytest.approx(0.01)
+        # threshold equals the top clean score; the 3-way tie at 1.0 is
+        # excluded because admitting the whole group would exceed the
+        # false-positive budget.
+        assert cal.threshold == 98.0
+        # detection uses >=: a score exactly at the threshold is detected,
+        # a score epsilon below it is not.
+        assert detection_rate([cal.threshold], cal.threshold) == 1.0
+        assert detection_rate([cal.threshold - 1e-12], cal.threshold) == 0.0
+
+
+# ===========================================================================
 # 19 — Real TrProvider w_channel=-1 canonical scoring
 # ===========================================================================
 def _real_tr_provider_import():
@@ -1745,7 +1942,7 @@ def _real_tr_provider_import():
 class TestWChannelMinusOneRealScoring:
     """Real TrProvider scoring with w_channel=-1 — no mocked get_accuracies,
     no mocked mask/gt_patch.  Only pipe inversion and image loading are
-    mocked."""
+    mocked.  Scoring runs through the package-local ``tr_scoring`` module."""
 
     LATENT_SHAPE = (1, 4, 64, 64)
 
@@ -1788,9 +1985,9 @@ class TestWChannelMinusOneRealScoring:
 
     def test_w_channel_minus_one_real_provider_scoring(self, tmp_path):
         """Full canonical path: real provider, real mask/gt_patch, real
-        get_accuracies, real evaluate_image → finite raw/canonical scores."""
+        FFT/mask math → finite complex-L1 raw/canonical scores."""
         import torch
-        from raven.detectors import tr_detector
+        from raven.detectors import tr_scoring
 
         provider = self._build_provider(-1)
         assert provider.watermarking_mask.shape == self.LATENT_SHAPE
@@ -1802,19 +1999,28 @@ class TestWChannelMinusOneRealScoring:
             ), "w_channel=-1 mask must cover every channel"
 
         pipe = self._mock_pipe()
-        mod = tr_detector._get_extract_module()
 
-        result = mod.evaluate_image(torch, provider, pipe,
-                                    Path(self._make_image(tmp_path)), 50)
+        result = tr_scoring.complex_l1_score(
+            torch, provider, pipe, Path(self._make_image(tmp_path)), 50)
 
-        assert "p_values" in result
-        assert len(result["p_values"]) == 1
-        assert result["p_values"][0] >= 0.0
-
-        raw = mod.raw_score("TR", result)
-        canonical = mod.canonical_score("TR", raw, result)
+        assert not result["nan"] and not result["inf"]
+        raw = result["score"]
+        canonical = tr_scoring.canonical_score(raw)
+        assert canonical == -raw
         assert math.isfinite(float(raw))
         assert math.isfinite(float(canonical))
+
+        # The explicitly named p-value mode still works end-to-end through
+        # the real provider's get_accuracies.
+        pv = tr_scoring.evaluate_log10p(
+            torch, provider, pipe, Path(self._make_image(tmp_path)), 50)
+        assert "p_values" in pv
+        assert len(pv["p_values"]) == 1
+        assert pv["p_values"][0] >= 0.0
+        assert "p_value_diagnostics" in pv
+        raw_p = tr_scoring.raw_log10p_score(pv)
+        assert math.isfinite(float(raw_p))
+        assert math.isfinite(tr_scoring.log10p_canonical(raw_p))
 
     def test_w_channel_minus_one_real_get_accuracies(self, tmp_path):
         """Real get_accuracies completes and produces p-values."""
