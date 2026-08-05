@@ -1968,3 +1968,102 @@ class TestStaticContract:
             STATUS_FAILED_STATE_VALIDATION, allow_missing_metrics=True)
         assert not stage_status_is_allowable(
             STATUS_FAILED_SCORING, allow_missing_metrics=True)
+
+
+# ---------------------------------------------------------------------------
+# Issue #29 — locked contract: scorer gets bare tensor, not dict
+# ---------------------------------------------------------------------------
+
+class TestInversionTensorContract:
+    """Regression: score_image must pass the bare inverted latent tensor
+    to T2SProvider.accuracies_for_state() — never dict-wrapped."""
+
+    def test_scorer_receives_bare_tensor_not_dict(self, tmp_path, monkeypatch):
+        """invert_image returns a torch.Tensor → scorer gets the bare tensor."""
+        import torch
+        state = _make_state()
+        latent = torch.zeros(1, 4, 64, 64)
+
+        captured_inv = []
+
+        def _accuracies(st, inv):
+            captured_inv.append(inv)
+            return _consistent_accuracies(0.88, 0.10, True)
+
+        inversion_mod = mock.MagicMock()
+        inversion_mod.invert_image.return_value = latent
+
+        provider_mod = mock.MagicMock()
+        provider_mod.T2SProvider.accuracies_for_state.side_effect = _accuracies
+
+        prov = {
+            "pipe": _make_fake_pipe(),
+            "t2s_provider_module": provider_mod,
+            "t2s_inversion_module": inversion_mod,
+            "device_obj": "cpu",
+            "state_metadata_index": {
+                ("1", "watermarked"): _make_canonical("1", "watermarked", state),
+            },
+            "state_cache": {("1", "watermarked"): state},
+            "missing_state_keys": set(),
+            "model_id": MODEL_ID,
+            "model_revision": MODEL_REVISION,
+            "scheduler": "DDIM",
+            "resolution": 512,
+            "num_inference_steps": 50,
+            "latent_shape": [1, 4, 64, 64],
+            "t2s_rng_modes": RNG_MODES,
+            "t2s_inversion_modes": INVERSION_MODES,
+            "t2s_protocol_modes": PROTOCOL_MODES,
+        }
+
+        entry = _make_entry("1", "watermarked", "original_watermarked")
+        with mock.patch("PIL.Image.open"), mock.patch("PIL.ImageOps.exif_transpose"):
+            result = t2s_detector.score_image(
+                prov, str(_fake_png(tmp_path, "wm01.png")),
+                evaluation_entry=entry)
+
+        assert len(captured_inv) == 1
+        assert isinstance(captured_inv[0], torch.Tensor), (
+            f"scorer received {type(captured_inv[0]).__name__}, expected torch.Tensor"
+        )
+        assert not isinstance(captured_inv[0], dict), (
+            "scorer received a dict — must be bare tensor"
+        )
+        assert result["t2s_score_true_key"] == 0.88
+        assert result["t2s_detection_success"] is True
+
+    def test_inversion_returning_dict_fails_closed(self, tmp_path):
+        """invert_image returns a dict → DetectorScoringError, never passed to scorer."""
+        state = _make_state()
+
+        inversion_mod = mock.MagicMock()
+        inversion_mod.invert_image.return_value = {"zT_torch": "fake_tensor"}
+
+        prov = {
+            "pipe": _make_fake_pipe(),
+            "t2s_provider_module": mock.MagicMock(),
+            "t2s_inversion_module": inversion_mod,
+            "device_obj": "cpu",
+            "state_metadata_index": {
+                ("1", "watermarked"): _make_canonical("1", "watermarked", state),
+            },
+            "state_cache": {("1", "watermarked"): state},
+            "missing_state_keys": set(),
+            "model_id": MODEL_ID,
+            "model_revision": MODEL_REVISION,
+            "scheduler": "DDIM",
+            "resolution": 512,
+            "num_inference_steps": 50,
+            "latent_shape": [1, 4, 64, 64],
+            "t2s_rng_modes": RNG_MODES,
+            "t2s_inversion_modes": INVERSION_MODES,
+            "t2s_protocol_modes": PROTOCOL_MODES,
+        }
+
+        entry = _make_entry("1", "watermarked", "original_watermarked")
+        with pytest.raises(DetectorScoringError, match="T2S inversion returned"):
+            with mock.patch("PIL.Image.open"), mock.patch("PIL.ImageOps.exif_transpose"):
+                t2s_detector.score_image(
+                    prov, str(_fake_png(tmp_path, "wm01.png")),
+                    evaluation_entry=entry)
