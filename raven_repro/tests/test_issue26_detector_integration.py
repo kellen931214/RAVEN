@@ -388,27 +388,118 @@ class TestGSRealAdapter:
 # ===========================================================================
 # TR — real tr_detector via StubRegistry
 # ===========================================================================
+class StubTRProvider:
+    """Minimum viable TR provider — all attrs production tr_detector reads."""
+    def __init__(self, **kw):
+        for k, v in kw.items():
+            setattr(self, k, v)
+        if not hasattr(self, "w_seed"): self.w_seed = 99
+        if not hasattr(self, "w_channel"): self.w_channel = 3
+        # gt_patch / watermarking_mask — tensor-like stubs
+        self.gt_patch = _FakeTensor()
+        self.watermarking_mask = _FakeTensor()
+
+
 class TestTRRealAdapter:
     def _env(self, monkeypatch):
         stubs = build_issue26_stubs()
+        # Wire pipe for TR adapter needs
+        stubs.pipe_utils.SCHEDULER_CLASSES = {"DDIM": type("DDIMScheduler", (), {})}
+        stubs.pipe.scheduler_inverse = mock.MagicMock()
+        stubs.pipe.scheduler_inverse.__class__.__name__ = "DDIMScheduler"
+        stubs.pipe.pipe = mock.MagicMock()
+        stubs.pipe.pipe.vae = mock.MagicMock()
+        stubs.pipe.pipe.vae.config = mock.MagicMock(scaling_factor=0.18215)
         install_issue26_stubs(monkeypatch, stubs)
+
         import raven.detectors.tr_detector as trd
         extract = stubs.extract_verification_scores
         monkeypatch.setattr(trd, "_get_extract_module", lambda: extract)
         monkeypatch.setattr(trd, "_extract_module", extract)
-        return stubs, trd
+
+        # Wire TrProvider factory
+        tr_factory = mock.MagicMock(side_effect=lambda *a, **kw: StubTRProvider(**kw))
+        stubs.tr_provider.TrProvider = tr_factory
+
+        # Mock tensor_sha256 (GPU boundary)
+        monkeypatch.setattr("raven.pairing_provenance.tensor_sha256",
+                            lambda t: "TGT_HASH")
+
+        return stubs, extract, tr_factory
+
+    def test_success(self, monkeypatch, tmp_path):
+        stubs, extract, tr_factory = self._env(monkeypatch)
+
+        # Compute real provider_config_hash
+        from raven.eval_protocol import require_uniform_provider_config
+        meta_wm = make_tr_meta_issue26("1", "watermarked")
+        meta_cl = make_tr_meta_issue26("1", "clean")
+        csv_rows = [meta_wm, meta_cl]
+        _, real_hash = require_uniform_provider_config("TR", csv_rows)
+        for r in csv_rows:
+            r["provider_config_hash"] = real_hash
+
+        rec_wm = make_record(tmp_path, "1", "watermarked", "TR")
+        rec_cl = make_record(tmp_path, "1", "clean", "TR")
+        out = write_baseline_run(tmp_path, "TR", records=[rec_wm, rec_cl], csv_rows=csv_rows)
+
+        # Scoring returns per-cohort distinct values
+        _scores = {"original_watermarked": 0.10, "attacked_watermarked": 0.20,
+                   "original_clean": 0.80, "attacked_clean": 0.70}
+        _call_idx = [0]
+        def _evaluate(torch_mod, provider, pipe, path, steps):
+            _call_idx[0] += 1
+            return {"tr_all_channel_raw_l1": 0.1, "tr_log_p": -10.0,
+                    "p_value_diagnostics": [{"log_p": -10.0, "sigma": 1.0,
+                                             "lambda": 0.5, "statistic": 2.0, "df": 1}]}
+        extract.evaluate_image.side_effect = _evaluate
+        def _raw(method, result):
+            return 0.1
+        extract.raw_score.side_effect = _raw
+        def _canonical(method, raw, result):
+            return float(raw)
+        extract.canonical_score.side_effect = _canonical
+
+        result = _eval([rec_wm, rec_cl], out, "TR",
+                       config={"method": "TR", "metadata_path": str(tmp_path / "meta.csv")})
+
+        # Debug rows before asserting
+        import warnings
+        if result["status"] != STATUS_COMPLETED:
+            try:
+                dbg_rows = _rows(out)
+                for r in dbg_rows:
+                    if r["status"] != ROW_STATUS_SCORED:
+                        warnings.warn(f"FAIL_ROW {r.get('evaluation_cohort')} {r.get('error','')[:200]}")
+            except Exception:
+                pass
+            warnings.warn(f"SETUP_ERR: {result.get('setup_error')}")
+        assert result["status"] == STATUS_COMPLETED, (
+            f"status={result['status']} err={result.get('setup_error')} "
+            f"reason={result.get('status_reducer_reason')}")
+        assert result["scored_count"] == 4
+        assert result["failed_count"] == 0
+        assert tr_factory.call_count == 1
+        assert extract.evaluate_image.call_count == 4
+        assert extract.raw_score.call_count == 4
+        assert extract.canonical_score.call_count == 4
+        rows = _rows(out)
+        assert len(rows) == 4
+        assert all(r["status"] == ROW_STATUS_SCORED for r in rows)
+        for r in rows:
+            assert isinstance(r["raw_score"], float)
+            assert isinstance(r["canonical_score"], float)
 
     def test_mixed_provider_config_rejected(self, monkeypatch, tmp_path):
-        stubs, trd = self._env(monkeypatch)
+        stubs, extract, tr_factory = self._env(monkeypatch)
         scoring_calls = []
         def _evaluate(*a, **kw):
             scoring_calls.append(1)
-            return {"tr_all_channel_raw_l1": 0.1}
-        stubs.extract_verification_scores.evaluate_image.side_effect = _evaluate
-        stubs.extract_verification_scores.raw_score.side_effect = (
-            lambda m, r: float(r.get("tr_all_channel_raw_l1", 0)))
-        stubs.extract_verification_scores.canonical_score.side_effect = (
-            lambda m, raw, r: raw)
+            return {"tr_all_channel_raw_l1": 0.1,
+                    "p_value_diagnostics": [{"log_p": -10.0}]}
+        extract.evaluate_image.side_effect = _evaluate
+        extract.raw_score.side_effect = lambda m, r: float(r.get("tr_all_channel_raw_l1", 0))
+        extract.canonical_score.side_effect = lambda m, raw, r: raw
 
         meta_wm = make_tr_meta_issue26("1", "watermarked", provider_config_hash="HASH_A")
         meta_cl = make_tr_meta_issue26("1", "clean", provider_config_hash="HASH_B")
@@ -422,6 +513,7 @@ class TestTRRealAdapter:
 
         assert result["status"] == STATUS_FAILED_STATE_VALIDATION
         assert result["scored_count"] == 0
+        assert tr_factory.call_count == 0
         assert len(scoring_calls) == 0
 
 
@@ -444,8 +536,8 @@ def make_tr_meta_issue26(run_id="1", role="watermarked", **kw):
         "w_measurement": _v("w_measurement", "l1_complex"),
         "w_injection": _v("w_injection", "complex"),
         "w_pattern_const": _v("w_pattern_const", "1.0"),
-        "watermark_target_sha256": _v("wt", "0" * 64),
-        "watermark_mask_sha256": _v("wm", "1" * 64),
+        "watermark_target_sha256": _v("wt", "TGT_HASH"),
+        "watermark_mask_sha256": _v("wm", "TGT_HASH"),
         "provider_config_hash": kw.get("provider_config_hash", "0" * 64),
     }
 
@@ -454,6 +546,19 @@ def make_tr_meta_issue26(run_id="1", role="watermarked", **kw):
 # GM — real gm_detector, real extract for bundle validation
 # ===========================================================================
 import hashlib as _hashlib
+
+
+class _FakeTensor:
+    """Tensor stub — all methods return self (chainable)."""
+    def __init__(self):
+        self.real = self
+    def __getattr__(self, name):
+        # Any unimplemented method returns a callable that returns self
+        return lambda *a, **kw: self
+    def contiguous(self):
+        return self
+    def detach(self):
+        return self
 
 
 def _file_sha256(path):
@@ -495,11 +600,6 @@ class StubGMProvider:
         self.w_measurement = kwargs["w_measurement"]
         self.w_injection = kwargs["w_injection"]
         # gt_patch / watermarking_mask stubs
-        class _FakeTensor:
-            def __init__(self):
-                self.real = self
-            def contiguous(self):
-                return self
         _ft = _FakeTensor()
         self.gt_patch = _ft
         self.watermarking_mask = _ft
@@ -734,7 +834,7 @@ class TestT2SRealAdapter:
 # run_evaluation() coverage
 # ===========================================================================
 class TestRunEvaluationCoverage:
-    @pytest.mark.parametrize("method", ["GS", "GM"])
+    @pytest.mark.parametrize("method", ["GS", "GM", "TR"])
     def test_run_evaluation_success(self, method, monkeypatch, tmp_path):
         if method == "GS":
             cls = TestGSRealAdapter()
@@ -748,7 +848,7 @@ class TestRunEvaluationCoverage:
             from experiments.eval import run_evaluation
             result = run_evaluation(out, device="cpu", stages=["detector"])
             stage = result["stages"]["detector"]
-        else:
+        elif method == "GM":
             cls = TestGMRealAdapter()
             stubs, real_extract, gm_factory = cls._env(monkeypatch)
             bd, mf, w1s, w2s = cls._build_bundle(tmp_path)
@@ -760,6 +860,26 @@ class TestRunEvaluationCoverage:
                                      csv_rows=[meta_wm, meta_cl])
             result = _eval([rec_wm, rec_cl], out, "GM",
                            config={"method": "GM", "metadata_path": str(tmp_path / "meta.csv")})
+            stage = result
+        elif method == "TR":
+            cls = TestTRRealAdapter()
+            stubs, extract, tr_factory = cls._env(monkeypatch)
+            from raven.eval_protocol import require_uniform_provider_config
+            meta_wm = make_tr_meta_issue26("1", "watermarked")
+            meta_cl = make_tr_meta_issue26("1", "clean")
+            csv_rows = [meta_wm, meta_cl]
+            _, real_hash = require_uniform_provider_config("TR", csv_rows)
+            for r in csv_rows:
+                r["provider_config_hash"] = real_hash
+            rec_wm = make_record(tmp_path, "1", "watermarked", "TR")
+            rec_cl = make_record(tmp_path, "1", "clean", "TR")
+            extract.evaluate_image.side_effect = lambda *a, **kw: {"tr_all_channel_raw_l1": 0.1, "p_value_diagnostics": [{"log_p": -10.0}]}
+            extract.raw_score.side_effect = lambda m, r: 0.1
+            extract.canonical_score.side_effect = lambda m, raw, r: float(raw)
+            out = write_baseline_run(tmp_path, "TR", records=[rec_wm, rec_cl],
+                                     csv_rows=csv_rows)
+            result = _eval([rec_wm, rec_cl], out, "TR",
+                           config={"method": "TR", "metadata_path": str(tmp_path / "meta.csv")})
             stage = result
         assert stage["status"] == STATUS_COMPLETED
         if result.get("failed_stages") is not None:
