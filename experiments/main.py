@@ -121,6 +121,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--base-seed", type=int, default=42)
     parser.add_argument("--prompt", default="",
                         help="Global fallback prompt (metadata prompt takes precedence)")
+    parser.add_argument("--prompt-source", default="metadata",
+                        choices=["metadata", "formal_config"],
+                        help="metadata: use per-sample prompt from metadata CSV; "
+                             "formal_config: force empty prompt regardless of metadata")
     parser.add_argument("--negative-prompt", default="")
     parser.add_argument("--model-id", default="RedbeardNZ/stable-diffusion-2-1-base")
     parser.add_argument("--model-revision",
@@ -234,6 +238,7 @@ def main(argv: list[str] | None = None) -> int:
         view_guided_attention=args.view_guided_attention,
         color_transfer=color_transfer_bool,
         prompt=args.prompt,
+        prompt_source=args.prompt_source,
         negative_prompt=args.negative_prompt,
         debug=args.debug,
         save_input_copy=args.save_input_copy,
@@ -329,10 +334,16 @@ def main(argv: list[str] | None = None) -> int:
                 logger.info("[%s/%s] seed=%d shift=(%g, %g)",
                              role, run_id, attack_seed, dx, dy)
 
-                # Per-sample prompt: metadata row takes precedence over CLI fallback.
-                sample_prompt = row.get("prompt", "") or global_fallback_prompt
-                sample_prompt_id = row.get("prompt_id", "")
-                sample_prompt_source = "metadata" if row.get("prompt", "") else "cli_fallback"
+                # Per-sample prompt: honour prompt_source policy.
+                prompt_source = config.get("prompt_source", "metadata")
+                if prompt_source == "formal_config":
+                    sample_prompt = ""
+                    sample_prompt_id = row.get("prompt_id", "")
+                    sample_prompt_source = "formal_config"
+                else:
+                    sample_prompt = row.get("prompt", "") or global_fallback_prompt
+                    sample_prompt_id = row.get("prompt_id", "")
+                    sample_prompt_source = "metadata" if row.get("prompt", "") else "cli_fallback"
 
                 # per-sample output dir
                 sample_out = output_dir / "samples" / role / run_id
