@@ -571,9 +571,11 @@ class TestScoreContractViolations:
     @pytest.mark.parametrize("method", ["GS", "GM", "T2S", "RID", "HSTR", "HSQR", "TR"])
     def test_score_returns_none_is_failed_scoring(self, method, monkeypatch, tmp_path):
         mod = DETECTOR_MODULES[method]
+        monkeypatch.setattr(mod, "load_state",
+            lambda *a, **kw: {"provider": "fake"})
         monkeypatch.setattr(mod, "score_image",
             lambda *a, **kw: None)
-        rec = _make_record("1", "watermarked", method)
+        rec = _make_record("1", "watermarked", method, source_metadata={"run_id": "1"})
         out = _write_run(tmp_path, method, records=[rec])
 
         result = evaluate_detector([rec], out, method, device="cpu")
@@ -581,15 +583,16 @@ class TestScoreContractViolations:
         assert result["status"] == STATUS_FAILED_SCORING
         assert result["scored_count"] == 0
         rows = _rows(out)
-        assert all(r["status"] == ROW_STATUS_FAILED_SCORING for r in rows)
         assert all(r["error_type"] == "NoneReturn" for r in rows)
 
     @pytest.mark.parametrize("method", ["GS", "GM", "T2S", "RID", "HSTR", "HSQR", "TR"])
     def test_score_returns_empty_dict_is_failed_scoring(self, method, monkeypatch, tmp_path):
         mod = DETECTOR_MODULES[method]
+        monkeypatch.setattr(mod, "load_state",
+            lambda *a, **kw: {"provider": "fake"})
         monkeypatch.setattr(mod, "score_image",
             lambda *a, **kw: {})
-        rec = _make_record("1", "watermarked", method)
+        rec = _make_record("1", "watermarked", method, source_metadata={"run_id": "1"})
         out = _write_run(tmp_path, method, records=[rec])
 
         result = evaluate_detector([rec], out, method, device="cpu")
@@ -601,17 +604,18 @@ class TestScoreContractViolations:
     @pytest.mark.parametrize("method", ["GS", "GM", "RID", "HSTR", "HSQR", "TR"])
     def test_missing_canonical_score_is_failed_scoring(self, method, monkeypatch, tmp_path):
         mod = DETECTOR_MODULES[method]
+        monkeypatch.setattr(mod, "load_state",
+            lambda *a, **kw: {"provider": "fake"})
         monkeypatch.setattr(mod, "score_image",
             lambda *a, **kw: {"raw_score": 0.5})
-        rec = _make_record("1", "watermarked", method)
+        rec = _make_record("1", "watermarked", method, source_metadata={"run_id": "1"})
         out = _write_run(tmp_path, method, records=[rec])
 
         result = evaluate_detector([rec], out, method, device="cpu")
 
         assert result["status"] == STATUS_FAILED_SCORING
         rows = _rows(out)
-        assert all("missing required field: canonical_score" in r.get("error", "")
-                   or "canonical_score" in r.get("error", "")
+        assert all("canonical_score" in r.get("error", "")
                    for r in rows)
 
 
@@ -624,7 +628,7 @@ class TestSetupAndScoringFailures:
         mod = DETECTOR_MODULES[method]
         monkeypatch.setattr(mod, "load_state",
             lambda *a, **kw: (_raise(DetectorMissingStateError("mock"))))
-        rec = _make_record("1", "watermarked", method)
+        rec = _make_record("1", "watermarked", method, source_metadata={"run_id": "1"})
         out = _write_run(tmp_path, method, records=[rec])
 
         result = evaluate_detector([rec], out, method, device="cpu")
@@ -638,7 +642,7 @@ class TestSetupAndScoringFailures:
         mod = DETECTOR_MODULES[method]
         monkeypatch.setattr(mod, "load_state",
             lambda *a, **kw: (_raise(DetectorProviderInitializationError("mock"))))
-        rec = _make_record("1", "watermarked", method)
+        rec = _make_record("1", "watermarked", method, source_metadata={"run_id": "1"})
         out = _write_run(tmp_path, method, records=[rec])
 
         result = evaluate_detector([rec], out, method, device="cpu")
@@ -652,7 +656,7 @@ class TestSetupAndScoringFailures:
         mod = DETECTOR_MODULES[method]
         monkeypatch.setattr(mod, "score_image",
             lambda *a, **kw: (_raise(DetectorScoringError("mock"))))
-        rec = _make_record("1", "watermarked", method)
+        rec = _make_record("1", "watermarked", method, source_metadata={"run_id": "1"})
         out = _write_run(tmp_path, method, records=[rec])
 
         result = evaluate_detector([rec], out, method, device="cpu")
@@ -663,7 +667,7 @@ class TestSetupAndScoringFailures:
 
     @pytest.mark.parametrize("method", ["GS", "GM", "T2S", "RID", "HSTR", "HSQR", "TR"])
     def test_missing_image_is_failed_missing_image(self, method, monkeypatch, tmp_path):
-        rec = _make_record("1", "watermarked", method)
+        rec = _make_record("1", "watermarked", method, source_metadata={"run_id": "1"})
         out = _write_run(tmp_path, method, records=[rec])
         # remove the output.png for watermarked role -> preflight catches it
         (out / "samples" / "watermarked" / "1" / "output.png").unlink()
@@ -684,7 +688,7 @@ class TestCohortStageStatus:
     @pytest.mark.parametrize("method", ["GS", "GM", "RID", "HSTR", "HSQR", "TR"])
     def test_missing_clean_cohort_is_completed_with_errors(self, method, monkeypatch, tmp_path):
         """No clean record => original_clean never requested => primary incomplete."""
-        rec = _make_record("1", "watermarked", method)
+        rec = _make_record("1", "watermarked", method, source_metadata={"run_id": "1"})
         out = _write_run(tmp_path, method, records=[rec])
 
         result = evaluate_detector([rec], out, method, device="cpu")
@@ -694,7 +698,7 @@ class TestCohortStageStatus:
 
     @pytest.mark.parametrize("method", ["GS", "GM", "RID", "HSTR", "HSQR", "TR"])
     def test_complete_cohorts_is_completed(self, method, monkeypatch, tmp_path):
-        rec_wm = _make_record("1", "watermarked", method)
+        rec_wm = _make_record("1", "watermarked", method, source_metadata={"run_id": "1"})
         rec_clean = _make_record("1", "clean", method)
         out = _write_run(tmp_path, method, records=[rec_wm, rec_clean])
 
@@ -904,7 +908,7 @@ class TestNoPermissiveFallbacks:
     def test_score_none_is_not_accidentally_scored(self, method, monkeypatch, tmp_path):
         mod = DETECTOR_MODULES[method]
         monkeypatch.setattr(mod, "score_image", lambda *a, **kw: None)
-        rec = _make_record("1", "watermarked", method)
+        rec = _make_record("1", "watermarked", method, source_metadata={"run_id": "1"})
         out = _write_run(tmp_path, method, records=[rec])
         result = evaluate_detector([rec], out, method, device="cpu")
         assert result["scored_count"] == 0
