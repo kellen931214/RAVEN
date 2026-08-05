@@ -1101,3 +1101,74 @@ class _FourierProv:
         self.gt_patch = _FakeTensor()
         self.watermarking_mask = _FakeTensor()
         self.get_wm_type = mock.MagicMock(return_value=wm_type)
+
+
+# ===========================================================================
+# CLI exit-code policy — mock run_evaluation, test main() exit code
+# ===========================================================================
+class TestCLIExitCodes:
+    @staticmethod
+    def _write_min_run(root):
+        """Write a minimal run dir so main() can load config + records."""
+        out = root / "run"; out.mkdir()
+        (out / "config.json").write_text(json.dumps({"method": "GS", "dataset": "test"}))
+        (out / "records.jsonl").write_text(json.dumps({
+            "run_id": "1", "role": "watermarked", "method": "GS",
+            "input_path": "/tmp/x.png", "output_path": "/tmp/y.png",
+            "attack_seed": 0, "planned_flow_dx_image_px": 0, "planned_flow_dy_image_px": 0,
+            "effective_source_flow_dx_image_px": 0, "effective_source_flow_dy_image_px": 0,
+            "debug_info_path": "", "debug_info_retained": False, "prompt": "",
+            "prompt_source": "metadata",
+        }) + "\n")
+
+    @staticmethod
+    def _make_result(status, failed_stages=None, skipped_stages=None):
+        return {
+            "output_dir": "/tmp/fake", "method": "GS", "dataset": "test",
+            "sample_count": 1, "evaluated_utc": "2025-01-01T00:00:00Z",
+            "stages": {"detector": {"status": status, "method": "GS",
+                        "stage": "detector", "available": True, "scored_count": 0}},
+            "failed_stages": failed_stages or [],
+            "skipped_stages": skipped_stages or [],
+            "stages_allowable": {"detector": False},
+        }
+
+    def test_success_exit_zero(self, monkeypatch, tmp_path):
+        self._write_min_run(tmp_path)
+        result = self._make_result(STATUS_COMPLETED, failed_stages=[])
+        result["stages_allowable"]["detector"] = True
+        monkeypatch.setattr("experiments.eval.run_evaluation", lambda *a, **kw: result)
+        from experiments.eval import main
+        rc = main(["--output-dir", str(tmp_path / "run"), "--device", "cpu",
+                    "--stages", "detector"])
+        assert rc == 0
+
+    def test_missing_state_nonzero(self, monkeypatch, tmp_path):
+        self._write_min_run(tmp_path)
+        result = self._make_result(STATUS_FAILED_MISSING_REQUIRED_STATE,
+                                    failed_stages=["detector"])
+        monkeypatch.setattr("experiments.eval.run_evaluation", lambda *a, **kw: result)
+        from experiments.eval import main
+        rc = main(["--output-dir", str(tmp_path / "run"), "--device", "cpu",
+                    "--stages", "detector"])
+        assert rc == 2
+
+    def test_state_validation_nonzero(self, monkeypatch, tmp_path):
+        self._write_min_run(tmp_path)
+        result = self._make_result(STATUS_FAILED_STATE_VALIDATION,
+                                    failed_stages=["detector"])
+        monkeypatch.setattr("experiments.eval.run_evaluation", lambda *a, **kw: result)
+        from experiments.eval import main
+        rc = main(["--output-dir", str(tmp_path / "run"), "--device", "cpu",
+                    "--stages", "detector"])
+        assert rc == 2
+
+    def test_scoring_failure_nonzero(self, monkeypatch, tmp_path):
+        self._write_min_run(tmp_path)
+        result = self._make_result(STATUS_FAILED_SCORING,
+                                    failed_stages=["detector"])
+        monkeypatch.setattr("experiments.eval.run_evaluation", lambda *a, **kw: result)
+        from experiments.eval import main
+        rc = main(["--output-dir", str(tmp_path / "run"), "--device", "cpu",
+                    "--stages", "detector"])
+        assert rc == 2
