@@ -463,17 +463,6 @@ class TestTRRealAdapter:
         result = _eval([rec_wm, rec_cl], out, "TR",
                        config={"method": "TR", "metadata_path": str(tmp_path / "meta.csv")})
 
-        # Debug rows before asserting
-        import warnings
-        if result["status"] != STATUS_COMPLETED:
-            try:
-                dbg_rows = _rows(out)
-                for r in dbg_rows:
-                    if r["status"] != ROW_STATUS_SCORED:
-                        warnings.warn(f"FAIL_ROW {r.get('evaluation_cohort')} {r.get('error','')[:200]}")
-            except Exception:
-                pass
-            warnings.warn(f"SETUP_ERR: {result.get('setup_error')}")
         assert result["status"] == STATUS_COMPLETED, (
             f"status={result['status']} err={result.get('setup_error')} "
             f"reason={result.get('status_reducer_reason')}")
