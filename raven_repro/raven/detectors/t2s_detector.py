@@ -795,8 +795,13 @@ def score_image(provider_info: dict[str, Any], image_path: str, *,
                 num_inversion_steps=official_steps,
                 benchmark_num_inference_steps=inference_steps,
             )
+            if not isinstance(zT, torch.Tensor):
+                raise DetectorScoringError(
+                    f"T2S inversion returned {type(zT).__name__}, "
+                    f"expected torch.Tensor"
+                )
             accuracies = t2s_provider_mod.T2SProvider.accuracies_for_state(
-                state, {"zT_torch": zT},
+                state, zT,
             )
     except Exception as exc:
         raise DetectorScoringError(
