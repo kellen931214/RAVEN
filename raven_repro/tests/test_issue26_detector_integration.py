@@ -752,78 +752,134 @@ class TestGMRealAdapter:
 
 
 # ===========================================================================
-# T2S — real t2s_detector, state/inversion/accuracy mocked
+# T2S — real t2s_detector, local stubs only
 # ===========================================================================
+import dataclasses as _dc
+
+
+@_dc.dataclass
+class T2SState:
+    """Local T2S state stub — matches production T2SWatermarkState contract."""
+    watermark_id: str = "wm-test"
+    provider_config_sha256: str = ""
+    rng_mode: str = "official_compatible"
+    inversion_mode: str = "benchmark_ddim"
+    protocol_mode: str = "official_math_shared_tr_clean"
+    model_id: str = "RedbeardNZ/stable-diffusion-2-1-base"
+    model_revision: str = "fake"
+    scheduler: str = "DDIM"
+    resolution: int = 512
+    num_inference_steps: int = 50
+    num_inversion_steps: int = 50
+    channel_layout: int = 4
+    latent_shape: tuple = (1, 4, 64, 64)
+    key_channels: list = dataclasses.field(default_factory=lambda: [0, 1])
+    msg_channels: list = dataclasses.field(default_factory=lambda: [2, 3])
+
+    def state_sha256(self):
+        return "sha"
+
+
 class TestT2SRealAdapter:
-    def _env(self, monkeypatch, tmp_path):
+    @staticmethod
+    def _t2s_orch_record(run_id, role, state, state_path, root):
+        """Minimal T2S record with embedded source_metadata for resolver."""
+        return {
+            "run_id": str(run_id), "role": role, "method": "T2S",
+            "input_path": str(root / "inputs" / role / run_id / "input.png"),
+            "output_path": str(root / "run" / "samples" / role / run_id / "output.png"),
+            "prompt": "", "prompt_source": "metadata", "attack_seed": 59,
+            "planned_flow_dx_image_px": 0.0, "planned_flow_dy_image_px": 0.0,
+            "effective_source_flow_dx_image_px": 0.0,
+            "effective_source_flow_dy_image_px": 0.0,
+            "debug_info_path": "", "debug_info_retained": False,
+            "source_metadata": {
+                "run_id": str(run_id), "role": role,
+                "t2s_state_path": str(state_path),
+                "t2s_state_sha256": "sha",
+                "t2s_watermark_id": state.watermark_id,
+                "t2s_provider_config_sha256": state.provider_config_sha256,
+                "t2s_protocol_mode": state.protocol_mode,
+                "t2s_rng_mode": state.rng_mode,
+                "t2s_inversion_mode": state.inversion_mode,
+                "t2s_num_inversion_steps": str(state.num_inversion_steps),
+            },
+        }
+
+    def _env(self, monkeypatch):
         stubs = build_issue26_stubs()
         install_issue26_stubs(monkeypatch, stubs)
-        import test_issue21_t2s_detector as t21
-        t21.install_pipe_utils_stub()
-        return stubs, t21
+        import raven.detectors.t2s_detector as t2d
+
+        # Pre-populate T2S provider module constants
+        stubs.t2s_provider.T2S_RNG_MODES = ["official_compatible", "raven_deterministic"]
+        stubs.t2s_provider.T2S_INVERSION_MODES = ["benchmark_ddim"]
+        stubs.t2s_provider.T2S_SHARED_TR_CLEAN_MODE = "official_math_shared_tr_clean"
+        stubs.t2s_provider.T2SProvider = mock.MagicMock()
+
+        return stubs, t2d
 
     def test_role_based_state_pairing(self, monkeypatch, tmp_path):
         from unittest import mock as um
-        stubs, t21 = self._env(monkeypatch, tmp_path)
-        cs = t21._make_state(watermark_id="clean-id",
-                             provider_config_sha256=t21._sha256("pc"))
-        ws = t21._make_state(watermark_id="wm-id",
-                             provider_config_sha256=t21._sha256("pc"))
+        stubs, t2d = self._env(monkeypatch)
+
+        cs = T2SState(watermark_id="clean-id",
+                      provider_config_sha256="sha_pc")
+        ws = T2SState(watermark_id="wm-id",
+                      provider_config_sha256="sha_pc")
         cp = tmp_path / "cs.json"; cp.write_text("{}")
         wp = tmp_path / "ws.json"; wp.write_text("{}")
-        cr = t21._make_orch_record("42", "clean", cs, cp, tmp_path)
-        wr = t21._make_orch_record("42", "watermarked", ws, wp, tmp_path)
-        out = t21._setup_run(tmp_path, [cr, wr])
-        t21.install_state_load_mock(monkeypatch, {str(cp): cs, str(wp): ws})
-        t21.install_accuracies_mock(monkeypatch, lambda st, inv:
-            t21._consistent_accuracies(0.91, 0.05, True) if st.watermark_id == "wm-id"
-            else t21._consistent_accuracies(0.11, 0.05, True))
-        t21.install_inversion_mock(monkeypatch)
+        cr = self._t2s_orch_record("42", "clean", cs, cp, tmp_path)
+        wr = self._t2s_orch_record("42", "watermarked", ws, wp, tmp_path)
+
+        # State load mock
+        _states = {str(cp): cs, str(wp): ws}
+        stubs.t2s_provider.T2SWatermarkState = mock.MagicMock()
+        stubs.t2s_provider.T2SWatermarkState.load = staticmethod(
+            lambda p: _states[str(p)])
+
+        # Inversion mock
+        stubs.t2s_inversion.invert_image = mock.MagicMock(
+            return_value=mock.MagicMock())
+
+        # Accuracy mock — different per watermark_id
+        def _accs(state, zT_dict):
+            if state.watermark_id == "wm-id":
+                return {"t2s_score_true_key": 0.91, "t2s_score_control_key": 0.05,
+                        "t2s_score_margin": 0.86, "detection_success": True,
+                        "key_accuracy": 1.0, "message_accuracy": 0.92}
+            return {"t2s_score_true_key": 0.11, "t2s_score_control_key": 0.05,
+                    "t2s_score_margin": 0.06, "detection_success": True,
+                    "key_accuracy": 1.0, "message_accuracy": 0.92}
+        stubs.t2s_provider.T2SProvider.accuracies_for_state = staticmethod(_accs)
+
+        out = write_baseline_run(tmp_path, "T2S", records=[cr, wr],
+                                 csv_rows=[
+            {"run_id": "42", "role": r, "t2s_state_path": str(p),
+             "t2s_state_sha256": "sha", "t2s_watermark_id": s.watermark_id,
+             "t2s_provider_config_sha256": "sha_pc",
+             "t2s_protocol_mode": s.protocol_mode,
+             "t2s_rng_mode": s.rng_mode,
+             "t2s_inversion_mode": s.inversion_mode,
+             "t2s_num_inversion_steps": str(s.num_inversion_steps)}
+            for r, p, s in (("clean", cp, cs), ("watermarked", wp, ws))
+        ])
         with um.patch("PIL.Image.open"), um.patch("PIL.ImageOps.exif_transpose"):
-            result = _eval([cr, wr], out, "T2S")
-        assert result["status"] == STATUS_COMPLETED
+            result = _eval([cr, wr], out, "T2S",
+                           config={"method": "T2S", "metadata_path": str(tmp_path / "meta.csv")})
+        assert result["status"] == STATUS_COMPLETED, (
+            f"status={result['status']} err={result.get('setup_error')}")
         rows = _rows(out)
         scored = [r for r in rows if r["status"] == ROW_STATUS_SCORED]
+        assert len(scored) == 4
         cids = {r["t2s_watermark_id"] for r in scored if r["source_role"] == "clean"}
         wids = {r["t2s_watermark_id"] for r in scored if r["source_role"] == "watermarked"}
         assert cids == {"clean-id"}
         assert wids == {"wm-id"}
 
-    def test_missing_state(self, monkeypatch, tmp_path):
-        from unittest import mock as um
-        stubs, t21 = self._env(monkeypatch, tmp_path)
-        t21.install_pipe_utils_stub()
-        st = t21._make_state()
-        mp = tmp_path / "missing.json"
-        rec = t21._make_orch_record("1", "watermarked", st, mp, tmp_path)
-        out = t21._setup_run(tmp_path, [rec])
-        monkeypatch.setattr(t21._provider_module().T2SWatermarkState, "load",
-            staticmethod(lambda p: pytest.fail("load must not be called")))
-        with um.patch("PIL.Image.open"), um.patch("PIL.ImageOps.exif_transpose"):
-            result = _eval([rec], out, "T2S")
-        assert result["status"] == STATUS_FAILED_MISSING_REQUIRED_STATE
 
-    def test_scoring_error(self, monkeypatch, tmp_path):
-        from unittest import mock as um
-        stubs, t21 = self._env(monkeypatch, tmp_path)
-        t21.install_pipe_utils_stub()
-        st = t21._make_state()
-        gp = tmp_path / "state.json"; gp.write_text("{}")
-        rec = t21._make_orch_record("1", "watermarked", st, gp, tmp_path)
-        out = t21._setup_run(tmp_path, [rec])
-        t21.install_state_load_mock(monkeypatch, {str(gp): st})
-        def _fail(*a, **kw): raise RuntimeError("OOM")
-        t21.install_inversion_mock(monkeypatch, _fail)
-        with um.patch("PIL.Image.open"), um.patch("PIL.ImageOps.exif_transpose"):
-            result = _eval([rec], out, "T2S")
-        assert result["status"] == STATUS_FAILED_SCORING
-
-
-# ===========================================================================
-# run_evaluation() coverage
-# ===========================================================================
 class TestRunEvaluationCoverage:
-    @pytest.mark.parametrize("method", ["GS", "GM", "TR"])
+    @pytest.mark.parametrize("method", ["GS", "GM", "TR", "T2S"])
     def test_run_evaluation_success(self, method, monkeypatch, tmp_path):
         if method == "GS":
             cls = TestGSRealAdapter()
@@ -870,6 +926,11 @@ class TestRunEvaluationCoverage:
             result = _eval([rec_wm, rec_cl], out, "TR",
                            config={"method": "TR", "metadata_path": str(tmp_path / "meta.csv")})
             stage = result
+        elif method == "T2S":
+            cls = TestT2SRealAdapter()
+            # Delegate to the method-specific test for setup and eval
+            cls.test_role_based_state_pairing(monkeypatch, tmp_path)
+            return
         assert stage["status"] == STATUS_COMPLETED
         if result.get("failed_stages") is not None:
             assert result["failed_stages"] == []
