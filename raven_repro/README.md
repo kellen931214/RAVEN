@@ -21,58 +21,20 @@ pip install open_clip_torch torchmetrics clean-fid
 
 The reproduction model is `RedbeardNZ/stable-diffusion-2-1-base` at revision `c6a5e9bab8d874d081de76fa270ae0aefa5410ff`.
 
-## Diagnostic Single Image
+## Running Attacks
 
-`scripts/run_raven.py` is **ABLATION ONLY - NOT A FORMAL EVALUATION ENTRYPOINT**.
-
-```bash
-python scripts/run_raven.py \
-  --input path/to/watermarked.png \
-  --output_dir /tmp/raven-tr-ablation \
-  --model_id RedbeardNZ/stable-diffusion-2-1-base \
-  --steps 50 \
-  --strength 0.15 \
-  --inversion_mode ddim \
-  --guidance_scale 2.5 \
-  --shift_min 24 \
-  --shift_max 32 \
-  --shift_sign random \
-  --shift_sampling independent_axes \
-  --shift_space image_pixels \
-  --warp_mode integer \
-  --padding_mode zeros \
-  --view_guided_attention true \
-  --color_transfer true \
-  --seed 42 \
-  --device cuda \
-  --debug true
-```
-
-## Diagnostic Folder Attack
-
-`scripts/attack_folder.py` is **ABLATION ONLY - NOT A FORMAL EVALUATION ENTRYPOINT**.
+Use the unified entrypoint `experiments/main.py` for single-image and batch attacks:
 
 ```bash
-python scripts/attack_folder.py \
-  --input_dir data/tr/diffusiondb \
-  --output_dir /tmp/raven-tr-folder \
-  --model_id RedbeardNZ/stable-diffusion-2-1-base \
-  --steps 50 \
-  --strength 0.15 \
-  --guidance_scale 2.5 \
-  --shift_min 24 \
-  --shift_max 32 \
-  --shift_sign random \
-  --shift_space image_pixels \
-  --warp_mode integer \
-  --padding_mode zeros \
-  --view_guided_attention true \
-  --color_transfer true \
-  --seed 42 \
-  --device cuda
+python experiments/main.py \
+  --dataset my_dataset --method TR \
+  --metadata /path/to/metadata.csv \
+  --output-dir /tmp/raven-attack \
+  --roles watermarked
 ```
 
-Each image is saved into its own subdirectory. Failed files are listed in `failed.txt`.
+Legacy diagnostic scripts (`scripts/run_raven.py`, `scripts/attack_folder.py`) have
+been removed. They were ablation-only CLIs with zero production callers.
 
 ## Evaluation
 
@@ -106,8 +68,7 @@ Do not run a full cohort until the 2/10/30 gates pass in fresh output roots.
 - `raven/warp.py`: integer zero-padded latent translation plus an explicit `grid_sample` ablation.
 - `raven/attention.py`: view-guided self-attention processor. Text cross-attention is left unchanged.
 - `raven/color_transfer.py`: effective-source-flow aligned LAB luminance/chroma transfer; unaligned modes are unsupported.
-- `scripts/run_raven.py`: single-image CLI.
-- `scripts/attack_folder.py`: folder CLI with failure logging.
+- `../experiments/main.py`: unified attack runner (single-image and batch).
 - `scripts/eval_quality.py`: PSNR/SSIM helper.
 - `scripts/audit_dataset.py`: metadata, hash, image-format, and pairing audit.
 - `../experiments/run_raven_formal_eval.py`: the single formal stage orchestrator.
@@ -137,13 +98,11 @@ debug_info.json
 ## Ablations
 
 All commands in this section are **ABLATION ONLY - NOT A FORMAL EVALUATION ENTRYPOINT**.
+Use `experiments/main.py` with the appropriate flags.
 
 ```bash
-python scripts/run_raven.py --input path/to/watermarked.png --output_dir outputs/no_vga --view_guided_attention false --color_transfer true
-python scripts/run_raven.py --input path/to/watermarked.png --output_dir outputs/strength_005 --strength 0.05
-python scripts/run_raven.py --input path/to/watermarked.png --output_dir outputs/shift_latent --shift_space latent_pixels
-python scripts/run_raven.py --input path/to/watermarked.png --output_dir outputs/forward_noise --inversion_mode forward_noise
-python scripts/run_raven.py --input path/to/watermarked.png --output_dir outputs/legacy_shift --shift_sampling coupled_diagonal
+python experiments/main.py --dataset ablation --method TR --metadata /tmp/one_sample.csv --output-dir outputs/no_vga --view-guided-attention false --color-transfer aligned
+python experiments/main.py --dataset ablation --method TR --metadata /tmp/one_sample.csv --output-dir outputs/strength_005 --strength 0.05
 ```
 
 ## Reproduction Audit Workflow
