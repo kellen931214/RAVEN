@@ -20,7 +20,7 @@ def compute_attack_seed(base_seed: int, run_id: str) -> int:
 
     For non-numeric run IDs the first 8 hex digits of the canonical JSON hash
     are used as the numeric component.  This is the same arithmetic the legacy
-    ``planned_shift()`` in ``run_raven_formal_eval.py`` used.
+    ``plan_shift()`` in ``experiment_config`` used.
     """
     try:
         numeric_id = int(run_id)

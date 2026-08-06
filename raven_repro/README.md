@@ -2,7 +2,7 @@
 
 This is a clean reproduction scaffold for **RAVEN: Erasing Invisible Watermarks via Novel View Synthesis**. It is intended for academic robustness evaluation on images you own or generated yourself.
 
-The implementation follows the local `PLAN.md` and uses the NFPA repository as an implementation reference for frame-guided self-attention and the optional `grid_sample` warp ablation. It does not modify NFPA.
+The implementation uses the NFPA repository as an implementation reference for frame-guided self-attention and the optional `grid_sample` warp ablation. It does not modify NFPA.
 
 ## Setup
 
@@ -38,57 +38,10 @@ python experiments/main.py \
 reflected in the exit code; the old per-file `error.txt` / `failed.txt` pattern
 is not reproduced.
 
-### Removed legacy scripts
-
-`scripts/run_raven.py` and `scripts/attack_folder.py` were deleted in commit
-`0dc34d7`. Both were ablation-only CLI wrappers around `RavenPipeline` with zero
-production callers.
-
-### Compatibility: old CLI → `experiments/main.py`
-
-| Old `run_raven.py` / `attack_folder.py` | `experiments/main.py` equivalent | Status |
-|---|---|---|
-| `--inversion_mode ddim` | `--diffusion-mode ddim` | renamed — exact equivalent |
-| `--inversion_mode forward_noise` | *none* | **unsupported** — `forward_noise` inversion + DDIM scheduler denoising. `--diffusion-mode ddpm` uses DDPM scheduler (stochastic denoising, different noise schedule). `--diffusion-mode ddim-ddpm` uses DDIM inversion (unet loop, not `add_noise`). The discarded combo `forward_noise + DDIM denoise` is the exact `FORBIDDEN_PAIR = ("ddpm", "ddim")` rejected by `experiment_config.py:37`. This ablation is intentionally removed. |
-| `--shift_sampling independent_axes` | `--shift-mode random` (default) | renamed — `plan_shift()` hardcodes random independent axes per sample |
-| `--shift_sampling coupled_diagonal` | *none* | **unsupported** — `plan_shift()` never produces this; pipeline path only reachable when `shift_x/shift_y` absent, which `main.py` always provides |
-| `--shift_sign random` | (default) | renamed — always random per axis |
-| `--shift_sign positive` / `negative` | *none* | **unsupported** — not reachable via `plan_shift()` |
-| `--shift_space image_pixels` / `latent_pixels` | `--shift-space` | renamed — passes through to pipeline unchanged |
-| `--warp_mode integer` / `grid_sample` | `--warp-mode` | renamed — passes through (default changed to `raven_paper_nfpa_gap_fill`) |
-| `--padding_mode zeros` / `reflection` / `border` | `--padding-mode` | renamed — passes through. Note: formal warp modes (`raven_paper_nfpa_gap_fill`) reject `zeros` at pipeline level |
-| `--shift_min` / `--shift_max` | `--shift-magnitude-min` / `--shift-magnitude-max` | renamed |
-| `--seed N` | `--base-seed N` | renamed — per-sample seed = base_seed + run_id |
-| `--view_guided_attention` | `--view-guided-attention` | renamed |
-| `--color_transfer` | `--color-transfer` (`aligned`/`none`) | renamed — bool→choice |
-| `--input <path>` (single image) | *none* | **unsupported** — `main.py` always reads input paths from metadata CSV |
-| `--input_dir <path>` (batch folder) | *none* | **unsupported** — no directory-walk mode |
-| `error.txt` / `failed.txt` | *none* | **unsupported** — `main.py` uses `records.jsonl` + exit code |
-
 ## Evaluation
 
-The only formal evaluation entrypoint is `experiments/run_raven_formal_eval.py`.
-Run stages separately against one output root. Omit `--output-root` and it resolves to
-the canonical, content-addressed root
-`outputs/<tr|gs>/<dataset>/<variant>/<source-manifest-sha>_<attack-config-hash>` — not a
-timestamp — so an identical re-run resumes the same root instead of creating another
-directory. An explicit `--output-root` must still live under the canonical root for
-`--method`.
-
-```bash
-python experiments/run_raven_formal_eval.py \
-  --dataset diffusiondb --method TR \
-  --source-metadata data/tr/diffusiondb/metadata.csv \
-  --expected-count 30 --batch-size 10 --device cuda --gpu 0 --stage snapshot
-```
-
-Then run `attack-watermarked`, `attack-clean` for TR, `verify`, `quality`, `fid`,
-`clip`, `aggregate`, and `validate` with the identical arguments plus `--resume`.
-`attack-clean` belongs to the TR protocol only; GS and the other methods never run it
-and never write a per-sample `input.png`.
-Formal color transfer is exclusively `paper_exact_two_stage_aligned` and consumes
-`effective_source_flow_dx_image_px` / `effective_source_flow_dy_image_px`.
-Do not run a full cohort until the 2/10/30 gates pass in fresh output roots.
+Use `experiments/eval.py` to run quality metrics, detector evaluation, FID, and
+CLIP against outputs produced by `experiments/main.py`.
 
 ## Key Files
 
@@ -97,18 +50,11 @@ Do not run a full cohort until the 2/10/30 gates pass in fresh output roots.
 - `raven/warp.py`: integer zero-padded latent translation plus an explicit `grid_sample` ablation.
 - `raven/attention.py`: view-guided self-attention processor. Text cross-attention is left unchanged.
 - `raven/color_transfer.py`: effective-source-flow aligned LAB luminance/chroma transfer; unaligned modes are unsupported.
-- `../experiments/main.py`: unified attack runner (single-image and batch).
-- `scripts/eval_quality.py`: PSNR/SSIM helper.
-- `scripts/audit_dataset.py`: metadata, hash, image-format, and pairing audit.
-- `../experiments/run_raven_formal_eval.py`: the single formal stage orchestrator.
+- `../experiments/main.py`: unified attack runner.
+- `../experiments/eval.py`: unified evaluation runner.
 - `raven/eval_protocol.py`: centralized formal attack, detector, FID, resume, provider, and CLIP provenance.
-- `scripts/raven_nfpa_tr_eval.py`: Tree-Ring complex-L1 detector helper used by the formal runner.
-- `scripts/run_diffusiondb_chain_after_clean.py`: disabled historical chain retained only for helper-level research evidence.
-- `../experiments/run_raven_aligned_color_eval.py`: the sole effective-flow aligned postprocessing evaluator.
-- `scripts/paired_generation_shards.py`: migrates committed rows into shard metadata, quarantines crash-written images without provenance, and merges shards only when run-ID coverage, latent uniqueness, image hashes, target/config hashes, and model revision all pass.
 - `raven/pairing_provenance.py`: fail-closed latent, image, target, pairing, and attack-config audits.
-- `scripts/build_verification_manifest.py` and `scripts/evaluate_verification.py`: strict pairing and calibrated verification utilities.
-- Archived legacy scripts live under `archive/legacy_scripts_20260716/`.
+- `raven/evaluation/scoring.py`: canonical detector scoring helpers shared across all 7 methods.
 
 ## Outputs
 
@@ -183,13 +129,8 @@ Historical scripts remain solely as reproducibility evidence.
 - If attention shape errors occur after upgrading Diffusers, first run `pytest tests/test_attention_shapes.py`, then inspect `raven/attention.py`.
 - If outputs drift too much, lower `--strength` or use `--view_guided_attention true --color_transfer true`.
 
-## Shared TR Clean V2
+## Watermark Cohort Generation
 
-`shared_tr_clean_v2` is a formal RAVEN comparison profile, separate from each
-method's official reproduction profile. GM, T2S, RID, HSTR, and HSQR runners
-under `experiments/generate_*_from_tr_shared_clean.py` consume canonical
-Tree-Ring metadata and clean artifacts, inject only the method-specific
-watermark through the authoritative provider, and write only method-specific
-`watermarked.png` outputs. A cohort is `formal_shared_tr_clean` only after the
-cross-method audit validates it by `run_id` against `data/tr/diffusiondb/metadata.csv`.
-See repository generation scripts for commands and schema details.
+`experiments/generate_*.py` scripts produce watermarked cohorts from shared
+Tree-Ring clean images. Each method injects only its own watermark through
+the authoritative provider and writes method-specific `watermarked.png` outputs.
