@@ -6,7 +6,7 @@ from typing import Literal
 
 from PIL import Image
 
-from .metrics import inverse_warp_valid_bounds, sample_inverse_warp_reference
+from .evaluation.metrics import inverse_warp_valid_bounds, sample_inverse_warp_reference
 
 ColorTransferMode = Literal[
     "paper_exact_two_stage",
