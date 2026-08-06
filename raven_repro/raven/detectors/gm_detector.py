@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import math
 import numbers
-import sys
 from pathlib import Path
 from typing import Any
 
@@ -106,13 +105,6 @@ def describe_required_artifacts() -> list[str]:
     ]
 
 
-def _ensure_paths():
-    repo = Path(__file__).resolve().parents[3]
-    p = str(repo / "eval_bench_wm")
-    if p not in sys.path:
-        sys.path.insert(0, p)
-
-
 def _get_scoring_module():
     from raven.evaluation import scoring
     return scoring
@@ -148,7 +140,7 @@ def _validate_required_gm_metadata(record: dict[str, Any]) -> None:
 
 
 def _canonical_provider_identity(kwargs: dict[str, Any]) -> str:
-    from raven.eval_protocol import canonical_json_hash
+    from raven.protocol import canonical_json_hash
     payload: dict[str, Any] = {}
     for field in _CANONICAL_KWARGS_FIELDS:
         value = kwargs.get(field)
@@ -160,7 +152,7 @@ def _canonical_provider_identity(kwargs: dict[str, Any]) -> str:
 
 
 def _validate_gm_protocol_mode(record: dict[str, Any]) -> None:
-    from raven.pairing_provenance import GM_SHARED_TR_CLEAN_MODE
+    from raven.detectors.protocols import GM_SHARED_TR_CLEAN_MODE
     actual = str(record.get("gm_protocol_mode", ""))
     if actual != GM_SHARED_TR_CLEAN_MODE:
         raise DetectorStateValidationError(
@@ -274,7 +266,6 @@ def _strict_provider_bool(provider: Any, attr: str) -> bool:
 
 def load_state(records: list[dict[str, Any]], device: str, **extra) -> dict[str, Any]:
     import torch
-    _ensure_paths()
     try:
         from eval_bench_wm.utils.pipe import pipe_utils
         from eval_bench_wm.utils.wm.gm_provider import GmProvider
@@ -374,7 +365,7 @@ def load_state(records: list[dict[str, Any]], device: str, **extra) -> dict[str,
             f"canonical={canonical_pio!r} provider={provider_pio!r} "
             f"bundle.manifest={bundle_pio!r}")
 
-    from raven.pairing_provenance import tensor_sha256
+    from raven.detectors.protocols import tensor_sha256
     if provider.gt_patch is None:
         raise DetectorStateValidationError("GM provider has no gt_patch")
     provider_target_hash = tensor_sha256(provider.gt_patch.real.contiguous())
@@ -391,7 +382,7 @@ def load_state(records: list[dict[str, Any]], device: str, **extra) -> dict[str,
             raise DetectorStateValidationError(f"run_id={rid}: cohort mask SHA mismatch")
 
     first_manifest = row_bindings[0]["manifest"]
-    from raven.pairing_provenance import GM_SHARED_TR_CLEAN_MODE
+    from raven.detectors.protocols import GM_SHARED_TR_CLEAN_MODE
     verified_provenance: dict[str, Any] = {
         "gm_bundle_dir": str(first_bundle_dir),
         "gm_bundle_config_sha256": str(first_manifest.get("bundle_config_sha256", "")),
@@ -630,7 +621,7 @@ def _resolve_gnr_classifier_usage(result, provider_info, *, kind) -> bool:
 
 
 def aggregate(detector_rows: list[dict[str, Any]], **extra) -> dict[str, Any]:
-    from raven.metrics import summarize_detection
+    from raven.evaluation.metrics import summarize_detection
     from . import ROW_STATUS_SCORED
     cohorts: dict[str, list[float]] = {}
     for row in detector_rows:

@@ -488,18 +488,7 @@ def load_state(records: list[dict[str, Any]], device: str,
     constructs exactly one provider built from the verified profile.  Pipe is
     built from cohort metadata, never hard-coded.
     """
-    import sys
-
     import torch
-
-    # ``eval_bench_wm`` is a namespace package (no __init__.py): the repo
-    # root must be on sys.path so ``import eval_bench_wm`` resolves, and the
-    # eval_bench_wm directory itself so the absolute ``from utils...``
-    # imports inside eval_bench_wm resolve.
-    repo = Path(__file__).resolve().parents[3]
-    for entry in (str(repo), str(repo / "eval_bench_wm")):
-        if entry not in sys.path:
-            sys.path.insert(0, entry)
 
     try:
         from eval_bench_wm.utils.pipe import pipe_utils
@@ -524,7 +513,7 @@ def load_state(records: list[dict[str, Any]], device: str,
         configs.append(_normalize_tr_provider_config(record, record_index=idx))
 
     # Uniform provider config via canonical hash
-    from raven.eval_protocol import provider_config_hash
+    from raven.protocol import provider_config_hash
     provider_hashes: set[str] = set()
     for idx, record in enumerate(records):
         try:
@@ -685,7 +674,7 @@ def load_state(records: list[dict[str, Any]], device: str,
         ) from exc
 
     # ---- 9: derive and verify target / mask identity ----
-    from raven.pairing_provenance import tensor_sha256
+    from raven.detectors.protocols import tensor_sha256
 
     target = getattr(provider, "gt_patch", None)
     if target is None:
@@ -928,7 +917,7 @@ def aggregate(detector_rows: list[dict[str, Any]], **extra) -> dict[str, Any]:
     A recalibration metric-computation error is never disguised as data
     unavailability: it re-raises as a structured scoring failure.
     """
-    from raven.metrics import summarize_detection
+    from raven.evaluation.metrics import summarize_detection
     from . import ROW_STATUS_SCORED
 
     cohorts: dict[str, list[float]] = {}

@@ -15,12 +15,6 @@ from pathlib import Path
 
 from PIL import Image, ImageOps
 
-# Ensure raven_repro/ and eval_bench_wm/ are importable.
-_REPO = Path(__file__).resolve().parents[3]
-for _p in (str(_REPO / "raven_repro"), str(_REPO / "eval_bench_wm")):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
-
 
 # ── tiny utilities (no external deps) ──────────────────────────────────────
 
@@ -37,7 +31,7 @@ def _integer(row: dict[str, str], names: tuple[str, ...], default: int) -> int:
     return int(value) if value is not None else default
 
 
-from raven.eval_protocol import sha256_path as _sha256
+from raven.protocol import sha256_path as _sha256
 
 
 # ── GS-specific helpers ────────────────────────────────────────────────────

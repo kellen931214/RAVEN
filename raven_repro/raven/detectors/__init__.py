@@ -473,7 +473,25 @@ def _lazy_imports():
     })
 
 
+def _ensure_eval_bench_wm_path() -> None:
+    """Ensure ``eval_bench_wm`` is importable — called once per process.
+
+    ``eval_bench_wm`` is a namespace package (no ``__init__.py``). Both the
+    repo root AND the ``eval_bench_wm`` directory must be on ``sys.path``:
+    the root so ``import eval_bench_wm`` resolves, and the directory so the
+    absolute ``from utils...`` imports inside eval_bench_wm resolve.
+    """
+    import sys
+    from pathlib import Path
+
+    repo = Path(__file__).resolve().parents[3]
+    for entry in (str(repo), str(repo / "eval_bench_wm")):
+        if entry not in sys.path:
+            sys.path.insert(0, entry)
+
+
 def get_detector_module(method: str):
+    _ensure_eval_bench_wm_path()
     _lazy_imports()
     mod = DETECTOR_MODULES.get(method.upper())
     if mod is None:

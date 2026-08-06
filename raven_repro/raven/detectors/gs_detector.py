@@ -22,7 +22,6 @@ Failure taxonomy
 from __future__ import annotations
 
 import math
-import sys
 from pathlib import Path
 from typing import Any
 
@@ -279,13 +278,6 @@ def describe_required_artifacts() -> list[str]:
     ]
 
 
-def _ensure_paths():
-    repo = Path(__file__).resolve().parents[3]
-    for p in [str(repo / "eval_bench_wm"), str(repo / "raven_repro" / "scripts")]:
-        if p not in sys.path:
-            sys.path.insert(0, p)
-
-
 # ---------------------------------------------------------------------------
 # Metadata preflight — must run BEFORE any provider_kwargs call
 # ---------------------------------------------------------------------------
@@ -395,7 +387,7 @@ def _validate_pipe_config_uniformity(
                 f"run_id={run_id}: {exc}"
             ) from exc
 
-        from raven.eval_protocol import canonical_json_hash
+        from raven.protocol import canonical_json_hash
 
         h = canonical_json_hash({
             "model_id": str(rec.get("model_id")),
@@ -432,7 +424,7 @@ def _validate_gs_provider_config(
 
     Returns ``(canonical_config, canonical_hash, pipe_hash, detection_policy_hash)``.
     """
-    from raven.eval_protocol import (
+    from raven.protocol import (
         require_uniform_provider_config,
         canonical_json_hash,
     )
@@ -616,7 +608,7 @@ def _construct_provider(
         )
 
     # ---- target identity ----
-    from raven.pairing_provenance import tensor_sha256
+    from raven.detectors.protocols import tensor_sha256
 
     source_target = str(metadata.get("watermark_target_sha256", ""))
     detector_target = tensor_sha256(provider.watermark_target_tensor())
@@ -627,7 +619,7 @@ def _construct_provider(
         )
 
     # ---- mask identity (GS has no mask — canonical sentinel) ----
-    from raven.eval_protocol import canonical_json_hash
+    from raven.protocol import canonical_json_hash
 
     source_mask = str(metadata.get("watermark_mask_sha256", ""))
     detector_mask = canonical_json_hash(
@@ -1048,8 +1040,6 @@ def load_state(records: list[dict[str, Any]], device: str,
     """
     import torch
 
-    _ensure_paths()
-
     try:
         from eval_bench_wm.utils.pipe import pipe_utils
         from eval_bench_wm.utils.wm.gs_provider import GsProvider
@@ -1129,9 +1119,8 @@ def score_image(provider_info: dict[str, Any], image_path: str, *,
     """
     import torch
     from PIL import Image, ImageOps
-    from raven.pairing_provenance import tensor_sha256
+    from raven.detectors.protocols import tensor_sha256
 
-    _ensure_paths()
     from raven.evaluation.scoring import (
         evaluate_image,
         raw_score as _canonical_raw_score,
@@ -1537,7 +1526,7 @@ def aggregate(detector_rows: list[dict[str, Any]], **extra) -> dict[str, Any]:
     ``detection_summary`` is a deprecated alias of the empirical summary
     with machine-readable deprecation markers.
     """
-    from raven.metrics import summarize_detection
+    from raven.evaluation.metrics import summarize_detection
     from . import ROW_STATUS_SCORED
 
     cohorts: dict[str, list[float]] = {}

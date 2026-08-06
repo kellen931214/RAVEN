@@ -13,7 +13,6 @@ never duplicated here.  All state identity fields fail closed.
 from __future__ import annotations
 
 import math
-import sys
 from pathlib import Path
 from typing import Any
 
@@ -153,13 +152,6 @@ def _validate_optional_accuracy(accuracies: dict[str, Any], field: str,
 # ---------------------------------------------------------------------------
 # Path helpers
 # ---------------------------------------------------------------------------
-
-def _ensure_paths():
-    repo = Path(__file__).resolve().parents[3]
-    for p in [str(repo / "eval_bench_wm"), str(repo / "raven_repro" / "scripts")]:
-        if p not in sys.path:
-            sys.path.insert(0, p)
-
 
 # ---------------------------------------------------------------------------
 # Metadata helpers
@@ -484,8 +476,6 @@ def load_state(records: list[dict[str, Any]], device: str,
     5. Build the pipe from a fully-validated state profile (no fallbacks).
     """
     import torch
-
-    _ensure_paths()
 
     # ---- Step 1: per-sample metadata index ----
     state_index: dict[tuple[str, str], dict[str, Any]] = {}

@@ -10,7 +10,7 @@ from __future__ import annotations
 import random
 from typing import Any, Mapping
 
-from .eval_protocol import canonical_json_hash
+from .protocol import canonical_json_hash
 
 
 def compute_attack_seed(base_seed: int, run_id: str) -> int:

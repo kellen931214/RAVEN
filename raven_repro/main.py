@@ -301,7 +301,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # --- initialize pipeline ONCE ---
     from raven.pipeline_raven import RavenPipeline
-    from raven.resource_guard import limit_cpu_threads
+    from raven.runtime import limit_cpu_threads
 
     limit_cpu_threads(1)
     logger.info("Initializing RavenPipeline (scheduler=%s)...", config["scheduler_mode"])

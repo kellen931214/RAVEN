@@ -27,7 +27,7 @@ for _root in (str(GENERATE_ROOT), str(RAVEN_ROOT), str(BENCH_ROOT)):
     if _root not in sys.path:
         sys.path.insert(0, _root)
 
-from raven.eval_protocol import method_data_root, source_metadata_path  # noqa: E402
+from generate.layout import method_data_root, source_metadata_path  # noqa: E402
 from runtime import (  # noqa: E402
     configure_gpu,
     finalize_gpu_logging,
@@ -35,9 +35,12 @@ from runtime import (  # noqa: E402
     utc_timestamp,
     write_experiment_records,
 )
-from raven.pairing_provenance import (  # noqa: E402
+from raven.detectors.protocols import (  # noqa: E402
     SHARED_CLEAN_PROTOCOL,
     SHARED_CLEAN_SOURCE_METHOD,
+)
+from raven.protocol import canonical_json_hash  # noqa: E402
+from generate.provenance import (  # noqa: E402
     SHARED_FOURIER_METHOD_CONFIG,
     audit_pairing_rows,
     audit_shared_clean_cohorts,
@@ -51,7 +54,6 @@ from shared_clean_tr import (  # noqa: E402
     append_row,
     assert_recorded_output,
     assert_resume_fields,
-    canonical_json_sha256,
     entrypoint_provenance,
     existing_completed_rows,
     finalize_run_manifest,
@@ -194,7 +196,7 @@ def _fourier_mask_sha256(spec: MethodSpec, provider: Any, manifest: Mapping[str,
         if value:
             return str(value)
     if spec.method == "HSQR":
-        return canonical_json_sha256({
+        return canonical_json_hash({
             "method": "HSQR",
             "mask_identity": "center_slice_protocol",
             "center_slice": [int(provider.start), int(provider.end)],
@@ -226,7 +228,7 @@ def _bundle_state(spec: MethodSpec, provider: Any, args: argparse.Namespace) -> 
 
 def _watermark_config(spec: MethodSpec, provider: Any, state: Mapping[str, Any], provenance: Mapping[str, Any]) -> Dict[str, Any]:
     provider_config = provider.provider_config() if hasattr(provider, "provider_config") else provider.detector_config()
-    provider_config_sha = provider.provider_config_sha256() if hasattr(provider, "provider_config_sha256") else canonical_json_sha256(provider_config)
+    provider_config_sha = provider.provider_config_sha256() if hasattr(provider, "provider_config_sha256") else canonical_json_hash(provider_config)
     return {
         "wm_type": spec.method,
         "protocol_mode": spec.protocol_mode,
@@ -348,7 +350,7 @@ def run_fourier_shared_clean(spec: MethodSpec, args: argparse.Namespace, guard: 
         raise SharedCleanError(f"{spec.method} shared-clean generation requires a persisted bundle")
     state = _bundle_state(spec, provider, args)
     watermark_config = _watermark_config(spec, provider, state, provenance)
-    watermark_config_sha256 = canonical_json_sha256(watermark_config)
+    watermark_config_sha256 = canonical_json_hash(watermark_config)
     run_manifest = finalize_run_manifest(
         manifest_path,
         stored_manifest,
@@ -599,7 +601,8 @@ def main_for_spec(spec: MethodSpec, argv: Optional[List[str]] = None) -> int:
     summary: Dict[str, Any] = {}
     error: Optional[str] = None
     try:
-        from raven.resource_guard import CpuMemoryGuard, limit_cpu_threads
+        from generate.runtime import CpuMemoryGuard
+        from raven.runtime import limit_cpu_threads
         import torch
 
         limit_cpu_threads(1)

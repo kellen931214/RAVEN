@@ -26,7 +26,6 @@ message substrings.
 from __future__ import annotations
 
 import math
-import sys
 from pathlib import Path
 from typing import Any
 
@@ -110,13 +109,6 @@ def describe_required_artifacts() -> list[str]:
     ]
 
 
-def _ensure_paths():
-    repo = Path(__file__).resolve().parents[3]
-    p = str(repo / "eval_bench_wm")
-    if p not in sys.path:
-        sys.path.insert(0, p)
-
-
 def _get_scoring_module():
     from raven.evaluation import scoring
     return scoring
@@ -124,7 +116,7 @@ def _get_scoring_module():
 
 def _protocol_mode_for_method(method: str) -> str:
     """Canonical protocol mode constant for a Fourier method."""
-    from raven.pairing_provenance import METHOD_PROTOCOL_MODES
+    from raven.detectors.protocols import METHOD_PROTOCOL_MODES
     field, mode = METHOD_PROTOCOL_MODES[method]
     return mode
 
@@ -371,7 +363,7 @@ def _validate_pipe_profile_fields(
 # ---------------------------------------------------------------------------
 def _compute_detector_target_hash(provider, method: str, manifest: dict) -> str:
     """Compute the detector-side target hash — never from source metadata."""
-    from raven.pairing_provenance import tensor_sha256
+    from raven.detectors.protocols import tensor_sha256
 
     if method in {"RID", "HSTR"}:
         if hasattr(provider, "selected_pattern_sha256") and provider.selected_pattern_sha256:
@@ -389,7 +381,7 @@ def _compute_detector_target_hash(provider, method: str, manifest: dict) -> str:
 
 def _compute_detector_mask_hash(provider, method: str, manifest: dict) -> str:
     """Compute the detector-side mask hash — never from source metadata."""
-    from raven.pairing_provenance import tensor_sha256
+    from raven.detectors.protocols import tensor_sha256
 
     if method in {"RID", "HSTR"}:
         if hasattr(provider, "watermark_mask_sha256") and provider.watermark_mask_sha256:
@@ -411,7 +403,7 @@ def _compute_detector_mask_hash(provider, method: str, manifest: dict) -> str:
         return str(manifest["mask_sha256"])
     if hasattr(provider, "watermark_channels") and hasattr(provider, "start") and hasattr(provider, "end"):
         try:
-            from raven.eval_protocol import canonical_json_hash
+            from raven.protocol import canonical_json_hash
             return canonical_json_hash({
                 "method": "HSQR",
                 "mask_identity": "center_slice_protocol",
@@ -500,7 +492,6 @@ def load_state(records: list[dict[str, Any]], device: str,
     """
     import torch
 
-    _ensure_paths()
     method = method.upper()
     if method not in FOURIER_METHODS:
         raise ValueError(f"Unknown Fourier method: {method}")
@@ -806,7 +797,7 @@ def score_image(provider_info: dict[str, Any], image_path: str, *,
 def aggregate(detector_rows: list[dict[str, Any]],
               method: str = "RID", **extra) -> dict[str, Any]:
     """Aggregate Fourier detector rows with method-specific score labels."""
-    from raven.metrics import summarize_detection
+    from raven.evaluation.metrics import summarize_detection
     from . import ROW_STATUS_SCORED
 
     method = method.upper()

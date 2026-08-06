@@ -1,63 +1,22 @@
-"""Authoritative protocol and provenance helpers for formal RAVEN evaluation."""
+"""Canonical protocol helpers for RAVEN attack and evaluation runtime.
+
+Provider config hashing, canonical JSON serialization, scheduler config
+normalization, and transform payload construction.  No generation layout,
+no data-root paths, no formal-run orchestration.
+"""
 
 from __future__ import annotations
 
 import hashlib
 import json
 import math
-import os
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Iterable, Mapping
 
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
-
-DATA_ROOT = REPO_ROOT / "data"
-OUTPUTS_ROOT = REPO_ROOT / "outputs"
-CLEAN_DATA_ROOT = DATA_ROOT / "clean"
-
-# method -> (watermarked data root, run output root)
-METHOD_DATA_ROOTS: dict[str, Path] = {
-    "TR": DATA_ROOT / "tr",
-    "GS": DATA_ROOT / "gs",
-    # shared_tr_clean_v2 cohorts (Issue #9). These roots hold only the
-    # method-specific watermarked images; the clean images stay in data/clean/
-    # and are never duplicated per method.
-    "GM": DATA_ROOT / "gm",
-    "T2S": DATA_ROOT / "t2s",
-    "RID": DATA_ROOT / "rid",
-    "HSTR": DATA_ROOT / "hstr",
-    "HSQR": DATA_ROOT / "hsqr",
-}
-METHOD_OUTPUT_ROOTS: dict[str, Path] = {
-    "TR": OUTPUTS_ROOT / "tr",
-    "GS": OUTPUTS_ROOT / "gs",
-    "GM": OUTPUTS_ROOT / "gm",
-    "T2S": OUTPUTS_ROOT / "t2s",
-    "RID": OUTPUTS_ROOT / "rid",
-    "HSTR": OUTPUTS_ROOT / "hstr",
-    "HSQR": OUTPUTS_ROOT / "hsqr",
-}
-
-# Methods whose formal protocol includes the attacked-clean recalibration branch.
-# Everything else must never produce attacked-clean artifacts.
-def method_data_root(method: str) -> Path:
-    """Canonical watermarked-data root for ``method`` (fail closed on unknown)."""
-    key = str(method).upper()
-    try:
-        return METHOD_DATA_ROOTS[key]
-    except KeyError:
-        raise ValueError(
-            f"no canonical data root for method {method!r}; "
-            f"known methods: {sorted(METHOD_DATA_ROOTS)}"
-        ) from None
-
-
-def source_metadata_path(method: str, dataset: str) -> Path:
-    """Canonical source metadata CSV for a generated cohort."""
-    return cohort_dir(method, dataset) / "metadata.csv"
-
-
+# --------------------------------------------------------------------------- #
+# Finite-value guard
+# --------------------------------------------------------------------------- #
 def _reject_non_finite(value: Any, path: str = "payload") -> None:
     if isinstance(value, float) and not math.isfinite(value):
         raise ValueError(f"{path} contains non-finite float: {value!r}")
@@ -69,6 +28,9 @@ def _reject_non_finite(value: Any, path: str = "payload") -> None:
             _reject_non_finite(item, f"{path}[{index}]")
 
 
+# --------------------------------------------------------------------------- #
+# Canonical JSON hashing
+# --------------------------------------------------------------------------- #
 def canonical_json_hash(payload: Mapping[str, Any]) -> str:
     _reject_non_finite(payload)
     text = json.dumps(
@@ -81,6 +43,9 @@ def canonical_json_hash(payload: Mapping[str, Any]) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+# --------------------------------------------------------------------------- #
+# Scheduler config — deterministic, no private metadata
+# --------------------------------------------------------------------------- #
 def canonical_scheduler_config(payload: Mapping[str, Any]) -> dict[str, Any]:
     """Return only deterministic scheduler parameters that affect inference.
 
@@ -96,6 +61,9 @@ def canonical_scheduler_config(payload: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+# --------------------------------------------------------------------------- #
+# File SHA-256
+# --------------------------------------------------------------------------- #
 def sha256_path(path: str | Path) -> str:
     path = Path(path)
     digest = hashlib.sha256()
@@ -105,6 +73,9 @@ def sha256_path(path: str | Path) -> str:
     return digest.hexdigest()
 
 
+# --------------------------------------------------------------------------- #
+# Transform config payload
+# --------------------------------------------------------------------------- #
 def transform_config_payload(debug_info: Mapping[str, Any]) -> dict[str, Any]:
     return {
         "model_id": debug_info["model_id"],
@@ -148,6 +119,162 @@ def transform_config_payload(debug_info: Mapping[str, Any]) -> dict[str, Any]:
         "torch_version": debug_info["torch_version"],
         "diffusers_version": debug_info["diffusers_version"],
     }
+
+
+# --------------------------------------------------------------------------- #
+# Provider config fields — canonical per-method schema
+# --------------------------------------------------------------------------- #
+TR_PROVIDER_FIELDS = (
+    "w_seed",
+    "w_channel",
+    "w_radius",
+    "w_pattern",
+    "w_mask_shape",
+    "w_measurement",
+    "w_injection",
+    "w_pattern_const",
+)
+
+PROVIDER_FIELDS_BY_METHOD = {
+    "TR": TR_PROVIDER_FIELDS,
+    "RID": (
+        "rid_protocol_mode",
+        "rid_bundle_config_sha256",
+        "rid_selected_pattern_sha256",
+        "rid_mask_sha256",
+        "rid_key_index",
+    ),
+    "HSTR": (
+        "hstr_protocol_mode",
+        "hstr_bundle_config_sha256",
+        "hstr_selected_pattern_sha256",
+        "hstr_mask_sha256",
+        "hstr_key_index",
+    ),
+    "HSQR": (
+        "hsqr_protocol_mode",
+        "hsqr_bundle_config_sha256",
+        "hsqr_selected_pattern_sha256",
+        "hsqr_mask_sha256",
+        "hsqr_key_index",
+    ),
+    "GS": (
+        "gs_protocol_mode",
+        "message_width_in_bytes",
+        "l",
+        "num_replications",
+        "gs_channel_copy",
+        "gs_hw_copy",
+        "gs_fpr",
+        "gs_user_number",
+    ),
+    "GM": (
+        "gm_protocol_mode",
+        "gm_bundle_config_sha256",
+        "gm_w1_file_sha256",
+        "gm_w2_file_sha256",
+        "gm_watermark_sha256",
+        "gm_m_sha256",
+        "gm_target_sha256",
+        "gm_mask_sha256",
+    ),
+    "T2S": (
+        "t2s_protocol_mode",
+        "t2s_rng_mode",
+        "t2s_inversion_mode",
+        "t2s_num_inversion_steps",
+        "t2s_provider_config_sha256",
+    ),
+}
+
+PROVIDER_REQUIRED_NONEMPTY_FIELDS: dict[str, frozenset[str]] = {
+    "GM": frozenset(PROVIDER_FIELDS_BY_METHOD["GM"]),
+    "T2S": frozenset(PROVIDER_FIELDS_BY_METHOD["T2S"]),
+    "RID": frozenset(PROVIDER_FIELDS_BY_METHOD["RID"]),
+    "HSTR": frozenset(PROVIDER_FIELDS_BY_METHOD["HSTR"]),
+    "HSQR": frozenset(PROVIDER_FIELDS_BY_METHOD["HSQR"]),
+}
+
+PROVIDER_DEFAULTS = {
+    "TR": {
+        "w_seed": 999999,
+        "w_channel": 3,
+        "w_radius": 10,
+        "w_pattern": "ring",
+        "w_mask_shape": "circle",
+        "w_measurement": "l1_complex",
+        "w_injection": "complex",
+        "w_pattern_const": 0.0,
+    },
+    "RID": {
+        "rid_protocol_mode": "",
+        "rid_bundle_config_sha256": "",
+        "rid_selected_pattern_sha256": "",
+        "rid_mask_sha256": "",
+        "rid_key_index": 0,
+    },
+    "HSTR": {
+        "hstr_protocol_mode": "",
+        "hstr_bundle_config_sha256": "",
+        "hstr_selected_pattern_sha256": "",
+        "hstr_mask_sha256": "",
+        "hstr_key_index": 0,
+    },
+    "HSQR": {
+        "hsqr_protocol_mode": "",
+        "hsqr_bundle_config_sha256": "",
+        "hsqr_selected_pattern_sha256": "",
+        "hsqr_mask_sha256": "",
+        "hsqr_key_index": 0,
+    },
+    "GS": {
+        "gs_protocol_mode": "official_compatible",
+        "message_width_in_bytes": 32,
+        "l": 1,
+        "num_replications": 64,
+        "gs_channel_copy": 1,
+        "gs_hw_copy": 8,
+        "gs_fpr": 1e-6,
+        "gs_user_number": 1000000,
+    },
+    "GM": {
+        "gm_protocol_mode": "",
+        "gm_bundle_config_sha256": "",
+        "gm_w1_file_sha256": "",
+        "gm_w2_file_sha256": "",
+        "gm_watermark_sha256": "",
+        "gm_m_sha256": "",
+        "gm_target_sha256": "",
+        "gm_mask_sha256": "",
+    },
+    "T2S": {
+        "t2s_protocol_mode": "",
+        "t2s_rng_mode": "",
+        "t2s_inversion_mode": "",
+        "t2s_num_inversion_steps": 0,
+        "t2s_provider_config_sha256": "",
+    },
+}
+
+
+# --------------------------------------------------------------------------- #
+# Provider config normalization
+# --------------------------------------------------------------------------- #
+def _normalized_scalar(value: Any, default: Any) -> Any:
+    if value in (None, ""):
+        value = default
+    if isinstance(default, bool):
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes"}
+        return bool(value)
+    if isinstance(default, int):
+        return int(value)
+    if isinstance(default, float):
+        value = float(value)
+        if not math.isfinite(value):
+            raise ValueError(f"non-finite provider value: {value!r}")
+        return value
+    return str(value)
 
 
 def provider_config(method: str, row: Mapping[str, Any]) -> dict[str, Any]:
@@ -197,5 +324,3 @@ def require_uniform_provider_config(
         )
     config_hash, config = next(iter(configs.items()))
     return config, config_hash
-
-

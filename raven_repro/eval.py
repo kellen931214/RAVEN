@@ -27,7 +27,7 @@ from raven.experiment_io import (  # noqa: E402
     config_path, detector_records_path, evaluation_dir,
     output_image_path, read_config, read_records_jsonl,
 )
-from raven.metrics import pair_quality_metrics  # noqa: E402
+from raven.evaluation.metrics import pair_quality_metrics  # noqa: E402
 from raven.detectors import (  # noqa: E402
     ALLOWABLE_STATUSES,
     DETECTOR_MODULES,
@@ -995,7 +995,7 @@ def evaluate_fid(
     config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     try:
-        from raven.quality import clean_fid, FID_PRIMARY_MODE
+        from raven.evaluation.metrics import clean_fid, FID_PRIMARY_MODE
     except ImportError:
         return {"stage": "fid", "status": STATUS_FAILED_MISSING_DEPENDENCY,
                 "reason": "clean-fid not installed."}
@@ -1054,7 +1054,7 @@ def evaluate_clip(
     config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     try:
-        from raven.quality import openclip_text_image_scores
+        from raven.evaluation.metrics import openclip_text_image_scores
     except ImportError:
         return {"stage": "clip", "status": STATUS_FAILED_MISSING_DEPENDENCY,
                 "reason": "open_clip_torch not installed."}

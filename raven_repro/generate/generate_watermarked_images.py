@@ -28,17 +28,11 @@ for root in (str(RAVEN_ROOT), str(BENCH_ROOT)):
     if root not in sys.path:
         sys.path.insert(0, root)
 
-from raven.eval_protocol import method_data_root
+from generate.layout import method_data_root
 from runtime import configure_gpu, finalize_gpu_logging, setup_run_logging, utc_timestamp, write_experiment_records
-from raven.pairing_provenance import (
-    GS_PAIRING_PROTOCOL,
-    PAIRING_PROTOCOL,
-    audit_pairing_rows,
-    build_pairing_sha256,
-    canonical_json_sha256,
-    sha256_path,
-    tensor_sha256,
-)
+from raven.detectors.protocols import GS_PAIRING_PROTOCOL, PAIRING_PROTOCOL, tensor_sha256
+from raven.protocol import canonical_json_hash
+from generate.provenance import audit_pairing_rows, build_pairing_sha256, sha256_path
 
 PAPER_WM_METHODS_IN_BENCH = ["GS", "TR", "RID", "HSTR", "HSQR"]
 PAPER_WM_NAMES = {
@@ -422,7 +416,7 @@ def run_method(args: argparse.Namespace, wm_type: str, prompt_rows: List[Dict[st
         watermark_mask_sha256 = tensor_sha256(wm_provider.watermarking_mask)
     else:
         watermark_target_sha256 = None
-        watermark_mask_sha256 = canonical_json_sha256(
+        watermark_mask_sha256 = canonical_json_hash(
             {"method": "GS", "mask": "not_applicable", "version": 1}
         )
     generation_config = {
@@ -434,7 +428,7 @@ def run_method(args: argparse.Namespace, wm_type: str, prompt_rows: List[Dict[st
         "resolution": args.resolution,
         "dtype": str(pipe_provider_target.get_dtype()),
     }
-    generation_config_sha256 = canonical_json_sha256(generation_config)
+    generation_config_sha256 = canonical_json_hash(generation_config)
     if wm_type == "TR":
         watermark_config = {
             "wm_type": "TR",
@@ -468,7 +462,7 @@ def run_method(args: argparse.Namespace, wm_type: str, prompt_rows: List[Dict[st
             "sampling_seed_policy": "base_seed+run_id",
             "watermark_mask_sha256": watermark_mask_sha256,
         }
-    watermark_config_sha256 = canonical_json_sha256(watermark_config)
+    watermark_config_sha256 = canonical_json_hash(watermark_config)
     message_bits_str_initial = None
 
     rows_written = 0
@@ -780,7 +774,8 @@ def main() -> int:
         if args.shard_index < 0 or args.shard_index >= args.num_shards:
             raise ValueError("--shard_index must be in [0, num_shards)")
 
-        from raven.resource_guard import CpuMemoryGuard, limit_cpu_threads
+        from generate.runtime import CpuMemoryGuard
+        from raven.runtime import limit_cpu_threads
         import torch
 
         limit_cpu_threads(1)

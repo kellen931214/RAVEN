@@ -13,14 +13,14 @@ from PIL import Image
 
 from .attention import install_view_guided_attention, restore_default_attention
 from .color_transfer import color_contrast_transfer_pil, color_transfer_diagnostics
-from .eval_protocol import (
+from .protocol import (
     canonical_json_hash,
     canonical_scheduler_config,
     transform_config_payload,
 )
 from .inversion import partial_diffusion_inversion
-from .resource_guard import limit_cpu_threads
-from .utils import image_size_divisible_by_8, save_image, save_json, seed_everything, tensor_to_image
+from .runtime import limit_cpu_threads
+from .runtime import image_size_divisible_by_8, save_image, save_json, seed_everything, tensor_to_image
 from .warp import (
     create_nfpa_translation_flow,
     latent_grid_warp,

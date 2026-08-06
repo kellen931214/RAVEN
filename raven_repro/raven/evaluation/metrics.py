@@ -1,20 +1,24 @@
-"""Protocol-correct metrics shared by RAVEN diagnostics and evaluation.
+"""Protocol-correct metrics for RAVEN evaluation.
 
 All watermark scores exposed here follow one convention: larger values mean
 "more likely watermarked".  This keeps threshold calibration independent of
 provider-specific score direction.
+
+FID and CLIP are lazy-imported so ``import raven.evaluation.metrics`` does not
+pull in diffusers, torch, open_clip, or cleanfid.
 """
 
 from __future__ import annotations
 
 import math
 from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import Iterable, Sequence
 
 
-SEMANTIC_METHODS = {"TR", "RID", "HSTR", "HSQR"}
-
-
+# --------------------------------------------------------------------------- #
+# Detection calibration
+# --------------------------------------------------------------------------- #
 @dataclass(frozen=True)
 class ThresholdCalibration:
     threshold: float
@@ -36,8 +40,7 @@ class DetectionSummary:
     attacked_auc: float
 
     def to_dict(self) -> dict:
-        payload = asdict(self)
-        return payload
+        return asdict(self)
 
 
 def calibrate_threshold(clean_scores: Sequence[float], target_fpr: float = 0.01) -> ThresholdCalibration:
@@ -124,15 +127,9 @@ def summarize_detection(
     )
 
 
-def normalize_bit_string(value: str, expected_length: int | None = None) -> str:
-    bits = "".join(str(value).split())
-    if not bits or set(bits) - {"0", "1"}:
-        raise ValueError("bit strings must contain only 0 and 1")
-    if expected_length is not None and len(bits) != expected_length:
-        raise ValueError(f"expected {expected_length} bits, got {len(bits)}")
-    return bits
-
-
+# --------------------------------------------------------------------------- #
+# Inverse-warp pair quality
+# --------------------------------------------------------------------------- #
 def inverse_warp_valid_bounds(
     height: int, width: int, flow_dx_px: float, flow_dy_px: float
 ) -> tuple[int, int, int, int]:
@@ -152,12 +149,7 @@ def inverse_warp_valid_bounds(
 
 
 def sample_inverse_warp_reference(reference, flow_dx_px: float, flow_dy_px: float):
-    """Sample reference at actual inverse-warp coordinates without padding.
-
-    The returned array covers only the valid target rectangle. Integer flows
-    reduce exactly to slicing; fractional flows use bilinear interpolation,
-    matching the continuous effective source flow reported by a bilinear warp.
-    """
+    """Sample reference at actual inverse-warp coordinates without padding."""
     import numpy as np
 
     source = np.asarray(reference)
@@ -193,12 +185,7 @@ def sample_inverse_warp_reference(reference, flow_dx_px: float, flow_dy_px: floa
 
 
 def crop_overlap_inverse_warp(reference, attacked, flow_dx_px: float, flow_dy_px: float):
-    """Crop valid inverse-warp correspondence using the effective source flow.
-
-    ``attacked[y, x]`` corresponds to ``reference[y + flow_dy, x + flow_dx]``.
-    No reflected/padded boundary participates. Fractional actual-grid flow uses
-    bilinear reference sampling rather than rounding a planned displacement.
-    """
+    """Crop valid inverse-warp correspondence using the effective source flow."""
     height = min(reference.shape[0], attacked.shape[0])
     width = min(reference.shape[1], attacked.shape[1])
     reference = reference[:height, :width]
@@ -255,3 +242,115 @@ def pair_quality_metrics(reference, attacked, flow_dx_px: float | None = None, f
     return result
 
 
+# --------------------------------------------------------------------------- #
+# FID (lazy import — requires clean-fid)
+# --------------------------------------------------------------------------- #
+FID_PRIMARY_MODE = "legacy_tensorflow"
+FID_SECONDARY_MODES: tuple[str, ...] = ("clean",)
+FID_MODES: dict[str, str] = {
+    "legacy_tensorflow": (
+        "TF Inception-2015-12-05 pool3 features with TensorFlow-compatible "
+        "bilinear resizing (original TensorFlow FID protocol)"
+    ),
+    "legacy_pytorch": (
+        "pytorch-fid ported Inception-2015-12-05 weights with PIL bilinear resizing"
+    ),
+    "clean": (
+        "clean-fid default: Inception-2015-12-05 features with clean-fid "
+        "anti-aliased bicubic resizing"
+    ),
+}
+
+
+def require_fid_mode(mode: str) -> str:
+    """Fail closed on an unregistered FID mode instead of silently using another."""
+    if mode not in FID_MODES:
+        raise ValueError(f"unknown FID mode {mode!r}; known modes: {sorted(FID_MODES)}")
+    return mode
+
+
+def fid_protocol_descriptor(
+    mode: str = FID_PRIMARY_MODE,
+    secondary_modes: Sequence[str] = FID_SECONDARY_MODES,
+) -> str:
+    """Stable provenance string for the FID protocol actually used."""
+    require_fid_mode(mode)
+    secondary = [require_fid_mode(name) for name in secondary_modes if name != mode]
+    text = f"clean-fid {mode} watermarked-vs-raven"
+    if secondary:
+        text += " (also recorded: " + ", ".join(sorted(secondary)) + ")"
+    return text
+
+
+def clean_fid(
+    reference_dir: str | Path,
+    attacked_dir: str | Path,
+    device: str = "cuda",
+    mode: str = FID_PRIMARY_MODE,
+    secondary_modes: Sequence[str] = FID_SECONDARY_MODES,
+) -> dict:
+    """FID between two staged folders, primary value under the TF FID protocol."""
+    import importlib.metadata
+    from cleanfid import fid
+
+    require_fid_mode(mode)
+    modes = [mode, *[name for name in secondary_modes if name != mode]]
+    values: dict[str, float] = {}
+    for name in modes:
+        values[require_fid_mode(name)] = float(
+            fid.compute_fid(str(reference_dir), str(attacked_dir), device=device, mode=name)
+        )
+    return {
+        "implementation": "clean-fid",
+        "clean_fid_version": importlib.metadata.version("clean-fid"),
+        "mode": mode,
+        "primary_mode": mode,
+        "secondary_modes": [name for name in modes if name != mode],
+        "protocol": fid_protocol_descriptor(mode, secondary_modes),
+        "feature_extractor": FID_MODES[mode],
+        "mode_values": values,
+        "mode_feature_extractors": {name: FID_MODES[name] for name in modes},
+        "reference_dir": str(Path(reference_dir).resolve()),
+        "attacked_dir": str(Path(attacked_dir).resolve()),
+        "value": values[mode],
+    }
+
+
+# --------------------------------------------------------------------------- #
+# CLIP (lazy import — requires open_clip_torch)
+# --------------------------------------------------------------------------- #
+def openclip_text_image_scores(
+    image_paths: Sequence[str | Path],
+    prompts: Sequence[str],
+    device: str = "cuda",
+    model_name: str = "ViT-bigG-14",
+    pretrained: str = "laion2b_s39b_b160k",
+) -> dict:
+    if len(image_paths) != len(prompts) or not image_paths:
+        raise ValueError("CLIP requires equally sized, non-empty image and prompt lists")
+    import open_clip
+    import torch
+    from PIL import Image
+
+    model, _, preprocess = open_clip.create_model_and_transforms(
+        model_name, pretrained=pretrained, device=device
+    )
+    tokenizer = open_clip.get_tokenizer(model_name)
+    scores = []
+    model.eval()
+    with torch.no_grad():
+        for path, prompt in zip(image_paths, prompts):
+            image = preprocess(Image.open(path).convert("RGB")).unsqueeze(0).to(device)
+            text = tokenizer([prompt]).to(device)
+            image_features = model.encode_image(image)
+            text_features = model.encode_text(text)
+            image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+            text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+            scores.append(float((image_features * text_features).sum().cpu().item()))
+    return {
+        "model_name": model_name,
+        "pretrained": pretrained,
+        "metric": "prompt-image cosine similarity",
+        "scores": scores,
+        "mean": sum(scores) / len(scores),
+    }

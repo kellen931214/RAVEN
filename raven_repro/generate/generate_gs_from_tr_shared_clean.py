@@ -46,7 +46,7 @@ for root in (str(GENERATE_ROOT), str(RAVEN_ROOT), str(BENCH_ROOT)):
     if root not in sys.path:
         sys.path.insert(0, root)
 
-from raven.eval_protocol import method_data_root, source_metadata_path
+from generate.layout import method_data_root, source_metadata_path
 from runtime import (
     configure_gpu,
     finalize_gpu_logging,
@@ -54,18 +54,20 @@ from runtime import (
     utc_timestamp,
     write_experiment_records,
 )
-from raven.pairing_provenance import (
+from raven.detectors.protocols import (
     GS_SHARED_TR_CLEAN_MODE,
     GS_SHARED_TR_CLEAN_PROTOCOL,
     GS_UNIFORM_DERIVATION,
     SHARED_CLEAN_PROTOCOL,
     SHARED_CLEAN_SOURCE_METHOD,
+    tensor_sha256,
+)
+from raven.protocol import canonical_json_hash
+from generate.provenance import (
     audit_pairing_rows,
     audit_tr_gs_shared_clean,
     build_pairing_sha256,
-    canonical_json_sha256,
     sha256_path,
-    tensor_sha256,
 )
 
 # Canonical TR-source plumbing lives in one place and is shared with the
@@ -267,7 +269,7 @@ def run(args: argparse.Namespace, guard: Any, device: Any) -> Dict[str, Any]:
         "resolution": args.resolution,
         "dtype": str(pipe_dtype),
     }
-    generation_config_sha256 = canonical_json_sha256(generation_config)
+    generation_config_sha256 = canonical_json_hash(generation_config)
     tr_generation_hashes = {str(row["generation_config_sha256"]) for row in tr_rows}
     if tr_generation_hashes != {generation_config_sha256}:
         raise SharedCleanError(
@@ -277,7 +279,7 @@ def run(args: argparse.Namespace, guard: Any, device: Any) -> Dict[str, Any]:
             "steps/guidance/resolution/dtype configuration"
         )
 
-    watermark_mask_sha256 = canonical_json_sha256(
+    watermark_mask_sha256 = canonical_json_hash(
         {"method": "GS", "mask": "not_applicable", "version": 1}
     )
     watermark_config = {
@@ -309,7 +311,7 @@ def run(args: argparse.Namespace, guard: Any, device: Any) -> Dict[str, Any]:
         "gs_uniform_derivation": GS_UNIFORM_DERIVATION,
         "watermark_mask_sha256": watermark_mask_sha256,
     }
-    watermark_config_sha256 = canonical_json_sha256(watermark_config)
+    watermark_config_sha256 = canonical_json_hash(watermark_config)
 
     rows_written = 0
     skipped = 0
@@ -604,7 +606,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     summary: Dict[str, Any] = {}
     error: Optional[str] = None
     try:
-        from raven.resource_guard import CpuMemoryGuard, limit_cpu_threads
+        from generate.runtime import CpuMemoryGuard
+        from raven.runtime import limit_cpu_threads
         import torch
 
         limit_cpu_threads(1)

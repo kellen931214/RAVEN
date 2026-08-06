@@ -40,14 +40,13 @@ for _root in (str(RAVEN_ROOT), str(BENCH_ROOT)):
     if _root not in sys.path:
         sys.path.insert(0, _root)
 
-from raven.pairing_provenance import (  # noqa: E402
+from raven.detectors.protocols import (  # noqa: E402
     SHARED_CLEAN_PROTOCOL,
     SHARED_CLEAN_SOURCE_METHOD,
-    audit_pairing_rows,
-    canonical_json_sha256,
-    sha256_path,
     tensor_sha256,
 )
+from raven.protocol import canonical_json_hash  # noqa: E402
+from generate.provenance import audit_pairing_rows, sha256_path  # noqa: E402
 
 #: SD 2.1 latent channel count. The canonical TR cohort is (1, 4, 64, 64).
 LATENT_CHANNELS = 4
@@ -59,7 +58,7 @@ __all__ = [
     "SharedCleanError",
     "CleanImageGuard",
     "append_row",
-    "canonical_json_sha256",
+    "canonical_json_hash",
     "entrypoint_provenance",
     "existing_completed_rows",
     "finalize_run_manifest",
@@ -260,7 +259,7 @@ def verify_generation_config(
     model, revision, scheduler, steps, guidance, resolution and dtype are the
     ones that produced the canonical clean images.
     """
-    generation_config_sha256 = canonical_json_sha256(dict(generation_config))
+    generation_config_sha256 = canonical_json_hash(dict(generation_config))
     tr_hashes = {str(row["generation_config_sha256"]) for row in tr_rows}
     if tr_hashes != {generation_config_sha256}:
         raise SharedCleanError(
@@ -323,7 +322,7 @@ def finalize_run_manifest(
     mismatch nothing is written.
     """
     payload = dict(payload)
-    run_config_sha256 = canonical_json_sha256(payload)
+    run_config_sha256 = canonical_json_hash(payload)
     if stored is not None:
         if str(stored.get("run_config_sha256", "")) != run_config_sha256:
             raise SharedCleanError(

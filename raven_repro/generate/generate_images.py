@@ -11,8 +11,19 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from runtime import configure_gpu, finalize_gpu_logging, setup_run_logging, utc_timestamp, write_experiment_records
-from raven.resource_guard import CpuMemoryGuard, limit_cpu_threads
-from raven.utils import parse_bool
+from generate.runtime import CpuMemoryGuard
+from raven.runtime import limit_cpu_threads
+
+
+def parse_bool(value: str | bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    normalized = str(value).strip().lower()
+    if normalized in {"true", "1", "yes", "on"}:
+        return True
+    if normalized in {"false", "0", "no", "off"}:
+        return False
+    raise argparse.ArgumentTypeError(f"expected bool, got {value!r}")
 
 
 def build_parser() -> argparse.ArgumentParser:

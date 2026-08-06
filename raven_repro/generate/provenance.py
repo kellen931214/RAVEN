@@ -1,429 +1,156 @@
-"""Fail-closed provenance helpers for paired watermark experiments."""
+"""Generation-only provenance: pairing audit, shared-clean validation, bundle verification.
+
+These functions validate that generated cohorts are internally consistent and
+faithful to their canonical source.  Attack and eval runtime never import this
+module — only generation orchestrators and shared-clean cohort builders use it.
+"""
 
 from __future__ import annotations
 
-import hashlib
 import json
-import math
 from collections import Counter
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
+from raven.detectors.protocols import (
+    ALLOWED_PAIRING_PROTOCOLS,
+    GM_SHARED_TR_CLEAN_MODE,
+    GM_UNIFORM_DERIVATION,
+    GS_PAIRING_PROTOCOL,
+    GS_SHARED_TR_CLEAN_MODE,
+    GS_SHARED_TR_CLEAN_PROTOCOL,
+    GS_UNIFORM_DERIVATION,
+    METHOD_COHORT_CONSTANT_FIELDS,
+    METHOD_COLLISION_COUNTED_FIELDS,
+    METHOD_PAIRING_FIELDS,
+    METHOD_PER_SAMPLE_UNIQUE_FIELDS,
+    METHOD_PROTOCOL_MODES,
+    METHOD_REQUIRED_FIELDS,
+    PAIRING_REQUIRED_FIELDS,
+    PER_SAMPLE_TARGET_METHODS,
+    SHARED_CLEAN_IDENTITY_FIELDS,
+    SHARED_CLEAN_METHOD_PROTOCOLS,
+    SHARED_CLEAN_PROTOCOL,
+    SHARED_CLEAN_SOURCE_METHOD,
+    SINGLE_TARGET_METHODS,
+    build_pairing_sha256,
+    gs_fields_for_protocol,
+    pairing_method,
+    sha256_path,
+)
+from raven.protocol import canonical_json_hash
 
-TR_PAIRING_PROTOCOL = "tree_ring_paired_base_latent_v1"
-GS_PAIRING_PROTOCOL = "gaussian_shading_shared_uniform_v1"
-# V2 cohort: GS embeds from the canonical Tree-Ring clean latent, so the clean
-# image and the pre-watermark latent are literally the same artifacts TR used.
-GS_SHARED_TR_CLEAN_PROTOCOL = "gaussian_shading_shared_tr_clean_v2"
-SHARED_CLEAN_PROTOCOL = "tr_canonical_clean_latent_v2"
-# gs_provider.GS_SHARED_TR_CLEAN_MODE — duplicated here because raven/ must not
-# import eval_bench_wm. test_gaussian_shading_shared_tr_clean asserts they match.
-GS_SHARED_TR_CLEAN_MODE = "official_math_shared_tr_clean"
-SHARED_CLEAN_SOURCE_METHOD = "TR"
-GS_UNIFORM_DERIVATION = "normal_cdf_of_tr_float32_base_latent"
 
 # --------------------------------------------------------------------------- #
-# shared_tr_clean_v2 — GaussMarker and T2SMark (Issue #9)
+# Shared Fourier method config
 # --------------------------------------------------------------------------- #
-# Same contract as the GS V2 cohort: the canonical Tree-Ring clean image and base
-# latent are read-only inputs, and only the method-specific watermarked image is
-# produced. Each method keeps its own protocol name so a cohort can never be
-# silently relabelled as another method's.
-GM_SHARED_TR_CLEAN_PROTOCOL = "gaussmarker_shared_tr_clean_v2"
-T2S_SHARED_TR_CLEAN_PROTOCOL = "t2smark_shared_tr_clean_v2"
 RID_SHARED_TR_CLEAN_PROTOCOL = "ringid_shared_tr_clean_v2"
 HSTR_SHARED_TR_CLEAN_PROTOCOL = "hstr_shared_tr_clean_v2"
 HSQR_SHARED_TR_CLEAN_PROTOCOL = "hsqr_shared_tr_clean_v2"
-# gm_provider.GM_SHARED_TR_CLEAN_MODE / t2s_provider.T2S_SHARED_TR_CLEAN_MODE —
-# duplicated here because raven/ must not import eval_bench_wm. The runners and
-# test_shared_tr_clean_gm_t2s assert they match.
-GM_SHARED_TR_CLEAN_MODE = "official_math_shared_tr_clean"
-T2S_SHARED_TR_CLEAN_MODE = "official_encoder_shared_tr_clean"
 RID_SHARED_TR_CLEAN_MODE = "official_math_shared_tr_clean"
 HSTR_SHARED_TR_CLEAN_MODE = "official_math_shared_tr_clean"
 HSQR_SHARED_TR_CLEAN_MODE = "official_math_shared_tr_clean"
-GM_UNIFORM_DERIVATION = "normal_cdf_of_tr_float32_base_latent"
 
-PAIRING_PROTOCOL = TR_PAIRING_PROTOCOL
-# Default protocol written by a new cohort for each method.
-PAIRING_PROTOCOLS = {"TR": TR_PAIRING_PROTOCOL, "GS": GS_PAIRING_PROTOCOL}
-# Every protocol a method may legitimately carry. V1 GS cohorts stay valid and
-# are never relabelled; V2 is an additional, separately-audited protocol.
-ALLOWED_PAIRING_PROTOCOLS = {
-    "TR": (TR_PAIRING_PROTOCOL,),
-    "GS": (GS_PAIRING_PROTOCOL, GS_SHARED_TR_CLEAN_PROTOCOL),
-    "GM": (GM_SHARED_TR_CLEAN_PROTOCOL,),
-    "T2S": (T2S_SHARED_TR_CLEAN_PROTOCOL,),
-    "RID": (RID_SHARED_TR_CLEAN_PROTOCOL,),
-    "HSTR": (HSTR_SHARED_TR_CLEAN_PROTOCOL,),
-    "HSQR": (HSQR_SHARED_TR_CLEAN_PROTOCOL,),
-}
-
-# Methods whose watermark target is one cohort-wide artifact (Tree-Ring style
-# ring pattern) versus methods that derive a fresh target per sample.
-SINGLE_TARGET_METHODS = frozenset({"TR", "GM", "RID", "HSTR", "HSQR"})
-PER_SAMPLE_TARGET_METHODS = frozenset({"GS", "T2S"})
-
-# V1 GS provenance. Field order is preserved byte-for-byte from the original
-# cohort so existing metadata column order and consumers are untouched.
-GS_REQUIRED_FIELDS = (
-    "gs_protocol_mode",
-    "gs_secret_index",
-    "gs_message_sha256",
-    "gs_key_sha256",
-    "gs_nonce_sha256",
-    "gs_secret_bundle_sha256",
-    "gs_sampling_seed",
-    "gs_sampling_uniform_sha256",
-    "gs_payload_layout",
-    "gs_cipher",
-)
-# Shared by every GS protocol version. V1 additionally records the RNG seed that
-# drew the uniforms; V2 has no RNG draw at all (the uniforms are a deterministic
-# function of the TR latent), so gs_sampling_seed is deliberately absent from V2
-# instead of being faked with an unrelated number.
-GS_CORE_FIELDS = tuple(f for f in GS_REQUIRED_FIELDS if f != "gs_sampling_seed")
-
-# Shared-clean identity recorded by every V2 row.
-GS_SHARED_CLEAN_V2_FIELDS = (
-    "shared_clean_protocol",
-    "shared_clean_source_method",
-    "shared_clean_source_metadata_path",
-    "shared_clean_source_metadata_sha256",
-    "shared_clean_sample_sha256",
-    "gs_uniform_derivation",
-    "tr_base_latent_sha256",
-    "tr_clean_path",
-    "tr_clean_sha256",
-)
-GS_V2_REQUIRED_FIELDS = GS_CORE_FIELDS + GS_SHARED_CLEAN_V2_FIELDS
-
-# Path fields are locations, not identities: they are required metadata but are
-# excluded from the pairing hash so a canonical-layout move cannot invalidate an
-# already-validated cohort. The content of everything a path points at is still
-# bound into the hash through its SHA-256.
-GS_V2_PAIRING_FIELDS = tuple(
-    field
-    for field in GS_V2_REQUIRED_FIELDS
-    if field not in {"shared_clean_source_metadata_path", "tr_clean_path"}
-)
-
-
-# Shared-clean identity recorded by every GM and T2S V2 row. This is the GS V2
-# set plus ``watermark_pre_injection_base_latent_sha256``, which Issue #9 makes
-# an explicit mandatory identity. GS's own tuple is deliberately left untouched:
-# changing it would invalidate every already-validated GS pairing hash.
-SHARED_CLEAN_COMMON_FIELDS = (
-    "shared_clean_protocol",
-    "shared_clean_source_method",
-    "shared_clean_source_metadata_path",
-    "shared_clean_source_metadata_sha256",
-    "shared_clean_sample_sha256",
-    "watermark_pre_injection_base_latent_sha256",
-    "tr_base_latent_sha256",
-    "tr_clean_path",
-    "tr_clean_sha256",
-    "watermarked_sha256",
-)
-
-# GaussMarker shared-clean provenance: bundle identity (ChaCha20 state, ring
-# target, mask), the deterministic uniform derivation, and both sides of the
-# ring injection.
-GM_CORE_FIELDS = (
-    "gm_protocol_mode",
-    "gm_uniform_derivation",
-    "gm_state_source",
-    "gm_bundle_dir",
-    "gm_bundle_config_sha256",
-    "gm_w1_file_sha256",
-    "gm_w2_file_sha256",
-    "gm_watermark_sha256",
-    "gm_m_sha256",
-    "gm_target_sha256",
-    "gm_mask_sha256",
-    "gm_pre_injection_latent_sha256",
-    "gm_post_injection_latent_sha256",
-    "gm_sampling_uniform_sha256",
-    "gm_provider_entrypoint_sha256",
-)
-GM_REQUIRED_FIELDS = GM_CORE_FIELDS + SHARED_CLEAN_COMMON_FIELDS
-
-# T2SMark shared-clean provenance: the portable state artifact and its digest,
-# the RNG/inversion profile, and the magnitude-multiset proof that the canonical
-# latent really was the encoder's Gaussian source.
-T2S_CORE_FIELDS = (
-    "t2s_protocol_mode",
-    "t2s_rng_mode",
-    "t2s_inversion_mode",
-    "t2s_watermark_id",
-    "t2s_state_path",
-    "t2s_state_sha256",
-    "t2s_provider_config_sha256",
-    "t2s_base_latent_sha256",
-    "t2s_abs_magnitude_sha256",
-    "t2s_master_key_sha256",
-    "t2s_session_key_sha256",
-    "t2s_message_sha256",
-    "t2s_provider_entrypoint_sha256",
-)
-T2S_REQUIRED_FIELDS = T2S_CORE_FIELDS + SHARED_CLEAN_COMMON_FIELDS
-
-# RID/HSTR/HSQR all perform method-specific Fourier-domain injection into the
-# caller-supplied canonical TR latent. The bundle records the selected pattern
-# and mask; the pre/post latent hashes prove the provider consumed that tensor.
-FOURIER_SHARED_CORE_TEMPLATE = (
-    "{prefix}_protocol_mode",
-    "{prefix}_state_source",
-    "{prefix}_bundle_dir",
-    "{prefix}_bundle_config_sha256",
-    "{prefix}_selected_pattern_sha256",
-    "{prefix}_mask_sha256",
-    "{prefix}_key_index",
-    "{prefix}_pre_injection_latent_sha256",
-    "{prefix}_post_injection_latent_sha256",
-    "{prefix}_provider_entrypoint_sha256",
-)
-RID_REQUIRED_FIELDS = tuple(field.format(prefix="rid") for field in FOURIER_SHARED_CORE_TEMPLATE) + SHARED_CLEAN_COMMON_FIELDS
-HSTR_REQUIRED_FIELDS = tuple(field.format(prefix="hstr") for field in FOURIER_SHARED_CORE_TEMPLATE) + SHARED_CLEAN_COMMON_FIELDS
-HSQR_REQUIRED_FIELDS = tuple(field.format(prefix="hsqr") for field in FOURIER_SHARED_CORE_TEMPLATE) + SHARED_CLEAN_COMMON_FIELDS
-
-# Path fields are locations, not identities (same rule as GS V2): required
-# metadata, excluded from the pairing hash, but everything they point at is
-# still bound through its SHA-256.
-SHARED_CLEAN_PATH_FIELDS = frozenset(
-    {
-        "shared_clean_source_metadata_path",
-        "tr_clean_path",
-        "gm_bundle_dir",
-        "t2s_state_path",
-        "rid_bundle_dir",
-        "hstr_bundle_dir",
-        "hsqr_bundle_dir",
-    }
-)
-GM_PAIRING_FIELDS = tuple(f for f in GM_REQUIRED_FIELDS if f not in SHARED_CLEAN_PATH_FIELDS)
-T2S_PAIRING_FIELDS = tuple(f for f in T2S_REQUIRED_FIELDS if f not in SHARED_CLEAN_PATH_FIELDS)
-RID_PAIRING_FIELDS = tuple(f for f in RID_REQUIRED_FIELDS if f not in SHARED_CLEAN_PATH_FIELDS)
-HSTR_PAIRING_FIELDS = tuple(f for f in HSTR_REQUIRED_FIELDS if f not in SHARED_CLEAN_PATH_FIELDS)
-HSQR_PAIRING_FIELDS = tuple(f for f in HSQR_REQUIRED_FIELDS if f not in SHARED_CLEAN_PATH_FIELDS)
-
-METHOD_REQUIRED_FIELDS = {
-    "GM": GM_REQUIRED_FIELDS,
-    "T2S": T2S_REQUIRED_FIELDS,
-    "RID": RID_REQUIRED_FIELDS,
-    "HSTR": HSTR_REQUIRED_FIELDS,
-    "HSQR": HSQR_REQUIRED_FIELDS,
-}
-METHOD_PAIRING_FIELDS = {
-    "GM": GM_PAIRING_FIELDS,
-    "T2S": T2S_PAIRING_FIELDS,
-    "RID": RID_PAIRING_FIELDS,
-    "HSTR": HSTR_PAIRING_FIELDS,
-    "HSQR": HSQR_PAIRING_FIELDS,
-}
-# Per-method constants that must hold for every row of a shared-clean cohort.
-METHOD_PROTOCOL_MODES = {
-    "GM": ("gm_protocol_mode", GM_SHARED_TR_CLEAN_MODE),
-    "T2S": ("t2s_protocol_mode", T2S_SHARED_TR_CLEAN_MODE),
-    "RID": ("rid_protocol_mode", RID_SHARED_TR_CLEAN_MODE),
-    "HSTR": ("hstr_protocol_mode", HSTR_SHARED_TR_CLEAN_MODE),
-    "HSQR": ("hsqr_protocol_mode", HSQR_SHARED_TR_CLEAN_MODE),
-}
-# Fields that identify one cohort-wide watermark state; exactly one value each.
-METHOD_COHORT_CONSTANT_FIELDS = {
-    "GM": (
-        "gm_bundle_config_sha256",
-        "gm_w1_file_sha256",
-        "gm_w2_file_sha256",
-        "gm_watermark_sha256",
-        "gm_m_sha256",
-        "gm_target_sha256",
-        "gm_mask_sha256",
-    ),
-    "T2S": ("t2s_provider_config_sha256",),
-    "RID": ("rid_bundle_config_sha256", "rid_selected_pattern_sha256", "rid_mask_sha256"),
-    "HSTR": ("hstr_bundle_config_sha256", "hstr_selected_pattern_sha256", "hstr_mask_sha256"),
-    "HSQR": ("hsqr_bundle_config_sha256", "hsqr_selected_pattern_sha256", "hsqr_mask_sha256"),
-}
-# Fields that must be distinct for every row; a repeat means two samples share
-# state that is supposed to be per-sample.
-METHOD_PER_SAMPLE_UNIQUE_FIELDS = {
-    "GM": ("gm_pre_injection_latent_sha256", "gm_post_injection_latent_sha256",
-           "gm_sampling_uniform_sha256"),
-    "T2S": ("t2s_watermark_id", "t2s_state_sha256", "t2s_abs_magnitude_sha256"),
-    "RID": ("rid_post_injection_latent_sha256",),
-    "HSTR": ("hstr_post_injection_latent_sha256",),
-    "HSQR": ("hsqr_post_injection_latent_sha256",),
-}
-# Per-sample fields drawn from a space small enough that repeats are expected
-# rather than evidence of shared state. The T2S session key is `--t2s_key_length`
-# bits (16 by default, matching upstream `run.py`), so a cohort of n samples has
-# roughly n*(n-1)/2 / 2**16 colliding pairs by the birthday bound: ~7.6 at
-# n=1001. Requiring global uniqueness there asserts something the draw cannot
-# guarantee. Detection reads each sample's own portable state, so two samples
-# sharing a session key is not shared state — it is two independent draws that
-# landed on the same 16-bit value. The collision count is recorded instead, so a
-# genuinely degenerate key draw (every row identical) is still visible.
-METHOD_COLLISION_COUNTED_FIELDS = {
-    "T2S": ("t2s_session_key_sha256",),
+SHARED_FOURIER_METHOD_CONFIG = {
+    "RID": {
+        "protocol": RID_SHARED_TR_CLEAN_PROTOCOL,
+        "mode_field": "rid_protocol_mode",
+        "mode": RID_SHARED_TR_CLEAN_MODE,
+        "bundle_dir_field": "rid_bundle_dir",
+        "bundle_config_field": "rid_bundle_config_sha256",
+        "pattern_field": "rid_selected_pattern_sha256",
+        "mask_field": "rid_mask_sha256",
+    },
+    "HSTR": {
+        "protocol": HSTR_SHARED_TR_CLEAN_PROTOCOL,
+        "mode_field": "hstr_protocol_mode",
+        "mode": HSTR_SHARED_TR_CLEAN_MODE,
+        "bundle_dir_field": "hstr_bundle_dir",
+        "bundle_config_field": "hstr_bundle_config_sha256",
+        "pattern_field": "hstr_selected_pattern_sha256",
+        "mask_field": "hstr_mask_sha256",
+    },
+    "HSQR": {
+        "protocol": HSQR_SHARED_TR_CLEAN_PROTOCOL,
+        "mode_field": "hsqr_protocol_mode",
+        "mode": HSQR_SHARED_TR_CLEAN_MODE,
+        "bundle_dir_field": "hsqr_bundle_dir",
+        "bundle_config_field": "hsqr_bundle_config_sha256",
+        "pattern_field": "hsqr_selected_pattern_sha256",
+        "mask_field": "hsqr_mask_sha256",
+    },
 }
 
 
-def gs_fields_for_protocol(protocol: str) -> tuple[str, ...]:
-    """GS provenance field tuple for a recorded pairing protocol (fail closed)."""
-    text = str(protocol or "")
-    if text == GS_PAIRING_PROTOCOL:
-        return GS_REQUIRED_FIELDS
-    if text == GS_SHARED_TR_CLEAN_PROTOCOL:
-        return GS_V2_REQUIRED_FIELDS
-    raise ValueError(f"unsupported GS pairing protocol: {protocol!r}")
-
-
-def gs_fields_for_rows(rows: Iterable[Mapping[str, Any]]) -> tuple[str, ...]:
-    """Resolve one GS field tuple for a cohort, rejecting mixed protocols."""
-    protocols = {str(row.get("protocol") or "") for row in rows}
-    if len(protocols) != 1:
-        raise ValueError(f"mixed GS pairing protocols in one cohort: {sorted(protocols)}")
-    return gs_fields_for_protocol(next(iter(protocols)))
-
-
-PAIRING_REQUIRED_FIELDS = (
-    "dataset",
-    "run_id",
-    "prompt",
-    "prompt_sha256",
-    "base_latent_seed",
-    "base_latent_sha256",
-    "clean_base_latent_sha256",
-    "watermarked_base_latent_sha256",
-    "watermarked_latent_sha256",
-    "watermark_target_sha256",
-    "watermark_mask_sha256",
-    "generation_config_sha256",
-    "watermark_config_sha256",
-    "pairing_sha256",
-    "clean_path",
-    "clean_sha256",
-    "watermarked_path",
-    "watermarked_sha256",
-    "model_id",
-    "model_revision",
-)
-
-PAIRING_HASH_FIELDS = (
-    "protocol",
-    "dataset",
-    "run_id",
-    "prompt_sha256",
-    "base_latent_seed",
-    "base_latent_sha256",
-    "clean_base_latent_sha256",
-    "watermarked_base_latent_sha256",
-    "watermarked_latent_sha256",
-    "watermark_target_sha256",
-    "watermark_mask_sha256",
-    "generation_config_sha256",
-    "watermark_config_sha256",
-)
-
-ATTACK_CONFIG_FIELDS = (
-    "seed",
-    "flow_dx_image_px",
-    "flow_dy_image_px",
-    "exact_ddim_timestep",
-    "steps",
-    "strength",
-    "guidance_scale",
-    "inversion_mode",
-    "inversion_prompt",
-    "reconstruction_prompt",
-    "warp_mode",
-    "sampling_mode",
-    "padding_mode",
-    "normalization_formula",
-    "color_transfer_mode",
-    "model_id",
-    "model_revision",
-)
-
-
-def canonical_json_sha256(payload: Mapping[str, Any]) -> str:
-    encoded = json.dumps(
-        dict(payload), sort_keys=True, separators=(",", ":"), ensure_ascii=False
-    ).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
-
-
-from .eval_protocol import sha256_path  # noqa: E402 — canonical definition
-
-
-def tensor_sha256(tensor) -> str:
-    """Hash exact tensor shape, dtype, and bytes without retaining extra copies."""
-    value = tensor.detach().cpu().contiguous()
-    header = json.dumps(
-        {"shape": list(value.shape), "dtype": str(value.dtype)},
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    digest = hashlib.sha256(header)
-    digest.update(value.view(-1).view(value.dtype).numpy().tobytes(order="C"))
-    return digest.hexdigest()
-
-
-def pairing_method(row: Mapping[str, Any]) -> str:
-    method = str(row.get("wm_type") or row.get("method") or "").upper()
-    if method:
-        return method
-    protocol = str(row.get("protocol") or "")
-    if protocol == TR_PAIRING_PROTOCOL:
-        return "TR"
-    if protocol in {GS_PAIRING_PROTOCOL, GS_SHARED_TR_CLEAN_PROTOCOL}:
-        return "GS"
-    if protocol == GM_SHARED_TR_CLEAN_PROTOCOL:
-        return "GM"
-    if protocol == T2S_SHARED_TR_CLEAN_PROTOCOL:
-        return "T2S"
-    if protocol == RID_SHARED_TR_CLEAN_PROTOCOL:
-        return "RID"
-    if protocol == HSTR_SHARED_TR_CLEAN_PROTOCOL:
-        return "HSTR"
-    if protocol == HSQR_SHARED_TR_CLEAN_PROTOCOL:
-        return "HSQR"
-    return ""
-
-
-def build_pairing_sha256(row: Mapping[str, Any]) -> str:
-    # CSV is the durable provenance format. Canonicalize scalar types exactly
-    # as they will be interpreted after a CSV round trip.
-    extra: tuple[str, ...] = ()
-    method = pairing_method(row)
-    if method == "GS":
-        protocol = str(row.get("protocol") or "")
-        # V1 hashes exactly the fields it always hashed; V2 additionally binds the
-        # full shared-clean identity (source metadata SHA, shared sample SHA, TR
-        # base-latent SHA, TR clean SHA, uniform derivation).
-        extra = (
-            GS_V2_PAIRING_FIELDS
-            if protocol == GS_SHARED_TR_CLEAN_PROTOCOL
-            else GS_REQUIRED_FIELDS
-        )
-    elif method in METHOD_PAIRING_FIELDS:
-        extra = METHOD_PAIRING_FIELDS[method]
-    payload = {field: str(row[field]) for field in PAIRING_HASH_FIELDS + extra}
-    payload["base_latent_seed"] = int(row["base_latent_seed"])
-    if method == "GS" and extra:
-        payload["gs_secret_index"] = int(row["gs_secret_index"])
-        if "gs_sampling_seed" in extra:
-            payload["gs_sampling_seed"] = int(row["gs_sampling_seed"])
-    return canonical_json_sha256(payload)
-
-
+# --------------------------------------------------------------------------- #
+# Shared-clean identity assertion
+# --------------------------------------------------------------------------- #
 def _required(row: Mapping[str, Any], field: str, run_id: str) -> Any:
     if field not in row or row[field] in (None, ""):
         raise ValueError(f"pairing provenance missing {field} for run_id={run_id}")
     return row[field]
 
 
+def _run_id_sort_key(run_id: str) -> tuple[int, Any]:
+    """Numeric run_ids sort numerically; anything else sorts as text after them."""
+    text = str(run_id)
+    return (0, int(text)) if text.lstrip("-").isdigit() else (1, text)
+
+
+def _index_tr_source(tr_rows: Iterable[Mapping[str, Any]]) -> dict[str, Mapping[str, Any]]:
+    tr_by_id: dict[str, Mapping[str, Any]] = {}
+    for row in tr_rows:
+        run_id = str(_required(row, "run_id", "unknown"))
+        if run_id in tr_by_id:
+            raise ValueError(f"duplicate TR run_id in shared-clean source: {run_id}")
+        if pairing_method(row) != "TR":
+            raise ValueError(f"shared-clean source row is not TR: run_id={run_id}")
+        tr_by_id[run_id] = row
+    if not tr_by_id:
+        raise ValueError("shared-clean audit requires a non-empty TR source cohort")
+    return tr_by_id
+
+
+def _assert_shared_clean_identity(
+    row: Mapping[str, Any], run_id: str, *, require_pre_injection: bool
+) -> None:
+    """The V2 promise: this row's clean image and pre-watermark latent ARE the TR ones.
+
+    Shared by every ``shared_tr_clean_v2`` method. Anything else is not
+    shared-clean, however well-formed the rest of the row looks.
+    """
+    if str(row["shared_clean_protocol"]) != SHARED_CLEAN_PROTOCOL:
+        raise ValueError(
+            f"unsupported shared_clean_protocol run_id={run_id}: "
+            f"{row['shared_clean_protocol']!r}"
+        )
+    if str(row["shared_clean_source_method"]) != SHARED_CLEAN_SOURCE_METHOD:
+        raise ValueError(
+            f"shared clean source must be {SHARED_CLEAN_SOURCE_METHOD} "
+            f"run_id={run_id}: {row['shared_clean_source_method']!r}"
+        )
+    base_hash = str(row["base_latent_sha256"])
+    if str(row["tr_base_latent_sha256"]) != base_hash:
+        raise ValueError(f"TR base latent SHA mismatch run_id={run_id}")
+    if str(row["tr_clean_sha256"]) != str(row["clean_sha256"]):
+        raise ValueError(f"TR clean image SHA mismatch run_id={run_id}")
+    if str(row["tr_clean_path"]) != str(row["clean_path"]):
+        raise ValueError(f"TR clean path mismatch run_id={run_id}")
+    if str(row["shared_clean_sample_sha256"]) != base_hash:
+        raise ValueError(
+            f"shared_clean_sample_sha256 is not the shared latent SHA run_id={run_id}"
+        )
+    if require_pre_injection:
+        if str(row["watermark_pre_injection_base_latent_sha256"]) != base_hash:
+            raise ValueError(
+                f"watermark_pre_injection_base_latent_sha256 is not the shared latent "
+                f"SHA run_id={run_id}"
+            )
+
+
+# --------------------------------------------------------------------------- #
+# Pairing row audit
+# --------------------------------------------------------------------------- #
 def audit_pairing_rows(
     rows: Iterable[Mapping[str, Any]],
     *,
@@ -570,7 +297,7 @@ def audit_pairing_rows(
             raise ValueError(f"clean/base latent mismatch run_id={run_id}")
         if str(row["watermarked_base_latent_sha256"]) != base_hash:
             raise ValueError(f"watermarked/base latent mismatch run_id={run_id}")
-        if str(row["prompt_sha256"]) != hashlib.sha256(str(row["prompt"]).encode("utf-8")).hexdigest():
+        if str(row["prompt_sha256"]) != __import__("hashlib").sha256(str(row["prompt"]).encode("utf-8")).hexdigest():
             raise ValueError(f"prompt hash mismatch run_id={run_id}")
         if str(row["pairing_sha256"]) != build_pairing_sha256(row):
             raise ValueError(f"pairing hash mismatch run_id={run_id}")
@@ -707,60 +434,9 @@ def audit_pairing_rows(
     return result
 
 
-SHARED_CLEAN_IDENTITY_FIELDS = (
-    "prompt_sha256",
-    "generation_config_sha256",
-    "base_latent_seed",
-    "base_latent_sha256",
-    "clean_base_latent_sha256",
-    "clean_path",
-    "clean_sha256",
-)
-
-
-#: Every method that may take part in a ``shared_tr_clean_v2`` cohort, and the
-#: exact protocol name its rows must carry.
-SHARED_CLEAN_METHOD_PROTOCOLS = {
-    "GS": GS_SHARED_TR_CLEAN_PROTOCOL,
-    "GM": GM_SHARED_TR_CLEAN_PROTOCOL,
-    "T2S": T2S_SHARED_TR_CLEAN_PROTOCOL,
-    "RID": RID_SHARED_TR_CLEAN_PROTOCOL,
-    "HSTR": HSTR_SHARED_TR_CLEAN_PROTOCOL,
-    "HSQR": HSQR_SHARED_TR_CLEAN_PROTOCOL,
-}
-
-
-SHARED_FOURIER_METHOD_CONFIG = {
-    "RID": {
-        "protocol": RID_SHARED_TR_CLEAN_PROTOCOL,
-        "mode_field": "rid_protocol_mode",
-        "mode": RID_SHARED_TR_CLEAN_MODE,
-        "bundle_dir_field": "rid_bundle_dir",
-        "bundle_config_field": "rid_bundle_config_sha256",
-        "pattern_field": "rid_selected_pattern_sha256",
-        "mask_field": "rid_mask_sha256",
-    },
-    "HSTR": {
-        "protocol": HSTR_SHARED_TR_CLEAN_PROTOCOL,
-        "mode_field": "hstr_protocol_mode",
-        "mode": HSTR_SHARED_TR_CLEAN_MODE,
-        "bundle_dir_field": "hstr_bundle_dir",
-        "bundle_config_field": "hstr_bundle_config_sha256",
-        "pattern_field": "hstr_selected_pattern_sha256",
-        "mask_field": "hstr_mask_sha256",
-    },
-    "HSQR": {
-        "protocol": HSQR_SHARED_TR_CLEAN_PROTOCOL,
-        "mode_field": "hsqr_protocol_mode",
-        "mode": HSQR_SHARED_TR_CLEAN_MODE,
-        "bundle_dir_field": "hsqr_bundle_dir",
-        "bundle_config_field": "hsqr_bundle_config_sha256",
-        "pattern_field": "hsqr_selected_pattern_sha256",
-        "mask_field": "hsqr_mask_sha256",
-    },
-}
-
-
+# --------------------------------------------------------------------------- #
+# Bundle artifact verifiers
+# --------------------------------------------------------------------------- #
 def _verify_bundle_manifest_fields(row: Mapping[str, Any], run_id: str, *, method: str) -> dict[str, str]:
     config = SHARED_FOURIER_METHOD_CONFIG[method]
     bundle_dir = Path(str(_required(row, config["bundle_dir_field"], run_id)))
@@ -803,13 +479,7 @@ def _verify_hsqr_bundle_artifacts(row: Mapping[str, Any], run_id: str) -> dict[s
 
 
 def _verify_gm_bundle_artifacts(row: Mapping[str, Any], run_id: str) -> dict[str, str]:
-    """The GM bundle this row names must still exist, byte-for-byte.
-
-    ``raven/`` must not import ``eval_bench_wm``, so the bundle is checked
-    structurally: the three artifacts exist, the manifest's own
-    ``bundle_config_sha256`` is the one the row recorded, and the two weight
-    files hash to the values the manifest and the row agree on.
-    """
+    """The GM bundle this row names must still exist, byte-for-byte."""
     bundle_dir = Path(str(_required(row, "gm_bundle_dir", run_id)))
     manifest_path = bundle_dir / "manifest.json"
     w1_path = bundle_dir / "w1.pth"
@@ -859,12 +529,7 @@ def _verify_gm_bundle_artifacts(row: Mapping[str, Any], run_id: str) -> dict[str
 
 
 def _verify_t2s_state_artifact(row: Mapping[str, Any], run_id: str) -> dict[str, str]:
-    """The T2S portable state this row names must exist and still be self-signed.
-
-    An unsigned or edited state is rejected exactly as ``T2SWatermarkState``
-    rejects it: the recomputed canonical digest of the payload must equal both
-    the digest stored inside the file and the one recorded in the metadata row.
-    """
+    """The T2S portable state this row names must exist and still be self-signed."""
     state_path = Path(str(_required(row, "t2s_state_path", run_id)))
     if not state_path.is_file():
         raise FileNotFoundError(f"T2S state artifact missing for run_id={run_id}: {state_path}")
@@ -882,7 +547,7 @@ def _verify_t2s_state_artifact(row: Mapping[str, Any], run_id: str) -> dict[str,
             f"{declared!r}"
         )
     payload = {key: value for key, value in record.items() if key != "state_sha256"}
-    recomputed = canonical_json_sha256(payload)
+    recomputed = canonical_json_hash(payload)
     if recomputed != declared:
         raise ValueError(
             f"T2S state signature invalid run_id={run_id}: declared={declared} "
@@ -896,9 +561,6 @@ def _verify_t2s_state_artifact(row: Mapping[str, Any], run_id: str) -> dict[str,
     return {"t2s_state_path": str(state_path), "t2s_state_sha256": declared}
 
 
-#: Per-method artifact verification run under ``verify_files=True``. A method
-#: cohort is only trustworthy if the state it was generated from still exists
-#: unchanged, not merely if its images hash correctly.
 METHOD_ARTIFACT_VERIFIERS = {
     "GM": _verify_gm_bundle_artifacts,
     "T2S": _verify_t2s_state_artifact,
@@ -908,6 +570,9 @@ METHOD_ARTIFACT_VERIFIERS = {
 }
 
 
+# --------------------------------------------------------------------------- #
+# Cross-method shared-clean audit
+# --------------------------------------------------------------------------- #
 def audit_shared_clean_cohorts(
     tr_rows: Iterable[Mapping[str, Any]],
     cohorts: Mapping[str, Iterable[Mapping[str, Any]]],
@@ -917,35 +582,7 @@ def audit_shared_clean_cohorts(
     expected_run_ids: Iterable[Any] | None = None,
     tr_metadata_path: str | Path | None = None,
 ) -> dict[str, Any]:
-    """Prove one or more V2 cohorts really reuse the canonical TR clean source.
-
-    ``cohorts`` maps a method name (``GS`` / ``GM`` / ``T2S``) to its metadata
-    rows. For every run_id in a method cohort, the TR and method rows must agree
-    on the full shared-clean identity, the method row's TR mirror fields must
-    agree with the TR row itself (so a hand-edited row cannot self-certify), and
-    both the clean image and the method's watermarked image must exist on disk
-    with the recorded SHA-256.
-
-    ``expected_run_ids`` makes coverage explicit and is the difference between
-    "the rows present are consistent" and "the cohort is complete". Every
-    required method's run_id set must equal it *exactly*: a missing row, an extra
-    row and a duplicated row are all rejected. Passing ``None`` for a formal
-    audit is not an option worth taking — use the full TR cohort's run_ids.
-
-    ``tr_metadata_path`` binds the cohorts to the actual source file: its
-    SHA-256 is recomputed from disk and must equal the
-    ``shared_clean_source_metadata_sha256`` recorded by every method row, so a
-    cohort generated against a since-changed TR metadata file cannot pass.
-
-    Under ``verify_files`` each method's own state artifact is verified too — the
-    GM bundle (manifest + ``w1.pth`` + ``w2.pth``) and the T2S portable state
-    JSON, including its signature.
-
-    Where two methods cover the same run_id they must agree with each other on
-    the shared clean artifacts and must have produced *different* watermarked
-    images. Equal seeds, equal filenames or equal run_ids are never accepted as
-    evidence of anything.
-    """
+    """Prove one or more V2 cohorts really reuse the canonical TR clean source."""
     tr_by_id = _index_tr_source(tr_rows)
 
     requested = {str(name).upper() for name in (require_methods or ())}
@@ -1024,8 +661,6 @@ def audit_shared_clean_cohorts(
             ):
                 if str(_required(row, mirror, run_id)) != str(tr_row[source]):
                     raise ValueError(f"{mirror} mismatch run_id={run_id}")
-            # Issue #9 mandatory identity; GS V2 rows predate the field name and
-            # bind the same fact through clean_base_latent_sha256 instead.
             if "watermark_pre_injection_base_latent_sha256" in row:
                 if str(row["watermark_pre_injection_base_latent_sha256"]) != str(
                     tr_row["base_latent_sha256"]
@@ -1041,7 +676,6 @@ def audit_shared_clean_cohorts(
                 raise ValueError(
                     f"{method} watermarked image is the clean image run_id={run_id}"
                 )
-            # The row must name the source file this audit actually read.
             if source_metadata_sha256 is not None:
                 recorded_source = str(
                     _required(row, "shared_clean_source_metadata_sha256", run_id)
@@ -1085,8 +719,6 @@ def audit_shared_clean_cohorts(
             raise ValueError(
                 f"cross-method shared-clean audit requires at least one {method} row"
             )
-        # Coverage: the cohort must be exactly the expected set, not a subset
-        # that happens to be internally consistent.
         if expected_ids is not None and (method in requested or not requested):
             missing = sorted(expected_ids - seen, key=_run_id_sort_key)
             extra = sorted(seen - expected_ids, key=_run_id_sort_key)
@@ -1098,7 +730,6 @@ def audit_shared_clean_cohorts(
                 )
         per_method[method] = checked
 
-    # Cross-method agreement for every run_id covered by more than one method.
     overlap: dict[str, dict[str, dict[str, Any]]] = {}
     for method, checked in per_method.items():
         for item in checked:
@@ -1213,5 +844,3 @@ def audit_tr_gs_shared_clean(
         "unique_gs_watermarked_sha256": result["unique_watermarked_sha256"]["GS"],
         "rows": checked,
     }
-
-

@@ -60,7 +60,7 @@ for _root in (str(GENERATE_ROOT), str(RAVEN_ROOT), str(BENCH_ROOT)):
     if _root not in sys.path:
         sys.path.insert(0, _root)
 
-from raven.eval_protocol import method_data_root, source_metadata_path  # noqa: E402
+from generate.layout import method_data_root, source_metadata_path  # noqa: E402
 from runtime import (  # noqa: E402
     configure_gpu,
     finalize_gpu_logging,
@@ -68,11 +68,14 @@ from runtime import (  # noqa: E402
     utc_timestamp,
     write_experiment_records,
 )
-from raven.pairing_provenance import (  # noqa: E402
+from raven.detectors.protocols import (  # noqa: E402
     SHARED_CLEAN_PROTOCOL,
     SHARED_CLEAN_SOURCE_METHOD,
     T2S_SHARED_TR_CLEAN_MODE,
     T2S_SHARED_TR_CLEAN_PROTOCOL,
+)
+from raven.protocol import canonical_json_hash  # noqa: E402
+from generate.provenance import (  # noqa: E402
     audit_pairing_rows,
     audit_shared_clean_cohorts,
     build_pairing_sha256,
@@ -85,7 +88,6 @@ from shared_clean_tr import (  # noqa: E402
     append_row,
     assert_recorded_output,
     assert_resume_fields,
-    canonical_json_sha256,
     entrypoint_provenance,
     existing_completed_rows,
     finalize_run_manifest,
@@ -301,7 +303,7 @@ def run(args: argparse.Namespace, guard: Any, device: Any) -> Dict[str, Any]:
             f"cohort={LATENT_CHANNELS}"
         )
 
-    watermark_mask_sha256 = canonical_json_sha256(
+    watermark_mask_sha256 = canonical_json_hash(
         {
             "method": "T2S",
             "mask": "key_pattern_derived_per_sample",
@@ -333,7 +335,7 @@ def run(args: argparse.Namespace, guard: Any, device: Any) -> Dict[str, Any]:
         "watermark_mask_sha256": watermark_mask_sha256,
         "provider_entrypoint_sha256": provenance["provider_entrypoint_sha256"],
     }
-    watermark_config_sha256 = canonical_json_sha256(watermark_config)
+    watermark_config_sha256 = canonical_json_hash(watermark_config)
 
     # --- gate 3: the full run identity, now that the provider and pipeline exist ---
     run_manifest = finalize_run_manifest(
@@ -418,7 +420,7 @@ def run(args: argparse.Namespace, guard: Any, device: Any) -> Dict[str, Any]:
                 raise SharedCleanError(
                     f"T2S RNG/inversion profile drift run_id={run_id}"
                 )
-            target_bits_sha256 = canonical_json_sha256(
+            target_bits_sha256 = canonical_json_hash(
                 {
                     "session_key_bits": state.expected_session_key_bits,
                     "message_bits": state.expected_message_bits,
@@ -730,7 +732,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     summary: Dict[str, Any] = {}
     error: Optional[str] = None
     try:
-        from raven.resource_guard import CpuMemoryGuard, limit_cpu_threads
+        from generate.runtime import CpuMemoryGuard
+        from raven.runtime import limit_cpu_threads
         import torch
 
         limit_cpu_threads(1)
