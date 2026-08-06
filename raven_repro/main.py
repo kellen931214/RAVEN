@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Unified RAVEN attack runner.
 
-    python3 experiments/main.py \\
+    python raven_repro/main.py \\
       --dataset synthetic \\
       --method TR \\
       --metadata /tmp/metadata.csv \\
@@ -39,9 +39,8 @@ from typing import Any
 
 from PIL import Image, ImageOps
 
-REPO = Path(__file__).resolve().parents[1]
-RAVEN_REPRO = REPO / "raven_repro"
-sys.path.insert(0, str(RAVEN_REPRO))
+_REPO = Path(__file__).resolve().parent
+sys.path.insert(0, str(_REPO))
 
 from raven.experiment_config import (  # noqa: E402
     check_config_match,

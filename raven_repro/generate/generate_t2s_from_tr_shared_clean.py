@@ -51,11 +51,12 @@ import traceback
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-EXPERIMENTS_ROOT = Path(__file__).resolve().parent
-WORKSPACE = EXPERIMENTS_ROOT.parent
-RAVEN_ROOT = WORKSPACE / "raven_repro"
-BENCH_ROOT = WORKSPACE / "eval_bench_wm"
-for _root in (str(EXPERIMENTS_ROOT), str(RAVEN_ROOT), str(BENCH_ROOT)):
+_HERE = Path(__file__).resolve()
+GENERATE_ROOT = _HERE.parent                      # raven_repro/generate/
+RAVEN_ROOT = _HERE.parents[1]                      # raven_repro/
+WORKSPACE = _HERE.parents[2]                       # repo root
+BENCH_ROOT = WORKSPACE / "eval_bench_wm"           # repo/eval_bench_wm
+for _root in (str(GENERATE_ROOT), str(RAVEN_ROOT), str(BENCH_ROOT)):
     if _root not in sys.path:
         sys.path.insert(0, _root)
 

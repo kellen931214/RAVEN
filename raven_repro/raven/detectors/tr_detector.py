@@ -25,7 +25,7 @@ invalid values cause ``DetectorStateValidationError``.  Mixed provider
 configurations across records are rejected before scoring.
 
 The adapter binds directly to the canonical source metadata schema written by
-``experiments/generate_watermarked_images.py``:
+``raven_repro/generate/generate_watermarked_images.py``:
 
     model_id, model_revision, scheduler_target, num_inference_steps_target,
     resolution, w_seed, w_channel, w_radius, w_pattern, w_mask_shape,

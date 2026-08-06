@@ -23,10 +23,10 @@ The reproduction model is `RedbeardNZ/stable-diffusion-2-1-base` at revision `c6
 
 ## Running Attacks
 
-Use the unified entrypoint `experiments/main.py` for attacks:
+Use `main.py` for attacks:
 
 ```bash
-python experiments/main.py \
+python main.py \
   --dataset my_dataset --method TR \
   --metadata /path/to/metadata.csv \
   --output-dir /tmp/raven-attack \
@@ -35,13 +35,12 @@ python experiments/main.py \
 
 `main.py` requires a metadata CSV (no single-image `--input` flag, no batch
 `--input_dir` flag). Per-sample failure is recorded in `records.jsonl` and
-reflected in the exit code; the old per-file `error.txt` / `failed.txt` pattern
-is not reproduced.
+reflected in the exit code.
 
 ## Evaluation
 
-Use `experiments/eval.py` to run quality metrics, detector evaluation, FID, and
-CLIP against outputs produced by `experiments/main.py`.
+Use `eval.py` to run quality metrics, detector evaluation, FID, and
+CLIP against outputs produced by `main.py`.
 
 ## Key Files
 
@@ -50,8 +49,8 @@ CLIP against outputs produced by `experiments/main.py`.
 - `raven/warp.py`: integer zero-padded latent translation plus an explicit `grid_sample` ablation.
 - `raven/attention.py`: view-guided self-attention processor. Text cross-attention is left unchanged.
 - `raven/color_transfer.py`: effective-source-flow aligned LAB luminance/chroma transfer; unaligned modes are unsupported.
-- `../experiments/main.py`: unified attack runner.
-- `../experiments/eval.py`: unified evaluation runner.
+- `main.py`: unified attack runner.
+- `eval.py`: unified evaluation runner.
 - `raven/eval_protocol.py`: centralized formal attack, detector, FID, resume, provider, and CLIP provenance.
 - `raven/pairing_provenance.py`: fail-closed latent, image, target, pairing, and attack-config audits.
 - `raven/evaluation/scoring.py`: canonical detector scoring helpers shared across all 7 methods.
@@ -73,7 +72,7 @@ debug_info.json
 ## Ablations
 
 Commands in this section are **ABLATION ONLY — NOT FORMAL EVALUATION**.
-Use `experiments/main.py` with appropriate flags.
+Use `main.py` with appropriate flags.
 
 Several historical ablations (`forward_noise` + DDIM denoise,
 `coupled_diagonal` shift sampling, fixed `positive`/`negative` shift sign,
@@ -82,12 +81,12 @@ and are intentionally removed. See the compatibility table above.
 
 ```bash
 # No view-guided attention
-python experiments/main.py --dataset ablation --method TR \
+python main.py --dataset ablation --method TR \
   --metadata /tmp/one_sample.csv --output-dir outputs/no_vga \
   --view-guided-attention false --color-transfer aligned
 
 # Reduced strength
-python experiments/main.py --dataset ablation --method TR \
+python main.py --dataset ablation --method TR \
   --metadata /tmp/one_sample.csv --output-dir outputs/strength_005 \
   --strength 0.05
 ```
@@ -131,6 +130,6 @@ Historical scripts remain solely as reproducibility evidence.
 
 ## Watermark Cohort Generation
 
-`experiments/generate_*.py` scripts produce watermarked cohorts from shared
+`generate/*.py` scripts produce watermarked cohorts from shared
 Tree-Ring clean images. Each method injects only its own watermark through
 the authoritative provider and writes method-specific `watermarked.png` outputs.

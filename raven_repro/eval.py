@@ -5,7 +5,7 @@ Reads ``config.json``, ``records.jsonl``, and per-sample ``output.png`` files
 produced by ``main.py``.  Runs quality metrics, detector evaluation, FID, and
 CLIP — all without importing or initializing ``RavenPipeline``.
 
-    python3 experiments/eval.py --output-dir /tmp/run --device cuda
+    python raven_repro/eval.py --output-dir /tmp/run --device cuda
 """
 
 from __future__ import annotations
@@ -20,9 +20,8 @@ import time
 from pathlib import Path
 from typing import Any
 
-REPO = Path(__file__).resolve().parents[1]
-RAVEN_REPRO = REPO / "raven_repro"
-sys.path.insert(0, str(RAVEN_REPRO))
+_REPO = Path(__file__).resolve().parent
+sys.path.insert(0, str(_REPO))
 
 from raven.experiment_io import (  # noqa: E402
     config_path, detector_records_path, evaluation_dir,

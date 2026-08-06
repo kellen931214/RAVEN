@@ -3,7 +3,7 @@
 Verifies:
 - ``raven`` package import
 - Detector registry has all 7 methods
-- ``experiments/main.py`` and ``experiments/eval.py`` parsers are constructable
+- ``raven_repro/main.py`` and ``raven_repro/eval.py`` parsers are constructable
 - ``normalize_config`` basic round-trip
 """
 
@@ -12,8 +12,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(REPO / "raven_repro"))
+_REPO = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(_REPO / "raven_repro"))
 
 
 def test_raven_import() -> None:
@@ -32,13 +32,13 @@ def test_detector_registry_all_seven_methods() -> None:
 
 
 def test_main_parser() -> None:
-    from experiments.main import build_parser
+    from main import build_parser
     parser = build_parser()
     assert parser is not None
 
 
 def test_eval_parser() -> None:
-    from experiments.eval import build_parser
+    from eval import build_parser
     parser = build_parser()
     assert parser is not None
 

@@ -32,7 +32,7 @@ and a local copy of `RedbeardNZ/stable-diffusion-2-1-base`.
 ## Attack
 
 ```bash
-python experiments/main.py \
+python raven_repro/main.py \
   --dataset my_dataset --method TR \
   --metadata /path/to/metadata.csv \
   --output-dir /tmp/raven-attack \
@@ -43,12 +43,12 @@ python experiments/main.py \
 `prompt`, `prompt_id`.  Method-specific fields (TR parameters, GS
 secrets, GM/T2S bundle paths) pass through unchanged.
 
-See `experiments/main.py --help` for all options.
+See `python raven_repro/main.py --help` for all options.
 
 ## Evaluate
 
 ```bash
-python experiments/eval.py \
+python raven_repro/eval.py \
   --output-dir /tmp/raven-attack \
   --device cuda
 ```
@@ -78,7 +78,7 @@ without re-initializing the attack pipeline.
 
 This repository does not include watermark datasets.
 Create a metadata CSV with paths to your own images.
-Generation scripts in `experiments/generate_*.py`
+Generation scripts in `raven_repro/generate/`
 can produce watermarked cohorts from shared TR clean images.
 
 ## License

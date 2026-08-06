@@ -32,9 +32,10 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional
 
-WORKSPACE = Path(__file__).resolve().parents[1]
-RAVEN_ROOT = WORKSPACE / "raven_repro"
-BENCH_ROOT = WORKSPACE / "eval_bench_wm"
+_HERE = Path(__file__).resolve()
+WORKSPACE = _HERE.parents[2]                         # repo root
+RAVEN_ROOT = _HERE.parents[1]                        # raven_repro/
+BENCH_ROOT = WORKSPACE / "eval_bench_wm"             # repo root / eval_bench_wm
 for _root in (str(RAVEN_ROOT), str(BENCH_ROOT)):
     if _root not in sys.path:
         sys.path.insert(0, _root)

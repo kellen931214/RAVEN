@@ -20,9 +20,10 @@ from typing import Any, Dict, List, Optional
 
 from PIL import Image
 
-WORKSPACE = Path(__file__).resolve().parents[1]
-RAVEN_ROOT = WORKSPACE / "raven_repro"
-BENCH_ROOT = WORKSPACE / "eval_bench_wm"
+_HERE = Path(__file__).resolve()
+WORKSPACE = _HERE.parents[2]                         # repo root
+RAVEN_ROOT = _HERE.parents[1]                        # raven_repro/
+BENCH_ROOT = WORKSPACE / "eval_bench_wm"             # repo root / eval_bench_wm
 for root in (str(RAVEN_ROOT), str(BENCH_ROOT)):
     if root not in sys.path:
         sys.path.insert(0, root)

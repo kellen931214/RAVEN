@@ -8,7 +8,7 @@ import csv
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "raven_repro"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from raven.gpu_utils import configure_gpu, finalize_gpu_logging, setup_run_logging, utc_timestamp, write_experiment_records
 from raven.resource_guard import CpuMemoryGuard, limit_cpu_threads
