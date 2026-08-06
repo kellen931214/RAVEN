@@ -42,29 +42,6 @@ from raven.eval_protocol import sha256_path as _sha256
 
 # ── GS-specific helpers ────────────────────────────────────────────────────
 
-def gs_sampling_provenance(row: dict[str, str], identifier: str) -> dict[str, str]:
-    from raven.pairing_provenance import gs_fields_for_protocol
-
-    protocol = str(row.get("protocol", ""))
-    protocol_fields = gs_fields_for_protocol(protocol)
-    fields = [
-        field
-        for field in ("gs_sampling_seed", "gs_sampling_uniform_sha256")
-        if field in protocol_fields
-    ]
-    if "gs_sampling_uniform_sha256" not in fields:
-        raise RuntimeError(
-            f"run_id={identifier}: GS protocol {protocol!r} defines no sampling "
-            "uniform provenance"
-        )
-    resolved: dict[str, str] = {}
-    for field in fields:
-        if not str(row.get(field, "")):
-            raise RuntimeError(f"run_id={identifier}: missing {field}")
-        resolved[field] = row[field]
-    return resolved
-
-
 # ── GM helpers ──────────────────────────────────────────────────────────────
 
 def gm_bundle_manifest(row: dict[str, str], identifier: str) -> tuple[Path, dict]:
@@ -204,39 +181,6 @@ def gm_provider_kwargs(row: dict[str, str], identifier: str) -> dict:
 
 # ── T2S adapter ─────────────────────────────────────────────────────────────
 
-class T2SStateDetector:
-    """Per-row detector bound to one T2SMark portable state."""
-
-    def __init__(self, state, provider_module, inversion_module):
-        self.state = state
-        self._provider_module = provider_module
-        self._invert_image = inversion_module.invert_image
-
-    def get_wm_type(self) -> str:
-        return "T2S"
-
-    def invert_images(self, images, pipe_provider_target=None, num_inference_steps=None, **_):
-        if pipe_provider_target is None:
-            raise ValueError("T2S inversion requires pipe_provider_target")
-        if isinstance(images, list):
-            if len(images) != 1:
-                raise ValueError("T2S inversion supports a single image per call")
-            images = images[0]
-        zT = self._invert_image(
-            pipe_provider_target,
-            images,
-            inversion_mode=self.state.inversion_mode,
-            num_inversion_steps=self.state.num_inversion_steps,
-            benchmark_num_inference_steps=self.state.num_inference_steps,
-        )
-        return {"zT_torch": zT}
-
-    def get_accuracies(self, reversed_latents):
-        return self._provider_module.T2SProvider.accuracies_for_state(
-            self.state, reversed_latents
-        )
-
-
 # ── Fourier helpers ─────────────────────────────────────────────────────────
 
 def _manifest_value(manifest: dict, field: str, identifier: str, method: str):
@@ -332,42 +276,6 @@ def hsqr_provider_from_bundle(row: dict[str, str], identifier: str, latent_shape
     return HSQRProvider.from_bundle(bundle, latent_shape=latent_shape, device=device)
 
 
-def t2s_state_for_row(row: dict[str, str], identifier: str):
-    from utils.wm.t2s_provider import T2SWatermarkState
-
-    state_path = Path(str(row.get("t2s_state_path", ""))).resolve()
-    if not state_path.is_file():
-        raise RuntimeError(f"run_id={identifier}: T2S state file not found: {state_path}")
-    state = T2SWatermarkState.load(state_path)
-    recorded = str(row.get("t2s_state_sha256", ""))
-    if not recorded or recorded != state.state_sha256():
-        raise RuntimeError(
-            f"run_id={identifier}: T2S state SHA mismatch: "
-            f"source={recorded!r} state={state.state_sha256()!r}"
-        )
-    recorded_id = str(row.get("t2s_watermark_id", ""))
-    if not recorded_id or recorded_id != state.watermark_id:
-        raise RuntimeError(
-            f"run_id={identifier}: T2S watermark_id mismatch: "
-            f"source={recorded_id!r} state={state.watermark_id!r}"
-        )
-    for field, row_field in (
-        ("rng_mode", "t2s_rng_mode"),
-        ("inversion_mode", "t2s_inversion_mode"),
-        ("provider_config_sha256", "t2s_provider_config_sha256"),
-    ):
-        expected = str(row.get(row_field, ""))
-        actual = str(getattr(state, field))
-        if not expected or expected != actual:
-            raise RuntimeError(
-                f"run_id={identifier}: T2S {row_field} mismatch: "
-                f"source={expected!r} state={actual!r}"
-            )
-    if int(row["t2s_num_inversion_steps"]) != int(state.num_inversion_steps):
-        raise RuntimeError(f"run_id={identifier}: T2S num_inversion_steps mismatch")
-    return state
-
-
 # ── Provider dispatch ───────────────────────────────────────────────────────
 
 def provider_kwargs(method: str, row: dict[str, str]) -> dict:
@@ -405,28 +313,6 @@ def provider_kwargs(method: str, row: dict[str, str]) -> dict:
     raise ValueError(method)
 
 
-def provider_class(method: str):
-    if method == "TR":
-        from utils.wm.tr_provider import TrProvider
-        return TrProvider
-    if method == "GS":
-        from utils.wm.gs_provider import GsProvider
-        return GsProvider
-    if method == "GM":
-        from utils.wm.gm_provider import GmProvider
-        return GmProvider
-    if method == "RID":
-        from utils.wm.ringid_provider import RingIDProvider
-        return RingIDProvider
-    if method == "HSTR":
-        from utils.wm.hstr_provider import HSTRProvider
-        return HSTRProvider
-    if method == "HSQR":
-        from utils.wm.hsqr_provider import HSQRProvider
-        return HSQRProvider
-    raise ValueError(method)
-
-
 # ── Score computation ───────────────────────────────────────────────────────
 
 def raw_score(method: str, result: dict) -> float:
@@ -450,18 +336,6 @@ def canonical_score(method: str, raw: float, result: dict) -> float:
         log_p = float(diagnostics[0].get("log_p", float("nan"))) if diagnostics else float("nan")
         return -log_p / math.log(10.0) if math.isfinite(log_p) else -math.log10(max(raw, sys.float_info.min))
     return -raw if method in {"RID", "HSTR", "HSQR"} else raw
-
-
-SCORE_DIRECTION_TEXT = {
-    "TR": "lower raw p-value means watermark; canonical=-log10(p)",
-    "GS": "higher bit accuracy means watermark",
-    "GM": "higher gm_raw_bit_accuracy means watermark",
-    "T2S": "higher t2s score_true_key means watermark",
-}
-
-
-def score_direction_text(method: str) -> str:
-    return SCORE_DIRECTION_TEXT.get(method, "lower raw L1 means watermark; canonical=-L1")
 
 
 # ── Image evaluation ────────────────────────────────────────────────────────
@@ -503,14 +377,3 @@ def evaluate_image(torch, provider, pipe, path: Path, steps: int) -> dict:
     return result
 
 
-def add_tr_diagnostics(record: dict, stage: str, result: dict) -> None:
-    diagnostics = result.get("p_value_diagnostics") or []
-    if not diagnostics:
-        return
-    item = diagnostics[0]
-    mapping = {
-        "log_p": "tr_log_p", "sigma": "tr_sigma", "lambda": "tr_lambda",
-        "statistic": "tr_statistic", "df": "tr_df", "p_underflow": "tr_p_underflow",
-    }
-    for source, destination in mapping.items():
-        record[f"{stage}_{destination}"] = item.get(source, "")
