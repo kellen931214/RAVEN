@@ -1,7 +1,7 @@
 """RID / HSTR / HSQR (Fourier) detector adapter.
 
 Delegates to the canonical bundle loading and scoring in
-``extract_verification_scores.py``.  Uses method-specific provider kwargs
+``raven.evaluation.scoring``.  Uses method-specific provider kwargs
 helpers (rid_provider_kwargs_from_bundle, hstr_provider_kwargs_from_bundle,
 hsqr_provider_from_bundle).
 
@@ -42,7 +42,7 @@ FOURIER_METHODS = frozenset({"RID", "HSTR", "HSQR"})
 
 # ---------------------------------------------------------------------------
 # Method-specific score definition labels (exact strings from the canonical
-# extract_verification_scores.py, lines 891-895).
+# raven.evaluation.scoring, canonical_score()).
 # ---------------------------------------------------------------------------
 _METHOD_SCORE_DEFINITIONS: dict[str, str] = {
     "RID": "rid_neg_channel_min_complex_l1",
@@ -112,22 +112,14 @@ def describe_required_artifacts() -> list[str]:
 
 def _ensure_paths():
     repo = Path(__file__).resolve().parents[3]
-    for p in [str(repo / "eval_bench_wm"), str(repo / "raven_repro" / "scripts")]:
-        if p not in sys.path:
-            sys.path.insert(0, p)
+    p = str(repo / "eval_bench_wm")
+    if p not in sys.path:
+        sys.path.insert(0, p)
 
 
-def _get_extract_module():
-    repo = Path(__file__).resolve().parents[3]
-    scripts_dir = repo / "raven_repro" / "scripts"
-    import importlib.util
-    spec = importlib.util.spec_from_file_location(
-        "extract_verification_scores_fourier",
-        scripts_dir / "extract_verification_scores.py",
-    )
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
+def _get_scoring_module():
+    from raven.evaluation import scoring
+    return scoring
 
 
 def _protocol_mode_for_method(method: str) -> str:
@@ -557,10 +549,10 @@ def load_state(records: list[dict[str, Any]], device: str,
 
     # --- Step 4: load extract module ----------------------------------------
     try:
-        mod = _get_extract_module()
+        mod = _get_scoring_module()
     except Exception as exc:
         raise DetectorDependencyError(
-            f"Cannot load extract_verification_scores: {exc}"
+            f"Cannot load raven.evaluation.scoring: {exc}"
         ) from exc
 
     # --- Step 5: canonical manifest loading + validation on every row -------
@@ -731,7 +723,7 @@ def load_state(records: list[dict[str, Any]], device: str,
     return {
         "provider": provider,
         "pipe": pipe,
-        "extract_module": mod,
+        "scoring_module": mod,
         "device_obj": device_obj,
         "method": method,
         "score_definition": score_definition,
@@ -772,7 +764,7 @@ def score_image(provider_info: dict[str, Any], image_path: str, *,
 
     provider = provider_info["provider"]
     method = provider_info["method"]
-    mod = provider_info["extract_module"]
+    mod = provider_info["scoring_module"]
     manifest = provider_info.get("_manifest", {})
 
     # Per-row target/mask identity validation — mandatory

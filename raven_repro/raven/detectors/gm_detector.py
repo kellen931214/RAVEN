@@ -108,20 +108,14 @@ def describe_required_artifacts() -> list[str]:
 
 def _ensure_paths():
     repo = Path(__file__).resolve().parents[3]
-    for p in [str(repo / "eval_bench_wm"), str(repo / "raven_repro" / "scripts")]:
-        if p not in sys.path:
-            sys.path.insert(0, p)
+    p = str(repo / "eval_bench_wm")
+    if p not in sys.path:
+        sys.path.insert(0, p)
 
 
-def _get_extract_module():
-    repo = Path(__file__).resolve().parents[3]
-    scripts_dir = repo / "raven_repro" / "scripts"
-    import importlib.util
-    spec = importlib.util.spec_from_file_location(
-        "extract_verification_scores_gm", scripts_dir / "extract_verification_scores.py")
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
+def _get_scoring_module():
+    from raven.evaluation import scoring
+    return scoring
 
 
 def _strict_type_check(value: Any, expected: Any, *, label: str) -> None:
@@ -295,9 +289,9 @@ def load_state(records: list[dict[str, Any]], device: str, **extra) -> dict[str,
         _validate_gm_protocol_mode(row)
 
     try:
-        mod = _get_extract_module()
+        mod = _get_scoring_module()
     except Exception as exc:
-        raise DetectorDependencyError(f"Cannot load extract_verification_scores: {exc}") from exc
+        raise DetectorDependencyError(f"Cannot load raven.evaluation.scoring: {exc}") from exc
 
     row_bindings: list[dict[str, Any]] = []
     for row in records:
@@ -413,7 +407,7 @@ def load_state(records: list[dict[str, Any]], device: str, **extra) -> dict[str,
     }
 
     return {
-        "provider": provider, "pipe": pipe, "extract_module": mod,
+        "provider": provider, "pipe": pipe, "scoring_module": mod,
         "device_obj": device_obj,
         "provider_target_hash": provider_target_hash,
         "provider_mask_hash": provider_mask_hash,
@@ -462,7 +456,7 @@ def score_image(provider_info: dict[str, Any], image_path: str, *,
         raise DetectorMissingStateError("GM scoring requires resolved source metadata (record=…)")
 
     provider = provider_info["provider"]
-    mod = provider_info["extract_module"]
+    mod = provider_info["scoring_module"]
 
     # ── All state validation BEFORE evaluate_image ──
     source_target = str(record.get("watermark_target_sha256", ""))

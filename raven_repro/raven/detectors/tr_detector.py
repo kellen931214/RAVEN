@@ -3,7 +3,7 @@
 Production TR scoring lives in this package: ``tr_scoring.py`` holds the
 image decode, inversion, FFT convention, mask/target extraction, and the
 default complex-L1 mean score.  The adapter never imports legacy scripts
-(``extract_verification_scores.py`` / ``raven_nfpa_tr_eval.py``) and never
+(``raven.evaluation.scoring`` / ``tr_scoring.py``) and never
 loads modules dynamically.
 
 Default score protocol (issue #28):

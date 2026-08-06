@@ -499,7 +499,7 @@ def _construct_provider(
         DetectorStateValidationError: any identity/runtime mismatch.
         DetectorProviderInitializationError: constructor failure.
     """
-    from extract_verification_scores import provider_kwargs as _canonical_gs_kwargs
+    from raven.evaluation.scoring import provider_kwargs as _canonical_gs_kwargs
 
     run_id = str(metadata.get("run_id", ""))
 
@@ -1132,7 +1132,7 @@ def score_image(provider_info: dict[str, Any], image_path: str, *,
     from raven.pairing_provenance import tensor_sha256
 
     _ensure_paths()
-    from extract_verification_scores import (
+    from raven.evaluation.scoring import (
         evaluate_image,
         raw_score as _canonical_raw_score,
         canonical_score as _canonical_canonical_score,

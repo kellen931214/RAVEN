@@ -192,4 +192,4 @@ Tree-Ring metadata and clean artifacts, inject only the method-specific
 watermark through the authoritative provider, and write only method-specific
 `watermarked.png` outputs. A cohort is `formal_shared_tr_clean` only after the
 cross-method audit validates it by `run_id` against `data/tr/diffusiondb/metadata.csv`.
-See `docs/SHARED_TR_CLEAN_V2.md` for commands and schema details.
+See repository generation scripts for commands and schema details.
