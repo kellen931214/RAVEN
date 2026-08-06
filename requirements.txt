@@ -1,0 +1,5 @@
+torch>=2.2.2
+diffusers>=0.31.0
+Pillow>=10.0.0
+numpy>=1.24.1
+scikit-image>=0.22.0

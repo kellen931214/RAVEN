@@ -64,7 +64,7 @@ class RavenPipeline:
             from diffusers import DDPMScheduler, DDIMScheduler, StableDiffusionPipeline
         except ImportError as exc:
             raise ImportError(
-                "RavenPipeline requires torch and diffusers. Install raven_repro/requirements.txt first."
+                "RavenPipeline requires torch and diffusers. Install requirements.txt first."
             ) from exc
 
         limit_cpu_threads(1)

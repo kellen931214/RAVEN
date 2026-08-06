@@ -18,12 +18,11 @@ seven watermarking methods.
 ## Install
 
 ```bash
-cd raven_repro
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-# Optional evaluation packages:
-pip install open_clip_torch torchmetrics clean-fid
+# For development:
+pip install -r requirements-dev.txt
 ```
 
 Requires `eval_bench_wm/` sibling directory with watermark providers
