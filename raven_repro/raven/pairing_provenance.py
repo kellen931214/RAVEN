@@ -287,26 +287,6 @@ def gs_fields_for_rows(rows: Iterable[Mapping[str, Any]]) -> tuple[str, ...]:
     return gs_fields_for_protocol(next(iter(protocols)))
 
 
-def method_provenance_fields(
-    method: str, rows: Iterable[Mapping[str, Any]]
-) -> tuple[str, ...]:
-    """Method-specific provenance columns that must survive into an eval run.
-
-    GS resolves its tuple from the cohort's own recorded pairing protocol (V1
-    and V2 carry different fields); GM and T2S have exactly one protocol each,
-    so their required-field tuple is the answer. A method with no
-    method-specific provenance returns an empty tuple rather than raising, so
-    TR / RID / HSTR / HSQR keep their current behaviour.
-
-    Callers use this instead of hard-coding ``if method == "GS"``, so adding a
-    method wires it through the snapshot drift gate, the resume-expectation
-    record and the verification manifest at once.
-    """
-    key = str(method).upper()
-    if key == "GS":
-        return gs_fields_for_rows(rows)
-    return tuple(METHOD_REQUIRED_FIELDS.get(key, ()))
-
 PAIRING_REQUIRED_FIELDS = (
     "dataset",
     "run_id",
@@ -374,12 +354,7 @@ def canonical_json_sha256(payload: Mapping[str, Any]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def sha256_path(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+from .eval_protocol import sha256_path  # noqa: E402 — canonical definition
 
 
 def tensor_sha256(tensor) -> str:
@@ -443,65 +418,10 @@ def build_pairing_sha256(row: Mapping[str, Any]) -> str:
     return canonical_json_sha256(payload)
 
 
-def build_attack_config_sha256(record: Mapping[str, Any]) -> str:
-    payload: dict[str, Any] = {}
-    for field in ATTACK_CONFIG_FIELDS:
-        if field not in record or record[field] is None:
-            raise ValueError(f"attack record missing required config field: {field}")
-        if record[field] == "" and field not in {"inversion_prompt", "reconstruction_prompt"}:
-            raise ValueError(f"attack record missing required config field: {field}")
-        value = record[field]
-        if field in {"seed", "exact_ddim_timestep", "steps"}:
-            value = int(value)
-        elif field in {"flow_dx_image_px", "flow_dy_image_px", "strength", "guidance_scale"}:
-            value = float(value)
-            if not math.isfinite(value):
-                raise ValueError(f"non-finite attack config value: {field}={value!r}")
-        payload[field] = value
-    return canonical_json_sha256(payload)
-
-
 def _required(row: Mapping[str, Any], field: str, run_id: str) -> Any:
     if field not in row or row[field] in (None, ""):
         raise ValueError(f"pairing provenance missing {field} for run_id={run_id}")
     return row[field]
-
-
-def _assert_shared_clean_identity(
-    row: Mapping[str, Any], run_id: str, *, require_pre_injection: bool
-) -> None:
-    """The V2 promise: this row's clean image and pre-watermark latent ARE the TR ones.
-
-    Shared by every ``shared_tr_clean_v2`` method. Anything else is not
-    shared-clean, however well-formed the rest of the row looks.
-    """
-    if str(row["shared_clean_protocol"]) != SHARED_CLEAN_PROTOCOL:
-        raise ValueError(
-            f"unsupported shared_clean_protocol run_id={run_id}: "
-            f"{row['shared_clean_protocol']!r}"
-        )
-    if str(row["shared_clean_source_method"]) != SHARED_CLEAN_SOURCE_METHOD:
-        raise ValueError(
-            f"shared clean source must be {SHARED_CLEAN_SOURCE_METHOD} "
-            f"run_id={run_id}: {row['shared_clean_source_method']!r}"
-        )
-    base_hash = str(row["base_latent_sha256"])
-    if str(row["tr_base_latent_sha256"]) != base_hash:
-        raise ValueError(f"TR base latent SHA mismatch run_id={run_id}")
-    if str(row["tr_clean_sha256"]) != str(row["clean_sha256"]):
-        raise ValueError(f"TR clean image SHA mismatch run_id={run_id}")
-    if str(row["tr_clean_path"]) != str(row["clean_path"]):
-        raise ValueError(f"TR clean path mismatch run_id={run_id}")
-    if str(row["shared_clean_sample_sha256"]) != base_hash:
-        raise ValueError(
-            f"shared_clean_sample_sha256 is not the shared latent SHA run_id={run_id}"
-        )
-    if require_pre_injection:
-        if str(row["watermark_pre_injection_base_latent_sha256"]) != base_hash:
-            raise ValueError(
-                f"watermark_pre_injection_base_latent_sha256 is not the shared latent "
-                f"SHA run_id={run_id}"
-            )
 
 
 def audit_pairing_rows(
@@ -808,26 +728,6 @@ SHARED_CLEAN_METHOD_PROTOCOLS = {
     "HSTR": HSTR_SHARED_TR_CLEAN_PROTOCOL,
     "HSQR": HSQR_SHARED_TR_CLEAN_PROTOCOL,
 }
-
-
-def _run_id_sort_key(run_id: str) -> tuple[int, Any]:
-    """Numeric run_ids sort numerically; anything else sorts as text after them."""
-    text = str(run_id)
-    return (0, int(text)) if text.lstrip("-").isdigit() else (1, text)
-
-
-def _index_tr_source(tr_rows: Iterable[Mapping[str, Any]]) -> dict[str, Mapping[str, Any]]:
-    tr_by_id: dict[str, Mapping[str, Any]] = {}
-    for row in tr_rows:
-        run_id = str(_required(row, "run_id", "unknown"))
-        if run_id in tr_by_id:
-            raise ValueError(f"duplicate TR run_id in shared-clean source: {run_id}")
-        if pairing_method(row) != "TR":
-            raise ValueError(f"shared-clean source row is not TR: run_id={run_id}")
-        tr_by_id[run_id] = row
-    if not tr_by_id:
-        raise ValueError("shared-clean audit requires a non-empty TR source cohort")
-    return tr_by_id
 
 
 SHARED_FOURIER_METHOD_CONFIG = {
@@ -1315,27 +1215,3 @@ def audit_tr_gs_shared_clean(
     }
 
 
-def assert_attack_pair_config_match(
-    clean_attack: Mapping[str, Any], watermarked_attack: Mapping[str, Any], run_id: str
-) -> str:
-    clean_hash = build_attack_config_sha256(clean_attack)
-    watermarked_hash = build_attack_config_sha256(watermarked_attack)
-    for label, record, computed in (
-        ("clean", clean_attack, clean_hash),
-        ("watermarked", watermarked_attack, watermarked_hash),
-    ):
-        stored = record.get("attack_config_sha256")
-        if not stored:
-            raise ValueError(f"{label} attack missing attack_config_sha256 run_id={run_id}")
-        if str(stored) != computed:
-            raise ValueError(f"{label} attack config hash mismatch run_id={run_id}")
-    if clean_hash != watermarked_hash:
-        raise ValueError(
-            f"attacked clean/watermarked config mismatch run_id={run_id}: "
-            f"clean={clean_hash} watermarked={watermarked_hash}"
-        )
-    clean_pair = str(clean_attack.get("pairing_sha256") or "")
-    wm_pair = str(watermarked_attack.get("pairing_sha256") or "")
-    if not clean_pair or clean_pair != wm_pair:
-        raise ValueError(f"attack source pairing mismatch run_id={run_id}")
-    return clean_hash

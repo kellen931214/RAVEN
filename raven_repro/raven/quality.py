@@ -127,28 +127,3 @@ def clean_fid(
     }
 
 
-def torchmetrics_fid(
-    reference_paths: Sequence[str | Path],
-    attacked_paths: Sequence[str | Path],
-    device: str = "cuda",
-) -> dict:
-    if not reference_paths or not attacked_paths:
-        raise ValueError("FID requires non-empty reference and attacked image sets")
-    if len(reference_paths) != len(attacked_paths):
-        raise ValueError("paired FID audit expects equal reference and attacked counts")
-    import numpy as np
-    import torch
-    from PIL import Image
-    from torchmetrics.image.fid import FrechetInceptionDistance
-
-    metric = FrechetInceptionDistance(feature=2048, normalize=True).to(device)
-    for real, fake in zip(reference_paths, attacked_paths):
-        real_tensor = torch.from_numpy(np.asarray(Image.open(real).convert("RGB")).copy()).permute(2, 0, 1).unsqueeze(0).float() / 255.0
-        fake_tensor = torch.from_numpy(np.asarray(Image.open(fake).convert("RGB")).copy()).permute(2, 0, 1).unsqueeze(0).float() / 255.0
-        metric.update(real_tensor.to(device), real=True)
-        metric.update(fake_tensor.to(device), real=False)
-    return {
-        "implementation": "torchmetrics",
-        "feature_extractor": "InceptionV3 2048",
-        "value": float(metric.compute().cpu().item()),
-    }

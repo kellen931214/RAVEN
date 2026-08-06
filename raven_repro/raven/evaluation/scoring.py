@@ -37,12 +37,7 @@ def _integer(row: dict[str, str], names: tuple[str, ...], default: int) -> int:
     return int(value) if value is not None else default
 
 
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+from raven.eval_protocol import sha256_path as _sha256
 
 
 # ── GS-specific helpers ────────────────────────────────────────────────────
