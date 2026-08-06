@@ -21,8 +21,6 @@ seven watermarking methods.
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-# For development:
-pip install -r requirements-dev.txt
 ```
 
 Requires `eval_bench_wm/` sibling directory with watermark providers
