@@ -66,7 +66,7 @@ for _root in (str(GENERATE_ROOT), str(RAVEN_ROOT), str(BENCH_ROOT)):
         sys.path.insert(0, _root)
 
 from raven.eval_protocol import method_data_root, source_metadata_path  # noqa: E402
-from raven.gpu_utils import (  # noqa: E402
+from runtime import (  # noqa: E402
     configure_gpu,
     finalize_gpu_logging,
     setup_run_logging,

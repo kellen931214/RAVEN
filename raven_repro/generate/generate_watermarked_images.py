@@ -29,7 +29,7 @@ for root in (str(RAVEN_ROOT), str(BENCH_ROOT)):
         sys.path.insert(0, root)
 
 from raven.eval_protocol import method_data_root
-from raven.gpu_utils import configure_gpu, finalize_gpu_logging, setup_run_logging, utc_timestamp, write_experiment_records
+from runtime import configure_gpu, finalize_gpu_logging, setup_run_logging, utc_timestamp, write_experiment_records
 from raven.pairing_provenance import (
     GS_PAIRING_PROTOCOL,
     PAIRING_PROTOCOL,

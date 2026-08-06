@@ -47,7 +47,7 @@ for root in (str(GENERATE_ROOT), str(RAVEN_ROOT), str(BENCH_ROOT)):
         sys.path.insert(0, root)
 
 from raven.eval_protocol import method_data_root, source_metadata_path
-from raven.gpu_utils import (
+from runtime import (
     configure_gpu,
     finalize_gpu_logging,
     setup_run_logging,
