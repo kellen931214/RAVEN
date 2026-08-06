@@ -23,7 +23,7 @@ The reproduction model is `RedbeardNZ/stable-diffusion-2-1-base` at revision `c6
 
 ## Running Attacks
 
-Use the unified entrypoint `experiments/main.py` for single-image and batch attacks:
+Use the unified entrypoint `experiments/main.py` for attacks:
 
 ```bash
 python experiments/main.py \
@@ -33,8 +33,37 @@ python experiments/main.py \
   --roles watermarked
 ```
 
-Legacy diagnostic scripts (`scripts/run_raven.py`, `scripts/attack_folder.py`) have
-been removed. They were ablation-only CLIs with zero production callers.
+`main.py` requires a metadata CSV (no single-image `--input` flag, no batch
+`--input_dir` flag). Per-sample failure is recorded in `records.jsonl` and
+reflected in the exit code; the old per-file `error.txt` / `failed.txt` pattern
+is not reproduced.
+
+### Removed legacy scripts
+
+`scripts/run_raven.py` and `scripts/attack_folder.py` were deleted in commit
+`0dc34d7`. Both were ablation-only CLI wrappers around `RavenPipeline` with zero
+production callers.
+
+### Compatibility: old CLI → `experiments/main.py`
+
+| Old `run_raven.py` / `attack_folder.py` | `experiments/main.py` equivalent | Status |
+|---|---|---|
+| `--inversion_mode ddim` | `--diffusion-mode ddim` | renamed — exact equivalent |
+| `--inversion_mode forward_noise` | *none* | **unsupported** — `forward_noise` inversion + DDIM scheduler denoising. `--diffusion-mode ddpm` uses DDPM scheduler (stochastic denoising, different noise schedule). `--diffusion-mode ddim-ddpm` uses DDIM inversion (unet loop, not `add_noise`). The discarded combo `forward_noise + DDIM denoise` is the exact `FORBIDDEN_PAIR = ("ddpm", "ddim")` rejected by `experiment_config.py:37`. This ablation is intentionally removed. |
+| `--shift_sampling independent_axes` | `--shift-mode random` (default) | renamed — `plan_shift()` hardcodes random independent axes per sample |
+| `--shift_sampling coupled_diagonal` | *none* | **unsupported** — `plan_shift()` never produces this; pipeline path only reachable when `shift_x/shift_y` absent, which `main.py` always provides |
+| `--shift_sign random` | (default) | renamed — always random per axis |
+| `--shift_sign positive` / `negative` | *none* | **unsupported** — not reachable via `plan_shift()` |
+| `--shift_space image_pixels` / `latent_pixels` | `--shift-space` | renamed — passes through to pipeline unchanged |
+| `--warp_mode integer` / `grid_sample` | `--warp-mode` | renamed — passes through (default changed to `raven_paper_nfpa_gap_fill`) |
+| `--padding_mode zeros` / `reflection` / `border` | `--padding-mode` | renamed — passes through. Note: formal warp modes (`raven_paper_nfpa_gap_fill`) reject `zeros` at pipeline level |
+| `--shift_min` / `--shift_max` | `--shift-magnitude-min` / `--shift-magnitude-max` | renamed |
+| `--seed N` | `--base-seed N` | renamed — per-sample seed = base_seed + run_id |
+| `--view_guided_attention` | `--view-guided-attention` | renamed |
+| `--color_transfer` | `--color-transfer` (`aligned`/`none`) | renamed — bool→choice |
+| `--input <path>` (single image) | *none* | **unsupported** — `main.py` always reads input paths from metadata CSV |
+| `--input_dir <path>` (batch folder) | *none* | **unsupported** — no directory-walk mode |
+| `error.txt` / `failed.txt` | *none* | **unsupported** — `main.py` uses `records.jsonl` + exit code |
 
 ## Evaluation
 
@@ -97,12 +126,24 @@ debug_info.json
 
 ## Ablations
 
-All commands in this section are **ABLATION ONLY - NOT A FORMAL EVALUATION ENTRYPOINT**.
-Use `experiments/main.py` with the appropriate flags.
+Commands in this section are **ABLATION ONLY — NOT FORMAL EVALUATION**.
+Use `experiments/main.py` with appropriate flags.
+
+Several historical ablations (`forward_noise` + DDIM denoise,
+`coupled_diagonal` shift sampling, fixed `positive`/`negative` shift sign,
+single-image `--input`, folder `--input_dir`) have no `main.py` equivalent
+and are intentionally removed. See the compatibility table above.
 
 ```bash
-python experiments/main.py --dataset ablation --method TR --metadata /tmp/one_sample.csv --output-dir outputs/no_vga --view-guided-attention false --color-transfer aligned
-python experiments/main.py --dataset ablation --method TR --metadata /tmp/one_sample.csv --output-dir outputs/strength_005 --strength 0.05
+# No view-guided attention
+python experiments/main.py --dataset ablation --method TR \
+  --metadata /tmp/one_sample.csv --output-dir outputs/no_vga \
+  --view-guided-attention false --color-transfer aligned
+
+# Reduced strength
+python experiments/main.py --dataset ablation --method TR \
+  --metadata /tmp/one_sample.csv --output-dir outputs/strength_005 \
+  --strength 0.05
 ```
 
 ## Reproduction Audit Workflow
