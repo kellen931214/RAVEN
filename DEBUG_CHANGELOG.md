@@ -3859,3 +3859,34 @@ Focused formal-table and table-updater tests cover structured detector-field ext
 - Push status: pending at time of entry
 - Entry point: `raven_repro/scripts/evaluate_verification.py`
 - Formal output eligibility: table/extractor maintenance only; no new formal result.
+
+## 2026-08-06 — Implement and evaluate Pixel-Space Shift variant for RAVEN
+
+### Problem
+User requested a pixel-space shift variant of RAVEN to evaluate whether performing spatial shift in image pixel space prior to DDIM inversion improves image quality, how regeneration affects quality, and whether Tree-Ring watermark detection is impacted compared to original latent-space RAVEN.
+
+### Root cause
+Original RAVEN performed spatial warp/shift on inverted latents ($z_\tau$) in latent space.
+
+### Affected files
+- `raven_repro/raven/warp.py:shift_image_pixels`
+- `raven_repro/raven/pipeline_raven.py:RavenPipeline.run`
+
+### Fix
+1. Added `shift_image_pixels` helper in `warp.py` supporting PIL/Tensor pixel shift with reflection padding.
+2. Added `shift_stage="pixel_space"` branch in `RavenPipeline.run()`, shifting `input_image` in pixel space before DDIM inversion of both reference and shifted images, followed by paired View-Guided Attention denoising.
+
+### Reused code
+Reused `partial_diffusion_inversion`, `install_view_guided_attention`, `clean_fid`, `LPIPS`, `open_clip`, `compute_psnr_ssim_overlap`, and `TrProvider`.
+
+### Validation
+- Unit test & 2-sample smoke check passed: `CUDA_VISIBLE_DEVICES=0 python3 scratch_test_pixel_shift.py` (`0 exit`).
+- Comparison experiment (N=30, 32px reflection shift on TR): `CUDA_VISIBLE_DEVICES=0 python3 scratch_compare_pixel_vs_latent_tr.py 30`.
+
+### Git provenance
+- Repository: `/workspace/RAVEN-worktrees/feature-worktree`
+- Branch: `feature-worktree`
+- Commit: pending
+- Entry point: `scratch_compare_pixel_vs_latent_tr.py`
+- Formal output eligibility: exploratory / comparative experiment.
+

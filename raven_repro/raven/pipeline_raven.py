@@ -29,6 +29,7 @@ from .warp import (
     raven_paper_nfpa_gap_fill_centered_warp,
     raven_paper_nfpa_gap_fill_warp,
     sample_translation,
+    shift_image_pixels,
     translate_latent,
 )
 
@@ -216,6 +217,7 @@ class RavenPipeline:
         debug: bool = False,
         inversion_mode: str = "ddim",
         save_input_copy: bool = True,
+        shift_stage: str = "latent_space",
     ) -> Image.Image:
         torch = self.torch
         restore_default_attention(self.pipe.unet, self._default_attn_processors)
@@ -263,9 +265,34 @@ class RavenPipeline:
             "nfpa_exact", "nfpa_pixel_center", "latent_grid_nearest_reflection", "latent_grid",
             "raven_paper_nfpa_gap_fill", "raven_paper_nfpa_gap_fill_centered",
         }
-        inverse_sampling_warp = warp_mode in inverse_sampling_modes
+        inverse_sampling_warp = warp_mode in inverse_sampling_modes or shift_stage == "pixel_space"
         nfpa_warp_metadata = None
-        if warp_mode == "raven_paper_nfpa_gap_fill":
+        if shift_stage == "pixel_space":
+            shifted_input_image = shift_image_pixels(input_image, dx=dx, dy=dy, padding_mode=padding_mode)
+            if save_input_copy or debug:
+                save_image(shifted_input_image, output_dir / "shifted_input_pixel.png")
+            shifted_inversion = partial_diffusion_inversion(
+                vae=self.pipe.vae,
+                scheduler=self.pipe.scheduler,
+                image=shifted_input_image,
+                num_inference_steps=steps,
+                strength=strength,
+                generator=self._make_generator(seed),
+                device=self.device,
+                dtype=self.dtype,
+                mode=inversion_mode,
+                unet=self.pipe.unet,
+                prompt_embeds=inversion_prompt_embeds,
+                guidance_scale=guidance_scale,
+            )
+            shifted_latents = shifted_inversion.noisy_latents
+            nfpa_warp_metadata = {
+                "effective_source_flow_dx_image_px": float(dx),
+                "effective_source_flow_dy_image_px": float(dy),
+                "padding_mode": padding_mode,
+                "shift_stage": "pixel_space",
+            }
+        elif warp_mode == "raven_paper_nfpa_gap_fill":
             if shift_space != "image_pixels":
                 raise ValueError("raven_paper_nfpa_gap_fill requires image-space flow")
             if padding_mode != "reflection":

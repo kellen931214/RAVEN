@@ -580,3 +580,52 @@ def translate_latent(
         padding_mode=padding_mode,
         align_corners=True,
     )
+
+
+def shift_image_pixels(
+    image,
+    dx: float,
+    dy: float,
+    padding_mode: str = "reflection",
+):
+    """Shift PIL Image or BCHW Tensor in pixel space with specified padding mode.
+    Positive dx moves content right, positive dy moves content down.
+    """
+    import math
+    import torch
+    import torch.nn.functional as F
+    from PIL import Image
+    import torchvision.transforms.functional as TF
+
+    is_pil = isinstance(image, Image.Image)
+    if is_pil:
+        img_t = TF.to_tensor(image)  # [C, H, W], float32 in [0, 1]
+    else:
+        img_t = image
+
+    if dx == 0 and dy == 0:
+        return image.copy() if is_pil else img_t.clone()
+
+    C, H, W = img_t.shape[-3:]
+    pad_x = int(math.ceil(abs(dx))) + 1
+    pad_y = int(math.ceil(abs(dy))) + 1
+
+    pad_mode = "reflect" if padding_mode == "reflection" else ("replicate" if padding_mode == "border" else "constant")
+
+    padded = F.pad(
+        img_t.unsqueeze(0) if img_t.ndim == 3 else img_t,
+        (pad_x, pad_x, pad_y, pad_y),
+        mode=pad_mode,
+    )
+    if img_t.ndim == 3:
+        padded = padded.squeeze(0)
+
+    start_y = int(round(pad_y - dy))
+    start_x = int(round(pad_x - dx))
+
+    shifted_t = padded[..., start_y : start_y + H, start_x : start_x + W]
+
+    if is_pil:
+        return TF.to_pil_image(shifted_t.clamp(0.0, 1.0))
+    return shifted_t
+
