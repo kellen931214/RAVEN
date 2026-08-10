@@ -37,6 +37,7 @@ from .hstr_provider import (
     HSTRProvider,
     OFFICIAL_GUIDANCE_SCALE as HSTR_OFFICIAL_GUIDANCE_SCALE,
     OFFICIAL_HSTR_PROFILE,
+    OFFICIAL_MATH_TR_ONLY_PROFILE,
     OFFICIAL_MODEL_ID as HSTR_OFFICIAL_MODEL_ID,
     OFFICIAL_RESOLUTION as HSTR_OFFICIAL_RESOLUTION,
     OFFICIAL_SCHEDULER as HSTR_OFFICIAL_SCHEDULER,
@@ -172,6 +173,7 @@ def run_provenance(args, provider, pipe_provider) -> typing.Dict[str, typing.Any
             "selected_key_seed": provider.selected_key_seed,
             "selected_pattern_sha256": provider.selected_pattern_sha256,
         })
+        provenance.update(provider.profile_provenance())
     else:
         provenance.update({
             "hsqr_profile": provider.profile,
@@ -279,7 +281,8 @@ def cohort_report_label(mode: str, profile_is_official: bool) -> str:
 
 HSTR_CSV_COLUMNS = [
     "image_index", "image_path", "image_sha256", "cohort_role", "status", "error",
-    "report_label", "hstr_channel_0_l1", "hstr_channel_3_l1", "hstr_channel_min_l1",
+    "report_label", "hstr_profile", "watermark_channels", "heterogeneous_channels",
+    "pattern_variant", "score_mode", "hstr_channel_0_l1", "hstr_channel_3_l1", "hstr_channel_min_l1",
     "score", "score_definition", "score_direction", "threshold", "threshold_source",
     "comparison_operator", "detection_success", "selected_key_index", "selected_key_seed",
     "selected_pattern_sha256", "bundle_sha256", "inversion_steps", "inversion_prompt_sha256",
@@ -421,7 +424,12 @@ def hstr_score_image(provider: HSTRProvider, pipe_provider, image_path: typing.U
         "hstr_channel_3_l1": None,
         "hstr_channel_min_l1": None,
         "score": None,
-        "score_definition": HSTR_SCORE_DEFINITION,
+        "score_definition": provider.score_definition,
+        "hstr_profile": provider.profile,
+        "watermark_channels": provider.watermark_channels,
+        "heterogeneous_channels": provider.heterogeneous_channels,
+        "pattern_variant": provider.pattern_variant,
+        "score_mode": provider.score_mode,
         "score_direction": threshold_info.get("score_direction", HSTR_SCORE_DIRECTION),
         "threshold": threshold_info.get("threshold"),
         "threshold_source": threshold_info.get("threshold_source"),
@@ -449,6 +457,7 @@ def hstr_score_image(provider: HSTRProvider, pipe_provider, image_path: typing.U
             "hstr_channel_3_l1": detection["hstr_channel_3_l1"],
             "hstr_channel_min_l1": detection["hstr_channel_min_l1"],
             "score": detection["score"],
+            "score_definition": detection["score_definition"],
             "recovered_latent_sha256": inversion["recovered_latent_sha256"],
             "inversion_parity_status": inversion.get("inversion_parity_status"),
             "inversion_weights_parity": inversion.get("inversion_weights_parity"),
@@ -465,19 +474,28 @@ def hstr_score_image(provider: HSTRProvider, pipe_provider, image_path: typing.U
     return row
 
 
-def hstr_official_roc(positive_scores: typing.Sequence[float], negative_scores: typing.Sequence[float], target_fpr: float) -> typing.Dict[str, typing.Any]:
+def hstr_official_roc(
+    positive_scores: typing.Sequence[float],
+    negative_scores: typing.Sequence[float],
+    target_fpr: float,
+    score_definition: str = HSTR_SCORE_DEFINITION,
+) -> typing.Dict[str, typing.Any]:
     return runner_common.official_roc(
         positive_scores,
         negative_scores,
         target_fpr,
-        score_definition=HSTR_SCORE_DEFINITION,
+        score_definition=score_definition,
         error_cls=SfwBundleError,
     )
 
 
 def require_official_generation_profile(args) -> None:
+    if args.hstr_profile not in (OFFICIAL_HSTR_PROFILE, OFFICIAL_MATH_TR_ONLY_PROFILE):
+        raise SfwBundleError(
+            "HSTR direct generation requires official_sfwmark_sd21 or official_math_tr_only, "
+            f"got {args.hstr_profile!r}"
+        )
     expected = {
-        "hstr_profile": OFFICIAL_HSTR_PROFILE,
         "modelid_target": HSTR_OFFICIAL_MODEL_ID,
         "scheduler_target": HSTR_OFFICIAL_SCHEDULER,
         "resolution": HSTR_OFFICIAL_RESOLUTION,
@@ -486,4 +504,4 @@ def require_official_generation_profile(args) -> None:
     }
     for field, value in expected.items():
         if getattr(args, field) != value:
-            raise SfwBundleError(f"official HSTR generation requires {field}={value!r}, got {getattr(args, field)!r}")
+            raise SfwBundleError(f"official-math HSTR generation requires {field}={value!r}, got {getattr(args, field)!r}")

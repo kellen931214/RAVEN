@@ -88,7 +88,6 @@ from utils.wm.ringid_provider import apply_arg_defaults as rid_apply_profile
 from utils.wm.ringid_provider import parser as rid_parser
 from utils.wm import sfw_bundle, sfw_runtime
 from utils.wm.sfw_bundle import SfwBundle, SfwBundleError
-from utils.wm.hstr_provider import HSTR_SCORE_DEFINITION
 from utils.wm.hstr_provider import apply_arg_defaults as hstr_apply_profile
 from utils.wm.hstr_provider import parser as hstr_parser
 
@@ -126,7 +125,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--wm_type", type=str, default="GM", choices=["GM", "HSTR"])
     parser.add_argument("--mode", type=str, default="verify",
-                        choices=["verify", "deployment_verify", "calibrate", "paper_eval"])
+                        choices=["verify", "deployment_verify", "calibrate", "paper_eval", "calibrate_eval"])
     parser.add_argument("--suspect_path", type=str, default=None,
                         help="One image file or a directory of images (verify mode).")
     parser.add_argument("--positive_path", type=str, default=None,
@@ -396,7 +395,7 @@ def _main_hstr(args, argv) -> int:
         summary = _run_cohort_hstr(args, provider, pipe_provider, out_dir, provenance, inputs)
 
     bundle_after = SfwBundle.load(bundle_dir).artifact_mtimes()
-    if args.mode == "calibrate":
+    if args.mode in ("calibrate", "calibrate_eval"):
         changed = {k for k in set(bundle_before) | set(bundle_after) if bundle_before.get(k) != bundle_after.get(k)}
         unexpected = changed - {sfw_bundle.THRESHOLD_FILENAME}
         if unexpected:
@@ -430,7 +429,7 @@ def _run_verify_hstr(args, provider, pipe_provider, out_dir: Path, provenance, i
         "image_count": len(rows),
         "ok_count": len(ok_rows),
         "error_count": len(rows) - len(ok_rows),
-        "score_definition": HSTR_SCORE_DEFINITION,
+        "score_definition": provider.score_definition,
         "score_direction": threshold_info.get("score_direction"),
         "comparison_operator": threshold_info.get("comparison_operator"),
         "threshold": threshold_info.get("threshold"),
@@ -460,10 +459,25 @@ def _run_cohort_hstr(args, provider, pipe_provider, out_dir: Path, provenance, i
         raise SfwBundleError(f"{len(failed)} HSTR cohort image(s) failed to score; first error: {failed[0]['error']}")
     positive_scores = [row["score"] for row in rows if row["cohort_role"] == "positive"]
     negative_scores = [row["score"] for row in rows if row["cohort_role"] == "negative"]
-    roc = sfw_runtime.hstr_official_roc(positive_scores, negative_scores, args.hstr_target_fpr)
+    roc = sfw_runtime.hstr_official_roc(
+        positive_scores, negative_scores, args.hstr_target_fpr, score_definition=provider.score_definition
+    )
     pairing = inputs["pairing"]
-    report_label = "official_paper_evaluation" if args.mode == "paper_eval" and provider.profile == "official_sfwmark_sd21" and pairing["paired"] else "calibrated_deployment_verification"
-    evaluation_mode = "official_paper_evaluation" if args.mode == "paper_eval" else "threshold_calibration"
+    is_paper_evaluation = args.mode in ("paper_eval", "calibrate_eval")
+    report_label = (
+        "official_paper_evaluation"
+        if is_paper_evaluation and provider.profile == "official_sfwmark_sd21" and pairing["paired"]
+        else "legacy_or_ablation_mode"
+        if is_paper_evaluation
+        else "calibrated_deployment_verification"
+    )
+    evaluation_mode = (
+        "threshold_calibration_and_paper_evaluation"
+        if args.mode == "calibrate_eval"
+        else "official_paper_evaluation"
+        if args.mode == "paper_eval"
+        else "threshold_calibration"
+    )
     for row in rows:
         row["threshold"] = roc["threshold"]
         row["threshold_source"] = "cohort_roc"
@@ -488,11 +502,11 @@ def _run_cohort_hstr(args, provider, pipe_provider, out_dir: Path, provenance, i
         "negative_cohort_sha256": sfw_bundle.canonical_sha256({"images": [sfw_bundle.sha256_file(p) for p in inputs["negatives"]]}),
         "note": "The threshold is derived from THIS positive/negative cohort with sklearn.metrics.roc_curve and FPR < target_fpr. It is experiment-specific, not a universal detector threshold.",
     })
-    if args.mode == "calibrate":
+    if args.mode in ("calibrate", "calibrate_eval"):
         artifact = sfw_bundle.build_threshold_artifact(
             threshold=roc["threshold"],
             binding=provider.binding_config(),
-            score_definition=HSTR_SCORE_DEFINITION,
+            score_definition=provider.score_definition,
             threshold_source="cohort_calibration",
             report_label="calibrated_deployment_verification",
             method="HSTR",
