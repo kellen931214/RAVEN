@@ -163,6 +163,8 @@ class TrOnlyAblationTests(unittest.TestCase):
 
     def test_official_math_tr_only_injects_only_channel_3_and_scores_only_channel_3(self):
         provider = self.tr_provider(hstr_key_index=3)
+        official = HSTRProvider(**provider_kwargs(hstr_key_index=3))
+        self.assertTrue(torch.equal(provider.gt_patch[:, 3], official.gt_patch[:, 3]))
         self.assertTrue(provider.uses_official_math)
         self.assertEqual(provider.provider_config()["watermark_channels"], [3])
         self.assertEqual(provider.provider_config()["heterogeneous_channels"], [])
@@ -229,6 +231,34 @@ class TrOnlyAblationTests(unittest.TestCase):
         provider = self.tr_provider()
         self.assertEqual(provider.generation_report_label, "legacy_or_ablation_mode")
         self.assertEqual(provider.generation_protocol, "hstr_tr_only_sfwmark_ablation_paired_direct_generation")
+
+
+class VerificationModeTests(unittest.TestCase):
+    def test_calibrate_eval_requires_verified_pairing_unless_explicitly_allowed(self):
+        import run_verify_watermark
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            positives = root / "positives"
+            negatives = root / "negatives"
+            positives.mkdir(); negatives.mkdir()
+            Image.new("RGB", (8, 8), "red").save(positives / "000000.png")
+            Image.new("RGB", (8, 8), "blue").save(negatives / "000000.png")
+            argv = [
+                "--wm_type", "HSTR", "--mode", "calibrate_eval",
+                "--positive_path", str(positives), "--negative_path", str(negatives),
+            ]
+            args = run_verify_watermark.build_parser().parse_args(argv)
+            with self.assertRaisesRegex(SystemExit, "requires a verified one-to-one paired cohort"):
+                run_verify_watermark._resolve_inputs_hstr(args)
+            args.allow_unmatched_cohorts = True
+            self.assertFalse(run_verify_watermark._resolve_inputs_hstr(args)["pairing"]["paired"])
+
+    def test_gm_rejects_calibrate_eval_before_bundle_or_model_work(self):
+        import run_verify_watermark
+
+        with self.assertRaisesRegex(SystemExit, "supported only for --wm_type HSTR"):
+            run_verify_watermark.main_gm(["--wm_type", "GM", "--mode", "calibrate_eval"])
 
 
 if __name__ == "__main__":

@@ -245,6 +245,8 @@ def main_gm(argv) -> int:
         args.mode = "verify"
     if args.wm_type == "HSTR":
         return _main_hstr(args, argv)
+    if args.mode == "calibrate_eval":
+        raise SystemExit("error: --mode calibrate_eval is supported only for --wm_type HSTR")
 
     profile_info = gm_apply_profile(args, argv)
     print(f"[GM] profile: {profile_info}", flush=True)
@@ -343,9 +345,9 @@ def _resolve_inputs_hstr(args) -> typing.Dict[str, typing.Any]:
     if not positives or not negatives:
         raise SystemExit("error: both cohorts must contain at least one image")
     pairing = sfw_runtime.resolve_pairing(positives, negatives, args.pair_manifest)
-    if args.mode == "paper_eval" and not pairing["paired"] and not args.allow_unmatched_cohorts:
+    if args.mode in ("paper_eval", "calibrate_eval") and not pairing["paired"] and not args.allow_unmatched_cohorts:
         raise SystemExit(
-            "error: the official HSTR paper protocol requires a verified one-to-one paired cohort "
+            "error: HSTR paper/calibrate_eval requires a verified one-to-one paired cohort "
             f"({pairing['reason']}). Supply --pair_manifest or per-sample metadata, or pass "
             "--allow_unmatched_cohorts to run a non-official ablation."
         )

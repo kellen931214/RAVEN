@@ -506,12 +506,16 @@ class HSTRProvider(WmProvider):
         return {"items": items}
 
     def __get_watermarking_mask(self) -> tuple[torch.Tensor, torch.Tensor]:
-        single_channel_tree_watermark_mask = torch.tensor(circle_mask(size=self.latent_shape[-1], r=RADIUS))
-        single_channel_heter_watermark_mask = torch.tensor(ring_mask(size=self.latent_shape[-1], r_out=RADIUS, r_in=RADIUS_CUTOFF))
+        single_channel_tree_watermark_mask = torch.tensor(
+            circle_mask(size=self.latent_shape[-1], r=RADIUS)
+        )
         masks = torch.zeros(self.latent_shape, dtype=torch.bool)
         masks[:, self.watermark_channels] = single_channel_tree_watermark_mask
         region_masks = [single_channel_tree_watermark_mask]
         if self.heterogeneous_channels:
+            single_channel_heter_watermark_mask = torch.tensor(
+                ring_mask(size=self.latent_shape[-1], r_out=RADIUS, r_in=RADIUS_CUTOFF)
+            )
             masks[:, self.heterogeneous_channels] = single_channel_heter_watermark_mask
             region_masks.insert(0, single_channel_heter_watermark_mask)
         watermark_region_mask_hstr = torch.stack(region_masks).to(self.device)
