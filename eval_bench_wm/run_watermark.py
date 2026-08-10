@@ -94,6 +94,7 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # args
 import argparse
+import gc
 
 
 def build_parser():
