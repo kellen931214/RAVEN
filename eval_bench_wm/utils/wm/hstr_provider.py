@@ -19,6 +19,7 @@ LEGACY_HSTR_PROFILE = "legacy_raven"
 SHARED_TR_CLEAN_HSTR_PROFILE = "official_math_shared_tr_clean"
 OFFICIAL_BASE_KEY_SEED = 7433
 OFFICIAL_MODEL_ID = "stabilityai/stable-diffusion-2-1-base"
+LOCAL_SD21_MIRROR_MODEL_ID = "RedbeardNZ/stable-diffusion-2-1-base"
 OFFICIAL_SCHEDULER = "DDIM"
 OFFICIAL_RESOLUTION = 512
 OFFICIAL_STEPS = 50
@@ -175,6 +176,12 @@ class HSTRProvider(WmProvider):
                 applied["overrides"][field] = getattr(args, field, None)
         return applied
 
+
+
+    @property
+    def uses_local_mirror_weights(self) -> bool:
+        return self.is_tr_only and self.model_id == LOCAL_SD21_MIRROR_MODEL_ID
+
     def _validate_official_profile(self) -> None:
         if tuple(self.latent_shape) != (1, 4, 64, 64):
             raise ValueError(f"{OFFICIAL_HSTR_PROFILE} requires latent_shape=(1,4,64,64), got {tuple(self.latent_shape)}")
@@ -182,8 +189,13 @@ class HSTRProvider(WmProvider):
             raise ValueError(f"{OFFICIAL_HSTR_PROFILE} requires shape=(1,4,64,64), got {self.shape}")
         if self.start != 10 or self.end != 54:
             raise ValueError(f"{OFFICIAL_HSTR_PROFILE} requires center slice 10:54")
-        if self.model_id not in (None, OFFICIAL_MODEL_ID):
-            raise ValueError(f"{OFFICIAL_HSTR_PROFILE} requires model {OFFICIAL_MODEL_ID}")
+        allowed_model_ids = {OFFICIAL_MODEL_ID}
+        if self.is_tr_only:
+            allowed_model_ids.add(LOCAL_SD21_MIRROR_MODEL_ID)
+        if self.model_id is not None and self.model_id not in allowed_model_ids:
+            raise ValueError(
+                f"{self.profile} requires model one of {sorted(allowed_model_ids)!r}, got {self.model_id!r}"
+            )
         if self.scheduler_type not in (None, OFFICIAL_SCHEDULER):
             raise ValueError(f"{OFFICIAL_HSTR_PROFILE} requires scheduler {OFFICIAL_SCHEDULER}")
         if self.resolution != OFFICIAL_RESOLUTION:
@@ -257,6 +269,10 @@ class HSTRProvider(WmProvider):
             "heterogeneous_channels": self.heterogeneous_channels,
             "pattern_variant": self.pattern_variant,
             "score_mode": self.score_mode,
+            "official_model_id": OFFICIAL_MODEL_ID,
+            "model_weights_status": (
+                "mirror_non_official" if self.uses_local_mirror_weights else "official_weights_requested"
+            ),
         }
 
     def provider_config(self) -> dict[str, typing.Any]:
@@ -299,6 +315,10 @@ class HSTRProvider(WmProvider):
             config.update({
                 "pattern_variant": self.pattern_variant,
                 "score_mode": self.score_mode,
+                "official_model_id": OFFICIAL_MODEL_ID,
+                "model_weights_status": (
+                    "mirror_non_official" if self.uses_local_mirror_weights else "official_weights_requested"
+                ),
             })
         return config
 

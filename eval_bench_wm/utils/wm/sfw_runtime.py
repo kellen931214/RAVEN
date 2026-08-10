@@ -38,6 +38,7 @@ from .hstr_provider import (
     OFFICIAL_GUIDANCE_SCALE as HSTR_OFFICIAL_GUIDANCE_SCALE,
     OFFICIAL_HSTR_PROFILE,
     OFFICIAL_MATH_TR_ONLY_PROFILE,
+    LOCAL_SD21_MIRROR_MODEL_ID,
     OFFICIAL_MODEL_ID as HSTR_OFFICIAL_MODEL_ID,
     OFFICIAL_RESOLUTION as HSTR_OFFICIAL_RESOLUTION,
     OFFICIAL_SCHEDULER as HSTR_OFFICIAL_SCHEDULER,
@@ -495,8 +496,17 @@ def require_official_generation_profile(args) -> None:
             "HSTR direct generation requires official_sfwmark_sd21 or official_math_tr_only, "
             f"got {args.hstr_profile!r}"
         )
+    allowed_model_ids = (
+        {HSTR_OFFICIAL_MODEL_ID, LOCAL_SD21_MIRROR_MODEL_ID}
+        if args.hstr_profile == OFFICIAL_MATH_TR_ONLY_PROFILE
+        else {HSTR_OFFICIAL_MODEL_ID}
+    )
+    if args.modelid_target not in allowed_model_ids:
+        raise SfwBundleError(
+            "official-math HSTR generation requires modelid_target in "
+            f"{sorted(allowed_model_ids)!r}, got {args.modelid_target!r}"
+        )
     expected = {
-        "modelid_target": HSTR_OFFICIAL_MODEL_ID,
         "scheduler_target": HSTR_OFFICIAL_SCHEDULER,
         "resolution": HSTR_OFFICIAL_RESOLUTION,
         "num_inference_steps_target": HSTR_OFFICIAL_STEPS,
