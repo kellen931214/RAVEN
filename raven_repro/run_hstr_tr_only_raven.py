@@ -67,6 +67,17 @@ def wait_for_generation(source_dir: Path, expected_samples: int, poll_seconds: i
         time.sleep(poll_seconds)
 
 
+def wait_for_cuda(gpu: int, poll_seconds: int) -> None:
+    """Wait without allocating model memory until the requested GPU is usable."""
+    while True:
+        import torch
+        if torch.cuda.is_available() and gpu < torch.cuda.device_count():
+            print(f"CUDA GPU {gpu} is available; starting watermarked-only attack", flush=True)
+            return
+        print(f"Waiting for CUDA GPU {gpu}; no attack process has been started", flush=True)
+        time.sleep(poll_seconds)
+
+
 def validated_manifest(source_dir: Path) -> tuple[Path, dict[str, Any]]:
     bundle_dir = source_dir / "hstr_bundle"
     manifest_path = bundle_dir / "manifest.json"
@@ -207,6 +218,7 @@ def main() -> int:
     bundle_dir, manifest = validated_manifest(source_dir)
     metadata_path = output_dir.parent / f"{output_dir.name}.hstr_tr_only_metadata.csv"
     build_metadata(rows, source_dir, bundle_dir, manifest, metadata_path)
+    wait_for_cuda(args.gpu, args.poll_seconds)
     run_watermarked_attack(args, metadata_path)
     add_untouched_clean_records(rows, source_dir, output_dir, metadata_path)
     run_evaluation(output_dir)
