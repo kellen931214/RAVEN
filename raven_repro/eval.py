@@ -217,6 +217,12 @@ def _build_detector_image_index(
         role = rec.get("role", "watermarked")
         cohorts = DETECTOR_COHORTS.get(role, {})
         for variant, info in cohorts.items():
+            # Reference-only clean records deliberately keep the original clean
+            # cohort for threshold calibration. Their output is a link to the
+            # input only for the canonical record layout; it is not an
+            # attacked-clean cohort and must never enter recalibration.
+            if role == "clean" and rec.get("reference_only_clean") and variant == "attacked":
+                continue
             image_path = _resolve_image_path(rec, info["image_source"], output_dir)
             index.append({
                 "run_id": run_id,
@@ -461,6 +467,8 @@ def evaluate_quality(
     ssim_values: list[float] = []
 
     for rec in records:
+        if rec.get("reference_only_clean"):
+            continue
         run_id = str(rec["run_id"])
         role = rec.get("role", "watermarked")
         input_path = Path(rec.get("input_path", ""))

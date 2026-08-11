@@ -38,6 +38,8 @@ from . import (
 )
 
 FOURIER_METHODS = frozenset({"RID", "HSTR", "HSQR"})
+HSTR_TR_ONLY_PROFILE = "official_math_tr_only"
+HSTR_TR_ONLY_DIRECT_PROTOCOL = "hstr_tr_only_sfwmark_ablation_paired_direct_generation"
 
 # ---------------------------------------------------------------------------
 # Method-specific score definition labels (exact strings from the canonical
@@ -230,6 +232,7 @@ def _validate_protocol_mode(
     record: dict[str, Any],
     method: str,
     row_label: str,
+    manifest: dict[str, Any],
 ) -> None:
     """Verify the row protocol mode against the method's canonical constant.
 
@@ -238,7 +241,11 @@ def _validate_protocol_mode(
     """
     prefix = method.lower()
     row_protocol = str(record.get(f"{prefix}_protocol_mode", ""))
-    expected = _protocol_mode_for_method(method)
+    expected = (
+        HSTR_TR_ONLY_DIRECT_PROTOCOL
+        if method == "HSTR" and manifest.get("profile_name") == HSTR_TR_ONLY_PROFILE
+        else _protocol_mode_for_method(method)
+    )
     if row_protocol != expected:
         raise DetectorStateValidationError(
             f"{row_label}: row {prefix}_protocol_mode={row_protocol!r} does not "
@@ -564,7 +571,7 @@ def load_state(records: list[dict[str, Any]], device: str,
         row_manifests.append(manifest)
         _validate_manifest_schema(manifest, method, row_label)
         _validate_manifest_method_identity(manifest, method, row_label)
-        _validate_protocol_mode(record, method, row_label)
+        _validate_protocol_mode(record, method, row_label, manifest)
 
     manifest = row_manifests[0]
 
@@ -708,8 +715,10 @@ def load_state(records: list[dict[str, Any]], device: str,
             f"{type(exc).__name__}: {exc}"
         ) from exc
 
-    score_definition = _METHOD_SCORE_DEFINITIONS.get(
-        method, f"{prefix}_score = -raw_l1")
+    score_definition = (
+        provider.score_definition if method == "HSTR"
+        else _METHOD_SCORE_DEFINITIONS.get(method, f"{prefix}_score = -raw_l1")
+    )
 
     return {
         "provider": provider,
@@ -801,8 +810,16 @@ def aggregate(detector_rows: list[dict[str, Any]],
     from . import ROW_STATUS_SCORED
 
     method = method.upper()
-    score_definition = _METHOD_SCORE_DEFINITIONS.get(
-        method, f"{method.lower()}_score = -raw_l1")
+    score_definitions = {
+        str(row["score_definition"])
+        for row in detector_rows
+        if row.get("status") == ROW_STATUS_SCORED and row.get("score_definition")
+    }
+    score_definition = (
+        next(iter(score_definitions))
+        if len(score_definitions) == 1
+        else _METHOD_SCORE_DEFINITIONS.get(method, f"{method.lower()}_score = -raw_l1")
+    )
 
     cohorts: dict[str, list[float]] = {}
     for row in detector_rows:
