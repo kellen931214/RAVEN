@@ -67,15 +67,26 @@ def wait_for_generation(source_dir: Path, expected_samples: int, poll_seconds: i
         time.sleep(poll_seconds)
 
 
+def cuda_gpu_ready(gpu: int) -> bool:
+    """Probe the exact physical GPU mapping used by raven_repro/main.py."""
+    env = dict(os.environ)
+    env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+    env["CUDA_VISIBLE_DEVICES"] = str(gpu)
+    probe = [
+        sys.executable, "-c",
+        "import torch; assert torch.cuda.is_available(); "
+        "x=torch.ones(1, device='cuda:0'); torch.cuda.synchronize(); print(x.item())",
+    ]
+    return subprocess.run(probe, env=env, stdout=subprocess.DEVNULL,
+                          stderr=subprocess.DEVNULL).returncode == 0
+
+
 def wait_for_cuda(gpu: int, poll_seconds: int) -> None:
-    """Wait without allocating model memory until the requested GPU is usable."""
-    while True:
-        import torch
-        if torch.cuda.is_available() and gpu < torch.cuda.device_count():
-            print(f"CUDA GPU {gpu} is available; starting watermarked-only attack", flush=True)
-            return
-        print(f"Waiting for CUDA GPU {gpu}; no attack process has been started", flush=True)
+    """Wait without model allocation until the selected GPU can execute PyTorch."""
+    while not cuda_gpu_ready(gpu):
+        print(f"Waiting for compatible CUDA GPU {gpu}; no attack process has been started", flush=True)
         time.sleep(poll_seconds)
+    print(f"CUDA GPU {gpu} is compatible; starting watermarked-only attack", flush=True)
 
 
 def validated_manifest(source_dir: Path) -> tuple[Path, dict[str, Any]]:
