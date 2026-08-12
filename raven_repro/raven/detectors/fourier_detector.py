@@ -39,7 +39,9 @@ from . import (
 
 FOURIER_METHODS = frozenset({"RID", "HSTR", "HSQR"})
 HSTR_TR_ONLY_PROFILE = "official_math_tr_only"
+HSTR_RID_ONLY_PROFILE = "official_math_rid_only"
 HSTR_TR_ONLY_DIRECT_PROTOCOL = "hstr_tr_only_sfwmark_ablation_paired_direct_generation"
+HSTR_RID_ONLY_DIRECT_PROTOCOL = "hstr_rid_only_sfwmark_ablation_paired_direct_generation"
 
 # ---------------------------------------------------------------------------
 # Method-specific score definition labels (exact strings from the canonical
@@ -241,10 +243,13 @@ def _validate_protocol_mode(
     """
     prefix = method.lower()
     row_protocol = str(record.get(f"{prefix}_protocol_mode", ""))
+    hstr_ablation_protocols = {
+        HSTR_TR_ONLY_PROFILE: HSTR_TR_ONLY_DIRECT_PROTOCOL,
+        HSTR_RID_ONLY_PROFILE: HSTR_RID_ONLY_DIRECT_PROTOCOL,
+    }
     expected = (
-        HSTR_TR_ONLY_DIRECT_PROTOCOL
-        if method == "HSTR" and manifest.get("profile_name") == HSTR_TR_ONLY_PROFILE
-        else _protocol_mode_for_method(method)
+        hstr_ablation_protocols.get(manifest.get("profile_name"), _protocol_mode_for_method(method))
+        if method == "HSTR" else _protocol_mode_for_method(method)
     )
     if row_protocol != expected:
         raise DetectorStateValidationError(

@@ -18,6 +18,7 @@ from utils.wm.ringid_provider import parser as ringid_parser
 from utils.wm.hstr_provider import (
     OFFICIAL_HSTR_PROFILE,
     OFFICIAL_MATH_TR_ONLY_PROFILE,
+    OFFICIAL_MATH_RID_ONLY_PROFILE,
     parser as hstr_parser,
 )
 from utils.wm.hsqr_provider import parser as hsqr_parser
@@ -968,7 +969,7 @@ def main(argv=None):
         return run_hsqr_generation(args, argv)
 
     if args.wm_type == "HSTR" and getattr(args, "hstr_profile", None) in (
-        OFFICIAL_HSTR_PROFILE, OFFICIAL_MATH_TR_ONLY_PROFILE
+        OFFICIAL_HSTR_PROFILE, OFFICIAL_MATH_TR_ONLY_PROFILE, OFFICIAL_MATH_RID_ONLY_PROFILE
     ):
         return run_hstr_generation(args, argv)
 

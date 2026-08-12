@@ -38,6 +38,7 @@ from .hstr_provider import (
     OFFICIAL_GUIDANCE_SCALE as HSTR_OFFICIAL_GUIDANCE_SCALE,
     OFFICIAL_HSTR_PROFILE,
     OFFICIAL_MATH_TR_ONLY_PROFILE,
+    OFFICIAL_MATH_RID_ONLY_PROFILE,
     LOCAL_SD21_MIRROR_MODEL_ID,
     OFFICIAL_MODEL_ID as HSTR_OFFICIAL_MODEL_ID,
     OFFICIAL_RESOLUTION as HSTR_OFFICIAL_RESOLUTION,
@@ -491,14 +492,16 @@ def hstr_official_roc(
 
 
 def require_official_generation_profile(args) -> None:
-    if args.hstr_profile not in (OFFICIAL_HSTR_PROFILE, OFFICIAL_MATH_TR_ONLY_PROFILE):
+    ablation_profiles = {OFFICIAL_MATH_TR_ONLY_PROFILE, OFFICIAL_MATH_RID_ONLY_PROFILE}
+    if args.hstr_profile not in ({OFFICIAL_HSTR_PROFILE} | ablation_profiles):
         raise SfwBundleError(
-            "HSTR direct generation requires official_sfwmark_sd21 or official_math_tr_only, "
+            "HSTR direct generation requires official_sfwmark_sd21, official_math_tr_only, "
+            "or official_math_rid_only, "
             f"got {args.hstr_profile!r}"
         )
     allowed_model_ids = (
         {HSTR_OFFICIAL_MODEL_ID, LOCAL_SD21_MIRROR_MODEL_ID}
-        if args.hstr_profile == OFFICIAL_MATH_TR_ONLY_PROFILE
+        if args.hstr_profile in ablation_profiles
         else {HSTR_OFFICIAL_MODEL_ID}
     )
     if args.modelid_target not in allowed_model_ids:
