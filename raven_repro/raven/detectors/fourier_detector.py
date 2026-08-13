@@ -857,6 +857,40 @@ def aggregate(detector_rows: list[dict[str, Any]],
     attacked = cohorts.get("attacked_watermarked", [])
 
     if clean and watermarked and attacked:
+        if method == "RID":
+            # RID's formal-paper row follows the shared strict ROC protocol
+            # used by the standalone verifiers.  It receives only canonical
+            # (higher-is-watermarked) scores; RingID's L1 detector itself is
+            # deliberately untouched.
+            from raven.evaluation.metrics import unified_detection_report
+
+            unified = unified_detection_report(
+                clean,
+                watermarked,
+                attacked,
+                score_definition=score_definition,
+                target_fpr=0.01,
+            )
+            result["unified_evaluation"] = unified
+            result["evaluation_protocol"] = unified["evaluation_protocol"]
+            result["threshold_policy"] = unified["threshold_policy"]
+            # Keep legacy summary keys for existing result consumers while
+            # making their source of truth the unified fixed-threshold report.
+            result["detection_summary"] = {
+                "target_fpr": unified["fpr_target"],
+                "fpr_rule": unified["fpr_rule"],
+                "threshold_type": "strict_roc_clean_negative_1pct_fpr",
+                "threshold_score_space": "canonical_score",
+                "threshold_comparison_operator": unified["threshold_comparison_operator"],
+                "clean_calibrated_threshold": unified["calibrated_threshold_before"],
+                "clean_calibrated_actual_fpr": unified["actual_fpr_before"],
+                "original_watermarked_tpr": unified["tpr_before"],
+                "attacked_watermarked_tpr": unified["tpr_after"],
+                "fixed_threshold_after": unified["fixed_threshold_after"],
+                "attack_success": unified["attack_success_rate"],
+            }
+            return result
+
         summary = summarize_detection(clean, watermarked, attacked, target_fpr=0.01)
         result["detection_summary"] = {
             "target_fpr": 0.01,

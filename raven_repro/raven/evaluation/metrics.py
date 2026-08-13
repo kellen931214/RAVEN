@@ -354,3 +354,61 @@ def openclip_text_image_scores(
         "scores": scores,
         "mean": sum(scores) / len(scores),
     }
+
+def unified_detection_report(
+    clean_scores: Sequence[float],
+    watermarked_scores: Sequence[float],
+    attacked_watermarked_scores: Sequence[float],
+    *,
+    score_definition: str,
+    target_fpr: float = 0.01,
+) -> dict:
+    """Build the paper-table detection report with one frozen ROC threshold.
+
+    The shared benchmark ROC helper defines the operating point: pool original
+    clean negatives with original-watermarked positives, select the *last* ROC
+    point where ``fpr < target_fpr``, then retain that threshold for the
+    attacked-watermarked cohort.  The attacked ROC-AUC is descriptive only; it
+    never supplies a second calibration threshold.
+
+    Inputs must already be in the canonical higher-is-watermarked score space.
+    This keeps provider-specific detector math and score direction outside the
+    benchmark protocol.
+    """
+    # Keep the formal evaluator on the same strict ROC implementation used by
+    # the standalone method verifiers (GM/RID/HSTR/HSQR).
+    from eval_bench_wm.utils.wm import runner_common
+
+    clean = [float(score) for score in clean_scores]
+    watermarked = [float(score) for score in watermarked_scores]
+    attacked = [float(score) for score in attacked_watermarked_scores]
+    before = runner_common.official_roc(
+        watermarked,
+        clean,
+        target_fpr,
+        score_definition=score_definition,
+    )
+    threshold = float(before["threshold"])
+    tpr_after = detection_rate(attacked, threshold)
+
+    return {
+        "evaluation_protocol": "unified_clean_negative_tpr_at_fpr_1pct",
+        "threshold_policy": "calibrate_before_attack_then_freeze",
+        "clean_scores": clean,
+        "watermarked_scores": watermarked,
+        "attacked_watermarked_scores": attacked,
+        "roc_auc_before": float(before["roc_auc"]),
+        "roc_auc_after": roc_auc(attacked, clean),
+        "fpr_target": float(target_fpr),
+        "fpr_rule": "strict_less_than",
+        "calibrated_threshold_before": threshold,
+        "actual_fpr_before": float(before["empirical_fpr"]),
+        "tpr_before": float(before["empirical_tpr"]),
+        "fixed_threshold_after": threshold,
+        "tpr_after": tpr_after,
+        "attack_success_rate": 1.0 - tpr_after,
+        "threshold_comparison_operator": before["comparison_operator"],
+        "score_direction": before["score_direction"],
+        "score_definition": before["score_definition"],
+        "after_roc_auc_policy": "descriptive_only_no_threshold_recalibration",
+    }
