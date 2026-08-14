@@ -65,7 +65,10 @@ from utils.image_utils import torch_to_PIL
 GM_OFFICIAL_SD21_PROFILE: typing.Dict[str, typing.Any] = {
     # generation
     "modelid_target": "stabilityai/stable-diffusion-2-1-base",
-    "model_revision": "fp16",
+    # ``fp16`` is a dtype/weight-variant convention, not a currently resolvable
+    # Hugging Face revision for SD 2.1 Base.  Keep the official fp16 compute
+    # dtype below, while loading the repository default revision.
+    "model_revision": None,
     "gm_torch_dtype": "float16",
     "scheduler_target": "DPM",
     "resolution": 512,
