@@ -355,25 +355,20 @@ def _compute_metric_availability(
     }
 
     if method_upper == "T2S":
-        # T2S: needs original_watermarked + attacked_watermarked for
-        # paired-key detection report.  Does NOT need original_clean.
-        has_wm = "original_watermarked" in scored_set
-        has_att = "attacked_watermarked" in scored_set
-        availability["primary_report_available"] = has_wm and has_att
-        availability["any_report_available"] = has_wm or has_att
-        availability["primary_report"] = "paired_key_detection_report"
-        availability["primary_required_cohorts"] = [
-            "original_watermarked", "attacked_watermarked",
-        ]
-        if not availability["primary_report_available"]:
-            availability["primary_missing"] = sorted(
-                {"original_watermarked", "attacked_watermarked"} - scored_set,
-            )
-        # T2S has no threshold/recalibrated distinction
-        availability["threshold_report_available"] = False
+        required = {"original_watermarked", "attacked_watermarked"}
+        available = required <= scored_set and "t2smark_official_detector_at_1pct_fpr" in aggregate
+        availability["primary_report_available"] = available
+        availability["any_report_available"] = bool(scored_set)
+        availability["primary_report"] = (
+            "T2SMark official detector evaluated at 1% FPR" if available else None
+        )
+        availability["primary_required_cohorts"] = sorted(required)
+        if not available:
+            availability["primary_missing"] = sorted(required - scored_set)
+        availability["threshold_report_available"] = available
+        availability["threshold_report"] = availability["primary_report"]
         availability["recalibrated_cohorts_available"] = False
         availability["recalibrated_report_available"] = False
-        availability["threshold_report"] = None
         return availability
 
     # ---- Threshold-based methods ----

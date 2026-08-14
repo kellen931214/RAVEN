@@ -130,11 +130,27 @@ T2S_INVERSION_MODES = ("t2s_official", "benchmark_ddim")
 #: end-to-end upstream generation parity: upstream always draws its own ``z``.
 T2S_SHARED_TR_CLEAN_MODE = "official_encoder_shared_tr_clean"
 
+# End-to-end upstream protocol. Unlike shared-clean, this mode requires run.py's
+# own fresh global-CPU torch.randn source and SD2.1 profile.
+T2S_OFFICIAL_END_TO_END_MODE = "official_t2s_end_to_end"
+T2S_OFFICIAL_SOURCE_COMMIT = "0c1fbfd50fcd1fba135477a2c016e284d5d7914d"
+
 T2S_SCORE_DIRECTION = "higher_is_watermarked"
 T2S_DECISION_RULE = "paired_key_comparison"
 T2S_DECISION_RULE_EXPRESSION = "score_true_key > score_control_key"
 T2S_DECISION_RULE_PROVENANCE = "raven_deployment_extension"
 T2S_OFFICIAL_EVALUATION = "cohort_roc_auc_and_tpr_at_fpr_1e-6"
+
+def t2s_cohort_roc(positive_scores: typing.Sequence[float],
+                   negative_scores: typing.Sequence[float],
+                   target_fpr: float) -> typing.Dict[str, typing.Any]:
+    """Use the shared strict-FPR ROC helper without changing T2S raw scores."""
+    from .runner_common import official_roc
+
+    return official_roc(
+        positive_scores, negative_scores, target_fpr=target_fpr,
+        score_definition="T2S official raw score: L1 norm of decoded key votes",
+    )
 
 
 parser = argparse.ArgumentParser(add_help=False)

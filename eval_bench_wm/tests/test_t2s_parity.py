@@ -24,6 +24,7 @@ if str(BENCH_ROOT) not in sys.path:
     sys.path.insert(0, str(BENCH_ROOT))
 
 from utils.canonical import canonical_json_dumps, canonical_json_sha256  # noqa: E402
+from utils.wm.t2s_inversion import _backward_ddim, official_unet_inversion  # noqa: E402
 from utils.wm.t2s_provider import (  # noqa: E402
     T2S_STATE_SCHEMA_VERSION,
     T2SMark,
@@ -32,6 +33,7 @@ from utils.wm.t2s_provider import (  # noqa: E402
     channel_layout,
     detect_from_reversed_latents,
     str_to_bits,
+    t2s_cohort_roc,
 )
 
 
@@ -322,7 +324,7 @@ def test_canonical_matches_raven_repro():
         pytest.skip("raven_repro not present")
     if str(raven_root) not in sys.path:
         sys.path.insert(0, str(raven_root))
-    from raven.pairing_provenance import canonical_json_sha256 as raven_hash
+    from raven.protocol import canonical_json_hash as raven_hash
 
     payload = {"z": 1, "a": "x", "nested": {"k": [1, 2], "j": True}, "n": None, "f": 0.5}
     assert canonical_json_sha256(payload) == raven_hash(payload)
@@ -738,3 +740,131 @@ def test_incompatible_verification_states_and_config_fail_closed(tmp_path):
     broken = _make_state(watermark_id="t2s-test-0004", msg_channels=[1, 2])
     with pytest.raises(SystemExit, match="does not cover"):
         check_states_compatible([(broken, image)], args())
+
+
+# --------------------------------------------------------------------------
+# 9. Official detector ROC at 1% FPR (paper-only operating point change)
+# --------------------------------------------------------------------------
+
+def test_official_detector_roc_uses_true_and_control_scores_with_strict_fpr():
+    true_key_scores = [1.0, 2.0]
+    control_key_scores = [0.0] * 100
+    roc = t2s_cohort_roc(true_key_scores, control_key_scores, 0.01)
+
+    assert roc["score_definition"] == "T2S official raw score: L1 norm of decoded key votes"
+    assert roc["roc_fpr_at_threshold"] < 0.01
+    assert roc["empirical_fpr"] < 0.01
+    assert roc["tpr_at_target_fpr"] == pytest.approx(1.0)
+
+
+def test_official_detector_aggregate_reports_before_and_after_independent_rocs():
+    raven_root = BENCH_ROOT.parent / "raven_repro"
+    if str(raven_root) not in sys.path:
+        sys.path.insert(0, str(raven_root))
+    from raven.detectors import ROW_STATUS_SCORED
+    from raven.detectors.t2s_detector import aggregate
+
+    def row(cohort, true, control, key_acc=1.0, msg_acc=1.0):
+        return {
+            "status": ROW_STATUS_SCORED, "evaluation_cohort": cohort,
+            "t2s_score_true_key": true, "t2s_score_control_key": control,
+            "t2s_score_margin": true - control,
+            "t2s_detection_success": true > control,
+            "t2s_key_accuracy": key_acc, "t2s_message_accuracy": msg_acc,
+            "t2s_rng_mode": "official_compatible",
+            "t2s_inversion_mode": "t2s_official",
+            "t2s_model_id": "stabilityai/stable-diffusion-2-1",
+            "t2s_model_revision": "fp16", "t2s_scheduler": "PNDMScheduler",
+            "t2s_num_inference_steps": 50, "t2s_num_inversion_steps": 10,
+            "t2s_guidance_scale": 7.5, "t2s_dtype": "torch.float16",
+            "t2s_key_channel_idx": 0, "t2s_key_length": 16,
+            "t2s_msg_length": 256, "t2s_tau": 0.674,
+            "t2s_fix_key": False,
+            "t2s_generation_protocol": "official_t2s_end_to_end",
+            "t2s_protocol_mode": "official_t2s_end_to_end",
+            "t2s_official_source_commit": "0c1fbfd50fcd1fba135477a2c016e284d5d7914d",
+            "t2s_base_latent_sha256": None,
+        }
+
+    rows = [row("original_watermarked", 2.0, 0.1)]
+    rows += [row("attacked_watermarked", 0.5, 0.1, 0.75, 0.6)]
+    report = aggregate(rows)
+
+    official = report["t2smark_official_detector_at_1pct_fpr"]
+    assert official["label"] == "T2SMark official detector evaluated at 1% FPR"
+    assert official["positive"] == "true-key score (norm1_w)"
+    assert official["negative"] == "fake/control-key score (norm1_no_w)"
+    assert official["score"] == "official raw L1 projection score"
+    assert official["fpr_rule"] == "strict_less_than"
+    assert official["before"]["tpr_at_fpr_lt_1pct"] == pytest.approx(1.0)
+    assert official["before"]["actual_fpr"] < 0.01
+    assert official["after"]["tpr_at_fpr_lt_1pct"] == pytest.approx(1.0)
+    assert official["before"]["threshold"] != official["after"]["threshold"]
+    assert "original_paired_key_comparison_rate" in report
+
+    shared_rows = [dict(item, t2s_protocol_mode="official_encoder_shared_tr_clean") for item in rows]
+    shared_report = aggregate(shared_rows)
+    assert shared_report["official_generation_eligible"] is False
+    assert "t2smark_official_detector_at_1pct_fpr" not in shared_report
+    assert shared_report["raven_shared_clean_adaptation"]["not_official_t2s_generation"] is True
+
+
+def test_message_decode_uses_recovered_session_key(monkeypatch):
+    state = _make_state()
+    expected_session = str_to_bits(state.expected_session_key_bits)
+    recovered_session = 1 - expected_session
+    calls = []
+
+    def fake_decode(self, reversed_noise, key, detection=False):
+        if self.m == state.key_length:
+            if detection:
+                return recovered_session, 7.0
+            return recovered_session
+        calls.append(key.clone())
+        return torch.zeros(state.msg_length, dtype=torch.int32)
+
+    monkeypatch.setattr(T2SMark, "decode", fake_decode)
+    detect_from_reversed_latents(state, torch.zeros(state.latent_shape))
+    assert len(calls) == 1
+    assert torch.equal(calls[0], recovered_session)
+    assert not torch.equal(calls[0], expected_session)
+
+
+# --------------------------------------------------------------------------
+# 10. Official inversion algebra
+# --------------------------------------------------------------------------
+
+def test_official_inversion_algebra_matches_direct_oracle():
+    class Scheduler:
+        init_noise_sigma = 1.0
+        class config:
+            num_train_timesteps = 100
+        timesteps = torch.tensor([90, 40])
+        alphas_cumprod = torch.linspace(0.1, 1.0, 101)
+        final_alpha_cumprod = torch.tensor(0.1)
+        def set_timesteps(self, steps):
+            assert steps == 2
+        def scale_model_input(self, latent, timestep):
+            return latent + float(timestep) * 0.0
+
+    class UNet:
+        def __call__(self, latent, timestep, encoder_hidden_states):
+            assert encoder_hidden_states.shape == (1, 1)
+            return type("Out", (), {"sample": torch.ones_like(latent) * 0.25})()
+
+    class Pipe:
+        scheduler = Scheduler()
+        unet = UNet()
+        def encode_prompt(self, prompt, device, n, do_cfg, negative):
+            assert (prompt, n, do_cfg, negative) == ("", 1, False, None)
+            return (torch.zeros(1, 1),)
+
+    z0 = torch.ones(1, 1, 2, 2)
+    got = official_unet_inversion(Pipe(), z0, num_inversion_steps=2, guidance_scale=1.0)
+    expected = z0.clone()
+    for timestep in reversed(torch.tensor([90, 40])):
+        previous = timestep - 100 // 2
+        alpha_t = Pipe.scheduler.alphas_cumprod[previous] if previous >= 0 else Pipe.scheduler.final_alpha_cumprod
+        alpha_prev = Pipe.scheduler.alphas_cumprod[timestep]
+        expected = _backward_ddim(expected, alpha_t, alpha_prev, torch.ones_like(expected) * 0.25)
+    assert torch.equal(got, expected)

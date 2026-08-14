@@ -77,7 +77,7 @@ def describe_required_artifacts() -> list[str]:
         "t2s_state_sha256 (validated fail-closed against loaded state)",
         "t2s_watermark_id (validated fail-closed against loaded state)",
         "t2s_provider_config_sha256 (validated fail-closed against loaded state)",
-        "t2s_protocol_mode (canonical shared-tr-clean mode)",
+        "t2s_protocol_mode (official end-to-end or explicit shared-clean mode)",
         "t2s_rng_mode (validated fail-closed against loaded state)",
         "t2s_inversion_mode (validated fail-closed against loaded state)",
         "t2s_num_inversion_steps (validated fail-closed against loaded state)",
@@ -517,7 +517,10 @@ def load_state(records: list[dict[str, Any]], device: str,
 
     rng_modes = frozenset(t2s_provider_module.T2S_RNG_MODES)
     inversion_modes = frozenset(t2s_provider_module.T2S_INVERSION_MODES)
-    protocol_modes = frozenset({t2s_provider_module.T2S_SHARED_TR_CLEAN_MODE})
+    protocol_modes = frozenset({
+        t2s_provider_module.T2S_SHARED_TR_CLEAN_MODE,
+        t2s_provider_module.T2S_OFFICIAL_END_TO_END_MODE,
+    })
 
     # ---- Step 2 & 3: per-key path check + state load ----
     state_cache: dict[tuple[str, str], Any] = {}
@@ -854,10 +857,12 @@ def score_image(provider_info: dict[str, Any], image_path: str, *,
         "t2s_provider_config_sha256": state.provider_config_sha256,
         "t2s_watermark_id": state.watermark_id,
         "t2s_protocol_mode": canonical["t2s_protocol_mode"],
+        "t2s_official_source_commit": canonical.get("t2s_official_source_commit"),
         "t2s_rng_mode": state.rng_mode,
         "t2s_inversion_mode": state.inversion_mode,
         "t2s_num_inversion_steps": official_steps,
         "t2s_num_inference_steps": inference_steps,
+        "t2s_guidance_scale": state.guidance_scale,
         "t2s_actual_official_inversion_steps": official_steps,
         "t2s_actual_benchmark_inference_steps": inference_steps,
         "t2s_effective_inversion_steps": effective_steps,
@@ -867,6 +872,14 @@ def score_image(provider_info: dict[str, Any], image_path: str, *,
         "t2s_model_revision": state.model_revision,
         "t2s_scheduler": state.scheduler,
         "t2s_resolution": state.resolution,
+        "t2s_key_channel_idx": state.key_channels[0] if len(state.key_channels) == 1 else None,
+        "t2s_key_length": state.key_length,
+        "t2s_msg_length": state.msg_length,
+        "t2s_tau": state.tau,
+        "t2s_fix_key": canonical.get("t2s_fix_key"),
+        "t2s_dtype": canonical.get("t2s_dtype"),
+        "t2s_generation_protocol": canonical.get("t2s_generation_protocol"),
+        "t2s_base_latent_sha256": state.base_latent_sha256,
         "t2s_state_verified": True,
         "decision_rule": "paired_key_comparison (score_true_key > score_control_key)",
         "score_direction": "higher_is_watermarked",
@@ -878,104 +891,143 @@ def score_image(provider_info: dict[str, Any], image_path: str, *,
 # ---------------------------------------------------------------------------
 
 def aggregate(detector_rows: list[dict[str, Any]], **extra) -> dict[str, Any]:
-    """Aggregate T2S detector rows by cohort.  Row-by-row to avoid zip
-    misalignment.  Defensively ignores non-finite bit accuracy values."""
+    """Official T2S detector ROC, reported at the paper 1% FPR point.
+
+    Upstream positives are true/master-key ``norm1_w`` scores and negatives are
+    fake/control-key ``norm1_no_w`` scores from the same image cohort.  Only the
+    operating point changes from upstream ``FPR < 1e-6`` to ``FPR < 0.01``.
+    """
     from . import ROW_STATUS_SCORED
+    from utils.wm.t2s_provider import (
+        T2S_OFFICIAL_END_TO_END_MODE, T2S_OFFICIAL_SOURCE_COMMIT, t2s_cohort_roc,
+    )
 
-    def _cohort(name: str) -> list[dict[str, Any]]:
-        return [r for r in detector_rows
-                if r.get("evaluation_cohort") == name
-                and r.get("status") == ROW_STATUS_SCORED]
+    cohorts = {
+        name: [r for r in detector_rows if r.get("status") == ROW_STATUS_SCORED
+               and r.get("evaluation_cohort") == name]
+        for name in ("original_watermarked", "attacked_watermarked")
+    }
+    scored_rows = [r for r in detector_rows if r.get("status") == ROW_STATUS_SCORED]
 
-    def _bit_stats(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
-        vals = []
-        unavailable = 0
-        for r in rows:
-            v = r.get("t2s_bit_accuracy")
-            if v is None:
-                unavailable += 1
-                continue
-            try:
-                fv = float(v)
-            except (ValueError, TypeError):
-                unavailable += 1
-                continue
-            if not math.isfinite(fv):
-                unavailable += 1
-                continue
-            vals.append(fv)
-        result: dict[str, Any] = {
-            "bit_accuracy_count": len(vals),
-            "bit_accuracy_unavailable_count": unavailable,
-        }
-        if vals:
-            arr = np.array(vals)
-            result.update({
-                "mean": float(np.mean(arr)),
-                "median": float(np.median(arr)),
-                "q25": float(np.quantile(arr, 0.25)),
-                "q75": float(np.quantile(arr, 0.75)),
-                "min": float(np.min(arr)),
-                "max": float(np.max(arr)),
-            })
-        return result if (vals or unavailable) else None
+    def values(rows, field):
+        return [float(r[field]) for r in rows]
 
-    original_wm = _cohort("original_watermarked")
-    attacked_wm = _cohort("attacked_watermarked")
-
-    scored = sum(1 for r in detector_rows if r.get("status") == ROW_STATUS_SCORED)
-    failed = len(detector_rows) - scored
-    required = {"original_watermarked", "attacked_watermarked"}
-    present = {r["evaluation_cohort"] for r in detector_rows
-               if r.get("status") == ROW_STATUS_SCORED}
-    missing = sorted(required - present)
+    def accuracy_summary(rows, field):
+        vals = [float(r[field]) for r in rows if r.get(field) is not None]
+        return None if not vals else {"count": len(vals), "mean": float(np.mean(vals))}
 
     result: dict[str, Any] = {
         "method": "T2S",
         "requested_count": len(detector_rows),
-        "scored_count": scored,
-        "failed_count": failed,
-        "cohort_counts": {c: len(_cohort(c)) for c in present},
-        "missing_cohorts": missing,
-        "score_type": "t2s_score_true_key",
+        "scored_count": len(scored_rows),
+        "failed_count": len(detector_rows) - len(scored_rows),
+        "cohort_counts": {name: len(rows) for name, rows in cohorts.items() if rows},
+        "evaluation_protocol": "T2SMark official detector evaluated at 1% FPR",
+        "positive": "score_true_key (official norm1_w)",
+        "negative": "score_control_key (official norm1_no_w, fake/control key)",
+        "score_type": "official_raw_l1_projection_score",
         "score_direction": "higher_is_watermarked",
-        "decision_rule": "paired_key_comparison (score_true_key > score_control_key)",
+        "fpr_target": 0.01,
+        "fpr_rule": "strict_less_than",
+        "raven_extension": {
+            "name": "paired_key_comparison_rate",
+            "expression": "score_true_key > score_control_key",
+            "not_a_detection_rate_or_tpr": True,
+        },
     }
+    if scored_rows:
+        first = scored_rows[0]
+        result["protocol_metadata"] = {
+            "method": "T2S",
+            "evaluation_protocol": "T2SMark official detector evaluated at 1% FPR",
+            "fpr_target": 0.01, "fpr_rule": "strict_less_than",
+            "t2s_rng_mode": first.get("t2s_rng_mode"),
+            "t2s_inversion_mode": first.get("t2s_inversion_mode"),
+            "model_id": first.get("t2s_model_id"),
+            "model_revision": first.get("t2s_model_revision"),
+            "scheduler": first.get("t2s_scheduler"),
+            "generation_steps": first.get("t2s_num_inference_steps"),
+            "inversion_steps": first.get("t2s_num_inversion_steps"),
+            "guidance_scale": first.get("t2s_guidance_scale"),
+            "dtype": first.get("t2s_dtype"),
+            "key_channel_idx": first.get("t2s_key_channel_idx"),
+            "key_length": first.get("t2s_key_length"),
+            "msg_length": first.get("t2s_msg_length"),
+            "tau": first.get("t2s_tau"), "fix_key": first.get("t2s_fix_key"),
+        }
 
-    def _cohort_metrics(name: str, rows: list[dict[str, Any]]) -> None:
+    for prefix, rows in (("original", cohorts["original_watermarked"]),
+                         ("attacked", cohorts["attacked_watermarked"])):
         if not rows:
-            return
-        bit_stats = _bit_stats(rows)
-        if bit_stats:
-            result[f"{name}_bit_accuracy"] = bit_stats
-        detections = [bool(r["t2s_detection_success"]) for r in rows]
-        result[f"{name}_detection_rate"] = sum(detections) / len(detections)
-        corrupted = 0
-        failed_readable = 0
-        for r in rows:
-            det = bool(r["t2s_detection_success"])
-            ba = r.get("t2s_bit_accuracy")
-            ba_val = None
-            if ba is not None:
-                try:
-                    ba_val = float(ba)
-                except (ValueError, TypeError):
-                    ba_val = None
-                if ba_val is not None and not math.isfinite(ba_val):
-                    ba_val = None
-            if det and ba_val is not None and ba_val < 1.0:
-                corrupted += 1
-            if not det and ba_val is not None and ba_val == 1.0:
-                failed_readable += 1
-        result[f"{name}_message_corrupted"] = corrupted
-        result[f"{name}_detection_failed_but_readable"] = failed_readable
+            continue
+        true_scores = values(rows, "t2s_score_true_key")
+        control_scores = values(rows, "t2s_score_control_key")
+        result[f"{prefix}_true_key_scores"] = true_scores
+        result[f"{prefix}_control_key_scores"] = control_scores
+        result[f"{prefix}_score_margin"] = values(rows, "t2s_score_margin")
+        result[f"{prefix}_paired_key_comparison_rate"] = float(np.mean([
+            bool(r["t2s_detection_success"]) for r in rows
+        ]))
+        result[f"{prefix}_session_key_bit_accuracy"] = accuracy_summary(rows, "t2s_key_accuracy")
+        result[f"{prefix}_message_bit_accuracy"] = accuracy_summary(rows, "t2s_message_accuracy")
 
-    _cohort_metrics("original_watermarked", original_wm)
-    _cohort_metrics("attacked_watermarked", attacked_wm)
-
-    if original_wm and attacked_wm:
-        result["attack_success_rate"] = (
-            1.0 - result.get("attacked_watermarked_detection_rate", 0.0)
+    relevant_rows = cohorts["original_watermarked"] + cohorts["attacked_watermarked"]
+    official_generation = bool(relevant_rows) and all(
+        r.get("t2s_protocol_mode") == T2S_OFFICIAL_END_TO_END_MODE
+        and r.get("t2s_rng_mode") == "official_compatible"
+        and r.get("t2s_inversion_mode") == "t2s_official"
+        and r.get("t2s_official_source_commit") == T2S_OFFICIAL_SOURCE_COMMIT
+        and r.get("t2s_base_latent_sha256") is None
+        and r.get("t2s_model_id") == "stabilityai/stable-diffusion-2-1"
+        and r.get("t2s_model_revision") == "fp16"
+        and r.get("t2s_scheduler") == "PNDMScheduler"
+        and r.get("t2s_num_inference_steps") == 50
+        and r.get("t2s_num_inversion_steps") == 10
+        and r.get("t2s_guidance_scale") == 7.5
+        and r.get("t2s_key_channel_idx") == 0
+        and r.get("t2s_key_length") == 16
+        and r.get("t2s_msg_length") == 256
+        and r.get("t2s_tau") == 0.674
+        for r in relevant_rows
+    )
+    result["official_generation_eligible"] = official_generation
+    report = {
+        "label": (
+            "T2SMark official detector evaluated at 1% FPR"
+            if official_generation else
+            "RAVEN shared-clean adaptation evaluated with T2SMark official detector at 1% FPR"
+        ),
+        "positive": "true-key score (norm1_w)",
+        "negative": "fake/control-key score (norm1_no_w)",
+        "score": "official raw L1 projection score",
+        "score_direction": "higher_is_watermarked",
+        "fpr_target": 0.01,
+        "fpr_rule": "strict_less_than",
+    }
+    for phase, rows in (("before", cohorts["original_watermarked"]),
+                        ("after", cohorts["attacked_watermarked"])):
+        if not rows:
+            continue
+        roc = t2s_cohort_roc(
+            values(rows, "t2s_score_true_key"),
+            values(rows, "t2s_score_control_key"),
+            0.01,
         )
-
+        report[phase] = {
+            "roc_auc": roc["roc_auc"],
+            "tpr_at_fpr_lt_1pct": roc["tpr_at_target_fpr"],
+            "threshold": roc["threshold"],
+            "actual_fpr": roc["empirical_fpr"],
+            "true_key_scores": values(rows, "t2s_score_true_key"),
+            "control_key_scores": values(rows, "t2s_score_control_key"),
+        }
+    if official_generation:
+        result["t2smark_official_detector_at_1pct_fpr"] = report
+    else:
+        result["raven_shared_clean_adaptation"] = {
+            "label": "RAVEN shared-clean adaptation",
+            "not_official_t2s_generation": True,
+            "official_1pct_result_emitted": False,
+            "t2smark_detector_diagnostic_at_1pct_fpr": report,
+        }
     return result
