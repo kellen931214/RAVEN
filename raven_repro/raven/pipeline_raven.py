@@ -195,6 +195,9 @@ class RavenPipeline:
         self,
         input_image: Image.Image,
         output_dir: str | Path,
+        pre_inversion_view_image: Optional[Image.Image] = None,
+        rgb_shift_dx: Optional[int] = None,
+        rgb_shift_dy: Optional[int] = None,
         steps: int = 50,
         strength: float = 0.15,
         guidance_scale: float = 2.5,
@@ -223,10 +226,28 @@ class RavenPipeline:
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         image_size_divisible_by_8(input_image)
+        pre_inversion_rgb_mode = pre_inversion_view_image is not None
+        if pre_inversion_rgb_mode:
+            if rgb_shift_dx is None or rgb_shift_dy is None:
+                raise ValueError(
+                    "pre_inversion_view_image requires rgb_shift_dx and rgb_shift_dy"
+                )
+            if not isinstance(rgb_shift_dx, int) or not isinstance(rgb_shift_dy, int):
+                raise TypeError("rgb_shift_dx and rgb_shift_dy must be integers")
+            image_size_divisible_by_8(pre_inversion_view_image)
+            if input_image.size != pre_inversion_view_image.size:
+                raise ValueError("reference and pre-inversion view images must have the same size")
+            if color_transfer:
+                raise ValueError(
+                    "pre-inversion RGB-view mode does not support latent-flow color transfer; "
+                    "pass color_transfer=False"
+                )
         # storage-light mode omits the redundant input.png copy; the original
         # source path/SHA is already recorded upstream in the formal record.
         if save_input_copy:
             save_image(input_image, output_dir / "input.png")
+        if pre_inversion_rgb_mode:
+            save_image(pre_inversion_view_image, output_dir / "shifted_zero_padded.png")
 
         generator = self._make_generator(seed)
         inversion_prompt_embeds = self._encode_prompt(
@@ -249,97 +270,125 @@ class RavenPipeline:
             prompt_embeds=inversion_prompt_embeds,
             guidance_scale=guidance_scale,
         )
-        if (shift_x is None) != (shift_y is None):
-            raise ValueError("shift_x and shift_y must be provided together")
-        if shift_x is None:
-            dx, dy = sample_translation(
-                shift_min, shift_max, shift_sign, seed=seed, sampling=shift_sampling
+        if pre_inversion_rgb_mode:
+            if shift_x not in (None, 0, 0.0) or shift_y not in (None, 0, 0.0):
+                raise ValueError(
+                    "pre-inversion RGB-view mode forbids a second latent shift; "
+                    "leave shift_x/shift_y unset or zero"
+                )
+            view_inversion = partial_diffusion_inversion(
+                vae=self.pipe.vae,
+                scheduler=self.pipe.scheduler,
+                image=pre_inversion_view_image,
+                num_inference_steps=steps,
+                strength=strength,
+                generator=generator,
+                device=self.device,
+                dtype=self.dtype,
+                mode=inversion_mode,
+                unet=self.pipe.unet,
+                prompt_embeds=inversion_prompt_embeds,
+                guidance_scale=guidance_scale,
             )
-            shift_source = "sample_translation"
+            dx, dy = float(rgb_shift_dx), float(rgb_shift_dy)
+            shift_source = "pre_inversion_rgb_zero_padding"
+            inverse_sampling_warp = False
+            nfpa_warp_metadata = None
+            shifted_latents = view_inversion.noisy_latents
+            aligned_effective_flow = None
         else:
-            dx, dy = float(shift_x), float(shift_y)
-            shift_source = "explicit_plan"
-        inverse_sampling_modes = {
-            "nfpa_exact", "nfpa_pixel_center", "latent_grid_nearest_reflection", "latent_grid",
-            "raven_paper_nfpa_gap_fill", "raven_paper_nfpa_gap_fill_centered",
-        }
-        inverse_sampling_warp = warp_mode in inverse_sampling_modes
-        nfpa_warp_metadata = None
-        if warp_mode == "raven_paper_nfpa_gap_fill":
-            if shift_space != "image_pixels":
-                raise ValueError("raven_paper_nfpa_gap_fill requires image-space flow")
-            if padding_mode != "reflection":
-                raise ValueError("raven_paper_nfpa_gap_fill requires padding_mode='reflection'")
-            shifted_latents, nfpa_warp_metadata = raven_paper_nfpa_gap_fill_warp(
-                inversion.noisy_latents,
-                dx_image_px=float(dx),
-                dy_image_px=float(dy),
-                vae_scale_factor=self.vae_scale_factor,
-                sampling_mode=latent_sampling_mode or "nearest",
-                return_metadata=True,
+            view_inversion = None
+            if (shift_x is None) != (shift_y is None):
+                raise ValueError("shift_x and shift_y must be provided together")
+            if shift_x is None:
+                dx, dy = sample_translation(
+                    shift_min, shift_max, shift_sign, seed=seed, sampling=shift_sampling
+                )
+                shift_source = "sample_translation"
+            else:
+                dx, dy = float(shift_x), float(shift_y)
+                shift_source = "explicit_plan"
+            inverse_sampling_modes = {
+                "nfpa_exact", "nfpa_pixel_center", "latent_grid_nearest_reflection", "latent_grid",
+                "raven_paper_nfpa_gap_fill", "raven_paper_nfpa_gap_fill_centered",
+            }
+            inverse_sampling_warp = warp_mode in inverse_sampling_modes
+            nfpa_warp_metadata = None
+            if warp_mode == "raven_paper_nfpa_gap_fill":
+                if shift_space != "image_pixels":
+                    raise ValueError("raven_paper_nfpa_gap_fill requires image-space flow")
+                if padding_mode != "reflection":
+                    raise ValueError("raven_paper_nfpa_gap_fill requires padding_mode='reflection'")
+                shifted_latents, nfpa_warp_metadata = raven_paper_nfpa_gap_fill_warp(
+                    inversion.noisy_latents,
+                    dx_image_px=float(dx),
+                    dy_image_px=float(dy),
+                    vae_scale_factor=self.vae_scale_factor,
+                    sampling_mode=latent_sampling_mode or "nearest",
+                    return_metadata=True,
+                )
+            elif warp_mode == "raven_paper_nfpa_gap_fill_centered":
+                if shift_space != "image_pixels":
+                    raise ValueError("raven_paper_nfpa_gap_fill_centered requires image-space flow")
+                if padding_mode != "reflection":
+                    raise ValueError("raven_paper_nfpa_gap_fill_centered requires padding_mode='reflection'")
+                shifted_latents, nfpa_warp_metadata = raven_paper_nfpa_gap_fill_centered_warp(
+                    inversion.noisy_latents,
+                    dx_image_px=float(dx),
+                    dy_image_px=float(dy),
+                    vae_scale_factor=self.vae_scale_factor,
+                    sampling_mode=latent_sampling_mode or "nearest",
+                    return_metadata=True,
+                )
+            elif warp_mode in {"nfpa_exact", "nfpa_pixel_center"}:
+                if shift_space != "image_pixels":
+                    raise ValueError(f"{warp_mode} requires image-space flow")
+                nfpa_flow = create_nfpa_translation_flow(
+                    dx_image_px=float(dx),
+                    dy_image_px=float(dy),
+                    batch=inversion.noisy_latents.shape[0],
+                    height=inversion.noisy_latents.shape[-2] * self.vae_scale_factor,
+                    width=inversion.noisy_latents.shape[-1] * self.vae_scale_factor,
+                    device=inversion.noisy_latents.device,
+                    dtype=inversion.noisy_latents.dtype,
+                )
+                shifted_latents, nfpa_warp_metadata = nfpa_warp_single_latent(
+                    inversion.noisy_latents, nfpa_flow, return_metadata=True,
+                    pixel_center_offset=0.5 if warp_mode == "nfpa_pixel_center" else 0.0,
+                )
+            elif warp_mode == "latent_grid_nearest_reflection":
+                if shift_space != "image_pixels":
+                    raise ValueError("latent_grid_nearest_reflection requires image-space shifts")
+                shifted_latents, nfpa_warp_metadata = latent_grid_warp_nearest_reflection(
+                    inversion.noisy_latents, float(dx), float(dy),
+                    vae_scale_factor=self.vae_scale_factor, return_metadata=True,
+                )
+            elif warp_mode == "latent_grid":
+                if shift_space != "image_pixels":
+                    raise ValueError("latent_grid requires image-space shifts")
+                shifted_latents, nfpa_warp_metadata = latent_grid_warp(
+                    inversion.noisy_latents, float(dx), float(dy),
+                    vae_scale_factor=self.vae_scale_factor,
+                    sampling_mode=latent_sampling_mode or "nearest",
+                    padding_mode=padding_mode,
+                    return_metadata=True,
+                )
+            else:
+                shifted_latents = translate_latent(
+                    inversion.noisy_latents,
+                    dx=dx,
+                    dy=dy,
+                    shift_space=shift_space,
+                    vae_scale_factor=self.vae_scale_factor,
+                    padding_mode=padding_mode,
+                    warp_mode=warp_mode,
+                )
+            aligned_effective_flow = (
+                require_effective_source_flow(nfpa_warp_metadata)
+                if color_transfer
+                else None
             )
-        elif warp_mode == "raven_paper_nfpa_gap_fill_centered":
-            if shift_space != "image_pixels":
-                raise ValueError("raven_paper_nfpa_gap_fill_centered requires image-space flow")
-            if padding_mode != "reflection":
-                raise ValueError("raven_paper_nfpa_gap_fill_centered requires padding_mode='reflection'")
-            shifted_latents, nfpa_warp_metadata = raven_paper_nfpa_gap_fill_centered_warp(
-                inversion.noisy_latents,
-                dx_image_px=float(dx),
-                dy_image_px=float(dy),
-                vae_scale_factor=self.vae_scale_factor,
-                sampling_mode=latent_sampling_mode or "nearest",
-                return_metadata=True,
-            )
-        elif warp_mode in {"nfpa_exact", "nfpa_pixel_center"}:
-            if shift_space != "image_pixels":
-                raise ValueError(f"{warp_mode} requires image-space flow")
-            nfpa_flow = create_nfpa_translation_flow(
-                dx_image_px=float(dx),
-                dy_image_px=float(dy),
-                batch=inversion.noisy_latents.shape[0],
-                height=inversion.noisy_latents.shape[-2] * self.vae_scale_factor,
-                width=inversion.noisy_latents.shape[-1] * self.vae_scale_factor,
-                device=inversion.noisy_latents.device,
-                dtype=inversion.noisy_latents.dtype,
-            )
-            shifted_latents, nfpa_warp_metadata = nfpa_warp_single_latent(
-                inversion.noisy_latents, nfpa_flow, return_metadata=True,
-                pixel_center_offset=0.5 if warp_mode == "nfpa_pixel_center" else 0.0,
-            )
-        elif warp_mode == "latent_grid_nearest_reflection":
-            if shift_space != "image_pixels":
-                raise ValueError("latent_grid_nearest_reflection requires image-space shifts")
-            shifted_latents, nfpa_warp_metadata = latent_grid_warp_nearest_reflection(
-                inversion.noisy_latents, float(dx), float(dy),
-                vae_scale_factor=self.vae_scale_factor, return_metadata=True,
-            )
-        elif warp_mode == "latent_grid":
-            if shift_space != "image_pixels":
-                raise ValueError("latent_grid requires image-space shifts")
-            shifted_latents, nfpa_warp_metadata = latent_grid_warp(
-                inversion.noisy_latents, float(dx), float(dy),
-                vae_scale_factor=self.vae_scale_factor,
-                sampling_mode=latent_sampling_mode or "nearest",
-                padding_mode=padding_mode,
-                return_metadata=True,
-            )
-        else:
-            shifted_latents = translate_latent(
-                inversion.noisy_latents,
-                dx=dx,
-                dy=dy,
-                shift_space=shift_space,
-                vae_scale_factor=self.vae_scale_factor,
-                padding_mode=padding_mode,
-                warp_mode=warp_mode,
-            )
-        aligned_effective_flow = (
-            require_effective_source_flow(nfpa_warp_metadata)
-            if color_transfer
-            else None
-        )
-        if debug:
+        if debug and not pre_inversion_rgb_mode:
             save_image(self._decode_latents(shifted_latents), output_dir / "latent_shift_only.png")
 
         latents = torch.cat([inversion.noisy_latents, shifted_latents], dim=0)
@@ -501,6 +550,42 @@ class RavenPipeline:
                 "paper_exact_two_stage_aligned" if color_transfer else "none"
             ),
         }
+        if pre_inversion_rgb_mode:
+            debug_info.update({
+                "transform_stage": "pre_inversion_rgb",
+                "shift_domain": "rgb_pixel_space",
+                "padding_mode": "zeros",
+                "padding_value_rgb": [0, 0, 0],
+                "circular": False,
+                "reflection": False,
+                "latent_shift": False,
+                "rgb_shift_dx": int(rgb_shift_dx),
+                "rgb_shift_dy": int(rgb_shift_dy),
+                "reference_branch": {
+                    "source": "original_rgb_input",
+                    "inversion": "independent_ddim_inversion",
+                    "latent_shape": list(inversion.noisy_latents.shape),
+                },
+                "view_branch": {
+                    "source": "shifted_zero_padded_rgb_input",
+                    "inversion": "independent_ddim_inversion",
+                    "latent_shape": list(view_inversion.noisy_latents.shape),
+                },
+                "latent_pair_order": ["reference_original", "view_shifted_rgb"],
+                "view_latent_source": (
+                    "ddim_inversion_of_shifted_zero_padded_rgb; "
+                    "not a translated reference latent"
+                ),
+                "color_transfer": False,
+                "color_transfer_mode": "none",
+                "transform_setting_name": "rgb_zero_padding_pre_inversion",
+                "implementation_classification": (
+                    "rgb_pixel_translation_before_independent_ddim_inversions"
+                ),
+                "interpolation_mode": "none",
+                "align_corners": None,
+                "normalized_coordinate_formula": None,
+            })
         planned_dx = dx if shift_space == "image_pixels" else float(dx) * self.vae_scale_factor
         planned_dy = dy if shift_space == "image_pixels" else float(dy) * self.vae_scale_factor
         debug_info.update({
@@ -539,6 +624,31 @@ class RavenPipeline:
                 )
             ),
         })
+        if pre_inversion_rgb_mode:
+            debug_info.update({
+                "latent_dx": None,
+                "latent_dy": None,
+                "flow_dx_image_px": None,
+                "flow_dy_image_px": None,
+                "image_dx": float(rgb_shift_dx),
+                "image_dy": float(rgb_shift_dy),
+                "visual_shift_dx_image_px": float(rgb_shift_dx),
+                "visual_shift_dy_image_px": float(rgb_shift_dy),
+                "visual_dx_image_px": float(rgb_shift_dx),
+                "visual_dy_image_px": float(rgb_shift_dy),
+                # The canonical legacy hash requires numeric latent-flow
+                # fields.  Zero means no latent warp occurred; the actual RGB
+                # transform is recorded separately in rgb_shift_{dx,dy}.
+                "legacy_latent_flow_fields": "0.0 (no latent shift)",
+                "planned_flow_dx_image_px": 0.0,
+                "planned_flow_dy_image_px": 0.0,
+                "effective_source_dx_latent": None,
+                "effective_source_dy_latent": None,
+                "effective_source_flow_dx_image_px": 0.0,
+                "effective_source_flow_dy_image_px": 0.0,
+                "effective_visual_shift_dx_image_px": float(rgb_shift_dx),
+                "effective_visual_shift_dy_image_px": float(rgb_shift_dy),
+            })
 
 
         debug_info["transform_config_hash"] = canonical_json_hash(
