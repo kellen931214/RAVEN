@@ -14,8 +14,10 @@ from utils.wm import sfw_bundle, sfw_runtime
 from utils.wm.sfw_bundle import SfwBundle, SfwBundleError
 from utils.wm.hstr_provider import (
     HSTR_SCORE_DEFINITION,
+    HSTR_TR_ONLY_SCORE_DEFINITION,
     OFFICIAL_BASE_KEY_SEED,
     OFFICIAL_HSTR_PROFILE,
+    OFFICIAL_MATH_TR_ONLY_PROFILE,
     HSTRProvider,
     apply_arg_defaults,
 )
@@ -150,6 +152,113 @@ class ParserProfileTests(unittest.TestCase):
         self.assertEqual(args.modelid_target, "stabilityai/stable-diffusion-2-1-base")
         self.assertEqual(args.scheduler_target, "DDIM")
         self.assertEqual(args.resolution, 512)
+
+
+class TrOnlyAblationTests(unittest.TestCase):
+    def tr_provider(self, **overrides):
+        return HSTRProvider(**provider_kwargs(
+            hstr_profile=OFFICIAL_MATH_TR_ONLY_PROFILE,
+            **overrides,
+        ))
+
+    def test_official_math_tr_only_injects_only_channel_3_and_scores_only_channel_3(self):
+        provider = self.tr_provider(hstr_key_index=3)
+        official = HSTRProvider(**provider_kwargs(hstr_key_index=3))
+        self.assertTrue(torch.equal(provider.gt_patch[:, 3], official.gt_patch[:, 3]))
+        self.assertTrue(provider.uses_official_math)
+        self.assertEqual(provider.provider_config()["watermark_channels"], [3])
+        self.assertEqual(provider.provider_config()["heterogeneous_channels"], [])
+        self.assertEqual(provider.provider_config()["pattern_variant"], "tr_only")
+        self.assertEqual(provider.provider_config()["score_mode"], "center_channel_3_complex_l1")
+        self.assertFalse(provider.masks[:, 0].any())
+        self.assertTrue(provider.masks[:, 3].any())
+        self.assertEqual(tuple(provider.watermark_region_mask_hstr.shape), (1, 64, 64))
+
+        clean = provider.sample_base_latent(123)
+        watermarked = provider.get_wm_latents(latents_clean=clean)["zT_torch"]
+        self.assertTrue(torch.equal(clean[:, 0], watermarked[:, 0]))
+        self.assertFalse(torch.equal(clean[:, 3], watermarked[:, 3]))
+        scores = provider.get_accuracies(watermarked)
+        self.assertEqual(scores["hstr_channel_0_l1"], [None])
+        self.assertEqual(scores["hstr_channel_min_l1"], [None])
+        self.assertEqual(scores["score_definition"], HSTR_TR_ONLY_SCORE_DEFINITION)
+        self.assertEqual(scores["hstr_score"], [-scores["hstr_channel_3_l1"][0]])
+
+    def test_tr_only_bundle_and_threshold_are_not_interchangeable_with_official_hstr(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            official = HSTRProvider(**provider_kwargs(hstr_bundle_dir=str(root / "official"), hstr_create_bundle=True))
+            tr_only = self.tr_provider(hstr_bundle_dir=str(root / "tr_only"), hstr_create_bundle=True)
+            self.assertNotEqual(official.provider_config_sha256(), tr_only.provider_config_sha256())
+            with self.assertRaises(SfwBundleError):
+                self.tr_provider(hstr_bundle_dir=str(root / "official"))
+            with self.assertRaises(SfwBundleError):
+                HSTRProvider(**provider_kwargs(hstr_bundle_dir=str(root / "tr_only")))
+
+            official_threshold = sfw_bundle.build_threshold_artifact(
+                threshold=-0.5,
+                binding=official.binding_config(),
+                score_definition=HSTR_SCORE_DEFINITION,
+                report_label="calibrated_deployment_verification",
+                method="HSTR",
+                threshold_source="cohort_calibration",
+            )
+            tr_threshold = sfw_bundle.build_threshold_artifact(
+                threshold=-0.5,
+                binding=tr_only.binding_config(),
+                score_definition=HSTR_TR_ONLY_SCORE_DEFINITION,
+                report_label="calibrated_deployment_verification",
+                method="HSTR",
+                threshold_source="cohort_calibration",
+            )
+            with self.assertRaises(SfwBundleError):
+                sfw_bundle.assert_threshold_compatible(official_threshold, tr_only.binding_config())
+            with self.assertRaises(SfwBundleError):
+                sfw_bundle.assert_threshold_compatible(tr_threshold, official.binding_config())
+
+    def test_tr_only_profile_gets_official_math_defaults_and_ablation_labels(self):
+        import run_watermark
+
+        argv = ["--wm_type", "HSTR", "--hstr_profile", OFFICIAL_MATH_TR_ONLY_PROFILE]
+        args = run_watermark.build_parser().parse_args(argv)
+        args.modelid_target = "stabilityai/stable-diffusion-xl-base-1.0"
+        args.scheduler_target = "DPM"
+        args.resolution = 1024
+        apply_arg_defaults(args, argv)
+        self.assertEqual(args.modelid_target, "stabilityai/stable-diffusion-2-1-base")
+        self.assertEqual(args.scheduler_target, "DDIM")
+        self.assertEqual(args.resolution, 512)
+        provider = self.tr_provider()
+        self.assertEqual(provider.generation_report_label, "legacy_or_ablation_mode")
+        self.assertEqual(provider.generation_protocol, "hstr_tr_only_sfwmark_ablation_paired_direct_generation")
+
+
+class VerificationModeTests(unittest.TestCase):
+    def test_calibrate_eval_requires_verified_pairing_unless_explicitly_allowed(self):
+        import run_verify_watermark
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            positives = root / "positives"
+            negatives = root / "negatives"
+            positives.mkdir(); negatives.mkdir()
+            Image.new("RGB", (8, 8), "red").save(positives / "000000.png")
+            Image.new("RGB", (8, 8), "blue").save(negatives / "000000.png")
+            argv = [
+                "--wm_type", "HSTR", "--mode", "calibrate_eval",
+                "--positive_path", str(positives), "--negative_path", str(negatives),
+            ]
+            args = run_verify_watermark.build_parser().parse_args(argv)
+            with self.assertRaisesRegex(SystemExit, "requires a verified one-to-one paired cohort"):
+                run_verify_watermark._resolve_inputs_hstr(args)
+            args.allow_unmatched_cohorts = True
+            self.assertFalse(run_verify_watermark._resolve_inputs_hstr(args)["pairing"]["paired"])
+
+    def test_gm_rejects_calibrate_eval_before_bundle_or_model_work(self):
+        import run_verify_watermark
+
+        with self.assertRaisesRegex(SystemExit, "supported only for --wm_type HSTR"):
+            run_verify_watermark.main_gm(["--wm_type", "GM", "--mode", "calibrate_eval"])
 
 
 if __name__ == "__main__":

@@ -1657,31 +1657,42 @@ def aggregate(detector_rows: list[dict[str, Any]], **extra) -> dict[str, Any]:
                     )
                     result["gs_official_detection_summary_status"] = "available"
                     result["gs_official_detection_summary"] = official_summary
-
-    # ---- 3.2 empirical clean-calibrated summary ----
-    clean = cohorts.get("original_clean", [])
-    watermarked = cohorts.get("original_watermarked", [])
-    attacked = cohorts.get("attacked_watermarked", [])
-
-    if clean and watermarked and attacked:
-        summary = summarize_detection(clean, watermarked, attacked,
-                                      target_fpr=0.01)
-        empirical: dict[str, Any] = {
-            "target_fpr": 0.01,
-            "threshold_source": "current_original_clean_cohort",
-            "calibrated_from_current_clean_negatives": True,
-            "clean_calibrated_threshold": summary.calibration.threshold,
-            "clean_calibrated_actual_fpr": summary.calibration.actual_fpr,
-            "original_watermarked_tpr": summary.watermarked_tpr,
-            "attacked_watermarked_tpr": summary.attacked_tpr,
-            "attack_success": 1.0 - summary.attacked_tpr,
-        }
-        result["clean_calibrated_1pct_fpr_summary"] = empirical
-        # ---- 3.3 backward-compat alias — empirical only, never official ----
-        # Machine-readable deprecation markers; never misread as GS official
-        # policy.
-        result["detection_summary"] = dict(empirical)
-        result["detection_summary_alias_of"] = "clean_calibrated_1pct_fpr_summary"
-        result["detection_summary_deprecated"] = True
+                    result["official_summary"] = {
+                        "method": "GS",
+                        "protocol": "official_beta_tail",
+                        "score_definition": "bit_accuracy",
+                        "threshold_source": "official beta/binomial tail",
+                        "target_fpr": official_summary["nominal_fpr"],
+                        "actual_fpr": official_summary["original_clean_positive_rate"],
+                        "threshold": official_summary["threshold"],
+                        "comparison_operator": official_summary["comparison_operator"],
+                        "calibrated_from_current_clean_negatives": False,
+                        "original_watermarked_tpr": official_summary["original_watermarked_detection_rate"],
+                        "attacked_watermarked_tpr": official_summary["attacked_watermarked_detection_rate"],
+                        "attack_success_rate": official_summary["attack_success"],
+                        "num_clean": len(cohorts.get("original_clean", [])),
+                        "num_watermarked": len(cohorts.get("original_watermarked", [])),
+                        "num_attacked": len(cohorts.get("attacked_watermarked", [])),
+                    }
+                    traceability = {
+                        "protocol": "official_beta_tail",
+                        "score_definition": "bit_accuracy",
+                        "threshold_source": "official beta/binomial tail (tau_bits)",
+                        "threshold": first["gs_official_tau_bits"],
+                        "comparison_operator": ">=",
+                        "supplementary_only": True,
+                    }
+                    for cohort, label in (
+                        ("original_watermarked", "original_watermarked_tpr"),
+                        ("attacked_watermarked", "attacked_watermarked_tpr"),
+                    ):
+                        values = [float(r["bit_accuracy"]) for r in complete
+                                  if r.get("evaluation_cohort") == cohort]
+                        traceability[label] = (
+                            None if not values else sum(
+                                value >= traceability["threshold"] for value in values
+                            ) / len(values)
+                        )
+                    result["official_traceability"] = traceability
 
     return result

@@ -73,10 +73,50 @@ def gm_provider_kwargs(row: dict[str, str], identifier: str) -> dict:
     import math as _math
 
     bundle_dir, manifest = gm_bundle_manifest(row, identifier)
-    if manifest.get("gnr_sha256") is not None or manifest.get("classifier_sha256") is not None:
+    # The release GNR/classifier are detector artifacts, not regenerated
+    # watermark state. Do not silently degrade official GM to raw bits.
+    repo_root = Path(__file__).resolve().parents[3]
+    gnr_path = repo_root / "eval_bench_wm" / "GM_utils" / "GNR_bits256" / "model_final.pth"
+    classifier_path = repo_root / "eval_bench_wm" / "GM_utils" / "sd21_cls2.pkl"
+    missing = [str(path) for path in (gnr_path, classifier_path) if not path.is_file()]
+    if missing:
+        raise FileNotFoundError(
+            f"run_id={identifier}: official GaussMarker ensemble artifacts missing: "
+            + ", ".join(missing)
+            + ". Required detector: inversion -> GNR restored bits and "
+              "Tree-Ring complex L1 -> sd21_cls2.pkl classifier probability; "
+              "gm_raw_bit_accuracy is not a fallback."
+        )
+    binding_path = gnr_path.parent / "artifact_binding.json"
+    if not binding_path.is_file():
+        raise FileNotFoundError(
+            f"run_id={identifier}: official GaussMarker GNR binding manifest missing: "
+            f"{binding_path}. A pretrained GNR must be bound to its w1/m/w2 state; "
+            "raw-bit fallback is forbidden."
+        )
+    try:
+        binding = json.loads(binding_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
         raise RuntimeError(
-            f"run_id={identifier}: GM bundle declares GNR/classifier artifacts; "
-            "ensemble-score detection is not wired up for this cohort"
+            f"run_id={identifier}: unreadable GaussMarker GNR binding manifest "
+            f"{binding_path}: {exc}"
+        ) from exc
+    if str(binding.get("model_final_sha256", "")) != _sha256(gnr_path):
+        raise RuntimeError(
+            f"run_id={identifier}: GNR checkpoint SHA256 does not match its binding manifest"
+        )
+    if str(binding.get("classifier_sha256", "")) != _sha256(classifier_path):
+        raise RuntimeError(
+            f"run_id={identifier}: classifier SHA256 does not match its GNR binding manifest"
+        )
+    mismatches = [
+        field for field in ("watermark_sha256", "m_sha256", "w2_tensor_sha256")
+        if str(manifest.get(field, "")) != str(binding.get(field, ""))
+    ]
+    if mismatches:
+        raise RuntimeError(
+            f"run_id={identifier}: pretrained GNR watermark-state mismatch for {mismatches}; "
+            "do not apply this checkpoint to the current cohort or fall back to raw bits."
         )
 
     def _require_str(key: str) -> str:
@@ -146,14 +186,17 @@ def gm_provider_kwargs(row: dict[str, str], identifier: str) -> dict:
         "gm_w_copy": _require_int("w_copy"),
         "gm_h_copy": _require_int("h_copy"),
         "gm_watermark_bits_seed": _optional_strict_int("watermark_bits_seed"),
-        "gm_use_gnr": False,
-        "gm_gnr_path": None,
+        "gm_use_gnr": True,
+        "gm_gnr_path": str(gnr_path),
         "gm_model_nf": _require_int("model_nf"),
         "gm_classifier_type": _require_int("classifier_type"),
-        "gm_use_classifier": False,
-        "gm_classifier_path": None,
+        "gm_use_classifier": True,
+        "gm_classifier_path": str(classifier_path),
         "modelid_target": _require_str("model_id"),
-        "model_revision": _require_str("model_revision"),
+        # Official SD 2.1 Base is loaded at the repository default revision;
+        # ``None`` must remain None so PipeProvider omits the ``revision``
+        # keyword rather than coercing it to the invalid string "None".
+        "model_revision": (None if manifest.get("model_revision") is None else _require_str("model_revision")),
         "scheduler_target": _require_str("scheduler"),
         "resolution": _require_int("resolution"),
         "gm_inversion_guidance": inversion_guidance_val,
@@ -315,9 +358,12 @@ def raw_score(method: str, result: dict) -> float:
     if method in {"RID", "HSTR", "HSQR"}:
         return float(result["l1_dist"][0])
     if method == "GM":
-        value = result.get("gm_raw_bit_accuracy")
+        value = result.get("gm_classifier_probability")
         if value is None:
-            raise RuntimeError("GM detector returned no gm_raw_bit_accuracy")
+            raise RuntimeError(
+                "GM detector returned no gm_classifier_probability; official "
+                "GaussMarker evaluation does not fall back to raw bit accuracy"
+            )
         return float(value)
     if method == "T2S":
         return float(result["t2s_score_true_key"])

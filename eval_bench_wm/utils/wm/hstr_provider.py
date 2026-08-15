@@ -14,21 +14,26 @@ from utils import utils
 
 
 OFFICIAL_HSTR_PROFILE = "official_sfwmark_sd21"
+OFFICIAL_MATH_TR_ONLY_PROFILE = "official_math_tr_only"
+OFFICIAL_MATH_RID_ONLY_PROFILE = "official_math_rid_only"
 LEGACY_HSTR_PROFILE = "legacy_raven"
 SHARED_TR_CLEAN_HSTR_PROFILE = "official_math_shared_tr_clean"
 OFFICIAL_BASE_KEY_SEED = 7433
 OFFICIAL_MODEL_ID = "stabilityai/stable-diffusion-2-1-base"
+LOCAL_SD21_MIRROR_MODEL_ID = "RedbeardNZ/stable-diffusion-2-1-base"
 OFFICIAL_SCHEDULER = "DDIM"
 OFFICIAL_RESOLUTION = 512
 OFFICIAL_STEPS = 50
 OFFICIAL_GUIDANCE_SCALE = 7.5
 HSTR_SCORE_DEFINITION = "hstr_score=-min(channel_0_l1,channel_3_l1)"
+HSTR_TR_ONLY_SCORE_DEFINITION = "hstr_tr_only_score=-channel_3_l1"
+HSTR_RID_ONLY_SCORE_DEFINITION = "hstr_rid_only_score=-channel_0_l1"
 HSTR_SCORE_DIRECTION = "higher_is_watermarked"
 HSTR_SHARED_TR_CLEAN_MODE = "official_math_shared_tr_clean"
 
 parser = argparse.ArgumentParser(add_help=False)
 parser.add_argument("--hstr_seed", default=None, type=int)
-parser.add_argument("--hstr_profile", default=LEGACY_HSTR_PROFILE, choices=[LEGACY_HSTR_PROFILE, OFFICIAL_HSTR_PROFILE, SHARED_TR_CLEAN_HSTR_PROFILE])
+parser.add_argument("--hstr_profile", default=LEGACY_HSTR_PROFILE, choices=[LEGACY_HSTR_PROFILE, OFFICIAL_HSTR_PROFILE, OFFICIAL_MATH_TR_ONLY_PROFILE, OFFICIAL_MATH_RID_ONLY_PROFILE, SHARED_TR_CLEAN_HSTR_PROFILE])
 parser.add_argument("--hstr_key_index", default=1, type=int)
 parser.add_argument("--hstr_bundle_dir", default=None, type=str)
 parser.add_argument("--hstr_create_bundle", action="store_true", default=False)
@@ -74,7 +79,7 @@ class HSTRProvider(WmProvider):
         **kwargs,
     ):
         super().__init__(**kwargs)
-        if hstr_profile not in (LEGACY_HSTR_PROFILE, OFFICIAL_HSTR_PROFILE, SHARED_TR_CLEAN_HSTR_PROFILE, HSTR_SHARED_TR_CLEAN_MODE):
+        if hstr_profile not in (LEGACY_HSTR_PROFILE, OFFICIAL_HSTR_PROFILE, OFFICIAL_MATH_TR_ONLY_PROFILE, OFFICIAL_MATH_RID_ONLY_PROFILE, SHARED_TR_CLEAN_HSTR_PROFILE, HSTR_SHARED_TR_CLEAN_MODE):
             raise ValueError(f"unknown HSTR profile {hstr_profile!r}")
         if wm_capacity != 2048:
             raise ValueError("official HSTR wm_capacity must be 2048")
@@ -83,7 +88,13 @@ class HSTRProvider(WmProvider):
         self.shape = (1, latent_channel, hw_latent, hw_latent)
         self.hstr_seed = hstr_seed
         self.wm_capacity = int(wm_capacity)
-        self.uses_official_math = self.profile in (OFFICIAL_HSTR_PROFILE, SHARED_TR_CLEAN_HSTR_PROFILE, HSTR_SHARED_TR_CLEAN_MODE)
+        self.uses_official_math = self.profile in (
+            OFFICIAL_HSTR_PROFILE,
+            OFFICIAL_MATH_TR_ONLY_PROFILE,
+            OFFICIAL_MATH_RID_ONLY_PROFILE,
+            SHARED_TR_CLEAN_HSTR_PROFILE,
+            HSTR_SHARED_TR_CLEAN_MODE,
+        )
         self.base_key_seed = OFFICIAL_BASE_KEY_SEED if self.uses_official_math else (999999 if hstr_seed is None else int(hstr_seed))
         self.hstr_seed_list = list(range(self.base_key_seed, self.base_key_seed + self.wm_capacity))
         self.fix_gt = int(fix_gt)
@@ -103,7 +114,7 @@ class HSTRProvider(WmProvider):
         self.start = int(start)
         self.end = int(end)
         self.center_slice = (slice(None), slice(None), slice(self.start, self.end), slice(self.start, self.end))
-        if self.profile == OFFICIAL_HSTR_PROFILE:
+        if self.profile in (OFFICIAL_HSTR_PROFILE, OFFICIAL_MATH_TR_ONLY_PROFILE, OFFICIAL_MATH_RID_ONLY_PROFILE):
             self._validate_official_profile()
         elif self.profile == SHARED_TR_CLEAN_HSTR_PROFILE:
             self._validate_shared_clean_profile()
@@ -147,7 +158,11 @@ class HSTRProvider(WmProvider):
     @classmethod
     def apply_arg_defaults(cls, args, argv=None):
         argv = list(argv or [])
-        if getattr(args, "hstr_profile", LEGACY_HSTR_PROFILE) != OFFICIAL_HSTR_PROFILE:
+        if getattr(args, "hstr_profile", LEGACY_HSTR_PROFILE) not in (
+            OFFICIAL_HSTR_PROFILE,
+            OFFICIAL_MATH_TR_ONLY_PROFILE,
+            OFFICIAL_MATH_RID_ONLY_PROFILE,
+        ):
             return {"profile": getattr(args, "hstr_profile", LEGACY_HSTR_PROFILE), "overrides": {}}
         explicit = {item for item in argv if item.startswith("--")}
         defaults = {
@@ -165,6 +180,12 @@ class HSTRProvider(WmProvider):
                 applied["overrides"][field] = getattr(args, field, None)
         return applied
 
+
+
+    @property
+    def uses_local_mirror_weights(self) -> bool:
+        return self.is_ablation and self.model_id == LOCAL_SD21_MIRROR_MODEL_ID
+
     def _validate_official_profile(self) -> None:
         if tuple(self.latent_shape) != (1, 4, 64, 64):
             raise ValueError(f"{OFFICIAL_HSTR_PROFILE} requires latent_shape=(1,4,64,64), got {tuple(self.latent_shape)}")
@@ -172,8 +193,13 @@ class HSTRProvider(WmProvider):
             raise ValueError(f"{OFFICIAL_HSTR_PROFILE} requires shape=(1,4,64,64), got {self.shape}")
         if self.start != 10 or self.end != 54:
             raise ValueError(f"{OFFICIAL_HSTR_PROFILE} requires center slice 10:54")
-        if self.model_id not in (None, OFFICIAL_MODEL_ID):
-            raise ValueError(f"{OFFICIAL_HSTR_PROFILE} requires model {OFFICIAL_MODEL_ID}")
+        allowed_model_ids = {OFFICIAL_MODEL_ID}
+        if self.is_ablation:
+            allowed_model_ids.add(LOCAL_SD21_MIRROR_MODEL_ID)
+        if self.model_id is not None and self.model_id not in allowed_model_ids:
+            raise ValueError(
+                f"{self.profile} requires model one of {sorted(allowed_model_ids)!r}, got {self.model_id!r}"
+            )
         if self.scheduler_type not in (None, OFFICIAL_SCHEDULER):
             raise ValueError(f"{OFFICIAL_HSTR_PROFILE} requires scheduler {OFFICIAL_SCHEDULER}")
         if self.resolution != OFFICIAL_RESOLUTION:
@@ -197,8 +223,86 @@ class HSTRProvider(WmProvider):
     def get_wm_type(self) -> str:
         return "HSTR"
 
-    def provider_config(self) -> dict[str, typing.Any]:
+    @property
+    def is_tr_only(self) -> bool:
+        return self.profile == OFFICIAL_MATH_TR_ONLY_PROFILE
+
+    @property
+    def is_rid_only(self) -> bool:
+        return self.profile == OFFICIAL_MATH_RID_ONLY_PROFILE
+
+    @property
+    def is_ablation(self) -> bool:
+        return self.is_tr_only or self.is_rid_only
+
+    @property
+    def watermark_channels(self) -> list[int]:
+        if self.is_rid_only:
+            return list(HETER_WATERMARK_CHANNEL)
+        return list(TREE_WATERMARK_CHANNEL)
+
+    @property
+    def heterogeneous_channels(self) -> list[int]:
+        return [] if self.is_tr_only else list(HETER_WATERMARK_CHANNEL)
+
+    @property
+    def pattern_variant(self) -> str:
+        if self.is_tr_only:
+            return "tr_only"
+        if self.is_rid_only:
+            return "rid_only"
+        return "official_hstr"
+
+    @property
+    def score_mode(self) -> str:
+        if self.is_tr_only:
+            return "center_channel_3_complex_l1"
+        if self.is_rid_only:
+            return "center_channel_0_complex_l1"
+        return "center_channel_min_complex_l1"
+
+    @property
+    def score_definition(self) -> str:
+        if self.is_tr_only:
+            return HSTR_TR_ONLY_SCORE_DEFINITION
+        if self.is_rid_only:
+            return HSTR_RID_ONLY_SCORE_DEFINITION
+        return HSTR_SCORE_DEFINITION
+
+    @property
+    def generation_report_label(self) -> str:
+        return "legacy_or_ablation_mode" if self.is_ablation else "official_profile_raw_scores"
+
+    @property
+    def generation_protocol(self) -> str:
+        if self.is_tr_only:
+            return "hstr_tr_only_sfwmark_ablation_paired_direct_generation"
+        if self.is_rid_only:
+            return "hstr_rid_only_sfwmark_ablation_paired_direct_generation"
+        return "hstr_official_sfwmark_paired_direct_generation"
+
+    def profile_provenance(self) -> dict[str, typing.Any]:
+        """Explicit ablation semantics added to manifests and reports.
+
+        The official profile deliberately retains its existing output contract.
+        """
+        if not self.is_ablation:
+            return {}
         return {
+            "method": "HSTR",
+            "profile_name": self.profile,
+            "watermark_channels": self.watermark_channels,
+            "heterogeneous_channels": self.heterogeneous_channels,
+            "pattern_variant": self.pattern_variant,
+            "score_mode": self.score_mode,
+            "official_model_id": OFFICIAL_MODEL_ID,
+            "model_weights_status": (
+                "mirror_non_official" if self.uses_local_mirror_weights else "official_weights_requested"
+            ),
+        }
+
+    def provider_config(self) -> dict[str, typing.Any]:
+        config = {
             "schema": sfw_bundle.SFW_BUNDLE_SCHEMA,
             "method": "HSTR",
             "profile_name": self.profile,
@@ -211,8 +315,8 @@ class HSTRProvider(WmProvider):
             "center_slice": [int(self.start), int(self.end)],
             "radius": int(RADIUS),
             "radius_cutoff": int(RADIUS_CUTOFF),
-            "watermark_channels": [int(x) for x in TREE_WATERMARK_CHANNEL],
-            "heterogeneous_channels": [int(x) for x in HETER_WATERMARK_CHANNEL],
+            "watermark_channels": self.watermark_channels,
+            "heterogeneous_channels": self.heterogeneous_channels,
             "wm_capacity": int(self.wm_capacity),
             "base_key_seed": int(self.base_key_seed),
             "selected_key_index": int(self.key_index),
@@ -226,13 +330,23 @@ class HSTRProvider(WmProvider):
             "injection_configuration": {
                 "center": True,
                 "cut_real": False,
-                "score_mode": "center_channel_min_complex_l1",
+                "score_mode": self.score_mode,
             },
             "inversion_prompt_sha256": sfw_bundle.sha256_text(self.inversion_prompt),
             "inversion_guidance_scale": float(self.inversion_guidance),
             "inversion_steps": int(self.inversion_steps),
             "vae_sample": False,
         }
+        if self.is_ablation:
+            config.update({
+                "pattern_variant": self.pattern_variant,
+                "score_mode": self.score_mode,
+                "official_model_id": OFFICIAL_MODEL_ID,
+                "model_weights_status": (
+                    "mirror_non_official" if self.uses_local_mirror_weights else "official_weights_requested"
+                ),
+            })
+        return config
 
     def provider_config_sha256(self) -> str:
         return sfw_bundle.canonical_sha256(self.provider_config())
@@ -251,7 +365,7 @@ class HSTRProvider(WmProvider):
     def sample_base_latent(self, sample_seed: int | None = None) -> torch.Tensor:
         if sample_seed is None:
             sample_seed = self.base_key_seed
-        if self.profile == OFFICIAL_HSTR_PROFILE:
+        if self.profile in (OFFICIAL_HSTR_PROFILE, OFFICIAL_MATH_TR_ONLY_PROFILE, OFFICIAL_MATH_RID_ONLY_PROFILE):
             device = torch.device(self.rng_device)
             generator = torch.Generator(device=device).manual_seed(int(sample_seed))
             return torch.randn(tuple(self.latent_shape), generator=generator, device=device, dtype=self.dtype).to(self.device)
@@ -259,7 +373,7 @@ class HSTRProvider(WmProvider):
         return torch.randn(tuple(self.latent_shape), generator=generator, dtype=torch.float32).to(self.device, self.dtype)
 
     def get_wm_latents(self, latents_clean: torch.Tensor = None, seed: int = None) -> dict[str, typing.Any]:
-        if seed is not None and self.profile != OFFICIAL_HSTR_PROFILE:
+        if seed is not None and self.profile not in (OFFICIAL_HSTR_PROFILE, OFFICIAL_MATH_TR_ONLY_PROFILE):
             utils.set_random_seed(seed)
         if latents_clean is None:
             latents_clean = self.sample_base_latent(seed)
@@ -355,23 +469,34 @@ class HSTRProvider(WmProvider):
         results = self.__get_l1_distance(
             reversed_latents_w=latents,
             mask=self.watermark_region_mask_hstr,
-            channel=RINGID_WATERMARK_CHANNEL,
+            channel=self.watermark_channels if self.is_ablation else RINGID_WATERMARK_CHANNEL,
             p=1,
             mode="complex",
-            channel_min=True,
+            channel_min=not self.is_ablation,
             center=True,
         )
         items = results["items"]
         l1_dist = [item["l1_dist"] for item in items]
         scores = [-float(value) for value in l1_dist]
+        channel_0_l1 = (
+            l1_dist if self.is_rid_only else
+            [None for _ in items] if self.is_tr_only else
+            [item["hstr_channel_0_l1"] for item in items]
+        )
+        channel_3_l1 = (
+            l1_dist if self.is_tr_only else
+            [None for _ in items] if self.is_rid_only else
+            [item["hstr_channel_3_l1"] for item in items]
+        )
+        channel_min_l1 = [None for _ in items] if self.is_ablation else l1_dist
         return {
             "l1_dist": l1_dist,
-            "hstr_channel_0_l1": [item["hstr_channel_0_l1"] for item in items],
-            "hstr_channel_3_l1": [item["hstr_channel_3_l1"] for item in items],
-            "hstr_channel_min_l1": l1_dist,
+            "hstr_channel_0_l1": channel_0_l1,
+            "hstr_channel_3_l1": channel_3_l1,
+            "hstr_channel_min_l1": channel_min_l1,
             "hstr_score": scores,
             "score_direction": HSTR_SCORE_DIRECTION,
-            "score_definition": HSTR_SCORE_DEFINITION,
+            "score_definition": self.score_definition,
             "selected_key_index": self.key_index,
             "selected_key_seed": self.selected_key_seed,
             "selected_pattern_sha256": self.selected_pattern_sha256,
@@ -435,15 +560,21 @@ class HSTRProvider(WmProvider):
         return {"items": items}
 
     def __get_watermarking_mask(self) -> tuple[torch.Tensor, torch.Tensor]:
-        single_channel_tree_watermark_mask = torch.tensor(circle_mask(size=self.latent_shape[-1], r=RADIUS))
-        single_channel_heter_watermark_mask = torch.tensor(ring_mask(size=self.latent_shape[-1], r_out=RADIUS, r_in=RADIUS_CUTOFF))
         masks = torch.zeros(self.latent_shape, dtype=torch.bool)
-        masks[:, TREE_WATERMARK_CHANNEL] = single_channel_tree_watermark_mask
-        masks[:, HETER_WATERMARK_CHANNEL] = single_channel_heter_watermark_mask
-        watermark_region_mask_hstr = torch.stack([
-            single_channel_heter_watermark_mask,
-            single_channel_tree_watermark_mask,
-        ]).to(self.device)
+        region_masks = []
+        if not self.is_rid_only:
+            single_channel_tree_watermark_mask = torch.tensor(
+                circle_mask(size=self.latent_shape[-1], r=RADIUS)
+            )
+            masks[:, TREE_WATERMARK_CHANNEL] = single_channel_tree_watermark_mask
+            region_masks.append(single_channel_tree_watermark_mask)
+        if self.heterogeneous_channels:
+            single_channel_heter_watermark_mask = torch.tensor(
+                ring_mask(size=self.latent_shape[-1], r_out=RADIUS, r_in=RADIUS_CUTOFF)
+            )
+            masks[:, self.heterogeneous_channels] = single_channel_heter_watermark_mask
+            region_masks.insert(0, single_channel_heter_watermark_mask)
+        watermark_region_mask_hstr = torch.stack(region_masks).to(self.device)
         return masks, watermark_region_mask_hstr
 
     def __get_watermarking_pattern(self) -> torch.Tensor:
@@ -452,17 +583,19 @@ class HSTRProvider(WmProvider):
             self.selected_key_seed,
             hs=True,
             center=True,
-            heter=True,
+            heter=bool(self.heterogeneous_channels),
         )
 
     def __get_watermarking_pattern_list(self) -> list[torch.Tensor]:
         return [
-            self.__make_Fourier_treering_pattern(self.shape, seed, hs=True, center=True, heter=True)
+            self.__make_Fourier_treering_pattern(
+                self.shape, seed, hs=True, center=True, heter=bool(self.heterogeneous_channels)
+            )
             for seed in self.hstr_seed_list
         ]
 
     def __key_seed_latent(self, hstr_seed: int) -> torch.Tensor:
-        if self.profile == OFFICIAL_HSTR_PROFILE:
+        if self.profile in (OFFICIAL_HSTR_PROFILE, OFFICIAL_MATH_TR_ONLY_PROFILE, OFFICIAL_MATH_RID_ONLY_PROFILE):
             device = torch.device(self.rng_device)
             generator = torch.Generator(device=device).manual_seed(int(hstr_seed))
             return torch.randn(self.shape, generator=generator, device=device, dtype=self.dtype).to(self.device)
@@ -509,7 +642,12 @@ class HSTRProvider(WmProvider):
             center_latent_ifft = HSTRProvider.ifft(center_latent_fft)
             center_latent_ifft = center_latent_ifft.real if cut_real or center_latent_ifft.imag.abs().max() < 1e-3 else center_latent_ifft
             inverted_latent = inverted_latent.clone()
-            inverted_latent[self.center_slice] = center_latent_ifft
+            if self.is_ablation:
+                inverted_latent[:, self.watermark_channels, self.start:self.end, self.start:self.end] = (
+                    center_latent_ifft[:, self.watermark_channels]
+                )
+            else:
+                inverted_latent[self.center_slice] = center_latent_ifft
             inverted_latent_fft = None
         else:
             inverted_latent_fft = HSTRProvider.fft(inverted_latent)

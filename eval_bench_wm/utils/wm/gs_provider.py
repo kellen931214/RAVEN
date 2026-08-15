@@ -72,7 +72,7 @@ parser.add_argument(
 )
 parser.add_argument('--gs_channel_copy', default=1, type=int)
 parser.add_argument('--gs_hw_copy', default=8, type=int)
-parser.add_argument('--gs_fpr', default=1e-6, type=float)
+parser.add_argument('--gs_fpr', default=0.01, type=float)
 parser.add_argument('--gs_user_number', default=1000000, type=int)
 parser.add_argument('--gs_sampling_seed', default=None, type=int)
 parser.add_argument('--gs_secret_index', default=None, type=int)
@@ -96,7 +96,7 @@ class GsProvider(WmProvider):
                  gs_detection_mode: str = "official_onebit",
                  gs_channel_copy: int = 1,
                  gs_hw_copy: int = 8,
-                 gs_fpr: float = 1e-6,
+                 gs_fpr: float = 0.01,
                  gs_user_number: int = 1000000,
                  gs_sampling_seed: typing.Optional[int] = None,
                  gs_secret_index: typing.Optional[int] = None,

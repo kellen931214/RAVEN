@@ -1,20 +1,26 @@
 #!/usr/bin/env python3
 """Offline RAVEN evaluation.
 
-Reads ``config.json``, ``records.jsonl``, and per-sample ``output.png`` files
-produced by ``main.py``.  Runs quality metrics, detector evaluation, FID, and
-CLIP — all without importing or initializing ``RavenPipeline``.
+Evaluates canonical RAVEN runs from ``config.json``, ``records.jsonl``, and
+per-sample ``output.png`` files.  The optional ``pixel-shift`` workflow also
+streams an external black-fill pixel shift through ``RavenPipeline`` before
+running the same evaluation stages.
 
     python raven_repro/eval.py --output-dir /tmp/run --device cuda
+    python raven_repro/eval.py --workflow pixel-shift --metadata data.csv \
+        --output-dir /tmp/pixel-shift --magnitudes 16 24 32
 """
 
 from __future__ import annotations
 
 import argparse
+import csv
+import gc
 import json
 import logging
 import math
 import os
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -23,9 +29,13 @@ from typing import Any
 _REPO = Path(__file__).resolve().parent
 sys.path.insert(0, str(_REPO))
 
+from raven.experiment_config import (  # noqa: E402
+    check_config_match, config_for_pipeline, normalize_config,
+)
 from raven.experiment_io import (  # noqa: E402
-    config_path, detector_records_path, evaluation_dir,
-    output_image_path, read_config, read_records_jsonl,
+    cleanup_intermediates, config_path, detector_records_path, evaluation_dir,
+    is_sample_complete, output_image_path, prepare_output_dir, read_config,
+    read_records_jsonl, rebuild_records_jsonl, write_config, write_record,
 )
 from raven.evaluation.metrics import pair_quality_metrics  # noqa: E402
 from raven.detectors import (  # noqa: E402
@@ -207,6 +217,12 @@ def _build_detector_image_index(
         role = rec.get("role", "watermarked")
         cohorts = DETECTOR_COHORTS.get(role, {})
         for variant, info in cohorts.items():
+            # Reference-only clean records deliberately keep the original clean
+            # cohort for threshold calibration. Their output is a link to the
+            # input only for the canonical record layout; it is not an
+            # attacked-clean cohort and must never enter recalibration.
+            if role == "clean" and rec.get("reference_only_clean") and variant == "attacked":
+                continue
             image_path = _resolve_image_path(rec, info["image_source"], output_dir)
             index.append({
                 "run_id": run_id,
@@ -451,6 +467,8 @@ def evaluate_quality(
     ssim_values: list[float] = []
 
     for rec in records:
+        if rec.get("reference_only_clean"):
+            continue
         run_id = str(rec["run_id"])
         role = rec.get("role", "watermarked")
         input_path = Path(rec.get("input_path", ""))
@@ -1090,6 +1108,78 @@ def evaluate_clip(
         return {"stage": "clip", "status": STATUS_FAILED_INTERNAL_ERROR,
                 "error": f"{type(exc).__name__}: {exc}"}
 
+# ===========================================================================
+# LPIPS stage
+# ===========================================================================
+def evaluate_lpips(
+    records: list[dict[str, Any]],
+    output_dir: str | Path,
+    device: str = "cuda",
+    config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Stream LPIPS over watermarked input/output pairs without image caching."""
+    try:
+        import lpips
+        import numpy as np
+        import torch
+        from PIL import Image
+    except ImportError:
+        return {"stage": "lpips", "status": STATUS_FAILED_MISSING_DEPENDENCY,
+                "reason": "lpips is not installed."}
+
+    wm_records = [record for record in records if record.get("role") == "watermarked"]
+    if not wm_records:
+        return {"stage": "lpips", "status": STATUS_SKIPPED_INSUFFICIENT_DATA,
+                "reason": "No watermarked records."}
+
+    model = lpips.LPIPS(net="alex").to(device).eval()
+    values: list[float] = []
+    failed = 0
+
+    def load_image(path: Path) -> torch.Tensor:
+        with Image.open(path) as image:
+            array = np.asarray(image.convert("RGB"), dtype=np.float32) / 127.5 - 1.0
+        return torch.from_numpy(array).permute(2, 0, 1).unsqueeze(0).to(device)
+
+    try:
+        with torch.no_grad():
+            for record in wm_records:
+                input_path = Path(record.get("input_path", ""))
+                output_path = output_image_path(output_dir, "watermarked", str(record["run_id"]))
+                if not input_path.is_file() or not output_path.is_file():
+                    failed += 1
+                    continue
+                try:
+                    reference = load_image(input_path)
+                    attacked = load_image(output_path)
+                    if reference.shape != attacked.shape:
+                        import torch.nn.functional as functional
+                        attacked = functional.interpolate(
+                            attacked, size=reference.shape[-2:], mode="bilinear", align_corners=False,
+                        )
+                    values.append(float(model(reference, attacked).item()))
+                    del reference, attacked
+                except Exception as exc:  # noqa: BLE001 - per-sample containment
+                    logger.warning("LPIPS failed for run_id=%s: %s", record.get("run_id"), exc)
+                    failed += 1
+                finally:
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+    finally:
+        del model
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    if not values:
+        return {"stage": "lpips", "status": STATUS_SKIPPED_INSUFFICIENT_DATA,
+                "reason": "No valid watermarked input/output pairs.", "failed_count": failed}
+    return {
+        "stage": "lpips", "status": STATUS_COMPLETED, "model": "alex",
+        "count": len(values), "failed_count": failed,
+        "mean": sum(values) / len(values), "min": min(values), "max": max(values),
+    }
+
 
 # ===========================================================================
 # Orchestrator
@@ -1100,6 +1190,7 @@ STAGE_RUNNERS: dict[str, Any] = {
         r, od, cfg.get("method", "TR"), dev, cfg),
     "fid": evaluate_fid,
     "clip": evaluate_clip,
+    "lpips": evaluate_lpips,
 }
 
 
@@ -1176,22 +1267,373 @@ def run_evaluation(
 
     return result
 
+# ===========================================================================
+# Pixel-shift workflows
+# ===========================================================================
+PIXEL_SHIFT_STAGES = ["quality", "detector", "fid", "clip", "lpips"]
+
+
+def _iter_pixel_shift_metadata(path: Path, limit: int | None):
+    """Yield normalized metadata rows without retaining the full CSV in RAM."""
+    from main import normalize_metadata_row
+
+    with path.open("r", encoding="utf-8-sig", newline="") as handle:
+        reader = csv.DictReader(handle)
+        for index, row in enumerate(reader):
+            if limit is not None and index >= limit:
+                break
+            yield normalize_metadata_row(row)
+
+
+def pixel_shift_with_black_fill(image, dx: int, dy: int):
+    """Translate an image in pixel space, dropping exposed pixels to black."""
+    from PIL import Image
+
+    shifted = Image.new(image.mode, image.size, color=0)
+    width, height = image.size
+    source_left, source_top = max(0, -dx), max(0, -dy)
+    source_right, source_bottom = min(width, width - dx), min(height, height - dy)
+    if source_left >= source_right or source_top >= source_bottom:
+        return shifted
+    shifted.paste(
+        image.crop((source_left, source_top, source_right, source_bottom)),
+        (max(0, dx), max(0, dy)),
+    )
+    return shifted
+
+
+def _pixel_shift_config(args: argparse.Namespace, output_dir: Path, magnitude: int) -> dict[str, Any]:
+    config = normalize_config(
+        diffusion_mode="ddim",
+        method="TR",
+        dataset=args.dataset,
+        metadata_path=str(args.metadata.resolve()),
+        output_dir=str(output_dir.resolve()),
+        roles=["watermarked"],
+        limit=args.limit,
+        gpu=args.gpu,
+        overwrite=args.overwrite,
+        resume=args.resume,
+        shift_mode="none",
+        shift_magnitude_min=magnitude,
+        shift_magnitude_max=magnitude,
+        base_seed=args.base_seed,
+        steps=args.steps,
+        strength=args.strength,
+        guidance_scale=args.guidance_scale,
+        shift_space="image_pixels",
+        warp_mode=args.warp_mode,
+        latent_sampling_mode=args.sampling,
+        padding_mode=args.padding_mode,
+        view_guided_attention=args.view_guided_attention,
+        color_transfer=args.color_transfer == "aligned",
+        prompt="",
+        prompt_source="metadata",
+        negative_prompt=args.negative_prompt,
+        debug=False,
+        save_input_copy=False,
+        save_intermediates=args.save_intermediates,
+        model_id=args.model_id,
+        model_revision=args.model_revision,
+        dtype=args.dtype,
+    )
+    config.update({
+        "workflow": "pixel_shift",
+        "pixel_shift": {
+            "dx_px": magnitude,
+            "dy_px": magnitude,
+            "fill": "black",
+            "internal_latent_shift": False,
+        },
+    })
+    return config
+
+
+def _write_workflow_result(output_dir: Path, result: dict[str, Any]) -> None:
+    destination = evaluation_dir(output_dir) / "summary.json"
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def _run_pixel_shift_attack_for_magnitude(
+    args: argparse.Namespace,
+    magnitude: int,
+    output_dir: Path,
+    pipe,
+) -> int:
+    """Run one pixel-shift cohort incrementally and write canonical records."""
+    from PIL import Image, ImageOps
+    from main import resolve_input_path
+    from raven.shift_plan import compute_attack_seed
+
+    config = _pixel_shift_config(args, output_dir, magnitude)
+    prepared = prepare_output_dir(output_dir, overwrite=args.overwrite, resume=args.resume)
+    if args.resume and config_path(prepared).is_file():
+        stored = read_config(prepared)
+        mismatches = check_config_match(stored, config)
+        if mismatches:
+            raise ValueError("pixel-shift resume config mismatch: " + ", ".join(sorted(mismatches)))
+        config = stored
+    else:
+        write_config(prepared, config)
+
+    pipeline_kwargs = config_for_pipeline(config)
+    completed = 0
+    for row in _iter_pixel_shift_metadata(args.metadata, args.limit):
+        run_id = str(row["run_id"])
+        if is_sample_complete(prepared, "watermarked", run_id):
+            continue
+        input_path = resolve_input_path(row, "watermarked")
+        with Image.open(input_path) as opened:
+            image = ImageOps.exif_transpose(opened).convert("RGB")
+            image.load()
+        shifted_input = pixel_shift_with_black_fill(image, magnitude, magnitude)
+        sample_dir = prepared / "samples" / "watermarked" / run_id
+        sample_dir.mkdir(parents=True, exist_ok=True)
+        attack_seed = compute_attack_seed(config["base_seed"], run_id)
+        final_image = pipe.run(
+            **pipeline_kwargs,
+            input_image=shifted_input,
+            output_dir=str(sample_dir),
+            seed=attack_seed,
+            prompt=row.get("prompt", ""),
+            shift_x=0.0,
+            shift_y=0.0,
+        )
+        output_path = output_image_path(prepared, "watermarked", run_id)
+        final_image.save(output_path)
+        record = {
+            "run_id": run_id,
+            "role": "watermarked",
+            "dataset": config["dataset"],
+            "method": "TR",
+            "input_path": str(input_path),
+            "output_path": str(output_path),
+            "prompt": row.get("prompt", ""),
+            "prompt_id": row.get("prompt_id", ""),
+            "prompt_source": "metadata",
+            "attack_seed": attack_seed,
+            "pixel_shift_dx_px": magnitude,
+            "pixel_shift_dy_px": magnitude,
+            "planned_flow_dx_image_px": 0.0,
+            "planned_flow_dy_image_px": 0.0,
+            "effective_source_flow_dx_image_px": 0.0,
+            "effective_source_flow_dy_image_px": 0.0,
+            "source_metadata": row,
+            "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
+        write_record(prepared, "watermarked", run_id, record)
+        if not config.get("save_intermediates"):
+            cleanup_intermediates(prepared, "watermarked", run_id)
+        completed += 1
+        del image, shifted_input, final_image
+        gc.collect()
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except ImportError:
+            pass
+    rebuild_records_jsonl(prepared)
+    return completed
+
+
+def _evaluate_pixel_shift_directory(args: argparse.Namespace, output_dir: Path) -> dict[str, Any]:
+    stages = args.stages or PIXEL_SHIFT_STAGES
+    result = run_evaluation(
+        output_dir,
+        device=args.device,
+        stages=stages,
+        allow_missing_metrics=args.allow_missing_metrics,
+    )
+    _write_workflow_result(output_dir, result)
+    return result
+
+
+def run_pixel_shift_workflow(args: argparse.Namespace) -> dict[str, Any]:
+    """Pixel-shift images, run RAVEN once per sample, then evaluate each cohort."""
+    if args.metadata is None or not args.metadata.is_file():
+        raise FileNotFoundError("--metadata is required for --workflow pixel-shift")
+
+    pipe = None
+    summaries: dict[str, Any] = {}
+    try:
+        if not args.eval_only:
+            if args.gpu is not None:
+                os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
+            import torch
+            if not torch.cuda.is_available():
+                raise RuntimeError("CUDA is required for pixel-shift RAVEN generation")
+            from raven.pipeline_raven import RavenPipeline
+            pipe = RavenPipeline(
+                model_id=args.model_id,
+                device="cuda",
+                dtype=args.dtype,
+                revision=args.model_revision,
+                scheduler_mode="ddim",
+            )
+
+        for magnitude in args.magnitudes:
+            directory = args.output_dir / f"pixel_shift_raven_{magnitude}px"
+            if args.eval_only:
+                if not config_path(directory).is_file():
+                    raise FileNotFoundError(f"config.json not found for --eval-only: {directory}")
+            else:
+                _run_pixel_shift_attack_for_magnitude(args, magnitude, directory, pipe)
+            summaries[str(magnitude)] = _evaluate_pixel_shift_directory(args, directory)
+    finally:
+        if pipe is not None:
+            del pipe
+            gc.collect()
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except ImportError:
+                pass
+
+    result = {"workflow": "pixel_shift", "magnitudes": summaries}
+    (args.output_dir / "pixel_shift_results.json").write_text(
+        json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8",
+    )
+    return result
+
+
+def rebuild_pixel_shift_records(args: argparse.Namespace) -> dict[str, Any]:
+    """Rebuild canonical records from existing pixel-shift output images, then evaluate."""
+    if args.metadata is None or not args.metadata.is_file():
+        raise FileNotFoundError("--metadata is required for --workflow rebuild-pixel-shift")
+
+    summaries: dict[str, Any] = {}
+    for magnitude in args.magnitudes:
+        directory = args.output_dir / f"pixel_shift_raven_{magnitude}px"
+        if not directory.is_dir():
+            raise FileNotFoundError(f"pixel-shift output directory not found: {directory}")
+        if not config_path(directory).is_file():
+            write_config(directory, _pixel_shift_config(args, directory, magnitude))
+
+        rebuilt = 0
+        for row in _iter_pixel_shift_metadata(args.metadata, args.limit):
+            run_id = str(row["run_id"])
+            watermarked_output = output_image_path(directory, "watermarked", run_id)
+            watermarked_input = Path(row.get("watermarked_path", ""))
+            if watermarked_output.is_file() and watermarked_input.is_file():
+                write_record(directory, "watermarked", run_id, {
+                    "run_id": run_id, "role": "watermarked", "dataset": args.dataset,
+                    "method": "TR", "input_path": str(watermarked_input),
+                    "output_path": str(watermarked_output), "prompt": row.get("prompt", ""),
+                    "prompt_id": row.get("prompt_id", ""), "prompt_source": "metadata",
+                    "pixel_shift_dx_px": magnitude, "pixel_shift_dy_px": magnitude,
+                    "planned_flow_dx_image_px": 0.0, "planned_flow_dy_image_px": 0.0,
+                    "effective_source_flow_dx_image_px": 0.0,
+                    "effective_source_flow_dy_image_px": 0.0,
+                    "source_metadata": row,
+                    "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                })
+                rebuilt += 1
+
+            clean_input = Path(row.get("clean_path", ""))
+            if clean_input.is_file():
+                clean_output = output_image_path(directory, "clean", run_id)
+                clean_output.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(clean_input, clean_output)
+                write_record(directory, "clean", run_id, {
+                    "run_id": run_id, "role": "clean", "dataset": args.dataset,
+                    "method": "TR", "input_path": str(clean_input),
+                    "output_path": str(clean_output), "prompt": row.get("prompt", ""),
+                    "prompt_id": row.get("prompt_id", ""), "prompt_source": "metadata",
+                    "pixel_shift_dx_px": 0, "pixel_shift_dy_px": 0,
+                    "planned_flow_dx_image_px": 0.0, "planned_flow_dy_image_px": 0.0,
+                    "effective_source_flow_dx_image_px": 0.0,
+                    "effective_source_flow_dy_image_px": 0.0,
+                    "source_metadata": row,
+                    "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                })
+        rebuild_records_jsonl(directory)
+        result = _evaluate_pixel_shift_directory(args, directory)
+        result["rebuilt_watermarked_count"] = rebuilt
+        summaries[str(magnitude)] = result
+
+    result = {"workflow": "rebuild_pixel_shift", "magnitudes": summaries}
+    (args.output_dir / "pixel_shift_rebuild_results.json").write_text(
+        json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8",
+    )
+    return result
+
 
 # ===========================================================================
 # CLI
 # ===========================================================================
+def _parse_bool(value: str | bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    normalized = str(value).strip().lower()
+    if normalized in {"true", "1", "yes", "on"}:
+        return True
+    if normalized in {"false", "0", "no", "off"}:
+        return False
+    raise argparse.ArgumentTypeError(f"expected bool, got {value!r}")
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--output-dir", type=Path, required=True)
+    p.add_argument(
+        "--workflow", default="evaluate",
+        choices=["evaluate", "pixel-shift", "rebuild-pixel-shift"],
+        help=("evaluate an existing run (default); generate/evaluate a pixel-space "
+              "shift cohort; or rebuild/evaluate an existing cohort"),
+    )
+    p.add_argument("--output-dir", type=Path, required=True,
+                   help="Run directory for evaluate; output root for pixel-shift workflows")
     p.add_argument("--device", default="cuda")
     p.add_argument("--stages", nargs="+",
-                   choices=["quality", "detector", "fid", "clip"],
-                   default=["quality", "detector"])
+                   choices=["quality", "detector", "fid", "clip", "lpips"],
+                   default=None,
+                   help="Defaults to quality/detector, or all stages for pixel-shift workflows")
     p.add_argument("--allow-missing-metrics", action="store_true")
     p.add_argument("--output", type=Path, default=None)
+    # The workflow options mirror RAVEN generation settings.  Metadata is
+    # streamed and only one image/pipeline result is retained at a time.
+    p.add_argument("--metadata", type=Path, default=None,
+                   help="CSV with run_id, watermarked_path, clean_path, and prompt")
+    p.add_argument("--dataset", default="diffusiondb")
+    p.add_argument("--magnitudes", type=int, nargs="+", default=[16, 24, 32])
+    p.add_argument("--limit", type=int, default=None,
+                   help="Process at most this many rows (streamed incrementally)")
+    p.add_argument("--eval-only", action="store_true",
+                   help="For pixel-shift, skip generation and evaluate existing outputs")
+    p.add_argument("--gpu", type=int, default=0)
+    p.add_argument("--model-id", default="RedbeardNZ/stable-diffusion-2-1-base")
+    p.add_argument("--model-revision",
+                   default="c6a5e9bab8d874d081de76fa270ae0aefa5410ff")
+    p.add_argument("--dtype", default="float16")
+    p.add_argument("--steps", type=int, default=50)
+    p.add_argument("--strength", type=float, default=0.15)
+    p.add_argument("--guidance-scale", type=float, default=2.5)
+    p.add_argument("--base-seed", type=int, default=42)
+    p.add_argument("--sampling", choices=["nearest", "bilinear"], default="nearest")
+    p.add_argument("--warp-mode", default="raven_paper_nfpa_gap_fill")
+    p.add_argument("--padding-mode", default="reflection")
+    p.add_argument("--color-transfer", choices=["aligned", "none"], default="aligned")
+    p.add_argument("--view-guided-attention", type=_parse_bool, default=True)
+    p.add_argument("--negative-prompt", default="")
+    p.add_argument("--save-intermediates", action="store_true")
+    p.add_argument("--resume", action="store_true")
+    p.add_argument("--overwrite", action="store_true")
     p.add_argument("--log-level", default="INFO",
                    choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     return p
+
+
+def _workflow_exit_code(result: dict[str, Any], allow_missing_metrics: bool) -> int:
+    """Return the worst per-magnitude evaluation exit code."""
+    magnitudes = result.get("magnitudes", {})
+    if not magnitudes:
+        return 1
+    return max(
+        determine_exit_code(summary, allow_missing_metrics=allow_missing_metrics)
+        for summary in magnitudes.values()
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1199,14 +1641,23 @@ def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=getattr(logging, args.log_level),
                         format="%(asctime)s [%(levelname)s] %(message)s",
                         datefmt="%Y-%m-%dT%H:%M:%S")
-    if not args.output_dir.is_dir():
+    if args.workflow == "evaluate" and not args.output_dir.is_dir():
         logger.error("output-dir does not exist: %s", args.output_dir)
         return 1
     try:
-        result = run_evaluation(args.output_dir, device=args.device,
-                                stages=args.stages,
-                                allow_missing_metrics=args.allow_missing_metrics)
-    except Exception as exc:
+        if args.workflow == "pixel-shift":
+            result = run_pixel_shift_workflow(args)
+            exit_code = _workflow_exit_code(result, args.allow_missing_metrics)
+        elif args.workflow == "rebuild-pixel-shift":
+            result = rebuild_pixel_shift_records(args)
+            exit_code = _workflow_exit_code(result, args.allow_missing_metrics)
+        else:
+            result = run_evaluation(args.output_dir, device=args.device,
+                                    stages=args.stages,
+                                    allow_missing_metrics=args.allow_missing_metrics)
+            exit_code = determine_exit_code(
+                result, allow_missing_metrics=args.allow_missing_metrics)
+    except Exception:
         logger.exception("Evaluation failed")
         return 1
 
@@ -1223,10 +1674,7 @@ def main(argv: list[str] | None = None) -> int:
         logger.error("Failed stages: %s", ", ".join(failed))
     if skipped:
         logger.warning("Skipped required stages: %s", ", ".join(skipped))
-
-    # ---- Issue #25: unified exit-code policy ----
-    return determine_exit_code(
-        result, allow_missing_metrics=args.allow_missing_metrics)
+    return exit_code
 
 
 if __name__ == "__main__":

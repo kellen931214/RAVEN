@@ -15,7 +15,12 @@ from utils.wm.tr_provider import parser as tr_parser
 from utils.wm.prc_provider import parser as prc_parser
 from utils.wm.tag_provider import parser as tag_parser
 from utils.wm.ringid_provider import parser as ringid_parser
-from utils.wm.hstr_provider import parser as hstr_parser
+from utils.wm.hstr_provider import (
+    OFFICIAL_HSTR_PROFILE,
+    OFFICIAL_MATH_TR_ONLY_PROFILE,
+    OFFICIAL_MATH_RID_ONLY_PROFILE,
+    parser as hstr_parser,
+)
 from utils.wm.hsqr_provider import parser as hsqr_parser
 from utils.wm.sph_provider import parser as sph_parser
 from utils.wm.t2s_provider import parser as t2s_parser
@@ -90,6 +95,7 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # args
 import argparse
+import gc
 
 
 def build_parser():
@@ -625,7 +631,7 @@ def run_hstr_generation(args, argv):
         manifest = dict(run_config)
         manifest.update({k: v for k, v in provenance.items() if k != "created_utc"})
         manifest["run_config_sha256"] = run_config_sha256
-        manifest["report_label"] = "official_profile_raw_scores"
+        manifest["report_label"] = provider.generation_report_label
         out_dir.mkdir(parents=True, exist_ok=True)
         manifest_path.write_text(sfw_bundle.canonical_json(manifest) + "\n", encoding="utf-8")
 
@@ -700,7 +706,7 @@ def run_hstr_generation(args, argv):
             "selected_key_seed": provider.selected_key_seed,
             "selected_pattern_sha256": provider.selected_pattern_sha256,
             "run_config_sha256": run_config_sha256,
-            "protocol": "hstr_official_sfwmark_paired_direct_generation",
+            "protocol": provider.generation_protocol,
         }
         row.update({k: v for k, v in provenance.items() if k != "created_utc"})
         row["created_utc"] = sfw_bundle.utc_now()
@@ -962,7 +968,9 @@ def main(argv=None):
     if args.wm_type == "HSQR":
         return run_hsqr_generation(args, argv)
 
-    if args.wm_type == "HSTR" and getattr(args, "hstr_profile", None) == "official_sfwmark_sd21":
+    if args.wm_type == "HSTR" and getattr(args, "hstr_profile", None) in (
+        OFFICIAL_HSTR_PROFILE, OFFICIAL_MATH_TR_ONLY_PROFILE, OFFICIAL_MATH_RID_ONLY_PROFILE
+    ):
         return run_hstr_generation(args, argv)
 
     wm_provider_cls = WmProviders[args.wm_type].value

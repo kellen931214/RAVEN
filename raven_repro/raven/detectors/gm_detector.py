@@ -37,13 +37,13 @@ _CANONICAL_KWARGS_FIELDS: tuple[str, ...] = (
 )
 
 _REQUIRED_SCORER_OUTPUTS: tuple[str, ...] = (
-    "gm_raw_bit_accuracy", "gm_raw_ring_l1",
+    "gm_raw_bit_accuracy", "gm_raw_ring_l1", "gm_ring_classifier_feature",
     "gm_report_label", "gm_score_definition",
     "gm_threshold_source", "gm_comparison_operator",
 )
 _NUMERIC_SCORER_FIELDS: frozenset[str] = frozenset({
     "gm_raw_bit_accuracy", "gm_raw_ring_l1",
-    "gm_restored_bit_accuracy", "gm_classifier_probability",
+    "gm_restored_bit_accuracy", "gm_classifier_probability", "gm_ring_classifier_feature",
 })
 _PROBABILITY_SCORER_FIELDS: frozenset[str] = frozenset({
     "gm_raw_bit_accuracy", "gm_restored_bit_accuracy", "gm_classifier_probability",
@@ -57,7 +57,7 @@ _PERSISTED_BUNDLE_FALSE_KWARGS: frozenset[str] = frozenset({
     "gm_create_bundle", "gm_allow_in_memory_state",
 })
 _NULLABLE_CANONICAL_FIELDS: frozenset[str] = frozenset({
-    "gm_gnr_path", "gm_classifier_path", "gm_watermark_bits_seed",
+    "gm_gnr_path", "gm_classifier_path", "gm_watermark_bits_seed", "model_revision",
 })
 
 _MISSING = object()
@@ -76,7 +76,7 @@ _PROVIDER_ATTR_BINDINGS: tuple[tuple[str, str, Any], ...] = (
     ("use_gnr", "gm_use_gnr", bool),
     ("use_classifier", "gm_use_classifier", bool),
     ("model_id", "modelid_target", str),
-    ("model_revision", "model_revision", str),
+    ("model_revision", "model_revision", (str, type(None))),
     ("scheduler_name", "scheduler_target", str),
     ("resolution", "resolution", int),
     ("inversion_guidance", "gm_inversion_guidance", numbers.Real),
@@ -154,9 +154,9 @@ def _canonical_provider_identity(kwargs: dict[str, Any]) -> str:
 def _validate_gm_protocol_mode(record: dict[str, Any]) -> None:
     from raven.detectors.protocols import GM_SHARED_TR_CLEAN_MODE
     actual = str(record.get("gm_protocol_mode", ""))
-    if actual != GM_SHARED_TR_CLEAN_MODE:
+    if actual not in {GM_SHARED_TR_CLEAN_MODE, "official_gaussmarker_released_state"}:
         raise DetectorStateValidationError(
-            f"GM protocol mode {actual!r} != {GM_SHARED_TR_CLEAN_MODE!r}")
+            f"unsupported GM protocol mode {actual!r}")
 
 
 def _validate_gm_provider_profile(manifest, kwargs, provider=None):
@@ -312,12 +312,25 @@ def load_state(records: list[dict[str, Any]], device: str, **extra) -> dict[str,
 
     try:
         device_obj = torch.device(device)
-        pipe = pipe_utils.get_pipe_provider(
-            pretrained_model_name_or_path=first_kwargs["modelid_target"],
-            revision=first_kwargs["model_revision"],
-            resolution=first_kwargs["resolution"],
-            device=device_obj, eager_loading=False,
-            schedulers_name=first_kwargs["scheduler_target"], disable_tqdm=True)
+        if first_kwargs["gm_profile"] == "official_sd21":
+            mirror = str(row_bindings[0]["manifest"].get("model_mirror_local_snapshot", ""))
+            if not mirror or not Path(mirror).is_dir():
+                raise DetectorMissingStateError("official GM bundle requires the verified local SD2.1 mirror snapshot")
+            if row_bindings[0]["manifest"].get("model_mirror_identity") != "exact_git_blob_and_lfs_oid_match_to_direct_clone_snapshot":
+                raise DetectorStateValidationError("GM local SD2.1 mirror identity is not verified")
+            from eval_bench_wm.utils.pipe.SD_provider import SDPipeProvider
+            pipe = SDPipeProvider(
+                pretrained_model_name_or_path=mirror, resolution=first_kwargs["resolution"], device=device_obj,
+                scheduler_classes=pipe_utils.SCHEDULER_CLASSES[first_kwargs["scheduler_target"]],
+                unet_id_or_checkpoint_dir=None, lora_checkpoint_dir=None, vae_id=None, zero_unet=False,
+                eager_loading=False, torch_dtype=torch.float16, local_files_only=True, disable_tqdm=True,
+            )
+        else:
+            pipe = pipe_utils.get_pipe_provider(
+                pretrained_model_name_or_path=first_kwargs["modelid_target"],
+                revision=first_kwargs["model_revision"], resolution=first_kwargs["resolution"],
+                device=device_obj, eager_loading=False, schedulers_name=first_kwargs["scheduler_target"],
+                disable_tqdm=True)
         latent_shape = pipe.get_latent_shape()
         provider = GmProvider(latent_shape=latent_shape, dtype=pipe.get_dtype(),
                                device=device_obj, **first_kwargs)
@@ -365,13 +378,13 @@ def load_state(records: list[dict[str, Any]], device: str, **extra) -> dict[str,
             f"canonical={canonical_pio!r} provider={provider_pio!r} "
             f"bundle.manifest={bundle_pio!r}")
 
-    from raven.detectors.protocols import tensor_sha256
+    from eval_bench_wm.utils.wm import gm_bundle as gm_bundle_module
     if provider.gt_patch is None:
         raise DetectorStateValidationError("GM provider has no gt_patch")
-    provider_target_hash = tensor_sha256(provider.gt_patch.real.contiguous())
+    provider_target_hash = gm_bundle_module.sha256_tensor(provider.gt_patch.contiguous())
     if getattr(provider, "watermarking_mask", None) is None:
         raise DetectorStateValidationError("GM provider has no watermarking_mask")
-    provider_mask_hash = tensor_sha256(provider.watermarking_mask.contiguous())
+    provider_mask_hash = gm_bundle_module.sha256_tensor(provider.watermarking_mask.contiguous())
 
     for row in records:
         rt, rm = str(row.get("watermark_target_sha256", "")), str(row.get("watermark_mask_sha256", ""))
@@ -382,7 +395,6 @@ def load_state(records: list[dict[str, Any]], device: str, **extra) -> dict[str,
             raise DetectorStateValidationError(f"run_id={rid}: cohort mask SHA mismatch")
 
     first_manifest = row_bindings[0]["manifest"]
-    from raven.detectors.protocols import GM_SHARED_TR_CLEAN_MODE
     verified_provenance: dict[str, Any] = {
         "gm_bundle_dir": str(first_bundle_dir),
         "gm_bundle_config_sha256": str(first_manifest.get("bundle_config_sha256", "")),
@@ -391,7 +403,7 @@ def load_state(records: list[dict[str, Any]], device: str, **extra) -> dict[str,
         "gm_m_sha256": str(first_manifest.get("m_sha256", "")),
         "gm_watermark_sha256": str(first_manifest.get("watermark_sha256", "")),
         "gm_target_sha256": str(first_manifest.get("w2_tensor_sha256", "")),
-        "gm_protocol_mode": GM_SHARED_TR_CLEAN_MODE,
+        "gm_protocol_mode": str(records[0]["gm_protocol_mode"]),
         "gm_profile": str(first_kwargs.get("gm_profile", "")),
         "gm_state_source": str(getattr(provider, "state_source", "bundle")),
         "gm_profile_is_official": provider_pio,
@@ -539,6 +551,7 @@ def score_image(provider_info: dict[str, Any], image_path: str, *,
         "raw_score": raw, "canonical_score": canonical,
         "gm_raw_bit_accuracy": float(result["gm_raw_bit_accuracy"]),
         "gm_raw_ring_l1": float(result["gm_raw_ring_l1"]),
+        "gm_ring_classifier_feature": float(result["gm_ring_classifier_feature"]),
         "gm_restored_bit_accuracy": result.get("gm_restored_bit_accuracy"),
         "gm_classifier_probability": result.get("gm_classifier_probability"),
         "gm_report_label": str(result["gm_report_label"]),
@@ -621,14 +634,48 @@ def _resolve_gnr_classifier_usage(result, provider_info, *, kind) -> bool:
 
 
 def aggregate(detector_rows: list[dict[str, Any]], **extra) -> dict[str, Any]:
-    from raven.evaluation.metrics import summarize_detection
+    import numpy as np
+    from sklearn.metrics import roc_auc_score, roc_curve
+
+    def official_roc(positive_scores: list[float], negative_scores: list[float]) -> dict[str, float | str]:
+        """Match gaussmarker_det.py: last sklearn ROC point with FPR < 0.01."""
+        labels = np.asarray([1] * len(positive_scores) + [0] * len(negative_scores))
+        probabilities = np.asarray(positive_scores + negative_scores, dtype=float)
+        fpr, tpr, thresholds = roc_curve(labels, probabilities, pos_label=1)
+        below_target = np.where(fpr < 0.01)[0]
+        if below_target.size == 0:
+            raise DetectorScoringError("official GaussMarker ROC has no point with FPR < 0.01")
+        index = int(below_target[-1])
+        return {
+            "target_fpr": 0.01,
+            "empirical_fpr": float(fpr[index]),
+            "tpr_at_target_fpr": float(tpr[index]),
+            "threshold": float(thresholds[index]),
+            "roc_auc": float(roc_auc_score(labels, probabilities)),
+            "comparison_operator": ">=",
+        }
+
     from . import ROW_STATUS_SCORED
     cohorts: dict[str, list[float]] = {}
     for row in detector_rows:
         if row.get("status") != ROW_STATUS_SCORED:
             continue
+        if row.get("gm_gnr_used") is not True or row.get("gm_classifier_used") is not True:
+            raise DetectorScoringError(
+                "official GaussMarker ROC requires GNR-restored bits and classifier probability"
+            )
+        if row.get("gm_score_definition") != "gm_ensemble_classifier_probability":
+            raise DetectorScoringError(
+                "official GaussMarker ROC requires gm_ensemble_classifier_probability"
+            )
+        if row.get("gm_classifier_probability") is None:
+            raise DetectorScoringError("official GaussMarker ROC row has no classifier probability")
         cs = row.get("canonical_score")
         if cs is not None and math.isfinite(float(cs)):
+            if float(cs) != float(row["gm_classifier_probability"]):
+                raise DetectorScoringError(
+                    "official GaussMarker ROC canonical_score must equal classifier probability"
+                )
             cohorts.setdefault(row.get("evaluation_cohort", ""), []).append(float(cs))
     scored = sum(1 for r in detector_rows if r.get("status") == ROW_STATUS_SCORED)
     failed = len(detector_rows) - scored
@@ -637,19 +684,36 @@ def aggregate(detector_rows: list[dict[str, Any]], **extra) -> dict[str, Any]:
         "scored_count": scored, "failed_count": failed,
         "cohort_counts": {c: len(v) for c, v in cohorts.items()},
         "missing_cohorts": sorted({"original_watermarked", "attacked_watermarked"} - set(cohorts)),
-        "score_type": "gm_raw_bit_accuracy", "score_direction": "higher_is_watermarked",
-        "official_ensemble_threshold_available": False,
+        "protocol": "official_gaussmarker_ensemble_roc",
+        "score_definition": "gm_classifier_probability",
+        "score_direction": "higher_is_watermarked",
+        "threshold_source": "official_gaussmarker_roc_curve_fpr_lt_0.01",
+        "target_fpr": 0.01,
+        "comparison_operator": ">=",
     }
     clean, wm, atk = cohorts.get("original_clean", []), cohorts.get("original_watermarked", []), cohorts.get("attacked_watermarked", [])
     if clean and wm and atk:
-        s = summarize_detection(clean, wm, atk, target_fpr=0.01)
-        result["detection_summary"] = {
-            "target_fpr": 0.01, "threshold_type": "empirical_clean_1pct_fpr",
-            "threshold_comparison_operator": ">=",
-            "clean_calibrated_threshold": s.calibration.threshold,
-            "clean_calibrated_actual_fpr": s.calibration.actual_fpr,
-            "original_watermarked_tpr": s.watermarked_tpr,
-            "attacked_watermarked_tpr": s.attacked_tpr,
-            "attack_success": 1.0 - s.attacked_tpr,
+        before = official_roc(wm, clean)
+        after = official_roc(atk, clean)
+        fixed_before_tpr = sum(score >= before["threshold"] for score in atk) / len(atk)
+        result["original_watermarked_roc"] = before
+        result["attacked_watermarked_roc"] = after
+        result["fixed_before_threshold_attacked_tpr"] = fixed_before_tpr
+        result["official_summary"] = {
+            "method": "GM",
+            "protocol": "official_gaussmarker_ensemble_roc",
+            "score_definition": "gm_classifier_probability",
+            "threshold_source": "official_gaussmarker_roc_curve_fpr_lt_0.01",
+            "target_fpr": 0.01,
+            "actual_fpr": after["empirical_fpr"],
+            "threshold": after["threshold"],
+            "original_watermarked_tpr": before["tpr_at_target_fpr"],
+            "attacked_watermarked_tpr": after["tpr_at_target_fpr"],
+            "attack_success_rate": 1.0 - after["tpr_at_target_fpr"],
+            "original_roc_auc": before["roc_auc"],
+            "attacked_roc_auc": after["roc_auc"],
+            "num_clean": len(clean),
+            "num_watermarked": len(wm),
+            "num_attacked": len(atk),
         }
     return result
